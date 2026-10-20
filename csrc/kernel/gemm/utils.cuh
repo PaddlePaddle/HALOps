@@ -20,7 +20,6 @@
 
 #include <array>
 #include <cstdio>
-#include <cute/algorithm/cooperative_copy.hpp>
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm100_tma.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
