@@ -1,0 +1,9 @@
+FROM iregistry.baidu-int.com/paddlepaddle/base-images:paddlecloud-ubuntu24.04-gcc13.3-cuda13.0-cudnn913-bccl1.4.1.4-nccl2.26.5-openmpi4.1.5-FleetY13.5.0B-rc12
+
+RUN python -m pip uninstall -y torch numpy
+
+RUN python -m pip install torch numpy pytest
+
+# RUN python -m pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/ --no-deps
+# RUN python -m pip install flashinfer-python  # 拉依赖
+# RUN python -m pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/

@@ -1,0 +1,15 @@
+scenario: prefill_dense
+
+batch_sizes: [1, 4]
+s_kv_list: [512, 8192]
+num_q_heads: 56
+num_kv_heads: 4
+head_dim: 128
+dtype: bfloat16
+causal: true
+cache_quant_type: "none"
+
+backends: [halops]
+cold_l2_cache: true
+refcheck: false
+refcheck_reference: golden

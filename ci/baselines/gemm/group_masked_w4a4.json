@@ -1,0 +1,35 @@
+{
+  "config": "group_masked_w4a4",
+  "op": "gemm",
+  "threshold": 0.05,
+  "entries": [
+    {
+      "key": {
+        "scenario": "group_masked",
+        "backend": "halops",
+        "num_experts": 4,
+        "max_m": "",
+        "m": 512,
+        "n": 256,
+        "k": 512,
+        "mode": "w4a4",
+        "case_tag": "group_masked_w4a4"
+      },
+      "median_us": 5.183
+    },
+    {
+      "key": {
+        "scenario": "group_masked",
+        "backend": "halops",
+        "num_experts": 10,
+        "max_m": "",
+        "m": 40960,
+        "n": 4096,
+        "k": 4096,
+        "mode": "w4a4",
+        "case_tag": "group_masked_w4a4"
+      },
+      "median_us": 252.364
+    }
+  ]
+}

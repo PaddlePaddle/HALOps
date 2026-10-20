@@ -1,0 +1,75 @@
+{
+  "config": "prefill_c16_gqa56-4",
+  "op": "attention",
+  "threshold": 0.05,
+  "entries": [
+    {
+      "key": {
+        "scenario": "prefill_dense",
+        "backend": "halops",
+        "batch_size": 1,
+        "s_q": 512,
+        "s_kv": 512,
+        "num_q_heads": 56,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": true,
+        "case_tag": "prefill_c16_gqa56-4",
+        "use_cuda_graph": false
+      },
+      "median_us": 14.848
+    },
+    {
+      "key": {
+        "scenario": "prefill_dense",
+        "backend": "halops",
+        "batch_size": 1,
+        "s_q": 8192,
+        "s_kv": 8192,
+        "num_q_heads": 56,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": true,
+        "case_tag": "prefill_c16_gqa56-4",
+        "use_cuda_graph": false
+      },
+      "median_us": 749.028
+    },
+    {
+      "key": {
+        "scenario": "prefill_dense",
+        "backend": "halops",
+        "batch_size": 4,
+        "s_q": 512,
+        "s_kv": 512,
+        "num_q_heads": 56,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": true,
+        "case_tag": "prefill_c16_gqa56-4",
+        "use_cuda_graph": false
+      },
+      "median_us": 48.848
+    },
+    {
+      "key": {
+        "scenario": "prefill_dense",
+        "backend": "halops",
+        "batch_size": 4,
+        "s_q": 8192,
+        "s_kv": 8192,
+        "num_q_heads": 56,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": true,
+        "case_tag": "prefill_c16_gqa56-4",
+        "use_cuda_graph": false
+      },
+      "median_us": 2864.932
+    }
+  ]
+}

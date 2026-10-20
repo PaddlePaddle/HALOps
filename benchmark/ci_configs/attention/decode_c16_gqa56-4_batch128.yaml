@@ -1,0 +1,15 @@
+scenario: decode_gqa
+
+batch_sizes: [128]
+s_kv_list: [1024, 32768]
+mtp_steps_list: [0, 3]
+num_q_heads: 56
+num_kv_heads: 4
+head_dim: 128
+dtype: bfloat16
+use_cuda_graph: false
+
+backends: [halops]
+cold_l2_cache: true
+refcheck: false
+refcheck_reference: golden

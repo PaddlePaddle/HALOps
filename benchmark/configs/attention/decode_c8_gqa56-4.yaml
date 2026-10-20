@@ -1,0 +1,21 @@
+# configs/attention/decode_c8_gqa56-4.yaml
+# HALOps FP8 (C8) decode benchmark — GQA 56:4, block_wise_fp8 quantization.
+# Only halops supports FP8 paged decode; other backends are skipped.
+# case_tag / output_path are auto-derived from this filename by benchmark.py.
+scenario: decode_gqa
+
+batch_sizes: [1, 4, 16, 32, 64, 128]
+s_kv_list: [1024, 4096, 16384, 65536, 131072]
+mtp_steps_list: [0, 1, 2, 3]
+num_q_heads: 56
+num_kv_heads: 4
+head_dim: 128
+dtype: float8_e4m3fn
+use_write_cache: false
+cache_quant_type: "block_wise_fp8"
+use_cuda_graph: false
+
+backends: [halops, fi, fi_trtllm]
+cold_l2_cache: true
+refcheck: true
+refcheck_reference: fi_trtllm

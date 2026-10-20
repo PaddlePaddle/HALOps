@@ -1,0 +1,75 @@
+{
+  "config": "prefill_chunked_c16_gqa56-4",
+  "op": "attention",
+  "threshold": 0.05,
+  "entries": [
+    {
+      "key": {
+        "scenario": "prefill_chunked_gqa",
+        "backend": "halops",
+        "batch_size": 1,
+        "s_q": 4096,
+        "s_kv": 8192,
+        "num_q_heads": 56,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": true,
+        "case_tag": "prefill_chunked_c16_gqa56-4",
+        "use_cuda_graph": false
+      },
+      "median_us": 557.89
+    },
+    {
+      "key": {
+        "scenario": "prefill_chunked_gqa",
+        "backend": "halops",
+        "batch_size": 1,
+        "s_q": 4096,
+        "s_kv": 69632,
+        "num_q_heads": 56,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": true,
+        "case_tag": "prefill_chunked_c16_gqa56-4",
+        "use_cuda_graph": false
+      },
+      "median_us": 5643.516
+    },
+    {
+      "key": {
+        "scenario": "prefill_chunked_gqa",
+        "backend": "halops",
+        "batch_size": 4,
+        "s_q": 4096,
+        "s_kv": 8192,
+        "num_q_heads": 56,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": true,
+        "case_tag": "prefill_chunked_c16_gqa56-4",
+        "use_cuda_graph": false
+      },
+      "median_us": 2070.814
+    },
+    {
+      "key": {
+        "scenario": "prefill_chunked_gqa",
+        "backend": "halops",
+        "batch_size": 4,
+        "s_q": 4096,
+        "s_kv": 69632,
+        "num_q_heads": 56,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": true,
+        "case_tag": "prefill_chunked_c16_gqa56-4",
+        "use_cuda_graph": false
+      },
+      "median_us": 22786.044
+    }
+  ]
+}

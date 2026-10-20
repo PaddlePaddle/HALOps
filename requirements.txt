@@ -1,0 +1,7 @@
+# Build and test environment for source builds (pip install --no-build-isolation).
+# Runtime dependencies are declared in pyproject.toml.
+torch>=2.13.0
+numpy>=1.24
+setuptools
+wheel
+pytest>=7.0

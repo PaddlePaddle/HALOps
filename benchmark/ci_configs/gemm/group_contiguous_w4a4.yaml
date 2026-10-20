@@ -1,0 +1,14 @@
+scenario: group_contiguous
+mode: w4a4
+
+# [num_experts, max_m, N, K] shapes (total m = num_experts * max_m, then
+# aligned to tile_m boundaries).
+shapes:
+  - [4, 128, 256, 512]
+  - [10, 4096, 4096, 4096]
+sm_count: -1
+
+backends: [halops]
+cold_l2_cache: true
+refcheck: false
+refcheck_reference: golden

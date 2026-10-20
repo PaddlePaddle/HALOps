@@ -1,0 +1,22 @@
+# Grouped contiguous W8A8 (FP8) GEMM across halops, flashinfer (fi), and
+# deepgemm.
+scenario: group_contiguous
+mode: w8a8
+
+# [num_experts, max_m, N, K] shapes (total m = num_experts * max_m, then
+# aligned to tile_m boundaries).
+shapes:
+  - [4, 128, 256, 512]
+  - [4, 256, 1024, 1024]
+  - [8, 512, 7168, 3584]
+  - [10, 4096, 7168, 3584]
+  - [4, 128, 4096, 4096]
+  - [8, 512, 4096, 4096]
+  - [8, 1024, 4096, 4096]
+  - [10, 4096, 4096, 4096]
+sm_count: -1
+
+backends: [halops, fi, deepgemm]
+cold_l2_cache: true
+refcheck: true
+refcheck_reference: golden

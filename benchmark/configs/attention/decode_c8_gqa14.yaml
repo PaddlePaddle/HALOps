@@ -1,0 +1,19 @@
+# configs/attention/decode_c16_gqa14.yaml
+# HALOps q layout = [B, H_KV, KBLOCKM=64, D]; folded from standard [B, H_Q, D].
+scenario: decode_gqa
+
+batch_sizes: [1, 4, 16, 32, 64, 128]
+s_kv_list: [1024, 4096, 16384, 65536, 131072]
+mtp_steps_list: [0, 1, 2, 3]
+num_q_heads: 14
+num_kv_heads: 1
+head_dim: 128
+dtype: float8_e4m3fn
+use_write_cache: false
+cache_quant_type: "block_wise_fp8"
+use_cuda_graph: false
+
+backends: [halops, fi, fi_trtllm]
+cold_l2_cache: true
+refcheck: true
+refcheck_reference: fi_trtllm

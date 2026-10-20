@@ -1,0 +1,39 @@
+BasedOnStyle: Google  # or LLVM, Chromium, etc.
+Language: Cpp
+
+# Main Indentation Settings
+IndentWidth: 4          # Indent width: 4 spaces
+TabWidth: 4             # Tab width: 4 spaces
+UseTab: Never           # Never use tabs, only spaces
+
+# Additional Indentation Settings
+AccessModifierOffset: -2              # public/private/protected indent offset: -2
+ContinuationIndentWidth: 4            # Continuation line indent: 4 spaces
+ConstructorInitializerIndentWidth: 4  # Constructor initializer list indent: 4 spaces
+
+# Ensure all indentation uses spaces
+BreakBeforeBraces: Attach
+# Fine-grained control for each case
+BraceWrapping:
+  AfterClass:      true       # Brace after class
+  AfterControlStatement: true # Brace after if/for/while
+  AfterEnum:       true       # Brace after enum
+  AfterFunction:   true       # Brace after function
+  AfterNamespace:  true       # Brace after namespace
+  AfterStruct:     true       # Brace after struct
+  AfterUnion:      true       # Brace after union
+  BeforeCatch:     true       # Brace before catch
+  BeforeElse:      true       # Brace before else
+  IndentBraces:    false      # Do not indent braces themselves
+
+# Pointer and reference alignment
+PointerAlignment: Left        # Pointer aligned to the left
+
+# Namespace indentation
+NamespaceIndentation: None    # No extra indentation inside namespaces
+
+# Indent case labels
+IndentCaseLabels: true        # case labels indented relative to switch
+
+# Preprocessor directive indentation
+IndentPPDirectives: AfterHash # Indent #if, #define, etc.

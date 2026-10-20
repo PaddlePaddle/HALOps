@@ -1,0 +1,54 @@
+[project]
+name = "halops"
+version = "0.1.0"
+description = "High-performance Accelerated LLM Operators: Attention, MLA, GEMM and quantization CUDA kernels for LLM inference"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.13.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "numpy>=1.24",
+    "pytest>=7.0",
+]
+dev = [
+    "halops[test]",
+    "pre-commit",
+]
+
+[build-system]
+requires = ["setuptools", "wheel", "torch>=2.13.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+force-exclude = true
+extend-exclude = [
+    "3rdparty",
+    "build",
+    "dist",
+    "*.egg-info",
+    "benchmark/logs",
+    "benchmark/reports",
+    "benchmark/results",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"halops/**/__init__.py" = ["F401"]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["halops*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

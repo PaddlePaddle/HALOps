@@ -1,0 +1,16 @@
+build
+halops.egg-info
+*.ncu-rep
+*.so
+dist/
+cutlass/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+*$py.class
+
+# Benchmark runtime outputs
+benchmark/logs/
+benchmark/reports/
+benchmark/results/

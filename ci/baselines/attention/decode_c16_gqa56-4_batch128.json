@@ -1,0 +1,75 @@
+{
+  "config": "decode_c16_gqa56-4_batch128",
+  "op": "attention",
+  "threshold": 0.05,
+  "entries": [
+    {
+      "key": {
+        "scenario": "decode_gqa",
+        "backend": "halops",
+        "batch_size": 128,
+        "s_q": 1,
+        "s_kv": 1024,
+        "num_q_heads": 56,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": true,
+        "case_tag": "decode_c16_gqa56-4_batch128",
+        "use_cuda_graph": false
+      },
+      "median_us": 65.601
+    },
+    {
+      "key": {
+        "scenario": "decode_gqa",
+        "backend": "halops",
+        "batch_size": 128,
+        "s_q": 4,
+        "s_kv": 1024,
+        "num_q_heads": 56,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": true,
+        "case_tag": "decode_c16_gqa56-4_batch128",
+        "use_cuda_graph": false
+      },
+      "median_us": 74.624
+    },
+    {
+      "key": {
+        "scenario": "decode_gqa",
+        "backend": "halops",
+        "batch_size": 128,
+        "s_q": 1,
+        "s_kv": 32768,
+        "num_q_heads": 56,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": true,
+        "case_tag": "decode_c16_gqa56-4_batch128",
+        "use_cuda_graph": false
+      },
+      "median_us": 1181.225
+    },
+    {
+      "key": {
+        "scenario": "decode_gqa",
+        "backend": "halops",
+        "batch_size": 128,
+        "s_q": 4,
+        "s_kv": 32768,
+        "num_q_heads": 56,
+        "num_kv_heads": 4,
+        "head_dim": 128,
+        "dtype": "bfloat16",
+        "causal": true,
+        "case_tag": "decode_c16_gqa56-4_batch128",
+        "use_cuda_graph": false
+      },
+      "median_us": 1187.311
+    }
+  ]
+}

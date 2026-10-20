@@ -1,0 +1,13 @@
+scenario: group_masked
+mode: w8a8
+
+# [num_experts, max_m, N, K] shapes.
+shapes:
+  - [4, 128, 256, 512]
+  - [10, 4096, 4096, 4096]
+sm_count: -1
+
+backends: [halops]
+cold_l2_cache: true
+refcheck: false
+refcheck_reference: golden

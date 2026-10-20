@@ -1,0 +1,35 @@
+{
+  "config": "dense_w4a4",
+  "op": "gemm",
+  "threshold": 0.05,
+  "entries": [
+    {
+      "key": {
+        "scenario": "dense_gemm",
+        "backend": "halops",
+        "num_experts": "",
+        "max_m": "",
+        "m": 128,
+        "n": 256,
+        "k": 512,
+        "mode": "w4a4",
+        "case_tag": "dense_w4a4"
+      },
+      "median_us": 4.591
+    },
+    {
+      "key": {
+        "scenario": "dense_gemm",
+        "backend": "halops",
+        "num_experts": "",
+        "max_m": "",
+        "m": 8192,
+        "n": 4096,
+        "k": 4096,
+        "mode": "w4a4",
+        "case_tag": "dense_w4a4"
+      },
+      "median_us": 53.342
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "config": "group_contiguous_w8a8",
+  "op": "gemm",
+  "threshold": 0.05,
+  "entries": [
+    {
+      "key": {
+        "scenario": "group_contiguous",
+        "backend": "halops",
+        "num_experts": 4,
+        "max_m": 128,
+        "m": 512,
+        "n": 256,
+        "k": 512,
+        "mode": "w8a8",
+        "case_tag": "group_contiguous_w8a8"
+      },
+      "median_us": 6.592
+    },
+    {
+      "key": {
+        "scenario": "group_contiguous",
+        "backend": "halops",
+        "num_experts": 10,
+        "max_m": 4096,
+        "m": 40960,
+        "n": 4096,
+        "k": 4096,
+        "mode": "w8a8",
+        "case_tag": "group_contiguous_w8a8"
+      },
+      "median_us": 439.957
+    }
+  ]
+}

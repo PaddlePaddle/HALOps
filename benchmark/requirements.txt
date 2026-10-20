@@ -1,0 +1,10 @@
+pyyaml>=6.0
+pandas>=2.0
+
+# Reference backends are optional. Install versions compatible with the selected
+# config and record the exact resolved versions in benchmark results.
+# flash-attn>=4.0.0
+# flashinfer>=0.6.13
+# deep_gemm>=2.6.1
+nvidia-cudnn-cu13>=9.24.0
+nvidia-cudnn-frontend

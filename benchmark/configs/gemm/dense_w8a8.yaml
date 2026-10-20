@@ -1,0 +1,19 @@
+# Dense W8A8 (FP8) GEMM across halops, flashinfer (fi), and deepgemm.
+scenario: dense_gemm
+mode: w8a8
+
+# [M, N, K] shapes.
+shapes:
+  - [128, 256, 512]
+  - [512, 1024, 1024]
+  - [4096, 7168, 3584]
+  - [8192, 7168, 3584]
+  - [128, 4096, 4096]
+  - [4096, 4096, 4096]
+  - [8192, 4096, 4096]
+sm_count: -1
+
+backends: [halops, fi, deepgemm]
+cold_l2_cache: true
+refcheck: true
+refcheck_reference: golden

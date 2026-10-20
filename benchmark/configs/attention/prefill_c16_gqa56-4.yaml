@@ -1,0 +1,15 @@
+# configs/prefill_dense_causal.yaml
+scenario: prefill_dense
+
+batch_sizes: [1, 2, 4]
+s_kv_list: [512, 1024, 2048, 4096, 8192]
+num_q_heads: 56
+num_kv_heads: 4
+head_dim: 128
+dtype: bfloat16
+causal: true
+
+backends: [halops, fa4, fi(auto), fi(trtllm-gen), cudnn]
+cold_l2_cache: true
+refcheck: true
+refcheck_reference: golden

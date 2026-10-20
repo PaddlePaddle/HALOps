@@ -1,0 +1,15 @@
+scenario: prefill_chunked_gqa
+
+batch_sizes: [1, 4]
+prefix_len_list: [4096, 65536]
+chunk_len_list: [4096]
+num_q_heads: 56
+num_kv_heads: 4
+head_dim: 128
+dtype: bfloat16
+cache_quant_type: "none"
+
+backends: [halops]
+cold_l2_cache: true
+refcheck: false
+refcheck_reference: golden
