@@ -1,24 +1,28 @@
-"""
 # Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
+
+"""Shared references and checkers for the fused SwiGLU + FP8/FP4 quant tests."""
 
 import numpy as np
 import torch
-from halops import fused_swiglu_quant
 
-torch.set_default_device("cuda")
+from halops import fused_swiglu_quant
+from tests.utils.fp4_utils import (
+    FP4_E2M1_MAX,
+    float32_to_ue4m3_rne,
+    fp4_abs_to_idx_round_half_up,
+)
 
 
 # ============================================================================
@@ -113,22 +117,6 @@ def swiglu_and_quant_group32_ref(x, token_nums_per_expert, group_num, group_size
 # FP4 reference: group-16, UE4M3 scale, SfAtom layout
 # ============================================================================
 
-FP4_E2M1_MAX = 6.0
-FP4_E2M1_VALUES = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
-_FP4_MIDPOINTS = (FP4_E2M1_VALUES[:-1] + FP4_E2M1_VALUES[1:]) / 2.0
-
-
-def _fp4_abs_to_idx(abs_x_flat):
-    return np.searchsorted(_FP4_MIDPOINTS, abs_x_flat, side="right").astype(np.uint8)
-
-
-def _float32_to_ue4m3(x):
-    """Encode positive float32 to UE4M3 bit pattern (uint8), RNE rounding."""
-    x_tensor = torch.tensor(np.asarray(x, dtype=np.float32), dtype=torch.float32)
-    x_tensor = torch.clip(x_tensor, min=0.0, max=448.0)
-    fp8_tensor = x_tensor.to(torch.float8_e4m3fn)
-    return fp8_tensor.view(torch.uint8).cpu().numpy().reshape(np.asarray(x).shape)
-
 
 def _ue4m3_to_float32(scale_ue4m3):
     """Decode UE4M3 (uint8) bit pattern to float32 scale value."""
@@ -165,7 +153,7 @@ def swiglu_and_quant_group16_ref(x, token_nums_per_expert, group_num, group_size
 
     # UE4M3 scale encoding
     scale = amax / FP4_E2M1_MAX  # [total_tokens, num_groups]
-    scale_byte = _float32_to_ue4m3(scale)
+    scale_byte = float32_to_ue4m3_rne(scale)
     # When scale is too small, UE4M3 may round to 0; use minimum positive value
     zero_mask = (scale_byte == 0) & (amax > 0.0)
     scale_byte[zero_mask] = 0x01
@@ -177,7 +165,7 @@ def swiglu_and_quant_group16_ref(x, token_nums_per_expert, group_num, group_size
     x_scaled = np.clip(x_scaled, -FP4_E2M1_MAX, FP4_E2M1_MAX)
     flat = x_scaled.reshape(total_tokens, hidden)
     sign_bits = (flat < 0).astype(np.uint8) << 3
-    mag_idx = _fp4_abs_to_idx(np.abs(flat))
+    mag_idx = fp4_abs_to_idx_round_half_up(np.abs(flat))
     fp4_codes = sign_bits | mag_idx  # [total_tokens, hidden]
 
     # Pack: even index = low nibble, odd index = high nibble
@@ -352,17 +340,15 @@ def verify_outputs_fp8(
 
     scale_diff = np.abs(ref_s_valid - fused_s_valid)
     scale_max_diff = int(scale_diff.max()) if scale_diff.size > 0 else 0
-
-    if scale_max_diff > 1:
-        bad_idx = np.where(scale_diff > 1)[0]
-        details = ", ".join(
+    bad_scale_idx = np.where(scale_diff > 1)[0]
+    assert scale_max_diff <= 1, (
+        f"[scale] {len(bad_scale_idx)} bytes differ by more than 1 "
+        f"(max_diff={scale_max_diff}): "
+        + ", ".join(
             f"byte[{idx}]: ref={ref_s_valid[idx]}, fused={fused_s_valid[idx]}"
-            for idx in bad_idx[:3]
+            for idx in bad_scale_idx[:3]
         )
-        raise AssertionError(
-            f"[scale] {len(bad_idx)} bytes differ by more than 1 "
-            f"(max_diff={scale_max_diff}): {details}"
-        )
+    )
 
     # ---------- fp8 check ----------
     ref_f = ref_fp8.to(torch.float32).cpu().numpy()
@@ -396,20 +382,18 @@ def verify_outputs_fp8(
     zero = (ref_m == 0) | (fused_m == 0)
     ok_per_val = within_1_ulp | approx_2x | small | zero
 
-    if not np.all(ok_per_val):
-        bad = ~ok_per_val
-        bad_idx = np.where(fp8_mismatch)
-        bad_r = bad_idx[0][bad]
-        bad_c = bad_idx[1][bad]
-        details = ", ".join(
-            f"row[{bad_r[i]}] col[{bad_c[i]}]: "
-            f"ref={ref_f_valid[bad_r[i], bad_c[i]]:.6f}, "
-            f"fused={fused_f_valid[bad_r[i], bad_c[i]]:.6f}"
-            for i in range(min(5, len(bad_r)))
-        )
-        raise AssertionError(
-            f"[fp8] {np.count_nonzero(bad)} genuine mismatches: {details}"
-        )
+    bad = ~ok_per_val
+    bad_idx = np.where(fp8_mismatch)
+    bad_r = bad_idx[0][bad]
+    bad_c = bad_idx[1][bad]
+    assert np.all(
+        ok_per_val
+    ), f"[fp8] {np.count_nonzero(bad)} genuine mismatches: " + ", ".join(
+        f"row[{bad_r[i]}] col[{bad_c[i]}]: "
+        f"ref={ref_f_valid[bad_r[i], bad_c[i]]:.6f}, "
+        f"fused={fused_f_valid[bad_r[i], bad_c[i]]:.6f}"
+        for i in range(min(5, len(bad_r)))
+    )
 
 
 def verify_outputs_fp4(
@@ -433,15 +417,11 @@ def verify_outputs_fp4(
     ref_s_valid = ref_s_flat[sfatom_byte_mask]
     fused_s_valid = fused_s_flat[sfatom_byte_mask]
 
-    if not np.array_equal(ref_s_valid, fused_s_valid):
-        scale_diff = np.abs(
-            ref_s_valid.astype(np.int16) - fused_s_valid.astype(np.int16)
-        )
-        n_diff = np.count_nonzero(scale_diff > 0)
-        max_diff = int(scale_diff.max())
-        # Accept ±1 due to fast-math SwiGLU precision differences
-        if max_diff > 1:
-            raise AssertionError(f"[scale] {n_diff} bytes differ, max_diff={max_diff}")
+    scale_diff = np.abs(ref_s_valid - fused_s_valid)
+    n_diff = np.count_nonzero(scale_diff > 0)
+    max_diff = int(scale_diff.max()) if scale_diff.size > 0 else 0
+    # Accept ±1 due to fast-math SwiGLU precision differences
+    assert max_diff <= 1, f"[scale] {n_diff} bytes differ, max_diff={max_diff}"
 
     # ---------- packed FP4 check ----------
     ref_p = ref_packed.cpu().numpy()
@@ -449,16 +429,12 @@ def verify_outputs_fp4(
     ref_p_valid = ref_p[valid_mask]
     fused_p_valid = fused_p[valid_mask]
 
-    if not np.array_equal(ref_p_valid, fused_p_valid):
-        diff_count = np.count_nonzero(ref_p_valid != fused_p_valid)
-        total = ref_p_valid.size
-        pct = diff_count / total * 100
-        # Allow small mismatch due to fast-math SwiGLU causing different amax
-        # → different scale
-        if pct >= 5.0:
-            raise AssertionError(
-                f"[packed] {diff_count}/{total} bytes differ ({pct:.2f}%)"
-            )
+    diff_count = np.count_nonzero(ref_p_valid != fused_p_valid)
+    total = ref_p_valid.size
+    pct = diff_count / total * 100 if total > 0 else 0.0
+    # Allow small mismatch due to fast-math SwiGLU causing different amax
+    # → different scale
+    assert pct < 5.0, f"[packed] {diff_count}/{total} bytes differ ({pct:.2f}%)"
 
 
 # ============================================================================

@@ -1,8 +1,10 @@
+[English](build_guide_EN.md) | 简体中文
+
 # HALOps 构建指南
 
 HALOps 当前仅提供源码构建。本文说明环境准备、wheel/开发态构建、安装验证和常见问题；项目通过 [`setup.py`](../setup.py) 和 PyTorch `CUDAExtension` 编译 CUDA/C++ 扩展。
 
-[返回 README](../README.md) | [Benchmark 指南](../benchmark/README.md)
+[返回 README](../README_CN.md) | [Benchmark 指南](../benchmark/README.md)
 
 ## 快速安装
 
@@ -93,6 +95,8 @@ python -m pip install dist/halops-*.whl --force-reinstall --no-deps
 
 先清理 `dist/`，保证通配符只匹配本次构建的 wheel。
 
+以上步骤等价于 `bash build.sh --release`。
+
 ### 3.3 开发态扩展编译
 
 需要让当前环境以 editable 方式引用源码树时，执行：
@@ -101,13 +105,13 @@ python -m pip install dist/halops-*.whl --force-reinstall --no-deps
 python -m pip install --no-build-isolation --no-deps -e . -v
 ```
 
-只修改 CUDA/C++ 扩展并希望直接刷新源码树中的 `.so` 时，可以执行：
+之后修改 CUDA/C++ 代码时，执行增量编译刷新源码树中的 `.so`：
 
 ```bash
-python setup.py build_ext
+bash build.sh
 ```
 
-该命令会把扩展从 `build/lib.*` 复制到 `halops/`，但不会生成或安装 wheel。
+该命令等价于 `python setup.py build_ext --inplace`：保留 `build/` 中的 Ninja 状态，只重新编译改动过的文件，并把扩展复制到 `halops/`，不生成或安装 wheel。可通过 `PYTHON=/path/to/python bash build.sh` 指定解释器。
 
 ### 3.4 控制编译并发
 

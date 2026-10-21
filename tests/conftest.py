@@ -14,14 +14,22 @@
 
 """Shared pytest configuration for HALOps operator tests."""
 
+import random
+
+import numpy as np
 import pytest
 import torch
 
 from tests.utils.device import skip_reason
 
 
+SEED = 2026
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "quick: fast subset of the mega_mla cases")
+    if torch.cuda.is_available():
+        torch.set_default_device("cuda")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -37,3 +45,11 @@ def pytest_collection_modifyitems(config, items):
 def _cuda_device():
     if torch.cuda.is_available():
         torch.cuda.set_device(0)
+
+
+@pytest.fixture(autouse=True)
+def _seed():
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)

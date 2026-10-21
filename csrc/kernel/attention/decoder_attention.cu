@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
@@ -59,6 +60,7 @@ void DecoderAttention(
     const std::optional<torch::Tensor>& kv_dequant_scale, const int head_num,
     const int kv_head_num, const int head_dim, const int max_seq_k,
     const int mtp_steps, const std::string& cache_quant_type_str) {
+    const at::cuda::OptionalCUDAGuard device_guard(q_input.device());
     using T = c10::BFloat16;
     using fp8 = c10::Float8_e4m3fn;
 
@@ -69,6 +71,11 @@ void DecoderAttention(
     constexpr int kBlockN = 128;
     constexpr int kHeadDim = 128;
     constexpr int kMinKvBlocksPerPartition = 2;
+    TORCH_CHECK(
+        head_dim == kHeadDim && kv_head_num > 0 && head_num % kv_head_num == 0,
+        "head_dim must be ", kHeadDim,
+        " and head_num a multiple of kv_head_num > 0; got head_dim=", head_dim,
+        ", head_num=", head_num, ", kv_head_num=", kv_head_num);
     const int batch_size = cu_seq_q.size(0) - 1;
 
     // GQA group and MTP tokens of one kv head must fit in one M tile.

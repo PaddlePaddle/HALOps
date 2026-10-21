@@ -429,9 +429,9 @@ struct TileScheduler {
                     if constexpr (SwapAB) {
                         uint32_t local_m_cluster =
                             cluster_n - expert * expert_ctn_;
-                        uint32_t local_m_start =
-                            local_m_cluster * cluster_n_tiles_ *
-                            cute::size<1>(TileShape{});
+                        uint32_t local_m_start = local_m_cluster *
+                                                 cluster_n_tiles_ *
+                                                 cute::size<1>(TileShape{});
                         if (local_m_start >=
                             static_cast<uint32_t>(__ldg(&masked_m_[expert]))) {
                             current_tile_id_ += cluster_num_;
@@ -506,10 +506,10 @@ struct TileScheduler {
 
             if constexpr (KernelTraits::KernelType == KernelMode::Masked) {
                 if constexpr (SwapAB) {
-                    expert_idx = m_idx_base * cute::size<1>(TileShape{}) /
+                    expert_idx = n_idx_base * cute::size<1>(TileShape{}) /
                                  max_m_per_expert_;
                     bool valid = expert_idx < num_experts_ &&
-                                 m_idx_base * cute::size<1>(TileShape{}) %
+                                 n_idx_base * cute::size<1>(TileShape{}) %
                                          max_m_per_expert_ <
                                      __ldg(&masked_m_[expert_idx]);
                     if (!valid) {

@@ -1,4 +1,4 @@
-# configs/prefill_dense_causal.yaml
+# configs/attention/prefill_c16_gqa56-4.yaml
 scenario: prefill_dense
 
 batch_sizes: [1, 2, 4]

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
@@ -35,6 +36,7 @@ void EncoderAttention(const torch::Tensor& q_input,
                       const torch::Tensor& cu_seq_k,
                       const torch::Tensor& attn_out,
                       const std::optional<torch::Tensor>& mask) {
+    const at::cuda::OptionalCUDAGuard device_guard(q_input.device());
     using T = c10::BFloat16;
     AttentionParams params;
     memset(&params, 0, sizeof(AttentionParams));
@@ -50,11 +52,18 @@ void EncoderAttention(const torch::Tensor& q_input,
     params.q_token_num = q_input.size(0);
     params.k_token_num = k_input.size(0);
     params.batch_size = cu_seq_q.size(0) - 1;
+    constexpr int kHeadDim = 128;
+    const int head_dim = q_input.size(2);
+    TORCH_CHECK(
+        head_dim == kHeadDim && params.kv_head_num > 0 &&
+            params.head_num % params.kv_head_num == 0,
+        "head_dim must be ", kHeadDim,
+        " and head_num a multiple of kv_head_num > 0; got head_dim=", head_dim,
+        ", head_num=", params.head_num, ", kv_head_num=", params.kv_head_num);
 
     // Softmax runs in the log2 domain.
     constexpr float kLog2e = 1.4426950408889634074;
-    params.scale_softmax_log2 =
-        1.0f / std::sqrt((float)q_input.size(2)) * kLog2e;
+    params.scale_softmax_log2 = 1.0f / std::sqrt((float)head_dim) * kLog2e;
     params.o_ptr = const_cast<T*>(attn_out.data_ptr<T>());
 
     auto stream =

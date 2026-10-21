@@ -1,29 +1,27 @@
-"""
 # Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
 
 import numpy as np
 import pytest
 import torch
 
 from halops import encoder_attention
-
-torch.manual_seed(0)
+from tests.utils.attn_utils import HEAD_DIM
 
 DTYPE = torch.bfloat16
-HEAD_DIM = 128
+HEAD_CASES = [(14, 1), (56, 4)]
+HEAD_IDS = [f"h{h}-kv{kv}" for h, kv in HEAD_CASES]
 
 
 def causal_reference(q_input, k_input, v_input, cu_seq_q, cu_seq_k):
@@ -76,20 +74,24 @@ def _run_encoder(seq_len_q, head_num, kv_head_num):
     return q, k, v, cu_seq_q, cu_seq_k, out
 
 
-@pytest.mark.parametrize("seq_len_q", [128, 256, 512])
-@pytest.mark.parametrize("head_num,kv_head_num", [(14, 1), (56, 4)])
+def _seq_id(seq_len):
+    return f"seq{seq_len}"
+
+
+@pytest.mark.parametrize("seq_len_q", [128, 256, 512], ids=_seq_id)
+@pytest.mark.parametrize("head_num,kv_head_num", HEAD_CASES, ids=HEAD_IDS)
 def test_encoder_attention_correctness(seq_len_q, head_num, kv_head_num):
     q, k, v, cu_seq_q, cu_seq_k, out = _run_encoder(seq_len_q, head_num, kv_head_num)
     ref = causal_reference(q, k, v, cu_seq_q, cu_seq_k)
-    np.testing.assert_allclose(
-        out.float().cpu().numpy(),
-        ref,
+    torch.testing.assert_close(
+        out.float().cpu(),
+        torch.from_numpy(ref),
         rtol=2e-2,
         atol=2e-2,
     )
 
 
-@pytest.mark.parametrize("seq_len_q", [8192, 32768])
+@pytest.mark.parametrize("seq_len_q", [8192, 32768], ids=_seq_id)
 def test_encoder_attention_long_seq_smoke(seq_len_q):
     # Long sequences: only validate that the kernel runs and produces finite
     # output of the expected shape. A full O(S^2) reference is intentionally
@@ -100,8 +102,8 @@ def test_encoder_attention_long_seq_smoke(seq_len_q):
     assert torch.isfinite(out.float()).all()
 
 
-@pytest.mark.parametrize("head_num,kv_head_num", [(14, 1), (56, 4)])
-@pytest.mark.parametrize("seq_len_q", [128, 512])
+@pytest.mark.parametrize("head_num,kv_head_num", HEAD_CASES, ids=HEAD_IDS)
+@pytest.mark.parametrize("seq_len_q", [128, 512], ids=_seq_id)
 def test_encoder_attention_determinism(seq_len_q, head_num, kv_head_num):
     # Same inputs must yield bit-identical outputs across runs. Build the
     # fixed q/k/v/mask once (cannot reuse _run_encoder, which re-randomizes),

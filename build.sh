@@ -1,4 +1,4 @@
-
+#!/usr/bin/env bash
 # Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,8 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Usage:
+#   bash build.sh            incremental build; the extension is placed in halops/
+#   bash build.sh --release  clean build, then build and install the wheel
+# Set PYTHON to choose the interpreter and MAX_JOBS to limit parallel jobs.
+
 set -e
+cd "$(dirname "$0")"
 PYTHON="${PYTHON:-python}"
-rm -rf build dist
-"$PYTHON" -m pip wheel --no-build-isolation --no-deps -v -w dist .
-"$PYTHON" -m pip install dist/halops-*.whl --force-reinstall --no-deps
+
+case "${1:-}" in
+    --release)
+        rm -rf build dist
+        "$PYTHON" -m pip wheel --no-build-isolation --no-deps -v -w dist .
+        "$PYTHON" -m pip install dist/halops-*.whl --force-reinstall --no-deps
+        ;;
+    "")
+        "$PYTHON" setup.py build_ext --inplace
+        ;;
+    *)
+        echo "Usage: bash build.sh [--release]" >&2
+        exit 1
+        ;;
+esac

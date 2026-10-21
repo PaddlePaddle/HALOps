@@ -219,6 +219,7 @@ __global__ void group_wise_quant_kernel(
 std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
                                           const bool is_fp4,
                                           const bool use_swizzle) {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
     TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor of shape [m, k]");
     TORCH_CHECK(input.scalar_type() == torch::kBFloat16 ||
                     input.scalar_type() == torch::kHalf,

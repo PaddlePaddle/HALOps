@@ -1,37 +1,37 @@
-"""
 # Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
 
-from halops.gemm.batch_gemm import batch_gemm
+import re
+
 import pytest
 import torch
-import numpy as np
+
+from halops import batch_gemm
+from tests.utils.fp4_utils import FP4_BLOCK_SIZE
 
 from tests.utils.gemm_utils import (
-    ue8m0_to_float32,
-    per_token_cast_to_fp8,
+    W4A4_TOL,
+    W8A8_TOL,
+    per_block_cast_to_fp4,
     per_block_cast_to_fp8,
     per_token_cast_to_fp4,
-    per_block_cast_to_fp4,
+    per_token_cast_to_fp8,
     reorder_sf_to_cutlass,
-    _expect_runtime_error,
+    ue8m0_to_float32,
 )
 
-torch.manual_seed(2026)
-torch.cuda.manual_seed_all(2026)
-torch.set_default_device("cuda")
+FP8_BLOCK_SIZE = 32
 
 
 # =====================================================================
@@ -94,382 +94,337 @@ def ref_batch_gemm_fp4(x_fp4_float, w_fp4_float):
 
 
 # =====================================================================
-# Test class
+# Input builders
 # =====================================================================
 
 
-class TestBatchGemmW8A8:
-    def setup(self, B=4, M=256, N=256, K=128, add_bias=False):
-        self.B = B
-        self.M = M
-        self.N = N
-        self.K = K
-        self.add_bias = add_bias
-        self.block_size = 32
+def make_w8a8_inputs(B, M, N, K, add_bias=False):
+    """Quantize random BF16 tensors to FP8 and return kernel + reference inputs."""
+    x_origin = torch.randn([B, M, K], dtype=torch.bfloat16)
+    w_origin = torch.randn([B, N, K], dtype=torch.bfloat16)
 
-        # Generate random BF16 tensors
-        x_origin = torch.randn([B, M, K], dtype=torch.bfloat16)
-        w_origin = torch.randn([B, N, K], dtype=torch.bfloat16)
+    # Quantize input: reshape to [B*M, K] for per_token_cast_to_fp8
+    x_flat = x_origin.reshape(B * M, K)
+    x_fp8_flat, sfa_logical = per_token_cast_to_fp8(x_flat, FP8_BLOCK_SIZE)
+    input_fp8 = x_fp8_flat.reshape(B, M, K)  # sfa_logical: [B*M, K//32]
 
-        # Quantize input: reshape to [B*M, K] for per_token_cast_to_fp8
-        x_flat = x_origin.reshape(B * M, K)
-        x_fp8_flat, sfa_logical_flat = per_token_cast_to_fp8(x_flat, self.block_size)
-        self.input_fp8 = x_fp8_flat.reshape(B, M, K)
-        self.sfa_logical = sfa_logical_flat  # [B*M, K//32]
+    # Quantize weight: [B, N, K]
+    weight_fp8, sfb_logical = per_block_cast_to_fp8(w_origin, FP8_BLOCK_SIZE)
 
-        # Quantize weight: [B, N, K]
-        self.weight_fp8, self.sfb_logical = per_block_cast_to_fp8(
-            w_origin, self.block_size
-        )
+    # Reorder scale factors to SfAtom layout
+    kb = K // FP8_BLOCK_SIZE
+    sfa = reorder_sf_to_cutlass(sfa_logical, B * M, kb)
+    sfb = reorder_sf_to_cutlass(sfb_logical, N, kb)
 
-        # Reorder scale factors to SfAtom layout
-        kb_a = K // self.block_size
-        kb_b = K // self.block_size
-        self.sfa = reorder_sf_to_cutlass(self.sfa_logical, B * M, kb_a)
-        self.sfb = reorder_sf_to_cutlass(self.sfb_logical, N, kb_b)
-
-        if add_bias:
-            self.bias = torch.rand([B, N], dtype=torch.bfloat16)
-        else:
-            self.bias = None
-
-    def run(self):
-        print(
-            f"[test] B={self.B}, M={self.M}, N={self.N}, K={self.K}, bias={self.add_bias}"
-        )
-
-        # Reference
-        ref_out = ref_batch_gemm_fp8(
-            self.input_fp8,
-            self.weight_fp8,
-            self.sfa_logical,
-            self.sfb_logical,
-            bias=self.bias,
-            block_size=self.block_size,
-        )
-
-        # Kernel output
-        output = torch.zeros(
-            [self.B, self.M, self.N], dtype=torch.bfloat16, device="cuda"
-        )
-        batch_gemm(
-            self.input_fp8,
-            self.weight_fp8,
-            self.sfa,
-            self.sfb,
-            output,
-            bias=self.bias,
-            sm_count=-1,
-            mode="w8a8",
-        )
-
-        # Compare per batch
-        for b in range(self.B):
-            ref_b = ref_out[b].to(torch.float32).cpu().numpy()
-            out_b = output[b].to(torch.float32).cpu().numpy()
-            diff = np.abs(out_b - ref_b)
-            max_diff = diff.max()
-            mean_diff = diff.mean()
-            print(f"  batch {b}: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
-            np.testing.assert_allclose(out_b, ref_b, rtol=2e-2, atol=2e-3)
-
-        print(
-            f"  [PASS] W8A8 Batch GEMM B={self.B}, M={self.M}, N={self.N}, K={self.K}"
-        )
-
-
-class TestBatchGemmW4A4:
-    def setup(self, B=4, M=256, N=256, K=256):
-        self.B = B
-        self.M = M
-        self.N = N
-        self.K = K
-        self.block_size = 16
-
-        # Generate random BF16 tensors
-        x_origin = torch.randn([B, M, K], dtype=torch.bfloat16)
-        w_origin = torch.randn([B, N, K], dtype=torch.bfloat16)
-
-        # Quantize input per-token: reshape to [B*M, K]
-        x_flat = x_origin.reshape(B * M, K)
-        x_packed_flat, sfa_logical_flat, x_deq_flat = per_token_cast_to_fp4(
-            x_flat, self.block_size
-        )
-        self.input_packed = x_packed_flat.reshape(B, M, K // 2)
-        self.sfa_logical = sfa_logical_flat  # [B*M, K//16]
-        self.x_fp4_float = x_deq_flat.reshape(B, M, K)
-
-        # Quantize weight per-block, one batch at a time
-        w_packed_list = []
-        sfb_logical_list = []
-        w_deq_list = []
-        for b in range(B):
-            w_packed_b, sfb_logical_b, w_deq_b = per_block_cast_to_fp4(
-                w_origin[b], self.block_size
-            )
-            w_packed_list.append(w_packed_b)
-            sfb_logical_list.append(sfb_logical_b)
-            w_deq_list.append(w_deq_b)
-        self.weight_packed = torch.stack(w_packed_list, dim=0)  # [B, N, K//2]
-        self.sfb_logical = torch.stack(sfb_logical_list, dim=0)  # [B, N, K//16]
-        self.w_fp4_float = torch.stack(w_deq_list, dim=0)  # [B, N, K]
-
-        # Reorder scale factors to SfAtom layout
-        kb = K // self.block_size
-        self.sfa = reorder_sf_to_cutlass(self.sfa_logical, B * M, kb)
-        self.sfb = reorder_sf_to_cutlass(self.sfb_logical, N, kb)
-
-        # W4A4 requires a per-expert (per-batch) scaling factor with shape [B]
-        self.alpha = torch.ones([B], dtype=torch.float32)
-
-    def run(self):
-        print(f"[test] W4A4 B={self.B}, M={self.M}, N={self.N}, K={self.K}")
-
-        # Reference
-        ref_out = ref_batch_gemm_fp4(self.x_fp4_float, self.w_fp4_float)
-
-        # Kernel output
-        output = torch.zeros(
-            [self.B, self.M, self.N], dtype=torch.bfloat16, device="cuda"
-        )
-        batch_gemm(
-            self.input_packed,
-            self.weight_packed,
-            self.sfa,
-            self.sfb,
-            output,
-            alpha=self.alpha,
-            sm_count=-1,
-            mode="w4a4-nvfp4",
-        )
-
-        # Compare per batch
-        for b in range(self.B):
-            ref_b = ref_out[b].to(torch.float32).cpu().numpy()
-            out_b = output[b].to(torch.float32).cpu().numpy()
-            np.testing.assert_allclose(out_b, ref_b, rtol=5e-2, atol=5e-2)
-
-        print(
-            f"  [PASS] W4A4 Batch GEMM B={self.B}, M={self.M}, N={self.N}, K={self.K}"
-        )
-
-
-# =====================================================================
-# Main test entry
-# =====================================================================
-
-
-def test_batch_gemm_w8a8_mid_m():
-    """Test mid-M path: total_m >= 128, uses 128x256x128 tile."""
-    t = TestBatchGemmW8A8()
-    t.setup(B=4, M=128, N=256, K=128)
-    t.run()
-
-
-def test_batch_gemm_w8a8_large_m():
-    """Test large-M path: total_m >= 4096, uses 256x256x128 tile."""
-    t = TestBatchGemmW8A8()
-    t.setup(B=4, M=1024, N=256, K=128)
-    t.run()
-
-
-def test_batch_gemm_w8a8_with_bias():
-    """Test W8A8 with bias path: uses 256x128x128 tile."""
-    t = TestBatchGemmW8A8()
-    t.setup(B=2, M=256, N=128, K=128, add_bias=True)
-    t.run()
-
-
-# ---- W8A8 boundary condition tests ----
-
-
-def test_batch_gemm_w8a8_small_m_swapab():
-    """Boundary: total_m < 128 triggers the SwapAB path (needs N%128, M%64, K%256)."""
-    t = TestBatchGemmW8A8()
-    t.setup(B=1, M=64, N=128, K=256)
-    t.run()
-
-
-def test_batch_gemm_w8a8_single_batch():
-    """Boundary: single batch (B=1) mid-M path."""
-    t = TestBatchGemmW8A8()
-    t.setup(B=1, M=256, N=256, K=128)
-    t.run()
-
-
-def test_batch_gemm_w8a8_larger_k():
-    """Boundary: larger K dimension."""
-    t = TestBatchGemmW8A8()
-    t.setup(B=2, M=128, N=256, K=512)
-    t.run()
-
-
-# ---- W8A8 error input tests ----
-
-
-def test_batch_gemm_w8a8_errors():
-    """Error inputs: invalid mode, wrong rank, mismatched shapes, bad divisibility."""
-    B, M, N, K = 2, 128, 256, 128
-
-    def make_w8a8():
-        x = torch.empty([B, M, K], dtype=torch.float8_e4m3fn)
-        w = torch.empty([B, N, K], dtype=torch.float8_e4m3fn)
-        sfa = torch.empty([B * M, K // 32], dtype=torch.uint8)
-        sfb = torch.empty([B, N, K // 32], dtype=torch.uint8)
-        out = torch.empty([B, M, N], dtype=torch.bfloat16)
-        return x, w, sfa, sfb, out
-
-    def run_bad_mode():
-        x, w, sfa, sfb, out = make_w8a8()
-        batch_gemm(x, w, sfa, sfb, out, None, None, -1, "w2a2")
-
-    _expect_runtime_error(run_bad_mode, "Unsupported mode")
-
-    def run_bad_input_rank():
-        _, w, sfa, sfb, out = make_w8a8()
-        x = torch.empty([B * M, K], dtype=torch.float8_e4m3fn)
-        batch_gemm(x, w, sfa, sfb, out, None, None, -1, "w8a8")
-
-    _expect_runtime_error(run_bad_input_rank, "input must be a 3D tensor")
-
-    def run_bad_weight_batch():
-        x, _, sfa, sfb, out = make_w8a8()
-        w = torch.empty([B + 1, N, K], dtype=torch.float8_e4m3fn)
-        batch_gemm(x, w, sfa, sfb, out, None, None, -1, "w8a8")
-
-    _expect_runtime_error(run_bad_weight_batch, "weight batch dim must match")
-
-    def run_bad_k():
-        bad_k = 96  # not divisible by 128 (mid-M tile K)
-        x = torch.empty([B, M, bad_k], dtype=torch.float8_e4m3fn)
-        w = torch.empty([B, N, bad_k], dtype=torch.float8_e4m3fn)
-        sfa = torch.empty([B * M, bad_k // 32], dtype=torch.uint8)
-        sfb = torch.empty([B, N, bad_k // 32], dtype=torch.uint8)
-        out = torch.empty([B, M, N], dtype=torch.bfloat16)
-        batch_gemm(x, w, sfa, sfb, out, None, None, -1, "w8a8")
-
-    _expect_runtime_error(
-        run_bad_k,
-        "No batch w8a8 tile for M=128 (grid M=256), N=256, K=96",
+    bias = torch.rand([B, N], dtype=torch.bfloat16) if add_bias else None
+    return dict(
+        input_fp8=input_fp8,
+        weight_fp8=weight_fp8,
+        sfa=sfa,
+        sfb=sfb,
+        sfa_logical=sfa_logical,
+        sfb_logical=sfb_logical,
+        bias=bias,
     )
 
 
-# ---- W8A8 determinism test ----
+def make_w4a4_inputs(B, M, N, K):
+    """Quantize random BF16 tensors to NVFP4 and return kernel + reference inputs."""
+    x_origin = torch.randn([B, M, K], dtype=torch.bfloat16)
+    w_origin = torch.randn([B, N, K], dtype=torch.bfloat16)
+
+    # Quantize input per-token: reshape to [B*M, K]
+    x_flat = x_origin.reshape(B * M, K)
+    x_packed_flat, sfa_logical, x_deq_flat = per_token_cast_to_fp4(
+        x_flat, FP4_BLOCK_SIZE
+    )
+    input_packed = x_packed_flat.reshape(B, M, K // 2)  # sfa_logical: [B*M, K//16]
+    x_fp4_float = x_deq_flat.reshape(B, M, K)
+
+    # Quantize weight per-block, one batch at a time
+    w_packed_list = []
+    sfb_logical_list = []
+    w_deq_list = []
+    for b in range(B):
+        w_packed_b, sfb_logical_b, w_deq_b = per_block_cast_to_fp4(
+            w_origin[b], FP4_BLOCK_SIZE
+        )
+        w_packed_list.append(w_packed_b)
+        sfb_logical_list.append(sfb_logical_b)
+        w_deq_list.append(w_deq_b)
+    weight_packed = torch.stack(w_packed_list, dim=0)  # [B, N, K//2]
+    sfb_logical = torch.stack(sfb_logical_list, dim=0)  # [B, N, K//16]
+    w_fp4_float = torch.stack(w_deq_list, dim=0)  # [B, N, K]
+
+    # Reorder scale factors to SfAtom layout
+    kb = K // FP4_BLOCK_SIZE
+    sfa = reorder_sf_to_cutlass(sfa_logical, B * M, kb)
+    sfb = reorder_sf_to_cutlass(sfb_logical, N, kb)
+
+    # W4A4 requires a per-expert (per-batch) scaling factor with shape [B]
+    alpha = torch.ones([B], dtype=torch.float32)
+    return dict(
+        input_packed=input_packed,
+        weight_packed=weight_packed,
+        sfa=sfa,
+        sfb=sfb,
+        alpha=alpha,
+        x_fp4_float=x_fp4_float,
+        w_fp4_float=w_fp4_float,
+    )
+
+
+def assert_close_per_batch(output, ref_out, tol, label):
+    """Compare kernel output against the reference batch by batch."""
+    for b in range(output.shape[0]):
+        torch.testing.assert_close(
+            output[b].to(torch.float32),
+            ref_out[b].to(torch.float32),
+            **tol,
+            msg=lambda s, b=b: f"{label} batch {b}: {s}",
+        )
+
+
+# =====================================================================
+# W8A8 correctness tests
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "B, M, N, K, add_bias",
+    [
+        # Mid-M path: total_m >= 128, uses 128x256x128 tile.
+        pytest.param(4, 128, 256, 128, False, id="mid_m"),
+        # Large-M path: total_m >= 4096, uses 256x256x128 tile.
+        pytest.param(4, 1024, 256, 128, False, id="large_m"),
+        # Bias path: uses 256x128x128 tile.
+        pytest.param(2, 256, 128, 128, True, id="with_bias"),
+        # Boundary: total_m < 128 triggers the SwapAB path (needs N%128, M%64, K%256).
+        pytest.param(1, 64, 128, 256, False, id="small_m_swapab"),
+        # Boundary: single batch (B=1) mid-M path.
+        pytest.param(1, 256, 256, 128, False, id="single_batch"),
+        # Boundary: larger K dimension.
+        pytest.param(2, 128, 256, 512, False, id="larger_k"),
+    ],
+)
+def test_batch_gemm_w8a8(B, M, N, K, add_bias):
+    inp = make_w8a8_inputs(B, M, N, K, add_bias=add_bias)
+    ref_out = ref_batch_gemm_fp8(
+        inp["input_fp8"],
+        inp["weight_fp8"],
+        inp["sfa_logical"],
+        inp["sfb_logical"],
+        bias=inp["bias"],
+        block_size=FP8_BLOCK_SIZE,
+    )
+
+    output = torch.zeros([B, M, N], dtype=torch.bfloat16)
+    batch_gemm(
+        inp["input_fp8"],
+        inp["weight_fp8"],
+        inp["sfa"],
+        inp["sfb"],
+        output,
+        bias=inp["bias"],
+        sm_count=-1,
+        mode="w8a8",
+    )
+
+    assert_close_per_batch(
+        output, ref_out, W8A8_TOL, f"W8A8 B={B}, M={M}, N={N}, K={K}, bias={add_bias}"
+    )
+
+
+# =====================================================================
+# W8A8 error input tests
+# =====================================================================
+
+_W8A8_ERR_SHAPE = dict(B=2, M=128, N=256, K=128)
+
+
+def make_empty_w8a8(B, M, N, K, x_shape=None, w_shape=None):
+    """Uninitialized W8A8 kernel inputs for argument-validation tests."""
+    x = torch.empty(x_shape or [B, M, K], dtype=torch.float8_e4m3fn)
+    w = torch.empty(w_shape or [B, N, K], dtype=torch.float8_e4m3fn)
+    sfa = torch.empty([B * M, K // 32], dtype=torch.uint8)
+    sfb = torch.empty([B, N, K // 32], dtype=torch.uint8)
+    out = torch.empty([B, M, N], dtype=torch.bfloat16)
+    return x, w, sfa, sfb, out
+
+
+@pytest.mark.parametrize(
+    "K, x_shape, w_shape, mode, expected",
+    [
+        pytest.param(128, None, None, "w2a2", "Unsupported mode", id="bad_mode"),
+        pytest.param(
+            128,
+            [256, 128],
+            None,
+            "w8a8",
+            "input must be a 3D tensor",
+            id="bad_input_rank",
+        ),
+        pytest.param(
+            128,
+            None,
+            [3, 256, 128],
+            "w8a8",
+            "weight batch dim must match",
+            id="bad_weight_batch",
+        ),
+        # K=96 is not divisible by 128 (mid-M tile K).
+        pytest.param(
+            96,
+            None,
+            None,
+            "w8a8",
+            "No batch w8a8 tile for M=128 (grid M=256), N=256, K=96",
+            id="bad_k",
+        ),
+    ],
+)
+def test_batch_gemm_w8a8_errors(K, x_shape, w_shape, mode, expected):
+    shape = dict(_W8A8_ERR_SHAPE, K=K)
+    x, w, sfa, sfb, out = make_empty_w8a8(**shape, x_shape=x_shape, w_shape=w_shape)
+    with pytest.raises((RuntimeError, AssertionError), match=re.escape(expected)):
+        batch_gemm(x, w, sfa, sfb, out, None, None, -1, mode)
+
+
+# =====================================================================
+# W8A8 determinism test
+# =====================================================================
 
 
 def test_batch_gemm_w8a8_determinism():
     """Determinism: identical inputs must produce bitwise-identical outputs."""
-    t = TestBatchGemmW8A8()
-    t.setup(B=4, M=128, N=256, K=128)
-    out1 = torch.zeros([t.B, t.M, t.N], dtype=torch.bfloat16, device="cuda")
-    out2 = torch.zeros([t.B, t.M, t.N], dtype=torch.bfloat16, device="cuda")
-    batch_gemm(t.input_fp8, t.weight_fp8, t.sfa, t.sfb, out1, None, None, -1, "w8a8")
-    batch_gemm(t.input_fp8, t.weight_fp8, t.sfa, t.sfb, out2, None, None, -1, "w8a8")
+    B, M, N, K = 4, 128, 256, 128
+    inp = make_w8a8_inputs(B, M, N, K)
+    args = (inp["input_fp8"], inp["weight_fp8"], inp["sfa"], inp["sfb"])
+    out1 = torch.zeros([B, M, N], dtype=torch.bfloat16)
+    out2 = torch.zeros([B, M, N], dtype=torch.bfloat16)
+    batch_gemm(*args, out1, None, None, -1, "w8a8")
+    batch_gemm(*args, out2, None, None, -1, "w8a8")
     assert torch.equal(out1, out2), "W8A8 batch_gemm output is not deterministic"
 
 
-# ---- W4A4 correctness tests ----
+# =====================================================================
+# W4A4 correctness tests
+# =====================================================================
 
 
-def test_batch_gemm_w4a4_mid_m():
-    """W4A4 mid-M path: total_m >= 128, uses 128x256x256 tile."""
-    t = TestBatchGemmW4A4()
-    t.setup(B=4, M=128, N=256, K=256)
-    t.run()
+@pytest.mark.parametrize(
+    "B, M, N, K",
+    [
+        # Mid-M path: total_m > 128, uses 128x256x256 tile.
+        pytest.param(4, 128, 256, 256, id="mid_m"),
+        # Large-M path: total_m >= 4096, uses 256x256x256 tile.
+        pytest.param(4, 1024, 256, 256, id="large_m"),
+        # Boundary: total_m <= 128 triggers SwapAB path (needs N%128, M%64, K%512).
+        pytest.param(1, 64, 128, 512, id="small_m_swapab"),
+        # Boundary: single batch (B=1) mid-M path.
+        pytest.param(1, 256, 256, 256, id="single_batch"),
+    ],
+)
+def test_batch_gemm_w4a4(B, M, N, K):
+    inp = make_w4a4_inputs(B, M, N, K)
+    ref_out = ref_batch_gemm_fp4(inp["x_fp4_float"], inp["w_fp4_float"])
+
+    output = torch.zeros([B, M, N], dtype=torch.bfloat16)
+    batch_gemm(
+        inp["input_packed"],
+        inp["weight_packed"],
+        inp["sfa"],
+        inp["sfb"],
+        output,
+        alpha=inp["alpha"],
+        sm_count=-1,
+        mode="w4a4-nvfp4",
+    )
+
+    assert_close_per_batch(
+        output, ref_out, W4A4_TOL, f"W4A4 B={B}, M={M}, N={N}, K={K}"
+    )
 
 
-def test_batch_gemm_w4a4_large_m():
-    """W4A4 large-M path: total_m >= 4096, uses 256x256x256 tile."""
-    t = TestBatchGemmW4A4()
-    t.setup(B=4, M=1024, N=256, K=256)
-    t.run()
+# =====================================================================
+# W4A4 error input tests
+# =====================================================================
+
+_W4A4_ERR_SHAPE = dict(B=2, M=128, N=256, K=256)
 
 
-# ---- W4A4 boundary condition tests ----
+def make_empty_w4a4(B, M, N, K, w_packed_k=None):
+    """Uninitialized W4A4 kernel inputs for argument-validation tests."""
+    x = torch.empty([B, M, K // 2], dtype=torch.uint8)
+    w = torch.empty([B, N, w_packed_k or K // 2], dtype=torch.uint8)
+    sfa = torch.empty([B * M, K // 16], dtype=torch.uint8)
+    sfb = torch.empty([B, N, K // 16], dtype=torch.uint8)
+    out = torch.empty([B, M, N], dtype=torch.bfloat16)
+    alpha = torch.ones([1], dtype=torch.float32)
+    return x, w, sfa, sfb, out, alpha
 
 
-def test_batch_gemm_w4a4_small_m_swapab():
-    """W4A4 boundary: total_m < 128 triggers SwapAB path (needs N%128, M%64, K%512)."""
-    t = TestBatchGemmW4A4()
-    t.setup(B=1, M=64, N=128, K=512)
-    t.run()
+@pytest.mark.parametrize(
+    "K, w_packed_k, pass_alpha, add_bias, expected",
+    [
+        pytest.param(
+            256, None, False, False, "W4A4 mode requires alpha", id="missing_alpha"
+        ),
+        # K=32 is not divisible by 64.
+        pytest.param(
+            32,
+            None,
+            True,
+            False,
+            "W4A4 batch GEMM K must be divisible by 64",
+            id="bad_k",
+        ),
+        pytest.param(
+            256,
+            256 // 2 + 1,
+            True,
+            False,
+            "packed input K/2 must match",
+            id="mismatched_packed_k",
+        ),
+        pytest.param(
+            256,
+            None,
+            True,
+            True,
+            "W4A4 batch GEMM does not support bias",
+            id="bias_unsupported",
+        ),
+    ],
+)
+def test_batch_gemm_w4a4_errors(K, w_packed_k, pass_alpha, add_bias, expected):
+    shape = dict(_W4A4_ERR_SHAPE, K=K)
+    x, w, sfa, sfb, out, alpha = make_empty_w4a4(**shape, w_packed_k=w_packed_k)
+    bias = (
+        torch.zeros([shape["B"], shape["N"]], dtype=torch.bfloat16)
+        if add_bias
+        else None
+    )
+    with pytest.raises((RuntimeError, AssertionError), match=re.escape(expected)):
+        batch_gemm(
+            x, w, sfa, sfb, out, bias, alpha if pass_alpha else None, -1, "w4a4-nvfp4"
+        )
 
 
-def test_batch_gemm_w4a4_single_batch():
-    """W4A4 boundary: single batch (B=1) mid-M path."""
-    t = TestBatchGemmW4A4()
-    t.setup(B=1, M=256, N=256, K=256)
-    t.run()
-
-
-# ---- W4A4 error input tests ----
-
-
-def test_batch_gemm_w4a4_errors():
-    """Error inputs: missing alpha, mismatched packed K, bad divisibility, bias unsupported."""
-    B, M, N, K = 2, 128, 256, 256
-
-    def make_w4a4():
-        x = torch.empty([B, M, K // 2], dtype=torch.uint8)
-        w = torch.empty([B, N, K // 2], dtype=torch.uint8)
-        sfa = torch.empty([B * M, K // 16], dtype=torch.uint8)
-        sfb = torch.empty([B, N, K // 16], dtype=torch.uint8)
-        out = torch.empty([B, M, N], dtype=torch.bfloat16)
-        alpha = torch.ones([1], dtype=torch.float32)
-        return x, w, sfa, sfb, out, alpha
-
-    def run_missing_alpha():
-        x, w, sfa, sfb, out, _ = make_w4a4()
-        batch_gemm(x, w, sfa, sfb, out, None, None, -1, "w4a4-nvfp4")
-
-    _expect_runtime_error(run_missing_alpha, "W4A4 mode requires alpha")
-
-    def run_bad_k():
-        bad_k = 32  # k=32 not divisible by 64
-        x = torch.empty([B, M, bad_k // 2], dtype=torch.uint8)
-        w = torch.empty([B, N, bad_k // 2], dtype=torch.uint8)
-        sfa = torch.empty([B * M, bad_k // 16], dtype=torch.uint8)
-        sfb = torch.empty([B, N, bad_k // 16], dtype=torch.uint8)
-        out = torch.empty([B, M, N], dtype=torch.bfloat16)
-        alpha = torch.ones([1], dtype=torch.float32)
-        batch_gemm(x, w, sfa, sfb, out, None, alpha, -1, "w4a4-nvfp4")
-
-    _expect_runtime_error(run_bad_k, "W4A4 batch GEMM K must be divisible by 64")
-
-    def run_mismatched_packed_k():
-        x = torch.empty([B, M, K // 2], dtype=torch.uint8)
-        w = torch.empty([B, N, K // 2 + 1], dtype=torch.uint8)
-        sfa = torch.empty([B * M, K // 16], dtype=torch.uint8)
-        sfb = torch.empty([B, N, K // 16], dtype=torch.uint8)
-        out = torch.empty([B, M, N], dtype=torch.bfloat16)
-        alpha = torch.ones([1], dtype=torch.float32)
-        batch_gemm(x, w, sfa, sfb, out, None, alpha, -1, "w4a4-nvfp4")
-
-    _expect_runtime_error(run_mismatched_packed_k, "packed input K/2 must match")
-
-    def run_bias_unsupported():
-        x, w, sfa, sfb, out, alpha = make_w4a4()
-        bias = torch.zeros([B, N], dtype=torch.bfloat16)
-        batch_gemm(x, w, sfa, sfb, out, bias, alpha, -1, "w4a4-nvfp4")
-
-    _expect_runtime_error(run_bias_unsupported, "W4A4 batch GEMM does not support bias")
-
-
-# ---- W4A4 determinism test ----
+# =====================================================================
+# W4A4 determinism test
+# =====================================================================
 
 
 def test_batch_gemm_w4a4_determinism():
     """Determinism: identical inputs must produce bitwise-identical outputs."""
-    t = TestBatchGemmW4A4()
-    t.setup(B=4, M=128, N=256, K=256)
-    out1 = torch.zeros([t.B, t.M, t.N], dtype=torch.bfloat16, device="cuda")
-    out2 = torch.zeros([t.B, t.M, t.N], dtype=torch.bfloat16, device="cuda")
-    batch_gemm(
-        t.input_packed, t.weight_packed, t.sfa, t.sfb, out1, None, t.alpha, -1, "w4a4-nvfp4"
-    )
-    batch_gemm(
-        t.input_packed, t.weight_packed, t.sfa, t.sfb, out2, None, t.alpha, -1, "w4a4-nvfp4"
-    )
+    B, M, N, K = 4, 128, 256, 256
+    inp = make_w4a4_inputs(B, M, N, K)
+    args = (inp["input_packed"], inp["weight_packed"], inp["sfa"], inp["sfb"])
+    out1 = torch.zeros([B, M, N], dtype=torch.bfloat16)
+    out2 = torch.zeros([B, M, N], dtype=torch.bfloat16)
+    batch_gemm(*args, out1, None, inp["alpha"], -1, "w4a4-nvfp4")
+    batch_gemm(*args, out2, None, inp["alpha"], -1, "w4a4-nvfp4")
     assert torch.equal(out1, out2), "W4A4 batch_gemm output is not deterministic"
 
 

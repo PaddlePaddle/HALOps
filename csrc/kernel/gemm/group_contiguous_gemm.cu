@@ -27,6 +27,7 @@ void GroupContiguousGemm(const torch::Tensor& input,
                          const std::optional<torch::Tensor>& bias,
                          const std::optional<torch::Tensor>& alpha,
                          const int sm_count, const std::string& mode = "w8a8") {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
     TORCH_CHECK(mode == "w8a8" || mode == "w4a4-nvfp4",
                 "Unsupported mode: ", mode,
                 ". Expected 'w8a8' or 'w4a4-nvfp4'.");
@@ -74,8 +75,12 @@ void GroupContiguousGemm(const torch::Tensor& input,
 
         LaunchCfg<KernelMode::Contiguous, MmaKind::MXFP8>(
             params,
-            {.m = m / num_experts, .n = n, .k = k, .m_grid = m,
-             .sm_count = sm, .has_bias = bias.has_value()},
+            {.m = m / num_experts,
+             .n = n,
+             .k = k,
+             .m_grid = m,
+             .sm_count = sm,
+             .has_bias = bias.has_value()},
             stream);
     } else {
         const int k = weight.size(2) * 2;  // 2 FP4 per packed byte
@@ -94,11 +99,14 @@ void GroupContiguousGemm(const torch::Tensor& input,
             "W4A4 mode requires alpha input (per-expert scaling factor).");
         params.ptr_alpha = alpha->data_ptr<float>();
         TORCH_CHECK(!bias.has_value(), "W4A4 mode does not support bias yet.");
-        LaunchCfg<KernelMode::Contiguous, MmaKind::NVFP4>(
-            params,
-            {.m = m / num_experts, .n = n, .k = k, .m_grid = m,
-             .sm_count = sm, .has_bias = false},
-            stream);
+        LaunchCfg<KernelMode::Contiguous, MmaKind::NVFP4>(params,
+                                                          {.m = m / num_experts,
+                                                           .n = n,
+                                                           .k = k,
+                                                           .m_grid = m,
+                                                           .sm_count = sm,
+                                                           .has_bias = false},
+                                                          stream);
     }
 }
 

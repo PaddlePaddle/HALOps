@@ -14,7 +14,7 @@
 # limitations under the License.
 """
 
-from typing import Tuple
+from typing import List
 
 import torch
 
@@ -31,7 +31,7 @@ def get_qk_token(
     actual_cu_seq_k: torch.Tensor,
     seq_lens_kv: torch.Tensor,
     kv_head_num: int = 0,
-) -> Tuple[torch.Tensor, ...]:
+) -> List[torch.Tensor]:
     """Compute actual_cu_seq_k, seq_lens_kv, and return max/total token statistics
     for subsequent attention kernels.
 
@@ -45,7 +45,7 @@ def get_qk_token(
         kv_head_num: Number of KV heads.
 
     Returns:
-        A tuple containing a single CPU tensor with contents
+        A list containing a single CPU tensor with contents
         ``[max_enc, max_dec, total_q, total_k]``.
 
     Example:

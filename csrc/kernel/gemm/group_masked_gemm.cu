@@ -27,6 +27,7 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
                      const std::optional<torch::Tensor>& alpha,
                      const int max_m_per_expert, const int sm_count,
                      const std::string& mode = "w8a8") {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
     TORCH_CHECK(mode == "w8a8" || mode == "w4a4-nvfp4",
                 "Unsupported mode: ", mode,
                 ". Expected 'w8a8' or 'w4a4-nvfp4'.");
@@ -83,8 +84,12 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
         }
         LaunchCfg<KernelMode::Masked, MmaKind::MXFP8>(
             params,
-            {.m = max_m_per_expert, .n = n, .k = k, .m_grid = m,
-             .sm_count = sm, .has_bias = bias.has_value()},
+            {.m = max_m_per_expert,
+             .n = n,
+             .k = k,
+             .m_grid = m,
+             .sm_count = sm,
+             .has_bias = bias.has_value()},
             stream);
     } else {
         const int k = weight.size(2) * 2;  // 2 FP4 per packed byte
@@ -103,11 +108,14 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
             "W4A4 mode requires alpha input (per-expert scaling factor).");
         params.ptr_alpha = alpha->data_ptr<float>();
         TORCH_CHECK(!bias.has_value(), "W4A4 mode does not support bias yet.");
-        LaunchCfg<KernelMode::Masked, MmaKind::NVFP4>(
-            params,
-            {.m = max_m_per_expert, .n = n, .k = k, .m_grid = m,
-             .sm_count = sm, .has_bias = false},
-            stream);
+        LaunchCfg<KernelMode::Masked, MmaKind::NVFP4>(params,
+                                                      {.m = max_m_per_expert,
+                                                       .n = n,
+                                                       .k = k,
+                                                       .m_grid = m,
+                                                       .sm_count = sm,
+                                                       .has_bias = false},
+                                                      stream);
     }
 }
 

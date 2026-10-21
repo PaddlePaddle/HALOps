@@ -58,7 +58,9 @@ python ci/update_baseline.py \
     --baseline-dir ci/baselines/
 ```
 
-`update_baseline.py` preserves any manually-set `threshold` values in existing JSONs.
+`update_baseline.py` takes the config name from the CSV `case_tag` column, keeps the newest
+run per config, preserves manually-set `threshold` values, and refuses to write a baseline
+(exit code 1) for a CSV that contains non-`OK` cases.
 
 ### 3. Customize Threshold
 
@@ -75,16 +77,23 @@ Each baseline JSON file has a `threshold` field controlling the failure threshol
 
 - Default: `0.05` (5% relative error)
 - Edit `threshold` in the corresponding JSON to customize per-config tolerance
-- Formula: `abs(current - baseline) / baseline > threshold` triggers FAIL
+- Formula: `(current - baseline) / baseline > threshold` (slower) triggers FAIL; being faster
+  than `-threshold` is printed as `[FASTER]` and does not fail
 
 ## Test Behavior
 
 | Scenario | Behavior |
 |----------|----------|
-| No baseline file | FAIL, log hints to create baseline |
+| No baseline file | FAIL (`[NO BASELINE]`) |
 | Within threshold | PASS |
-| Exceeds threshold | FAIL, reports current value, baseline value, and error % |
-| benchmark.py crashes | FAIL, outputs stdout/stderr |
+| Slower than threshold | FAIL, reports current value, baseline value, and error % |
+| Faster than threshold | PASS, printed as `[FASTER]` (consider updating the baseline) |
+| Case status not `OK` (FAIL / TIMEOUT / OOM) | FAIL |
+| Baseline entry with no result in this run | FAIL |
+| Result with no baseline entry | FAIL |
+| benchmark.py raises (non-zero exit) | FAIL, outputs stdout/stderr |
+
+Only the newest CSV per config in the output directory is compared.
 
 ## Test Coverage
 

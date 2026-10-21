@@ -176,6 +176,11 @@ std::vector<torch::Tensor> PrefillPermuteToMaskedGemmDispatch(
         IsFusedAlignedTo(output_scale.data_ptr<uint8_t>(), kFusedAlignment),
         "output_scale buffer is not 128-byte aligned");
 
+    if (num_tokens == 0) {
+        return {permute_x, output_scale, permuted_indice_map,
+                token_nums_per_expert};
+    }
+
     int sm_count = GetSmCount();
     int max_blocks_per_sm = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -205,6 +210,7 @@ std::vector<torch::Tensor> PrefillPermuteToMaskedGemm(
     const torch::Tensor& x, const torch::Tensor& scale,
     const torch::Tensor& topk_ids, const int num_local_experts,
     const int max_token_num) {
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
     const bool broadcast_scale = (scale.scalar_type() != torch::kByte);
     TORCH_CHECK(scale.scalar_type() == torch::kInt ||
                     scale.scalar_type() == torch::kByte,
