@@ -348,7 +348,10 @@ def test_batch_gemm_w8a8_errors():
         out = torch.empty([B, M, N], dtype=torch.bfloat16)
         batch_gemm(x, w, sfa, sfb, out, None, None, -1, "w8a8")
 
-    _expect_runtime_error(run_bad_k, "requires K to be divisible by 128")
+    _expect_runtime_error(
+        run_bad_k,
+        "No batch w8a8 tile for M=128 (grid M=256), N=256, K=96",
+    )
 
 
 # ---- W8A8 determinism test ----
