@@ -26,6 +26,11 @@ def _check():
     if not _FI_AVAILABLE:
         raise ImportError("flashinfer not installed.")
 
+# fastest backend for flashinfer.
+FI_DEFAULT_BACKEND = {"w8a8": "cudnn", "w4a4-nvfp4": "cute-dsl"}
+def _fi_backend(inp: dict) -> str:
+    """Resolve the FlashInfer kernel backend: explicit override, else per-mode default."""
+    return inp.get("backend") or FI_DEFAULT_BACKEND.get(inp.get("mode", "w8a8"), "auto")
 
 def run_fi_dense_gemm(inp: dict):
     """Run FlashInfer dense GEMM (W8A8 via mm_mxfp8, W4A4 via mm_fp4)."""
@@ -35,6 +40,7 @@ def run_fi_dense_gemm(inp: dict):
     # flashinfer >= 0.7.2 dense kernels only take 1D 128x4-swizzled block
     # scales (M_padded * K_padded,).
     mode = inp.get("mode", "w8a8")
+    backend = _fi_backend(inp)
     if mode == "w4a4-mxfp4":
         raise ValueError(
             "flashinfer backend does not support mode 'w4a4-mxfp4' yet"
@@ -51,7 +57,7 @@ def run_fi_dense_gemm(inp: dict):
             alpha=alpha_scalar,
             out_dtype=torch.bfloat16,
             block_size=16,
-            backend=inp.get("backend", "cutlass"),
+            backend=backend,
             use_nvfp4=True,
         )
     else:
@@ -61,7 +67,7 @@ def run_fi_dense_gemm(inp: dict):
             inp["a_descale"].reshape(-1),
             inp["b_descale"].reshape(-1),
             out_dtype=torch.bfloat16,
-            backend=inp.get("backend", "cutlass"),
+            backend=backend,
         )
 
 
