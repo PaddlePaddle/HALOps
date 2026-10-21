@@ -83,14 +83,6 @@ def batch_gemm(
         >>> out = torch.empty(b, m, n, dtype=torch.bfloat16, device="cuda")
         >>> batch_gemm(x, w, sfa, sfb, out, mode="w8a8")
     """
-    assert mode in ["w8a8", "w4a4-nvfp4"], (
-        f"Unsupported mode: {mode!r}. "
-        "batch_gemm does not support 'w4a4-mxfp4'."
-    )
-    assert mode != "w4a4-nvfp4" or alpha is not None, (
-        "W4A4 mode requires alpha input (per-batch scaling factor) "
-        f"for mode {mode!r}."
-    )
     halops_kernel.batch_gemm(
         input, weight, sfa, sfb, output, bias, alpha, sm_count, mode
     )

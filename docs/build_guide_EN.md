@@ -111,8 +111,6 @@ After changing CUDA/C++ code, run an incremental build to refresh the `.so` in t
 bash build.sh
 ```
 
-This is equivalent to `python setup.py build_ext --inplace`: it keeps the Ninja state in `build/`, recompiles only changed files, and copies the extension into `halops/` without building or installing a wheel. Use `PYTHON=/path/to/python bash build.sh` to choose the interpreter.
-
 ### 3.4 Control Build Parallelism
 
 PyTorch extensions compile in parallel through Ninja by default. Reduce the number of parallel jobs if memory is limited:

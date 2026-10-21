@@ -421,7 +421,7 @@ def run_bad_rank_output():
     ],
 )
 def test_group_contiguous_unsupported_shapes(launch, expected):
-    with pytest.raises((RuntimeError, AssertionError), match=re.escape(expected)):
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
         launch()
 
 

@@ -236,7 +236,7 @@ def test_gemm_w4a4(m, n, k):
             48,
             None,
             None,
-            "W4A4 GEMM K must be divisible by 64",
+            "No dense w4a4-nvfp4 tile for M=128 (grid M=128), N=256, K=48",
             id="w4a4_bad_k",
         ),
         pytest.param(

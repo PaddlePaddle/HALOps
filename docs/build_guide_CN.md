@@ -111,8 +111,6 @@ python -m pip install --no-build-isolation --no-deps -e . -v
 bash build.sh
 ```
 
-该命令等价于 `python setup.py build_ext --inplace`：保留 `build/` 中的 Ninja 状态，只重新编译改动过的文件，并把扩展复制到 `halops/`，不生成或安装 wheel。可通过 `PYTHON=/path/to/python bash build.sh` 指定解释器。
-
 ### 3.4 控制编译并发
 
 PyTorch 扩展默认通过 Ninja 并行编译。内存不足时可降低并行任务数：

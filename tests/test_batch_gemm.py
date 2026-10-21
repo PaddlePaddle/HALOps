@@ -286,7 +286,7 @@ def make_empty_w8a8(B, M, N, K, x_shape=None, w_shape=None):
 def test_batch_gemm_w8a8_errors(K, x_shape, w_shape, mode, expected):
     shape = dict(_W8A8_ERR_SHAPE, K=K)
     x, w, sfa, sfb, out = make_empty_w8a8(**shape, x_shape=x_shape, w_shape=w_shape)
-    with pytest.raises((RuntimeError, AssertionError), match=re.escape(expected)):
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
         batch_gemm(x, w, sfa, sfb, out, None, None, -1, mode)
 
 
@@ -370,13 +370,13 @@ def make_empty_w4a4(B, M, N, K, w_packed_k=None):
         pytest.param(
             256, None, False, False, "W4A4 mode requires alpha", id="missing_alpha"
         ),
-        # K=32 is not divisible by 64.
+        # K=32 fits no W4A4 tile.
         pytest.param(
             32,
             None,
             True,
             False,
-            "W4A4 batch GEMM K must be divisible by 64",
+            "No batch w4a4-nvfp4 tile for M=",
             id="bad_k",
         ),
         pytest.param(
@@ -405,7 +405,7 @@ def test_batch_gemm_w4a4_errors(K, w_packed_k, pass_alpha, add_bias, expected):
         if add_bias
         else None
     )
-    with pytest.raises((RuntimeError, AssertionError), match=re.escape(expected)):
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
         batch_gemm(
             x, w, sfa, sfb, out, bias, alpha if pass_alpha else None, -1, "w4a4-nvfp4"
         )

@@ -37,6 +37,9 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
 
     const int m = input.size(0);
     const int n = weight.size(0);
+    TORCH_CHECK(output.size(0) == m && output.size(1) == n,
+                "output shape must be [M, N], got [", output.size(0), ", ",
+                output.size(1), "], expected [", m, ", ", n, "]");
     const int sm = sm_count_arg > 0 ? sm_count_arg : GetSmCount();
     const cudaStream_t stream = GetCurrentCUDAStream(input);
 
@@ -52,9 +55,6 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),
                     ", weight K=", k);
-        TORCH_CHECK(output.size(0) == m && output.size(1) == n,
-                    "output shape must be [M, N], got [", output.size(0), ", ",
-                    output.size(1), "], expected [", m, ", ", n, "]");
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();
@@ -83,10 +83,6 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
             input.size(1) == weight.size(1),
             "packed input K/2 must match packed weight K/2, got input K/2=",
             input.size(1), ", weight K/2=", weight.size(1));
-        TORCH_CHECK(output.size(0) == m && output.size(1) == n,
-                    "output shape must be [M, N], got [", output.size(0), ", ",
-                    output.size(1), "], expected [", m, ", ", n, "]");
-        CheckDivisible(k, 64, "W4A4 GEMM K");
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();

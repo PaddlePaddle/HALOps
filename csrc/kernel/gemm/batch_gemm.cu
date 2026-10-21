@@ -47,8 +47,6 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
         "output shape must be [B, M, N]");
 
     // sfa/sfb: [B*M, sf_k] or [B, M, sf_k] -- same underlying memory.
-    TORCH_CHECK(sfa.is_contiguous(), "sfa must be contiguous");
-    TORCH_CHECK(sfb.is_contiguous(), "sfb must be contiguous");
 
     const cudaStream_t stream = GetCurrentCUDAStream(input);
     const int sm = sm_count > 0 ? sm_count : GetSmCount();
@@ -89,7 +87,6 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
         TORCH_CHECK(input.size(2) == weight.size(2),
                     "packed input K/2 must match packed weight K/2, got ",
                     input.size(2), ", weight K/2=", weight.size(2));
-        CheckDivisible(k, 64, "W4A4 batch GEMM K");
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();

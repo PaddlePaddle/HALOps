@@ -88,7 +88,6 @@ void GroupContiguousGemm(const torch::Tensor& input,
             input.size(1) == weight.size(2),
             "packed input K/2 must match packed weight K/2, got input K/2=",
             input.size(1), ", weight K/2=", weight.size(2));
-        CheckDivisible(k, 64, "W4A4 contiguous GEMM K");
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();
