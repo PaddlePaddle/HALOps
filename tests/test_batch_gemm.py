@@ -240,7 +240,7 @@ class TestBatchGemmW4A4:
             output,
             alpha=self.alpha,
             sm_count=-1,
-            mode="w4a4",
+            mode="w4a4-nvfp4",
         )
 
         # Compare per batch
@@ -417,7 +417,7 @@ def test_batch_gemm_w4a4_errors():
 
     def run_missing_alpha():
         x, w, sfa, sfb, out, _ = make_w4a4()
-        batch_gemm(x, w, sfa, sfb, out, None, None, -1, "w4a4")
+        batch_gemm(x, w, sfa, sfb, out, None, None, -1, "w4a4-nvfp4")
 
     _expect_runtime_error(run_missing_alpha, "W4A4 mode requires alpha")
 
@@ -429,7 +429,7 @@ def test_batch_gemm_w4a4_errors():
         sfb = torch.empty([B, N, bad_k // 16], dtype=torch.uint8)
         out = torch.empty([B, M, N], dtype=torch.bfloat16)
         alpha = torch.ones([1], dtype=torch.float32)
-        batch_gemm(x, w, sfa, sfb, out, None, alpha, -1, "w4a4")
+        batch_gemm(x, w, sfa, sfb, out, None, alpha, -1, "w4a4-nvfp4")
 
     _expect_runtime_error(run_bad_k, "W4A4 batch GEMM K must be divisible by 64")
 
@@ -440,14 +440,14 @@ def test_batch_gemm_w4a4_errors():
         sfb = torch.empty([B, N, K // 16], dtype=torch.uint8)
         out = torch.empty([B, M, N], dtype=torch.bfloat16)
         alpha = torch.ones([1], dtype=torch.float32)
-        batch_gemm(x, w, sfa, sfb, out, None, alpha, -1, "w4a4")
+        batch_gemm(x, w, sfa, sfb, out, None, alpha, -1, "w4a4-nvfp4")
 
     _expect_runtime_error(run_mismatched_packed_k, "packed input K/2 must match")
 
     def run_bias_unsupported():
         x, w, sfa, sfb, out, alpha = make_w4a4()
         bias = torch.zeros([B, N], dtype=torch.bfloat16)
-        batch_gemm(x, w, sfa, sfb, out, bias, alpha, -1, "w4a4")
+        batch_gemm(x, w, sfa, sfb, out, bias, alpha, -1, "w4a4-nvfp4")
 
     _expect_runtime_error(run_bias_unsupported, "W4A4 batch GEMM does not support bias")
 
@@ -462,10 +462,10 @@ def test_batch_gemm_w4a4_determinism():
     out1 = torch.zeros([t.B, t.M, t.N], dtype=torch.bfloat16, device="cuda")
     out2 = torch.zeros([t.B, t.M, t.N], dtype=torch.bfloat16, device="cuda")
     batch_gemm(
-        t.input_packed, t.weight_packed, t.sfa, t.sfb, out1, None, t.alpha, -1, "w4a4"
+        t.input_packed, t.weight_packed, t.sfa, t.sfb, out1, None, t.alpha, -1, "w4a4-nvfp4"
     )
     batch_gemm(
-        t.input_packed, t.weight_packed, t.sfa, t.sfb, out2, None, t.alpha, -1, "w4a4"
+        t.input_packed, t.weight_packed, t.sfa, t.sfb, out2, None, t.alpha, -1, "w4a4-nvfp4"
     )
     assert torch.equal(out1, out2), "W4A4 batch_gemm output is not deterministic"
 

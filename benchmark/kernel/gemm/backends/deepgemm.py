@@ -68,7 +68,7 @@ def make_dense_inputs(x_bf16: torch.Tensor, w_bf16: torch.Tensor, mode: str) -> 
     n = w_bf16.shape[0]
     out = torch.empty(m, n, dtype=torch.bfloat16, device=x_bf16.device)
 
-    cast = dg.per_token_cast_to_fp4 if mode == "w4a4" else dg.per_token_cast_to_fp8
+    cast = dg.per_token_cast_to_fp4 if mode.startswith("w4a4") else dg.per_token_cast_to_fp8
     a_data, a_sf = cast(x_bf16, use_ue8m0=True, gran_k=32)
     b_data, b_sf = cast(w_bf16, use_ue8m0=True, gran_k=32)
     a_sf = dg.transform_sf_into_required_layout(a_sf, m, k, (1, 32))
@@ -108,7 +108,7 @@ def make_grouped_masked_inputs(
     a_bf16 = x_bf16.reshape(num_groups, max_m, k)
     masked_m = masked_m.to(device=dev, dtype=torch.int32)
 
-    if mode == "w4a4":
+    if mode.startswith("w4a4"):
         # A: FP4 per-token (gran_k=32), pre-pack SF to UE8M0 INT
         a_fp4 = torch.empty(num_groups, max_m, k // 2, dtype=torch.int8, device=dev)
         a_sf_list = []
@@ -190,7 +190,7 @@ def make_grouped_contiguous_inputs(
     dev = x_bf16.device
     m_indices = m_indices.to(device=dev, dtype=torch.int32)
 
-    if mode == "w4a4":
+    if mode.startswith("w4a4"):
         a_fp4, a_sf = dg.per_token_cast_to_fp4(x_bf16, use_ue8m0=True, gran_k=32)
         a_sf_packed = dg.get_mn_major_tma_aligned_packed_ue8m0_tensor(a_sf)
         b_fp4 = torch.empty(num_groups, n, k // 2, dtype=torch.int8, device=dev)
@@ -239,7 +239,7 @@ def run_dense_gemm(inp: dict):
     _check()
     import deep_gemm as dg
 
-    if inp.get("mode") == "w4a4":
+    if inp.get("mode", "w8a8").startswith("w4a4"):
         dg.fp8_fp4_gemm_nt(
             inp["a"], inp["b"], inp["out"], recipe_a=(1, 32), recipe_b=(1, 32)
         )
@@ -255,7 +255,7 @@ def run_group_masked_gemm(inp: dict):
     _check()
     import deep_gemm as dg
 
-    if inp.get("mode") == "w4a4":
+    if inp.get("mode", "w8a8").startswith("w4a4"):
         dg.m_grouped_fp8_fp4_gemm_nt_masked(
             inp["a"],
             inp["b"],
@@ -277,7 +277,7 @@ def run_group_contiguous_gemm(inp: dict):
     _check()
     import deep_gemm as dg
 
-    if inp.get("mode") == "w4a4":
+    if inp.get("mode", "w8a8").startswith("w4a4"):
         dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
             inp["a"],
             inp["b"],

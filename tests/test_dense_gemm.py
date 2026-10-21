@@ -193,7 +193,7 @@ class TestGemmW4A4:
                 self.sfb,
                 alpha=self.alpha,
                 sm_count=self.sm_count,
-                mode="w4a4",
+                mode="w4a4-nvfp4",
             )
 
         diff = (output.to(torch.float32) - ref_out.to(torch.float32)).abs()
@@ -303,7 +303,7 @@ def test_gemm_unsupported_shapes():
         sfb = torch.empty([n, k // 16], dtype=torch.uint8)
         out = torch.empty([m, n], dtype=torch.bfloat16)
         alpha = torch.ones([1], dtype=torch.float32)
-        dense_gemm(x, w, sfa, sfb, out, None, alpha, -1, "w4a4")
+        dense_gemm(x, w, sfa, sfb, out, None, alpha, -1, "w4a4-nvfp4")
 
     _expect_runtime_error(run_w4a4_bad_k, "W4A4 GEMM K must be divisible by 64")
 
@@ -358,7 +358,7 @@ def test_gemm_w4a4_determinism():
         t.sfb,
         alpha=t.alpha,
         sm_count=t.sm_count,
-        mode="w4a4",
+        mode="w4a4-nvfp4",
     )
     out2 = gemm_wrapper(
         t.x_packed,
@@ -367,7 +367,7 @@ def test_gemm_w4a4_determinism():
         t.sfb,
         alpha=t.alpha,
         sm_count=t.sm_count,
-        mode="w4a4",
+        mode="w4a4-nvfp4",
     )
     assert torch.equal(out1, out2), "W4A4 dense_gemm output is not deterministic"
 

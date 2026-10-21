@@ -11,7 +11,7 @@ description: Generate benchmark config YAML for the HALOps kernel benchmark (bai
 
 ## 何时使用
 
-用户希望为某个场景新增/生成 benchmark 配置时。用户通常会给出场景和意图（如“给 decode 加个 FP8 的配置”“加一组 group_masked 的 w4a4 shape”），细节可能不全，由本 skill 补齐。
+用户希望为某个场景新增/生成 benchmark 配置时。用户通常会给出场景和意图（如“给 decode 加个 FP8 的配置”“加一组 group_masked 的 w4a4-nvfp4 shape”），细节可能不全，由本 skill 补齐。
 
 ## 交互原则（面向用户）
 
@@ -62,7 +62,7 @@ description: Generate benchmark config YAML for the HALOps kernel benchmark (bai
 
 - **关键字段向用户追问**：直接决定测什么的字段必须问清，不要替用户假设。包括遍历维度（`s_kv_list`、`batch_sizes`、`shapes`、`prefix_len_list`/`chunk_len_list` 等）、`dtype`/`mode`、`backends`，以及决定 shape 的 `num_q_heads`/`num_kv_heads`/`head_dim`。若用户未给出 head 几何，可参考同族现有配置推断并标注 `# inferred`，但要在确认环节明确提示这是推断值。
 - **次要字段自动推断并标注**：`refcheck`、`refcheck_reference`、`cold_l2_cache`、`use_cuda_graph`、`sm_count`、`mtp_steps_list`、`cache_quant_type` 等可参考同场景现有配置或代码默认值推断。生成时用 YAML 注释标注哪些是推断值（如 `# inferred`）。
-- `gpu_type` 通常可省略（默认 `b200`），但当 `mode: w4a4` 或 dtype 为 FP4 时，roofline 指标只有 `b200` 有意义；若用户目标 GPU 非 `b200`，应提示该限制。
+- `gpu_type` 通常可省略（默认 `b200`），但当 `mode: w4a4-nvfp4` 或 dtype 为 FP4 时，roofline 指标只有 `b200` 有意义；若用户目标 GPU 非 `b200`，应提示该限制。
 - **dtype 字符串写法**：多数场景用 `getattr(torch, cfg["dtype"])` 实例化，因此必须写 torch 属性名（如 `bfloat16`），写 `bf16` 会报错。`fp8`/`e4m3` 这类别名只在个别场景（如 `decode_gqa`）局部支持，勿跨场景套用；不确定时读该 scenario 的 `build_inputs` 确认。
 
 参考同 op 目录下已有 `.yaml` 的写法，保持字段顺序与风格一致。若现有配置不带 `# inferred` 之类注释，在写入仓库前与用户确认是否去掉这些标注以保持风格统一。

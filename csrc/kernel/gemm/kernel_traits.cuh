@@ -69,10 +69,9 @@ struct GemmKernelTraits {
     static constexpr bool SwapAB = KernelConfig_::SwapAB;
     static constexpr bool HasAlpha = KernelConfig_::HasAlpha;
     static constexpr bool KDenseW8A8 =
-        KernelType == KernelMode::Naive && !AddBias && !KernelConfig_::KIsFP4;
+        KernelType == KernelMode::Dense && !AddBias && !KernelConfig_::KIsFP4;
     static constexpr bool KIsDense =
-        KernelType == KernelMode::Naive && !AddBias;
-    static constexpr bool IsPackedSfb = KernelConfig_::IsPackedSfb;
+        KernelType == KernelMode::Dense && !AddBias;
     static constexpr int KMaxAlphaExperts = 256;
     static constexpr bool IsPairUmma = KernelConfig_::IsPairUmma;
     static constexpr int KNumCTA = IsPairUmma ? 2 : 1;
@@ -200,15 +199,18 @@ struct GemmKernelTraits {
                          "Static cluster shape used: TileShape should be "
                          "evenly divided by TiledMma");
 
-    // For unaligned-N pair tiles (see IsSfbUnaligned) the SFB tile is a run of
-    // 128-row atoms, so the SF MMA atom is 128 wide rather than round_up(N).
+    // An unaligned-N tile (see IsSfbUnaligned) reads its scale as a run of
+    // 128-row atoms, so its SF MMA atom is 128 wide, in the tile's own recipe.
     using MMA_SF_T = cute::conditional_t<
-        !KIsFP4 && !SwapAB && (KNumCTA == 2 || IsPackedSfb) &&
-            KBlockN % 128 != 0,
-        cute::SM100_MMA_MXF8F6F4_SS<TypeA, TypeB, TypeAccumulate_, TypeSF,
-                                    KBlockM / KNumCTA, 128,
+        SwapAB || KBlockN % 128 == 0, typename TiledMma::MMA_ScaleFactor,
+        cute::conditional_t<
+            KIsFP4,
+            cute::SM100_MMA_MXF4_SS<TypeA, TypeB, TypeAccumulate_, TypeSF,
+                                    KBlockM / KNumCTA, 128, KSFVecSize,
                                     cute::UMMA::Major::K, cute::UMMA::Major::K>,
-        typename TiledMma::MMA_ScaleFactor>;
+            cute::SM100_MMA_MXF8F6F4_SS<
+                TypeA, TypeB, TypeAccumulate_, TypeSF, KBlockM / KNumCTA, 128,
+                cute::UMMA::Major::K, cute::UMMA::Major::K>>>;
     using TiledMma_SF = cute::TiledMMA<
         cute::MMA_Atom<MMA_SF_T>,
         cute::Layout<cute::Shape<cute::_1, cute::_1, cute::_1>>,
@@ -228,20 +230,25 @@ struct GemmKernelTraits {
     static constexpr bool IsCtaNSmall =
         cute::size<1>(CtaShape_MNK{}) < Blk_MN{};
     static constexpr int IsCtaN64 = cute::size<1>(CtaShape_MNK{}) == 64;
-    // A pair tile whose N is not a multiple of the 128-row SF atom (e.g. 224)
-    // starts at a 32-row-aligned offset inside an atom.  SFB is then loaded as
-    // the covering run of whole atoms, and the MMA's SFB TMEM address is moved
-    // forward by the offset (one TMEM column holds 32 rows of an atom).
     static constexpr bool IsSfbUnaligned = !KIsFP4 && !SwapAB &&
-                                           (KNumCTA == 2 || IsPackedSfb) &&
+                                           KBlockN > 128 &&
                                            KBlockN % 128 != 0;
     static_assert(!IsSfbUnaligned || KBlockN % 32 == 0,
                   "unaligned SFB tiles need KBlockN % 32 == 0");
+    // Used when BLOCK_N=224.
+    static constexpr bool IsSfbRowShift =
+        IsSfbUnaligned && KBlockN % 64 != 0;
+    static constexpr int KSfbTransposeWarpId = KLoadCWarpId;
+    static constexpr int KSfbTransposeWarps = KNumWarp - KSfbTransposeWarpId;
+    static_assert(!IsSfbRowShift || (!AddBias && KSfbTransposeWarps >= 1),
+                  "the 224-column SFB rewrite needs the idle bias-loader warp");
     static constexpr int KSfbMaxOffset =
-        !IsSfbUnaligned || IsPackedSfb ? 0 : (KBlockN % 64 == 0 ? 64 : 96);
+        !IsSfbUnaligned ? 0 : (KBlockN % 64 == 0 ? 64 : 96);
     static constexpr int KSfbLoadN =
         (KBlockN + KSfbMaxOffset + 127) / 128 * 128;
     static constexpr int KSfbAtoms = KSfbLoadN / 128;
+    static_assert(!IsSfbRowShift || KSfbLoadN >= KBlockN + 32,
+                  "the 224-column window must have room for the 32-row shift");
     static int constexpr CTA_N_SF =
         IsSfbUnaligned
             ? KSfbLoadN
@@ -392,6 +399,10 @@ struct GemmKernelTraits {
         // it, so the peer arrives on this cluster barrier.
         alignas(8) typename cutlass::arch::ClusterBarrier::ValueType
             overlap_cluster_bar;
+
+        static constexpr int KSfFullStages = IsSfbRowShift ? KPrologueStages : 1;
+        alignas(8) typename cutlass::arch::ClusterTransactionBarrier::ValueType
+            sf_full[KSfFullStages];
     };
 
     static void print_args() {}

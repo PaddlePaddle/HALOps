@@ -52,19 +52,20 @@ def batch_gemm(
     Args:
         input: [B, M, K] CUDA tensor.
             w8a8: dtype float8_e4m3fn.
-            w4a4: dtype uint8 (packed FP4, logical K is size(2)*2).
+            w4a4-nvfp4: dtype uint8 (packed FP4, logical K is size(2)*2).
         weight: [B, N, K] CUDA tensor. Same dtype/packing rules as input.
         sfa: [B, M, sf_k] scale factor for A, dtype uint8, CUTLASS SfAtom 128x4 swizzled layout.
-            sf_k = K // 32 (w8a8) or K // 16 (w4a4).
+            sf_k = K // 32 (w8a8) or K // 16 (w4a4-nvfp4).
             w8a8: UE8M0 encoding (block_size=32).
-            w4a4: UE4M3 encoding (block_size=16).
+            w4a4-nvfp4: UE4M3 encoding (block_size=16).
         sfb: [B, N, sf_k] scale factor for B, dtype uint8, same SfAtom layout as sfa.
         output: [B, M, N] pre-allocated output tensor, dtype bfloat16. Written in-place.
-        bias: Optional [N] bfloat16 bias vector. Only supported in w8a8 mode.
-        alpha: Optional float32 per-expert scaling factor with shape [B], one
-            value per batch item. Required for w4a4 mode.
+        bias: Optional [B, N] bfloat16 bias vector. Only supported in w8a8 mode.
+        alpha: Optional float32 per-batch scaling factor with shape [B], one
+            value per batch item. Required for ``w4a4-nvfp4``.
         sm_count: Number of SMs to use (-1 for all available).
-        mode: ``"w8a8"`` for FP8 E4M3 GEMM; ``"w4a4"`` for FP4 E2M1 GEMM.
+        mode: ``"w8a8"`` or ``"w4a4-nvfp4"``. ``"w4a4-mxfp4"`` is not
+            supported by this kernel yet.
 
     Returns:
         None. The result is written in-place to output.
@@ -82,6 +83,14 @@ def batch_gemm(
         >>> out = torch.empty(b, m, n, dtype=torch.bfloat16, device="cuda")
         >>> batch_gemm(x, w, sfa, sfb, out, mode="w8a8")
     """
+    assert mode in ["w8a8", "w4a4-nvfp4"], (
+        f"Unsupported mode: {mode!r}. "
+        "batch_gemm does not support 'w4a4-mxfp4'."
+    )
+    assert mode != "w4a4-nvfp4" or alpha is not None, (
+        "W4A4 mode requires alpha input (per-batch scaling factor) "
+        f"for mode {mode!r}."
+    )
     halops_kernel.batch_gemm(
         input, weight, sfa, sfb, output, bias, alpha, sm_count, mode
     )

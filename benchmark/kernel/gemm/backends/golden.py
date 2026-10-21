@@ -34,7 +34,7 @@ def _ue4m3_to_scale(sf: torch.Tensor) -> torch.Tensor:
     return sf.view(torch.float8_e4m3fn).to(torch.float32)
 
 
-def _dequant_to_bf16(src_bf16: torch.Tensor, is_fp4: bool) -> torch.Tensor:
+def _dequant_to_bf16(src_bf16: torch.Tensor, mode: str) -> torch.Tensor:
     """Re-quantize a bf16 source to fp8/fp4 and dequantize it back to bf16.
 
     The kernels under test consume group-wise quantized fp8/fp4 operands, so
@@ -51,7 +51,17 @@ def _dequant_to_bf16(src_bf16: torch.Tensor, is_fp4: bool) -> torch.Tensor:
     """
     from halops.gemm.group_wise_quant import group_wise_quant
 
-    group = 16 if is_fp4 else 32
+    if mode == "w8a8":
+        is_fp4 = False
+        group = 32
+    elif mode == "w4a4-nvfp4":
+        is_fp4 = True
+        group = 16
+    else:
+        raise ValueError(
+            f"golden backend does not support mode {mode!r}. "
+            "Expected 'w8a8' or 'w4a4-nvfp4'."
+        )
     rows, k = src_bf16.shape
     q, sf = group_wise_quant(src_bf16, is_fp4=is_fp4, use_swizzle=False)
 
@@ -80,11 +90,11 @@ def run_dense_golden(inp: dict) -> torch.Tensor:
     the golden is a neutral baseline that excludes quantization noise and shares
     the kernels' compute and output dtype.
 
-    inp keys: x_bf16 [M, K], w_bf16 [N, K], mode ("w8a8" | "w4a4").
+    inp keys: x_bf16 [M, K], w_bf16 [N, K], mode ("w8a8" | "w4a4-nvfp4").
     """
-    is_fp4 = inp.get("mode") == "w4a4"
-    x = _dequant_to_bf16(inp["x_bf16"], is_fp4)
-    w = _dequant_to_bf16(inp["w_bf16"], is_fp4)
+    mode = inp.get("mode", "w8a8")
+    x = _dequant_to_bf16(inp["x_bf16"], mode)
+    w = _dequant_to_bf16(inp["w_bf16"], mode)
     return torch.matmul(x, w.t())
 
 
@@ -101,16 +111,16 @@ def run_grouped_golden(inp: dict) -> torch.Tensor:
             x_bf16   [M, K]      unquantized activation source (bfloat16)
             w_bf16   [E, N, K]   unquantized per-expert weight source (bfloat16)
             m_indptr [E+1]       per-group row offsets (prefix sum)
-            mode     str         "w8a8" (fp8) or "w4a4" (fp4)
+            mode     str         "w8a8" (fp8) or "w4a4-nvfp4" (fp4)
 
     Returns:
         torch.Tensor [M, N] bfloat16 reference output.
     """
-    is_fp4 = inp.get("mode") == "w4a4"
-    x = _dequant_to_bf16(inp["x_bf16"], is_fp4)  # [M, K]
+    mode = inp.get("mode", "w8a8")
+    x = _dequant_to_bf16(inp["x_bf16"], mode)  # [M, K]
     w_src = inp["w_bf16"]  # [E, N, K]
     num_groups, n, k = w_src.shape
-    w = _dequant_to_bf16(w_src.reshape(num_groups * n, k), is_fp4).reshape(
+    w = _dequant_to_bf16(w_src.reshape(num_groups * n, k), mode).reshape(
         num_groups, n, k
     )
     # Materialize offsets on CPU once to avoid per-group GPU->CPU syncs.

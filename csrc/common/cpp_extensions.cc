@@ -73,8 +73,7 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const torch::Tensor& sfa, const torch::Tensor& sfb,
                torch::Tensor& output, const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha, const int sm_count,
-               const std::string& mode,
-               const std::optional<torch::Tensor>& sfb_packed);
+               const std::string& mode);
 
 void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
                      const torch::Tensor& sfa, const torch::Tensor& sfb,
@@ -158,8 +157,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("dense_gemm", &halops::DenseGemm, py::arg("input"), py::arg("weight"),
           py::arg("sfa"), py::arg("sfb"), py::arg("output"), py::arg("bias"),
-          py::arg("alpha"), py::arg("sm_count"), py::arg("mode"),
-          py::arg("sfb_packed") = py::none());
+          py::arg("alpha"), py::arg("sm_count"), py::arg("mode"));
     m.def("group_masked_gemm", &halops::GroupMaskedGemm);
     m.def("group_contiguous_gemm", &halops::GroupContiguousGemm);
     m.def("batch_gemm", &halops::BatchGemm);

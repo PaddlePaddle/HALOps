@@ -44,18 +44,28 @@ def group_masked_gemm(
 
     Args:
         input: [num_experts * max_m_per_expert, K] CUDA tensor.
-            w8a8: dtype float8_e4m3fn. w4a4: dtype uint8 (packed FP4).
+            w8a8: dtype float8_e4m3fn. w4a4-nvfp4: dtype uint8 (packed FP4).
         weight: [num_experts, N, K] 3D CUDA tensor. Per-expert weights.
         sfa: Scale factor for A, dtype uint8, SfAtom layout.
         sfb: Scale factor for B, dtype uint8, SfAtom layout.
         masked_m: [num_experts] int32. Actual valid token count per expert.
         output: [num_experts * max_m_per_expert, N] bfloat16 output. Written in-place.
-        bias: Optional bfloat16 bias. Only supported in w8a8 mode.
-        alpha: Optional float32 per-expert scale. Required for w4a4.
+        bias: Optional [num_experts, N] bfloat16 bias. Only supported in w8a8 mode.
+        alpha: Optional float32 per-expert scale with shape [num_experts].
+            Required for ``w4a4-nvfp4``.
         max_m_per_expert: Maximum tokens per expert (padding bound), must be > 0.
         sm_count: Number of SMs to use (-1 for all available).
-        mode: ``"w8a8"`` or ``"w4a4"``.
+        mode: ``"w8a8"`` or ``"w4a4-nvfp4"``. ``"w4a4-mxfp4"`` is not
+            supported by this kernel yet.
     """
+    assert mode in ["w8a8", "w4a4-nvfp4"], (
+        f"Unsupported mode: {mode!r}. "
+        "group_masked_gemm does not support 'w4a4-mxfp4'."
+    )
+    assert mode != "w4a4-nvfp4" or alpha is not None, (
+        "W4A4 mode requires alpha input (per-expert scaling factor) "
+        f"for mode {mode!r}."
+    )
     halops_kernel.group_masked_gemm(
         input,
         weight,

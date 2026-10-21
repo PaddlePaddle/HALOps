@@ -409,7 +409,7 @@ def reorder_sf_to_cutlass(sf_logical, mn_dim, kb_dim):
 def _expect_runtime_error(fn, expected):
     try:
         fn()
-    except RuntimeError as e:
+    except (RuntimeError, AssertionError) as e:
         msg = str(e)
         assert expected in msg, f"expected '{expected}' in RuntimeError, got: {msg}"
     else:

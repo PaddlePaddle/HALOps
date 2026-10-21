@@ -1,5 +1,5 @@
 scenario: dense_gemm
-mode: w4a4
+mode: w4a4-nvfp4
 
 # [M, N, K] shapes.
 shapes:

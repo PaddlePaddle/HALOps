@@ -242,7 +242,7 @@ struct TileScheduler {
 
         if (use_compact_sched_) {
             if constexpr (KernelTraits::KernelType == KernelMode::Contiguous ||
-                          KernelTraits::KernelType == KernelMode::Naive ||
+                          KernelTraits::KernelType == KernelMode::Dense ||
                           KernelTraits::KernelType == KernelMode::Batch) {
                 // No padding: every tile is valid.
                 total_valid_tiles_ = total_tiles_;
