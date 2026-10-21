@@ -277,7 +277,7 @@ def test_gemm_unsupported_shapes():
 
     _expect_runtime_error(
         run_w8a8_bad_k,
-        "No W8A8 dense GEMM tile shape supports M=128, N=256, K=96",
+        "No dense w8a8 tile for M=128 (grid M=128), N=256, K=96",
     )
 
     def run_w8a8_bad_n():
@@ -292,7 +292,7 @@ def test_gemm_unsupported_shapes():
     # Shape-aware dispatch includes N=128 tiles; N=255 fits none of them.
     _expect_runtime_error(
         run_w8a8_bad_n,
-        "No W8A8 dense GEMM tile shape supports M=128, N=255, K=128",
+        "No dense w8a8 tile for M=128 (grid M=128), N=255, K=128",
     )
 
     def run_w4a4_bad_k():

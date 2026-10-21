@@ -628,7 +628,10 @@ def test_group_masked_unsupported_shapes():
         out = torch.empty([num_experts * max_m, n], dtype=torch.bfloat16)
         group_masked_gemm(x, w, sfa, sfb, masked_m, out, None, None, max_m, -1, "w8a8")
 
-    _expect_runtime_error(run_w8a8_bad_max_m, "requires M to be divisible by 128")
+    _expect_runtime_error(
+        run_w8a8_bad_max_m,
+        "No masked w8a8 tile for M=129 (grid M=258), N=256, K=128",
+    )
 
     def run_w4a4_bias():
         num_experts, max_m, n, k = 2, 128, 128, 512

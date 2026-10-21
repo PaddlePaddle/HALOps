@@ -506,7 +506,10 @@ def test_group_contiguous_unsupported_shapes():
         out = torch.empty([m, n], dtype=torch.bfloat16)
         group_contiguous_gemm(x, w, sfa, sfb, expert_ids, out, None, None, -1, "w8a8")
 
-    _expect_runtime_error(run_w8a8_bad_m, "requires M to be divisible by 128")
+    _expect_runtime_error(
+        run_w8a8_bad_m,
+        "No contiguous w8a8 tile for M=129 (grid M=129), N=256, K=128",
+    )
 
     def run_w4a4_bias():
         m, n, k, num_experts = 128, 256, 512, 1
