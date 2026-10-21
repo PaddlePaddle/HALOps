@@ -1,11 +1,36 @@
 # HALOps Benchmark 指南
 
+[English Quick Reference](#english-quick-reference) | [简体中文](#环境准备)
+
+## English Quick Reference
+
+Kernel-level benchmark. Each run executes the same set of cases for every backend listed in the YAML config and writes a CSV, a Markdown report and a log. Results only hold for the stated hardware, software versions, config and measurement method; public performance claims must also pass the correctness check.
+
+Install HALOps first ([Build Guide](../docs/build_guide_EN.md)), then the benchmark dependencies. Reference backends (FlashAttention, FlashInfer, DeepGEMM, SGLang, cuDNN) are not installed by this file; install only what the YAML `backends` list uses. Run all commands from `benchmark/`.
+
+```bash
+python -m pip install -r benchmark/requirements.txt
+
+# All backends listed in the YAML
+python benchmark.py --config=attention/prefill_chunked_c16_gqa14-1.yaml --gpu=0
+
+# A single backend (must be in the YAML `backends` list; one --config only)
+python benchmark.py --config=gemm/dense_w8a8.yaml --backend=halops --gpu=0
+```
+
+- `--config` takes a path relative to `configs/` (recommended), a file name unique across `configs/<op>/`, or an absolute path. Bundled configs live in `configs/attention/` and `configs/gemm/`.
+- Common options: `--gpu` (default `0`, sets `CUDA_VISIBLE_DEVICES`), `--timing-method` (`profiler` or `cupti`, default `profiler`), `--dry-run-iters` (default `10`), `--repeat-iters` (default `50`), `--refcheck-reference`. See `python benchmark.py --help`.
+- Outputs share one timestamp `{ts}`: `results/{ts}_{config}.csv`, `reports/{ts}_{scenario}_{case_tag}.md`, `logs/{ts}_{op}_{config}.log`.
+- Speedup is `other_backend_median_us / halops_median_us`; above `1.00x` means HALOps is faster.
+
+The sections below (in Chinese) cover config forms, timing methods, correctness rules and the scenario × backend matrix in detail.
+
 Kernel 级 benchmark。每次运行会按 YAML 中声明的 backend 列表逐个执行同一组 case，并输出 CSV、Markdown 报告与日志。
 Benchmark 结果只代表指定硬件、软件版本、配置与测量方法。公开性能结论还必须通过正确性校验。
 
 ## 环境准备
 
-先按 [构建指南](../docs/build_guide.md) 安装 HALOps，再安装 Benchmark 框架依赖：
+先按 [构建指南](../docs/build_guide_CN.md) 安装 HALOps，再安装 Benchmark 框架依赖：
 
 ```bash
 python -m pip install -r benchmark/requirements.txt
@@ -119,8 +144,8 @@ python core/report.py \
 | 场景 | halops | golden | fa2 | fa4 | fi | deepgemm | cudnn | sglang_triton |
 | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | `decode_gqa` | ✅ | ✅ | ✅ | ✅¹ | ✅² | — | ✅ | — |
-| `prefill_dense` | ✅ | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
-| `prefill_chunked_gqa` | ✅ | ✅ | ✅ | ✅ | — | — | — | — |
+| `prefill_dense` | ✅ | ✅ | ✅ | ✅ | ✅³ | — | ✅ | ✅ |
+| `prefill_chunked_gqa` | ✅ | ✅ | ✅ | ✅ | ✅⁴ | — | — | — |
 | `dense_gemm` | ✅ | ✅ | — | — | ✅ | ✅ | — | — |
 | `group_masked` | ✅ | ✅ | — | — | ✅ | ✅ | — | — |
 | `group_contiguous` | ✅ | ✅ | — | — | ✅ | ✅ | — | — |
@@ -128,6 +153,8 @@ python core/report.py \
 - `halops` 为默认基准，`golden` 为正确性参考。
 - ¹ `decode_gqa` 还提供 `fa4_paged`。
 - ² `decode_gqa` 的 `fi` 有多个后端变体：`fi(auto)`、`fi(fa2)`、`fi(fa3)`、`fi(trtllm-gen)`，以及独立的 `fi_trtllm`。
+- ³ `prefill_dense` 的 `fi` 变体：`fi(auto)`、`fi(trtllm-gen)`。
+- ⁴ `prefill_chunked_gqa` 的 `fi` 变体：`fi(auto)`、`fi(cudnn)`、`fi(trtllm-gen)`。
 - 实际可用的 backend 还取决于运行环境是否安装了对应依赖。
 
 ## 相关文档

@@ -157,36 +157,3 @@ def reference_attention(q, k, v, head_num, kv_head_num, head_dim=HEAD_DIM):
             softmax = exp_scores / np.sum(exp_scores)
             out[qi, h, :] = softmax @ v_slice
     return out
-
-
-def build_kv_cache(
-    k_list, v_list, kv_head_num, num_blocks, max_blk_per_seq, head_dim=HEAD_DIM
-):
-    """Scatter per-sequence K/V into a paged cache and build the block table.
-
-    Args:
-        k_list: list of [kv_len, kv_head_num, head_dim] arrays, one per sequence.
-        v_list: list of [kv_len, kv_head_num, head_dim] arrays, one per sequence.
-        kv_head_num: number of KV heads.
-        num_blocks: total number of physical cache blocks.
-        max_blk_per_seq: maximum blocks reserved per sequence.
-        head_dim: per-head dimension.
-
-    Returns:
-        Tuple ``(cache_k, cache_v, block_tables)`` numpy arrays where the caches
-        have shape [num_blocks, kv_head_num, BLOCK_SIZE, head_dim] and
-        ``block_tables`` has shape [batch, max_blk_per_seq].
-    """
-    ck = np.zeros([num_blocks, kv_head_num, BLOCK_SIZE, head_dim], np.float32)
-    cv = np.zeros([num_blocks, kv_head_num, BLOCK_SIZE, head_dim], np.float32)
-    batch = len(k_list)
-    bt = np.zeros([batch, max_blk_per_seq], np.int32)
-    for b, (k_np, v_np) in enumerate(zip(k_list, v_list)):
-        base = b * max_blk_per_seq
-        for t in range(len(k_np)):
-            blk = base + t // BLOCK_SIZE
-            off = t % BLOCK_SIZE
-            ck[blk, :, off, :] = k_np[t]
-            cv[blk, :, off, :] = v_np[t]
-        bt[b] = np.arange(base, base + max_blk_per_seq)
-    return ck, cv, bt

@@ -492,6 +492,7 @@ static inline int64_t compute_kb_dim(int64_t hidden_size,
 std::vector<torch::Tensor> FusedSwigluQuant(
     const torch::Tensor& input, const torch::Tensor& token_nums_per_expert,
     const bool is_fp4) {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
     TORCH_CHECK(input.scalar_type() == torch::kBFloat16,
                 "input dtype must be bfloat16");
     TORCH_CHECK(token_nums_per_expert.scalar_type() == torch::kInt32,
@@ -560,6 +561,10 @@ std::vector<torch::Tensor> FusedSwigluQuant(
     // out_scale: [E*M, kb_dim] uint8 in SfAtom layout.
     auto out_scale =
         torch::empty({total_rows, kb_dim}, input.options().dtype(torch::kByte));
+
+    if (token_num == 0) {
+        return {out_quant, out_scale};
+    }
 
     int sm_count = GetSmCount();
     constexpr int BLOCKS_PER_SM = 4;

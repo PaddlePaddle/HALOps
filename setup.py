@@ -69,24 +69,15 @@ gencode_flags = [
     "-O3",
 ]
 
-# NDEBUG is opt-OUT, because turning it off is a debugging tool with real value:
-# CUTLASS guards its parameter checks with it, so a misconfigured pipeline fails
-# SILENTLY in the shipping build.  Concretely, sm90_pipeline.hpp:355-370 sets
-# `is_signalling_thread_ = 0` and then `asm("brkpt")` when `num_consumers` matches
-# neither 32 nor a multiple of 128 -- with NDEBUG that brkpt is gone and the only
-# symptom is `unspecified launch failure`, which cost four rounds of guessing.
-#
-# ⚠️ NEVER take PERFORMANCE numbers from an assert-enabled build: the asserts cost
-# instructions and perturb register allocation.  Use it to localize, then turn it
-# back on.  Usage:  MEGA_MLA_ASSERTS=1 python setup.py build_ext --inplace
+# NDEBUG is on by default. MEGA_MLA_ASSERTS=1 turns it off to enable CUTLASS
+# parameter asserts for debugging; do not take performance numbers from such a
+# build.
 if os.environ.get("MEGA_MLA_ASSERTS", "0") in ("0", "", "false", "False"):
     gencode_flags.append("-DNDEBUG")
 else:
     print("[setup.py] NDEBUG OFF -- CUTLASS asserts enabled (do NOT trust timings)")
 
-# Opt-in debug defines, e.g. MEGA_MLA_NVCC_DEFINES="-DMEGA_MLA_WATCHDOG=1".
-# Kept as an env passthrough rather than a permanent flag so the shipping build is
-# byte-identical when it is unset.
+# Optional debug defines, e.g. MEGA_MLA_NVCC_DEFINES="-DMEGA_MLA_WATCHDOG=1".
 _extra = os.environ.get("MEGA_MLA_NVCC_DEFINES", "").split()
 if _extra:
     print(f"[setup.py] extra nvcc defines: {' '.join(_extra)}")
@@ -111,13 +102,10 @@ setup(
                 "csrc/kernel/mega_mla/mega_mla.cu",
                 "csrc/common/cpp_extensions.cc",
             ],
-            # ⚠️ The debug defines must reach the C++ TU too, not just nvcc: the
-            # pybind registration in cpp_extensions.cc is guarded by the same macros,
-            # and a define that reaches only nvcc yields a binding that is declared in
-            # the .cu and never registered -- the symptom is "the extension does not
-            # expose <name>" on a build that compiled cleanly.
+            # Debug defines also go to the C++ compiler: pybind registrations in
+            # cpp_extensions.cc are guarded by the same macros.
             extra_compile_args={"nvcc": gencode_flags, "cxx": _extra},
-            libraries=["cublasLt", "cuda", "nvidia-ml"],
+            libraries=["cuda"],
         ),
     ],
     cmdclass={"build_ext": InplaceBuildExtension},

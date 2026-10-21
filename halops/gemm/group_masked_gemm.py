@@ -58,14 +58,6 @@ def group_masked_gemm(
         mode: ``"w8a8"`` or ``"w4a4-nvfp4"``. ``"w4a4-mxfp4"`` is not
             supported by this kernel yet.
     """
-    assert mode in ["w8a8", "w4a4-nvfp4"], (
-        f"Unsupported mode: {mode!r}. "
-        "group_masked_gemm does not support 'w4a4-mxfp4'."
-    )
-    assert mode != "w4a4-nvfp4" or alpha is not None, (
-        "W4A4 mode requires alpha input (per-expert scaling factor) "
-        f"for mode {mode!r}."
-    )
     halops_kernel.group_masked_gemm(
         input,
         weight,

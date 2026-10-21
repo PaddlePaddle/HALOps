@@ -92,7 +92,7 @@ def parse_csv_results(csv_path, op):
         op (str): Operator type, "attention" or "gemm".
 
     Returns:
-        list[tuple[dict, float]]: List of (key_dict, median_us) tuples.
+        list[tuple[dict, float, str]]: List of (key_dict, median_us, status).
 
     Raises:
         KeyError: If the CSV file is missing the "median_us" column.
@@ -123,7 +123,8 @@ def parse_csv_results(csv_path, op):
                 key_dict[col] = val
 
             median_us = float(row["median_us"])
-            results.append((key_dict, median_us))
+            status = row.get("status") or "OK"
+            results.append((key_dict, median_us, status))
     return results
 
 
@@ -186,7 +187,8 @@ def find_csv_files(output_dir, config_name, backend=""):
             *_{config_name}_{backend}.csv; otherwise matches *_{config_name}.csv.
 
     Returns:
-        list[str]: List of matching CSV file paths.
+        list[str]: The newest matching CSV file (names start with a timestamp),
+            or an empty list. Older runs in a reused output dir are ignored.
     """
     results_dir = os.path.join(output_dir, "results")
     if not os.path.isdir(results_dir):
@@ -195,7 +197,65 @@ def find_csv_files(output_dir, config_name, backend=""):
         pattern = os.path.join(results_dir, f"*_{config_name}_{backend}.csv")
     else:
         pattern = os.path.join(results_dir, f"*_{config_name}.csv")
-    return glob.glob(pattern)
+    return sorted(glob.glob(pattern))[-1:]
+
+
+def compare_with_baseline(results, baseline_data, baseline_path):
+    """Compare benchmark results with baseline entries.
+
+    A case fails when its status is not OK, when it has no baseline entry, when a
+    baseline entry has no result (e.g. the case failed and was not written), or
+    when it is slower than baseline by more than the threshold. Being faster is
+    reported but does not fail.
+
+    Args:
+        results (list[tuple[dict, float, str]]): Parsed CSV rows.
+        baseline_data (dict): Baseline JSON data.
+        baseline_path (str): Baseline file path, used in messages.
+
+    Returns:
+        tuple[list[str], list[str]]: (failures, faster-than-baseline notes).
+    """
+    threshold = baseline_data.get("threshold", THRESHOLD)
+    entries = baseline_data.get("entries", [])
+    failures, faster = [], []
+
+    for key_dict, current_median, status in results:
+        if status != "OK":
+            failures.append(f"  [{status}] {key_to_str(key_dict)}")
+            continue
+        baseline_median = find_baseline_entry(baseline_data, key_dict)
+        if baseline_median is None:
+            failures.append(
+                f"  [NO BASELINE ENTRY] {key_to_str(key_dict)}\n"
+                f"    -> add this entry to {baseline_path}"
+            )
+            continue
+        if baseline_median <= 0:
+            failures.append(
+                f"  [INVALID BASELINE] {key_to_str(key_dict)}: "
+                f"median_us={baseline_median}"
+            )
+            continue
+        relative_error = (current_median - baseline_median) / baseline_median
+        detail = (
+            f"current={current_median:.3f}us, baseline={baseline_median:.3f}us, "
+            f"relative_error={relative_error*100:+.2f}% "
+            f"(threshold={threshold*100:.1f}%)"
+        )
+        if relative_error > threshold:
+            failures.append(f"  [REGRESSION] {key_to_str(key_dict)}:\n    {detail}")
+        elif relative_error < -threshold:
+            faster.append(f"  [FASTER] {key_to_str(key_dict)}:\n    {detail}")
+
+    result_keys = [key_dict for key_dict, _, _ in results]
+    for entry in entries:
+        if entry["key"] not in result_keys:
+            failures.append(
+                f"  [NO RESULT] {key_to_str(entry['key'])}: not produced by this run"
+            )
+
+    return failures, faster
 
 
 # ---------------------------------------------------------------------------
@@ -300,39 +360,21 @@ def test_benchmark(config_path, benchmark_output_dir, gpu_id, baseline_dir, back
     baseline_path = os.path.join(baseline_dir, op, f"{config_name}.json")
     if baseline_data is None:
         pytest.fail(
-            f"[无 BASELINE] 未找到 '{config_name}' 的 baseline 文件。\n"
-            f"  请手动创建: {baseline_path}"
+            f"[NO BASELINE] baseline file for '{config_name}' not found.\n"
+            f"  Create it with ci/update_baseline.py: {baseline_path}"
         )
 
-    # Compare results against baseline
-    threshold = baseline_data.get("threshold", THRESHOLD)
-    failures = []
-    for key_dict, current_median in all_results:
-        baseline_median = find_baseline_entry(baseline_data, key_dict)
-        if baseline_median is None:
-            failures.append(
-                f"  [缺失] {key_to_str(key_dict)}: baseline 中无对应条目\n"
-                f"    → 请在 {baseline_path} 中添加该条目"
-            )
-            continue
-
-        if baseline_median == 0:
-            continue
-
-        relative_error = abs(current_median - baseline_median) / baseline_median
-        if relative_error > threshold:
-            failures.append(
-                f"  [REGRESSION] {key_to_str(key_dict)}:\n"
-                f"    current={current_median:.3f}us, "
-                f"baseline={baseline_median:.3f}us, "
-                f"relative_error={relative_error*100:.2f}% (threshold={threshold*100:.1f}%)"
-            )
+    failures, faster = compare_with_baseline(all_results, baseline_data, baseline_path)
+    if faster:
+        print(
+            f"Faster than baseline beyond threshold ({config_name}):\n"
+            + "\n".join(faster)
+        )
 
     if failures:
         failure_msg = (
-            f"检测到性能回归 ({config_name}):\n" + "\n".join(failures) + f"\n\n"
-            f"  [提示] 如确认性能变化合理，请手动修改 baseline 文件:\n"
-            f"    文件路径: {baseline_path}\n"
-            f"    将对应条目的 'median_us' 值更新为当前测试结果。"
+            f"CI check failed ({config_name}):\n" + "\n".join(failures) + f"\n\n"
+            f"  If the change is expected, update the baseline with ci/update_baseline.py:\n"
+            f"    {baseline_path}"
         )
         pytest.fail(failure_msg)

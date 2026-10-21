@@ -14,7 +14,7 @@
 # limitations under the License.
 """
 
-from typing import Optional, Tuple
+from typing import List, Optional
 
 import torch
 
@@ -40,7 +40,7 @@ def write_cache_kv_decoder(
     head_dim: int = 128,
     max_input_len: int = 0,
     cache_quant_type: str = "none",
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> List[torch.Tensor]:
     """Process the current decode token fused QKV, generate Q output for decode
     attention, and append K/V to paged KV cache.
 
@@ -63,7 +63,7 @@ def write_cache_kv_decoder(
         cache_quant_type: ``"none"`` for BF16 cache; ``"block_wise_fp8"`` for FP8 cache.
 
     Returns:
-        A tuple ``(q_output, q_dequant_scale)`` where:
+        A list ``[q_output, q_dequant_scale]`` where:
         - ``q_output``: [batch, kv_head_num, 64, head_dim], BF16 for BF16 path
           or float8_e4m3fn for FP8 path.
         - ``q_dequant_scale``: [batch, kv_head_num] float32. In the FP8 path it

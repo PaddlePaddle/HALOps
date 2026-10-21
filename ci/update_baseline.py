@@ -27,10 +27,9 @@ import csv
 import glob
 import json
 import os
-import re
 import sys
 
-from constants import ATTENTION_KEY_COLS, GEMM_KEY_COLS
+from constants import ATTENTION_KEY_COLS, GEMM_KEY_COLS, THRESHOLD
 
 
 def detect_op_from_csv(csv_path, fieldnames):
@@ -48,24 +47,6 @@ def detect_op_from_csv(csv_path, fieldnames):
     elif "num_experts" in fieldnames or "mode" in fieldnames:
         return "gemm"
     return None
-
-
-def extract_config_name(csv_filename):
-    """Extract config name from CSV filename.
-
-    Filename format: 'YYYYMMDD_HHMMSS_<config_name>.csv', strips timestamp prefix.
-
-    Args:
-        csv_filename (str): CSV filename (without directory).
-
-    Returns:
-        str: Config name (without timestamp prefix and extension).
-    """
-    name = os.path.splitext(csv_filename)[0]
-    match = re.match(r"^\d{8}_\d{6}_(.+)$", name)
-    if match:
-        return match.group(1)
-    return name
 
 
 def parse_value(val):
@@ -98,35 +79,46 @@ def process_csv(csv_path):
     Args:
         csv_path (str): Absolute path to the CSV file.
 
+    The config name is taken from the ``case_tag`` column, which benchmark.py
+    sets to the config file name, so the backend suffix in the CSV file name
+    does not leak into the baseline file name.
+
     Returns:
-        tuple[str | None, str | None, list[dict]]: (config_name, op, entries).
-            Returns (None, None, []) when op type cannot be detected.
+        tuple[str | None, str | None, list[dict], list[str]]:
+            (config_name, op, entries, failed_cases). Returns
+            (None, None, [], []) when op type cannot be detected.
 
     Raises:
         KeyError: If the CSV file is missing the "median_us" column.
     """
     csv_filename = os.path.basename(csv_path)
-    config_name = extract_config_name(csv_filename)
+    config_name = None
 
     entries = []
+    failed = []
     with open(csv_path, "r") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames
         op = detect_op_from_csv(csv_path, fieldnames)
         if op is None:
             print(f"  WARNING: Cannot detect op type for {csv_filename}, skipping.")
-            return None, None, []
+            return None, None, [], []
 
         key_cols = ATTENTION_KEY_COLS if op == "attention" else GEMM_KEY_COLS
 
         for row in reader:
+            config_name = row["case_tag"]
             key_dict = {}
             for col in key_cols:
                 key_dict[col] = parse_value(row.get(col, ""))
+            status = row.get("status") or "OK"
+            if status != "OK":
+                failed.append(f"{status}: {key_dict}")
+                continue
             median_us = float(row["median_us"])
             entries.append({"key": key_dict, "median_us": median_us})
 
-    return config_name, op, entries
+    return config_name, op, entries, failed
 
 
 def main():
@@ -167,8 +159,13 @@ def main():
     print(f"Found {len(csv_files)} CSV file(s) in {results_dir}")
     updated = []
 
+    skipped = []
+    # Sorted by timestamp prefix: for a config with several runs, the newest wins.
     for csv_path in sorted(csv_files):
-        config_name, op, entries = process_csv(csv_path)
+        config_name, op, entries, failed = process_csv(csv_path)
+        if failed:
+            skipped.append(f"  {csv_path}: " + "; ".join(failed))
+            continue
         if config_name is None or not entries:
             continue
 
@@ -178,11 +175,11 @@ def main():
 
         # Preserve existing threshold if baseline already exists
         output_path = os.path.join(op_dir, f"{config_name}.json")
-        threshold = 0.05
+        threshold = THRESHOLD
         if os.path.exists(output_path):
             with open(output_path, "r") as f:
                 existing = json.load(f)
-                threshold = existing.get("threshold", 0.05)
+                threshold = existing.get("threshold", THRESHOLD)
 
         baseline_data = {
             "config": config_name,
@@ -200,6 +197,12 @@ def main():
     print(f"\nBaseline update complete. {len(updated)} file(s) updated:")
     for item in updated:
         print(item)
+
+    if skipped:
+        print("\nERROR: not updated, CSV contains failed cases:")
+        for item in skipped:
+            print(item)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

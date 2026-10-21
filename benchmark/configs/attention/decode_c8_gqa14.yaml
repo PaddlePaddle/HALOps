@@ -1,4 +1,4 @@
-# configs/attention/decode_c16_gqa14.yaml
+# configs/attention/decode_c8_gqa14.yaml
 # HALOps q layout = [B, H_KV, KBLOCKM=64, D]; folded from standard [B, H_Q, D].
 scenario: decode_gqa
 

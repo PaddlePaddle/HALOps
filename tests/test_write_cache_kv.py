@@ -1,42 +1,78 @@
-"""
 # Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
 
 import numpy as np
 import pytest
 import torch
 
-from halops import write_cache_kv_encoder, write_cache_kv_decoder
-from tests.utils.attn_utils import quant_fp8_per128_tokens
-from tests.utils.device import skip_reason
+from halops import write_cache_kv_decoder, write_cache_kv_encoder
 
-if skip_reason():
-    pytest.skip(skip_reason(), allow_module_level=True)
+from tests.utils.attn_utils import BLOCK_SIZE, HEAD_DIM, quant_fp8_per128_tokens
 
-torch.manual_seed(0)
-
-HEAD_DIM = 128
-BLOCK_SIZE = 128
 MAX_INPUT_LEN = 8192
 DTYPE = torch.bfloat16
+# Tolerance for the per-block FP8 dequant scales vs the reference abs-max scale.
+SCALE_TOL = dict(rtol=1e-3, atol=1e-6)
 
-# Identity RoPE table (cos=1, sin=0) so that Q/K pass through unchanged.
-rotary_embs = torch.zeros(
-    2, MAX_INPUT_LEN, HEAD_DIM // 2, dtype=torch.float32, device="cuda"
-)
-rotary_embs[0] = 1
+HEAD_CASES = [(14, 1), (56, 4)]
+HEAD_IDS = [f"h{h}-kv{kv}" for h, kv in HEAD_CASES]
+
+
+def _seq_id(seq_len):
+    return f"seq{seq_len}"
+
+
+def _prefix_id(prefix_len):
+    return f"prefix{prefix_len}"
+
+
+@pytest.fixture(scope="module")
+def rotary_embs():
+    """Identity RoPE table (cos=1, sin=0) so that Q/K pass through unchanged."""
+    table = torch.zeros(
+        2, MAX_INPUT_LEN, HEAD_DIM // 2, dtype=torch.float32, device="cuda"
+    )
+    table[0] = 1
+    return table
+
+
+@pytest.fixture(scope="module")
+def rotary_embs_enc():
+    """Identity RoPE table (cos=1, sin=0) for the BF16 encoder kernel.
+
+    The BF16 encoder kernel applies partial NeoX RoPE with rope_dim =
+    HEAD_DIM // 4, so its cos/sin table stride differs from the decoder's
+    HEAD_DIM // 2.
+    """
+    table = torch.zeros(
+        2, MAX_INPUT_LEN, HEAD_DIM // 4, dtype=torch.float32, device="cuda"
+    )
+    table[0] = 1
+    return table
+
+
+@pytest.fixture(scope="module")
+def norm_gammas():
+    """All-ones ``(q_norm_gamma, k_norm_gamma)`` RMSNorm weights."""
+    q_norm_gamma = torch.ones(HEAD_DIM, dtype=torch.float32, device="cuda")
+    k_norm_gamma = torch.ones(HEAD_DIM, dtype=torch.float32, device="cuda")
+    return q_norm_gamma, k_norm_gamma
+
+
+def _fp8_step_atol(absmax):
+    """Allow a single-FP8-step boundary flip (~absmax / 8)."""
+    return absmax / 8 + 1e-6
 
 
 def _alloc_cache(num_blocks, kv_head_num):
@@ -47,17 +83,12 @@ def _alloc_cache(num_blocks, kv_head_num):
     return cache_k, cache_v
 
 
-@pytest.mark.parametrize("head_num,kv_head_num", [(14, 1), (56, 4)])
-@pytest.mark.parametrize("seq_len", [128, 256])
-def test_write_cache_kv_encoder_correctness(head_num, kv_head_num, seq_len):
+@pytest.mark.parametrize("head_num,kv_head_num", HEAD_CASES, ids=HEAD_IDS)
+@pytest.mark.parametrize("seq_len", [128, 256], ids=_seq_id)
+def test_write_cache_kv_encoder_correctness(
+    rotary_embs_enc, head_num, kv_head_num, seq_len
+):
     batch = 1
-    # The BF16 encoder kernel applies partial NeoX RoPE with rope_dim =
-    # HEAD_DIM // 4, so its cos/sin table stride differs from the decoder's
-    # HEAD_DIM // 2. Build an encoder-specific identity table (cos=1, sin=0).
-    rotary_embs_enc = torch.zeros(
-        2, MAX_INPUT_LEN, HEAD_DIM // 4, dtype=torch.float32, device="cuda"
-    )
-    rotary_embs_enc[0] = 1
     num_blocks = MAX_INPUT_LEN // BLOCK_SIZE
     qkv = torch.randn(
         seq_len, head_num + 2 * kv_head_num, HEAD_DIM, dtype=DTYPE, device="cuda"
@@ -118,13 +149,15 @@ def test_write_cache_kv_encoder_correctness(head_num, kv_head_num, seq_len):
     for t in range(seq_len):
         blk, off = t // BLOCK_SIZE, t % BLOCK_SIZE
         v_off = (off & ~3) | ((off & 1) << 1) | ((off & 2) >> 1)
-        assert torch.equal(cache_k[blk, :, off, :], k_ref[t])
-        assert torch.equal(cache_v[blk, :, v_off, :], v_ref[t])
+        assert torch.equal(cache_k[blk, :, off, :], k_ref[t]), f"K token {t}"
+        assert torch.equal(cache_v[blk, :, v_off, :], v_ref[t]), f"V token {t}"
 
 
-@pytest.mark.parametrize("head_num,kv_head_num", [(14, 1), (56, 4)])
-@pytest.mark.parametrize("prefix_len", [1, 130])
-def test_write_cache_kv_decoder_correctness(head_num, kv_head_num, prefix_len):
+@pytest.mark.parametrize("head_num,kv_head_num", HEAD_CASES, ids=HEAD_IDS)
+@pytest.mark.parametrize("prefix_len", [1, 130], ids=_prefix_id)
+def test_write_cache_kv_decoder_correctness(
+    rotary_embs, head_num, kv_head_num, prefix_len
+):
     batch = 1
     num_blocks = MAX_INPUT_LEN // BLOCK_SIZE
     qkv = torch.randn(
@@ -172,8 +205,8 @@ def test_write_cache_kv_decoder_correctness(head_num, kv_head_num, prefix_len):
     assert torch.equal(cache_v[blk, :, v_off, :], v_ref[0])
 
 
-@pytest.mark.parametrize("head_num,kv_head_num", [(14, 1), (56, 4)])
-def test_write_cache_kv_decoder_determinism(head_num, kv_head_num):
+@pytest.mark.parametrize("head_num,kv_head_num", HEAD_CASES, ids=HEAD_IDS)
+def test_write_cache_kv_decoder_determinism(rotary_embs, head_num, kv_head_num):
     batch, prefix_len = 1, 130
     num_blocks = MAX_INPUT_LEN // BLOCK_SIZE
     qkv = torch.randn(
@@ -215,17 +248,15 @@ def test_write_cache_kv_decoder_determinism(head_num, kv_head_num):
     assert torch.equal(cv1, cv2)
 
 
-@pytest.mark.parametrize("head_num,kv_head_num", [(14, 1), (56, 4)])
-@pytest.mark.parametrize("seq_len", [128, 256])
-def test_write_cache_kv_encoder_determinism(head_num, kv_head_num, seq_len):
+@pytest.mark.parametrize("head_num,kv_head_num", HEAD_CASES, ids=HEAD_IDS)
+@pytest.mark.parametrize("seq_len", [128, 256], ids=_seq_id)
+def test_write_cache_kv_encoder_determinism(
+    rotary_embs_enc, head_num, kv_head_num, seq_len
+):
     # Same inputs must yield bit-identical Q/K/V outputs and paged cache
     # contents across runs. Build fixed inputs once, then invoke the kernel
     # twice into freshly-zeroed output and cache buffers.
     batch = 1
-    rotary_embs_enc = torch.zeros(
-        2, MAX_INPUT_LEN, HEAD_DIM // 4, dtype=torch.float32, device="cuda"
-    )
-    rotary_embs_enc[0] = 1
     num_blocks = MAX_INPUT_LEN // BLOCK_SIZE
     qkv = torch.randn(
         seq_len, head_num + 2 * kv_head_num, HEAD_DIM, dtype=DTYPE, device="cuda"
@@ -312,9 +343,11 @@ def _dequant_fp8_cache(cache_uint8, kv_dequant_scale, slot):
     return (fp8 * scale).cpu().numpy()
 
 
-@pytest.mark.parametrize("head_num,kv_head_num", [(14, 1), (56, 4)])
-@pytest.mark.parametrize("seq_len", [128, 256])
-def test_write_cache_kv_encoder_fp8_determinism(head_num, kv_head_num, seq_len):
+@pytest.mark.parametrize("head_num,kv_head_num", HEAD_CASES, ids=HEAD_IDS)
+@pytest.mark.parametrize("seq_len", [128, 256], ids=_seq_id)
+def test_write_cache_kv_encoder_fp8_determinism(
+    rotary_embs, norm_gammas, head_num, kv_head_num, seq_len
+):
     # FP8 (block_wise_fp8) cache write: the kernel block-wise quantizes K/V into
     # a uint8 (packed FP8) cache and writes the per-block dequant scale. Identical
     # inputs must yield bit-identical Q/K/V outputs, packed FP8 cache, and scales.
@@ -330,8 +363,7 @@ def test_write_cache_kv_encoder_fp8_determinism(head_num, kv_head_num, seq_len):
     block_tables = torch.arange(num_blocks, dtype=torch.int32, device="cuda").reshape(
         batch, num_blocks
     )
-    q_norm_gamma = torch.ones(HEAD_DIM, dtype=torch.float32, device="cuda")
-    k_norm_gamma = torch.ones(HEAD_DIM, dtype=torch.float32, device="cuda")
+    q_norm_gamma, k_norm_gamma = norm_gammas
 
     def _run():
         cache_k = torch.zeros(
@@ -377,12 +409,14 @@ def test_write_cache_kv_encoder_fp8_determinism(head_num, kv_head_num, seq_len):
 
     first = _run()
     second = _run()
-    for a, b in zip(first, second):
-        assert _equal_bits(a, b)
+    for i, (a, b) in enumerate(zip(first, second)):
+        assert _equal_bits(a, b), f"output {i} is not deterministic"
 
 
-@pytest.mark.parametrize("head_num,kv_head_num", [(14, 1), (56, 4)])
-def test_write_cache_kv_decoder_fp8_determinism(head_num, kv_head_num):
+@pytest.mark.parametrize("head_num,kv_head_num", HEAD_CASES, ids=HEAD_IDS)
+def test_write_cache_kv_decoder_fp8_determinism(
+    rotary_embs, norm_gammas, head_num, kv_head_num
+):
     # FP8 decode cache write: the returned q_output is packed FP8 and the current
     # token's K/V is block-wise quantized into the uint8 cache. Identical inputs
     # must produce bit-identical q_output, q/kv dequant scales, and packed cache.
@@ -401,8 +435,7 @@ def test_write_cache_kv_decoder_fp8_determinism(head_num, kv_head_num):
     block_tables = torch.arange(num_blocks, dtype=torch.int32, device="cuda").reshape(
         batch, num_blocks
     )
-    q_norm_gamma = torch.ones(HEAD_DIM, dtype=torch.float32, device="cuda")
-    k_norm_gamma = torch.ones(HEAD_DIM, dtype=torch.float32, device="cuda")
+    q_norm_gamma, k_norm_gamma = norm_gammas
 
     def _run():
         cache_k = torch.zeros(
@@ -445,18 +478,20 @@ def test_write_cache_kv_decoder_fp8_determinism(head_num, kv_head_num):
 
     first = _run()
     second = _run()
-    for a, b in zip(first, second):
-        assert _equal_bits(a, b)
+    for i, (a, b) in enumerate(zip(first, second)):
+        assert _equal_bits(a, b), f"output {i} is not deterministic"
 
 
-@pytest.mark.parametrize("head_num,kv_head_num", [(14, 1), (56, 4)])
-@pytest.mark.parametrize("seq_len", [128, 256])
-def test_write_cache_kv_encoder_fp8_accuracy(head_num, kv_head_num, seq_len):
+@pytest.mark.parametrize("head_num,kv_head_num", HEAD_CASES, ids=HEAD_IDS)
+@pytest.mark.parametrize("seq_len", [128, 256], ids=_seq_id)
+def test_write_cache_kv_encoder_fp8_accuracy(
+    rotary_embs, head_num, kv_head_num, seq_len
+):
     # FP8 (block_wise_fp8) encoder cache write accuracy. With gamma=None the
     # kernel applies identity RoPE and no RMSNorm, so K/V pass through unchanged
     # and are only block-wise (per-128-token) abs-max quantized into the packed
     # uint8 cache. We compare the dequantized cache and the per-block scales
-    # against tests.attn_utils.quant_fp8_per128_tokens, the same block-wise FP8
+    # against tests.utils.attn_utils.quant_fp8_per128_tokens, the same block-wise FP8
     # reference used by the decode-attention accuracy test.
     batch = 1
     num_blocks = MAX_INPUT_LEN // BLOCK_SIZE
@@ -521,14 +556,13 @@ def test_write_cache_kv_encoder_fp8_accuracy(head_num, kv_head_num, seq_len):
     deq_v = _dequant_fp8_cache(cache_v, kv_dequant_scale, 1)
 
     # Per-block K/V scales must match the reference abs-max / FP8_MAX.
-    kv_scale_np = kv_dequant_scale.cpu().numpy()
-    for g in range(groups):
-        np.testing.assert_allclose(
-            kv_scale_np[g, :, 0], k_scale[g], rtol=1e-3, atol=1e-6
-        )
-        np.testing.assert_allclose(
-            kv_scale_np[g, :, 1], v_scale[g], rtol=1e-3, atol=1e-6
-        )
+    kv_scale = kv_dequant_scale.cpu()
+    torch.testing.assert_close(
+        kv_scale[:groups, :, 0], torch.from_numpy(k_scale), **SCALE_TOL
+    )
+    torch.testing.assert_close(
+        kv_scale[:groups, :, 1], torch.from_numpy(v_scale), **SCALE_TOL
+    )
 
     # Gather the dequantized cache back into logical [token, head, dim] order:
     # K sits at its natural within-block offset, V at the 8-row-reordered offset.
@@ -544,15 +578,22 @@ def test_write_cache_kv_encoder_fp8_accuracy(head_num, kv_head_num, seq_len):
     # tight mean bound guards against a wrong layout/reorder/scale index (which
     # would shift essentially every element by the full signal magnitude).
     absmax = max(float(np.abs(k_np).max()), float(np.abs(v_np).max()))
-    np.testing.assert_allclose(kernel_k, k_deq, rtol=0.0, atol=absmax / 8 + 1e-6)
-    np.testing.assert_allclose(kernel_v, v_deq, rtol=0.0, atol=absmax / 8 + 1e-6)
+    atol = _fp8_step_atol(absmax)
+    torch.testing.assert_close(
+        torch.from_numpy(kernel_k), torch.from_numpy(k_deq), rtol=0.0, atol=atol
+    )
+    torch.testing.assert_close(
+        torch.from_numpy(kernel_v), torch.from_numpy(v_deq), rtol=0.0, atol=atol
+    )
     assert np.abs(kernel_k - k_deq).mean() < absmax * 1e-2
     assert np.abs(kernel_v - v_deq).mean() < absmax * 1e-2
 
 
-@pytest.mark.parametrize("head_num,kv_head_num", [(14, 1), (56, 4)])
-@pytest.mark.parametrize("prefix_len", [1, 130])
-def test_write_cache_kv_decoder_fp8_accuracy(head_num, kv_head_num, prefix_len):
+@pytest.mark.parametrize("head_num,kv_head_num", HEAD_CASES, ids=HEAD_IDS)
+@pytest.mark.parametrize("prefix_len", [1, 130], ids=_prefix_id)
+def test_write_cache_kv_decoder_fp8_accuracy(
+    rotary_embs, head_num, kv_head_num, prefix_len
+):
     # FP8 (block_wise_fp8) decode cache write accuracy. The single new token's
     # K/V is block-wise abs-max quantized into the packed uint8 cache at offset
     # == prefix_len (K at the natural offset, V at the 8-row-reordered offset),
@@ -611,19 +652,27 @@ def test_write_cache_kv_decoder_fp8_accuracy(head_num, kv_head_num, prefix_len):
     deq_k = _dequant_fp8_cache(cache_k, kv_dequant_scale, 0)
     deq_v = _dequant_fp8_cache(cache_v, kv_dequant_scale, 1)
 
-    kv_scale_np = kv_dequant_scale.cpu().numpy()
-    np.testing.assert_allclose(kv_scale_np[blk, :, 0], k_scale[0], rtol=1e-3, atol=1e-6)
-    np.testing.assert_allclose(kv_scale_np[blk, :, 1], v_scale[0], rtol=1e-3, atol=1e-6)
+    kv_scale = kv_dequant_scale.cpu()
+    torch.testing.assert_close(
+        kv_scale[blk, :, 0], torch.from_numpy(k_scale[0]), **SCALE_TOL
+    )
+    torch.testing.assert_close(
+        kv_scale[blk, :, 1], torch.from_numpy(v_scale[0]), **SCALE_TOL
+    )
 
     absmax = max(float(np.abs(k_np).max()), float(np.abs(v_np).max()))
-    np.testing.assert_allclose(
-        deq_k[blk, :, off, :], k_deq[0], rtol=0.0, atol=absmax / 8 + 1e-6
-    )
-    np.testing.assert_allclose(
-        deq_v[blk, :, _fp8_v_reorder(off), :],
-        v_deq[0],
+    atol = _fp8_step_atol(absmax)
+    torch.testing.assert_close(
+        torch.from_numpy(deq_k[blk, :, off, :]),
+        torch.from_numpy(k_deq[0]),
         rtol=0.0,
-        atol=absmax / 8 + 1e-6,
+        atol=atol,
+    )
+    torch.testing.assert_close(
+        torch.from_numpy(deq_v[blk, :, _fp8_v_reorder(off), :]),
+        torch.from_numpy(v_deq[0]),
+        rtol=0.0,
+        atol=atol,
     )
 
 

@@ -1,26 +1,23 @@
-"""
 # Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
 
-import numpy as np
+import re
+
 import pytest
 import torch
 
 from halops import get_qk_token
-
-torch.manual_seed(0)
 
 
 def reference_get_qk_token(enc, dec, q_tokens_per_sample, max_batch):
@@ -84,30 +81,32 @@ def _call(enc, dec, q_tokens_per_sample, max_batch, kv_head_num=1):
     (summary,) = get_qk_token(
         enc_t, dec_t, cu_seq_q, cu_seq_k, actual_cu_seq_k, seq_lens_kv, kv_head_num
     )
-    return (
-        summary.cpu().numpy(),
-        seq_lens_kv.cpu().numpy(),
-        actual_cu_seq_k.cpu().numpy(),
-    )
+    return summary.cpu(), seq_lens_kv.cpu(), actual_cu_seq_k.cpu()
+
+
+def _i32(values):
+    return torch.tensor(values, dtype=torch.int32, device="cpu")
 
 
 @pytest.mark.parametrize(
     "enc,dec,qtok",
     [
-        ([128], [0], [128]),  # single encoder sample
-        ([0], [512], [1]),  # single decoder sample
-        ([128, 0], [0, 512], [128, 1]),  # mixed encoder + decoder
-        ([64, 96, 0, 0], [0, 0, 200, 300], [64, 96, 1, 2]),  # mixed batch
-        ([0, 0], [0, 128], [1, 1]),  # one sample with dec==0 -> kv 0
+        pytest.param([128], [0], [128], id="single_encoder"),
+        pytest.param([0], [512], [1], id="single_decoder"),
+        pytest.param([128, 0], [0, 512], [128, 1], id="mixed_enc_dec"),
+        pytest.param(
+            [64, 96, 0, 0], [0, 0, 200, 300], [64, 96, 1, 2], id="mixed_batch"
+        ),
+        pytest.param([0, 0], [0, 128], [1, 1], id="dec_zero_kv_zero"),
     ],
 )
 def test_get_qk_token_correctness(enc, dec, qtok):
     max_batch = len(enc) + 4
     summary, seq_lens_kv, actual_cu = _call(enc, dec, qtok, max_batch)
     ref_summary, ref_kv, ref_cu = reference_get_qk_token(enc, dec, qtok, max_batch)
-    np.testing.assert_array_equal(summary, np.array(ref_summary, dtype=np.int32))
-    np.testing.assert_array_equal(seq_lens_kv, np.array(ref_kv, dtype=np.int32))
-    np.testing.assert_array_equal(actual_cu, np.array(ref_cu, dtype=np.int32))
+    assert torch.equal(summary, _i32(ref_summary)), f"{summary=} {ref_summary=}"
+    assert torch.equal(seq_lens_kv, _i32(ref_kv)), f"{seq_lens_kv=} {ref_kv=}"
+    assert torch.equal(actual_cu, _i32(ref_cu)), f"{actual_cu=} {ref_cu=}"
 
 
 def test_get_qk_token_padding_zeroed():
@@ -115,7 +114,7 @@ def test_get_qk_token_padding_zeroed():
     enc, dec, qtok = [0, 0], [100, 200], [1, 1]
     max_batch = 8
     _, seq_lens_kv, _ = _call(enc, dec, qtok, max_batch)
-    assert np.all(seq_lens_kv[len(enc) :] == 0)
+    assert torch.all(seq_lens_kv[len(enc) :] == 0), f"{seq_lens_kv=}"
 
 
 def test_get_qk_token_zero_q_token():
@@ -123,7 +122,7 @@ def test_get_qk_token_zero_q_token():
     enc, dec, qtok = [0], [256], [0]
     max_batch = 4
     _, seq_lens_kv, _ = _call(enc, dec, qtok, max_batch)
-    assert seq_lens_kv[0] == 0
+    assert seq_lens_kv[0] == 0, f"{seq_lens_kv=}"
 
 
 def test_get_qk_token_determinism():
@@ -131,9 +130,9 @@ def test_get_qk_token_determinism():
     max_batch = 8
     s1, kv1, cu1 = _call(enc, dec, qtok, max_batch)
     s2, kv2, cu2 = _call(enc, dec, qtok, max_batch)
-    np.testing.assert_array_equal(s1, s2)
-    np.testing.assert_array_equal(kv1, kv2)
-    np.testing.assert_array_equal(cu1, cu2)
+    assert torch.equal(s1, s2)
+    assert torch.equal(kv1, kv2)
+    assert torch.equal(cu1, cu2)
 
 
 def test_get_qk_token_wrong_dtype_raises():
@@ -145,7 +144,7 @@ def test_get_qk_token_wrong_dtype_raises():
     cu_seq_k = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
     actual_cu_seq_k = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
     seq_lens_kv = torch.zeros(batch, dtype=torch.int32, device="cuda")
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match=re.escape("expected scalar type Int")):
         get_qk_token(enc, dec, cu_seq_q, cu_seq_k, actual_cu_seq_k, seq_lens_kv, 1)
 
 

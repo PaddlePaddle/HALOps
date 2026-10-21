@@ -1,4 +1,5 @@
 build
+.github
 halops.egg-info
 *.ncu-rep
 *.so

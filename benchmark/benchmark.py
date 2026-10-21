@@ -98,6 +98,7 @@ def discover_configs(configs_root: str | Path) -> list[Path]:
 
 
 def _run_scenarios(op, cfg):
+    """Run every batch size of a config; return False if any raised."""
     try:
         SCENARIOS = OP_REGISTRY[op]
         scenario = cfg.get("scenario")
@@ -109,6 +110,8 @@ def _run_scenarios(op, cfg):
         import traceback
 
         traceback.print_exc()
+        return False
+    return True
 
 
 def main(args):
@@ -130,6 +133,7 @@ def main(args):
     reports_dir = output_dir / "reports"
     logs_dir = output_dir / "logs"
 
+    failed_configs = []
     for raw_config in raw_configs:
         config_path, op = resolve_config(str(raw_config), configs_dir)
         config_path = str(config_path)
@@ -199,7 +203,8 @@ def main(args):
             print_backend_versions(cfg.get("backends", []))
             print("=" * 60)
 
-            _run_scenarios(op, cfg)
+            if not _run_scenarios(op, cfg):
+                failed_configs.append(config_name)
 
         from core.report import generate_reports_from_csv
 
@@ -210,6 +215,10 @@ def main(args):
             log_path=log_path,
             name_suffix=args.backend or "",
         )
+
+    if failed_configs:
+        print(f"[FATAL] failed configs: {failed_configs}", flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

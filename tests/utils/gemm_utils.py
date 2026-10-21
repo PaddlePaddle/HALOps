@@ -1,19 +1,18 @@
-"""
 # Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-Shared test helpers for GEMM quantization tests (FP8 / NVFP4).
+"""Shared test helpers for GEMM quantization tests (FP8 / NVFP4).
 
 These reference implementations and CUTLASS SfAtom reorder helpers are shared
 across the dense / grouped / batched GEMM test files. Note that
@@ -25,6 +24,12 @@ below.
 
 import numpy as np
 import torch
+
+from tests.utils.fp4_utils import FP4_E2M1_MAX, FP4_E2M1_VALUES, FP4_MIDPOINTS
+
+# Comparison tolerances shared by the GEMM tests.
+W8A8_TOL = dict(rtol=2e-2, atol=2e-3)
+W4A4_TOL = dict(rtol=5e-2, atol=5e-2)
 
 # =====================================================================
 # FP8 (W8A8) quantization helpers
@@ -140,14 +145,9 @@ def per_block_cast_to_fp8(x, block_size=32):
 # NVFP4 (W4A4) quantization helpers
 # =====================================================================
 
-FP4_E2M1_MAX = 6.0
-FP4_E2M1_VALUES = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
-
-_FP4_MIDPOINTS = (FP4_E2M1_VALUES[:-1] + FP4_E2M1_VALUES[1:]) / 2.0
-
 
 def _fp4_abs_to_idx(abs_x_flat):
-    return np.searchsorted(_FP4_MIDPOINTS, abs_x_flat).astype(np.uint8)
+    return np.searchsorted(FP4_MIDPOINTS, abs_x_flat).astype(np.uint8)
 
 
 def float_to_fp4_e2m1(x_f32):
@@ -399,18 +399,3 @@ def reorder_sf_to_cutlass(sf_logical, mn_dim, kb_dim):
         return torch.tensor(result, dtype=torch.uint8)
     else:
         return torch.tensor(result.reshape(orig_shape), dtype=torch.uint8)
-
-
-# =====================================================================
-# Shared test assertion helper
-# =====================================================================
-
-
-def _expect_runtime_error(fn, expected):
-    try:
-        fn()
-    except (RuntimeError, AssertionError) as e:
-        msg = str(e)
-        assert expected in msg, f"expected '{expected}' in RuntimeError, got: {msg}"
-    else:
-        raise AssertionError(f"expected RuntimeError containing: {expected}")

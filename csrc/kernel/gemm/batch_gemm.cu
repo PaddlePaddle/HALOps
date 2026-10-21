@@ -25,6 +25,7 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
                torch::Tensor& output, const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha, const int sm_count,
                const std::string& mode = "w8a8") {
+    const at::cuda::OptionalCUDAGuard device_guard(input.device());
     TORCH_CHECK(mode == "w8a8" || mode == "w4a4-nvfp4",
                 "Unsupported mode: ", mode,
                 ". Expected 'w8a8' or 'w4a4-nvfp4'.");
@@ -46,8 +47,6 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
         "output shape must be [B, M, N]");
 
     // sfa/sfb: [B*M, sf_k] or [B, M, sf_k] -- same underlying memory.
-    TORCH_CHECK(sfa.is_contiguous(), "sfa must be contiguous");
-    TORCH_CHECK(sfb.is_contiguous(), "sfb must be contiguous");
 
     const cudaStream_t stream = GetCurrentCUDAStream(input);
     const int sm = sm_count > 0 ? sm_count : GetSmCount();
@@ -76,7 +75,11 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
         }
         LaunchCfg<KernelMode::Batch, MmaKind::MXFP8>(
             params,
-            {.m = m, .n = n, .k = k, .m_grid = m * batches, .sm_count = sm,
+            {.m = m,
+             .n = n,
+             .k = k,
+             .m_grid = m * batches,
+             .sm_count = sm,
              .has_bias = bias.has_value()},
             stream);
     } else {
@@ -84,7 +87,6 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
         TORCH_CHECK(input.size(2) == weight.size(2),
                     "packed input K/2 must match packed weight K/2, got ",
                     input.size(2), ", weight K/2=", weight.size(2));
-        CheckDivisible(k, 64, "W4A4 batch GEMM K");
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();
@@ -95,11 +97,14 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
         params.ptr_alpha = alpha->data_ptr<float>();
         TORCH_CHECK(!bias.has_value(),
                     "W4A4 batch GEMM does not support bias yet.");
-        LaunchCfg<KernelMode::Batch, MmaKind::NVFP4>(
-            params,
-            {.m = m, .n = n, .k = k, .m_grid = m * batches, .sm_count = sm,
-             .has_bias = false},
-            stream);
+        LaunchCfg<KernelMode::Batch, MmaKind::NVFP4>(params,
+                                                     {.m = m,
+                                                      .n = n,
+                                                      .k = k,
+                                                      .m_grid = m * batches,
+                                                      .sm_count = sm,
+                                                      .has_bias = false},
+                                                     stream);
     }
 }
 

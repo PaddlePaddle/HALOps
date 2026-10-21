@@ -1,18 +1,16 @@
-"""
 # Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
 
 import numpy as np
 import pytest
@@ -25,10 +23,13 @@ HIDDEN = 7168
 NUM_LOCAL_EXPERTS = 20
 TOPK = 4
 
+# (num_tokens, max_token_num)
+CASES = [(64, 128), (128, 256)]
+CASE_IDS = [f"{t}-{m}" for t, m in CASES]
 
-def _make_inputs(num_tokens, seed):
+
+def _make_inputs(num_tokens):
     """Build (x, scale, topk_ids) matching the kernel's expected layout."""
-    torch.manual_seed(seed)
     hidden_scale = HIDDEN // 128 // 4
     x = torch.randn([num_tokens, HIDDEN], device="cuda").to(torch.float8_e4m3fn)
     scale = torch.randint(
@@ -56,13 +57,7 @@ def _gather_via_indice_map(permute_x, indice_map, src_x):
     return flat[dst], src[token_idx]
 
 
-@pytest.mark.parametrize(
-    "num_tokens,max_token_num",
-    [
-        (64, 128),
-        (128, 256),
-    ],
-)
+@pytest.mark.parametrize("num_tokens,max_token_num", CASES, ids=CASE_IDS)
 def test_prefill_permute_determinism(num_tokens, max_token_num):
     """Two identical calls must agree on counts and gather-equivalent contents.
 
@@ -73,7 +68,7 @@ def test_prefill_permute_determinism(num_tokens, max_token_num):
       2. each run's ``permute_x``, gathered through its own ``indice_map``,
          reproduces the source ``x`` exactly.
     """
-    x, scale, topk_ids = _make_inputs(num_tokens, seed=42)
+    x, scale, topk_ids = _make_inputs(num_tokens)
 
     px1, _, im1, cnt1 = prefill_permute_to_masked_gemm(
         x, scale, topk_ids, NUM_LOCAL_EXPERTS, max_token_num
@@ -88,21 +83,15 @@ def test_prefill_permute_determinism(num_tokens, max_token_num):
     # 2. Each run must be internally consistent: permute_x gathered through its
     #    own indice_map reconstructs the source x.
     g1, e1 = _gather_via_indice_map(px1, im1, x)
-    np.testing.assert_array_equal(g1, e1)
+    assert np.array_equal(g1, e1), "run 1: permute_x does not reproduce source x"
     g2, e2 = _gather_via_indice_map(px2, im2, x)
-    np.testing.assert_array_equal(g2, e2)
+    assert np.array_equal(g2, e2), "run 2: permute_x does not reproduce source x"
 
 
-@pytest.mark.parametrize(
-    "num_tokens,max_token_num",
-    [
-        (64, 128),
-        (128, 256),
-    ],
-)
+@pytest.mark.parametrize("num_tokens,max_token_num", CASES, ids=CASE_IDS)
 def test_prefill_permute_indice_map_invalid_slots(num_tokens, max_token_num):
     """topk_ids == -1 entries must map to -1 in the returned indice_map."""
-    x, scale, topk_ids = _make_inputs(num_tokens, seed=7)
+    x, scale, topk_ids = _make_inputs(num_tokens)
 
     topk_np = topk_ids.cpu().numpy()
     num_invalid = max(1, (num_tokens * TOPK) // 4)

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
@@ -826,10 +827,15 @@ void WriteCacheKVEncoder(
     const int kv_head_num, const int head_dim, const int max_seq_len_q,
     const int max_seq_len_k, const int max_input_len,
     const std::string& cache_quant_type_str) {
+    const at::cuda::OptionalCUDAGuard device_guard(qkv_input.device());
     constexpr int kThreads = 128;
     constexpr int kHeadDim = 128;
     constexpr int kBlockSize = 128;
-    assert(kHeadDim == head_dim);
+    TORCH_CHECK(
+        head_dim == kHeadDim && kv_head_num > 0 && head_num % kv_head_num == 0,
+        "head_dim must be ", kHeadDim,
+        " and head_num a multiple of kv_head_num > 0; got head_dim=", head_dim,
+        ", head_num=", head_num, ", kv_head_num=", kv_head_num);
 
     const int batch_size = cu_seq_q.size(0) - 1;
     const int64_t total_tokens = qkv_input.size(0);
@@ -837,7 +843,6 @@ void WriteCacheKVEncoder(
     const int gqa_group_size = head_num / kv_head_num;
 
     using T = c10::BFloat16;
-    using fp8 = c10::Float8_e4m3fn;
     dim3 grid_dims;
 
     if (cache_quant_type_str == "block_wise_fp8") {
@@ -1340,11 +1345,16 @@ std::vector<torch::Tensor> WriteCacheKVDecoder(
     const std::optional<torch::Tensor>& k_norm_gamma, const int head_num,
     const int kv_head_num, const int head_dim, const int max_input_len,
     const std::string& cache_quant_type_str) {
+    const at::cuda::OptionalCUDAGuard device_guard(qkv_input.device());
     constexpr int kThreads = 128;
     constexpr int kHeadDim = 128;
     constexpr int kBlockSize = 128;
     constexpr int kBlockM = 64;
-    assert(kHeadDim == head_dim);
+    TORCH_CHECK(
+        head_dim == kHeadDim && kv_head_num > 0 && head_num % kv_head_num == 0,
+        "head_dim must be ", kHeadDim,
+        " and head_num a multiple of kv_head_num > 0; got head_dim=", head_dim,
+        ", head_num=", head_num, ", kv_head_num=", kv_head_num);
 
     const int batch_size = cu_seq_q.size(0) - 1;
     const int max_blocks_per_seq = block_tables.size(1);
@@ -1496,6 +1506,7 @@ std::vector<torch::Tensor> GetQKToken(const torch::Tensor& seq_lens_encoder,
                                       const torch::Tensor& actual_cu_seq_k,
                                       const torch::Tensor& seq_lens_kv,
                                       const int kv_head_num) {
+    const at::cuda::OptionalCUDAGuard device_guard(seq_lens_encoder.device());
     const int batch_size = cu_seq_q.size(0) - 1;
     const int max_batch_size = seq_lens_kv.size(0);
     torch::Tensor max_token_num =
