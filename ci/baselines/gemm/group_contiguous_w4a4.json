@@ -12,7 +12,7 @@
         "m": 512,
         "n": 256,
         "k": 512,
-        "mode": "w4a4",
+        "mode": "w4a4-nvfp4",
         "case_tag": "group_contiguous_w4a4"
       },
       "median_us": 5.744
@@ -26,7 +26,7 @@
         "m": 40960,
         "n": 4096,
         "k": 4096,
-        "mode": "w4a4",
+        "mode": "w4a4-nvfp4",
         "case_tag": "group_contiguous_w4a4"
       },
       "median_us": 243.565

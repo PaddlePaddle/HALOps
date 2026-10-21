@@ -12,7 +12,7 @@
         "m": 128,
         "n": 256,
         "k": 512,
-        "mode": "w4a4",
+        "mode": "w4a4-nvfp4",
         "case_tag": "dense_w4a4"
       },
       "median_us": 4.591
@@ -26,7 +26,7 @@
         "m": 8192,
         "n": 4096,
         "k": 4096,
-        "mode": "w4a4",
+        "mode": "w4a4-nvfp4",
         "case_tag": "dense_w4a4"
       },
       "median_us": 53.342

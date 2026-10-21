@@ -92,7 +92,7 @@ Auto-discovers all yaml files under `benchmark/ci_configs/`, each yaml becomes
 an independent pytest test case:
 
 - `attention/` — decode/prefill scenarios, various batch_size, dtype, context lengths
-- `gemm/` — dense/group_contiguous/group_masked scenarios, w4a4/w8a8 modes
+- `gemm/` — dense/group_contiguous/group_masked scenarios, w8a8/w4a4-nvfp4 modes
 
 ## Baseline Environment
 

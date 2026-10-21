@@ -103,7 +103,7 @@
 
 普通参数：
 
-- `mode`（默认 `w8a8`）：支持 `w8a8` 和 `w4a4`。
+- `mode`（默认 `w8a8`）：支持 `w8a8` 和 `w4a4-nvfp4`（kernel 也支持 `w4a4-mxfp4`，但 benchmark 暂无对应量化输入生成）。
 - `sm_count`（默认 `-1`）：`-1` 表示不限制 SM 数量。
 
 ### `group_masked` 和 `group_contiguous`
@@ -114,7 +114,7 @@
 
 普通参数：
 
-- `mode`（默认 `w8a8`）：支持 `w8a8` 和 `w4a4`。
+- `mode`（默认 `w8a8`）：支持 `w8a8` 和 `w4a4-nvfp4`（grouped kernel 暂不支持 `w4a4-mxfp4`）。
 - `sm_count`（默认 `-1`）。
 
 所有现有 GEMM 场景均要求 `K` 为 `32` 的倍数。

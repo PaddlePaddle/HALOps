@@ -79,7 +79,7 @@ _DEFAULT_GPU = "b200"
 def get_gpu_peak(gpu_name: str, dtype_bytes: float) -> tuple[float, float]:
     """Return (peak_tflops, peak_tbps) for a GPU and operand precision.
 
-    dtype_bytes: 0.5 -> FP4 (w4a4), 1 -> FP8, 2 -> BF16/FP16.
+    dtype_bytes: 0.5 -> FP4 (w4a4-nvfp4), 1 -> FP8, 2 -> BF16/FP16.
     Raises ValueError if the requested precision is unsupported on the GPU.
     """
     bf16_tflops, fp8_tflops, fp4_tflops, hbm_tbps = GPU_SPECS.get(

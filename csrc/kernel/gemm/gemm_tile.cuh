@@ -77,7 +77,7 @@ struct TileSpec {
 
 enum class MmaKind : int32_t {
     BF16 = 0,
-    MXFP8FP4 = 1,
+    MXFP8 = 1,
     MXFP4 = 2,
     NVFP4 = 3,
 };
@@ -86,7 +86,7 @@ template <MmaKind Kind>
 struct MmaTraits;
 
 template <>
-struct MmaTraits<MmaKind::MXFP8FP4> {
+struct MmaTraits<MmaKind::MXFP8> {
     using Operand = cutlass::float_e4m3_t;
     using Output = cutlass::bfloat16_t;
     using Scale = cutlass::float_ue8m0_t;
@@ -104,7 +104,7 @@ struct MmaTraits<MmaKind::NVFP4> {
     static constexpr bool kFp4 = true;
     static constexpr int kSfVecSize = 16;
     static constexpr bool kHasAlpha = true;
-    static constexpr const char* kName = "nvfp4";
+    static constexpr const char* kName = "w4a4-nvfp4";
 };
 
 template <>
@@ -115,7 +115,7 @@ struct MmaTraits<MmaKind::MXFP4> {
     static constexpr bool kFp4 = true;
     static constexpr int kSfVecSize = 32;
     static constexpr bool kHasAlpha = false;
-    static constexpr const char* kName = "mxfp4";
+    static constexpr const char* kName = "w4a4-mxfp4";
 };
 
 template <MmaKind Kind, KernelMode Mode, TileSpec S>
@@ -237,7 +237,7 @@ inline constexpr std::array<TileSpec, 10> kFp4Tiles = {
 template <MmaKind Kind>
 struct CandidateTiles;
 template <>
-struct CandidateTiles<MmaKind::MXFP8FP4> {
+struct CandidateTiles<MmaKind::MXFP8> {
     static constexpr const auto& tiles = kFp8Tiles;
 };
 template <>

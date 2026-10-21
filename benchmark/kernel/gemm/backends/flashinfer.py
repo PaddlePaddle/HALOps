@@ -35,7 +35,11 @@ def run_fi_dense_gemm(inp: dict):
     # flashinfer >= 0.7.2 dense kernels only take 1D 128x4-swizzled block
     # scales (M_padded * K_padded,).
     mode = inp.get("mode", "w8a8")
-    if mode == "w4a4":
+    if mode == "w4a4-mxfp4":
+        raise ValueError(
+            "flashinfer backend does not support mode 'w4a4-mxfp4' yet"
+        )
+    if mode == "w4a4-nvfp4":
         a_descale = inp["sfa"].view(torch.float8_e4m3fn).reshape(-1)
         b_descale = inp["sfb"].view(torch.float8_e4m3fn).reshape(-1)
         alpha_scalar = inp["alpha"].reshape(())
@@ -69,7 +73,11 @@ def run_fi_group_masked_gemm(inp: dict):
     mode = inp.get("mode", "w8a8")
     m_indptr = inp["m_indptr"]
 
-    if mode == "w4a4":
+    if mode == "w4a4-mxfp4":
+        raise ValueError(
+            "flashinfer backend does not support mode 'w4a4-mxfp4' yet"
+        )
+    if mode == "w4a4-nvfp4":
         return flashinfer.grouped_mm_fp4(
             inp["x"],
             inp["w"],

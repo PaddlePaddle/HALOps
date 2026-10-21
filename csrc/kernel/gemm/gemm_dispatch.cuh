@@ -184,7 +184,7 @@ inline std::span<const TileOverride> Overrides(MmaKind kind, KernelMode mode) {
         return {};
     }
     switch (kind) {
-        case MmaKind::MXFP8FP4:
+        case MmaKind::MXFP8:
             return kDenseFp8Overrides;
         case MmaKind::NVFP4:
         case MmaKind::MXFP4:
@@ -200,7 +200,7 @@ inline int PickByCostModel(const TileSpec* tiles, int count, MmaKind kind,
                            const GemmShape& s, KernelMode mode) {
     // Dense Fp8 prices an M below one legacy 128-row tile as 128 rows.
     GemmShape c = s;
-    if (mode == KernelMode::Dense && kind == MmaKind::MXFP8FP4) {
+    if (mode == KernelMode::Dense && kind == MmaKind::MXFP8) {
         c.m = std::max(c.m, cost::kMFloorFp8);
         c.m_grid = c.m;
     }

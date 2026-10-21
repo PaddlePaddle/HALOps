@@ -27,8 +27,9 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
                      const std::optional<torch::Tensor>& alpha,
                      const int max_m_per_expert, const int sm_count,
                      const std::string& mode = "w8a8") {
-    TORCH_CHECK(mode == "w8a8" || mode == "w4a4", "Unsupported mode: ", mode,
-                ". Expected 'w8a8' or 'w4a4'.");
+    TORCH_CHECK(mode == "w8a8" || mode == "w4a4-nvfp4",
+                "Unsupported mode: ", mode,
+                ". Expected 'w8a8' or 'w4a4-nvfp4'.");
     TORCH_CHECK(input.dim() == 2,
                 "input must be a 2D tensor of shape [num_experts * "
                 "max_m_per_expert, K]");
@@ -80,7 +81,7 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
         if (bias.has_value()) {
             params.ptr_c = bias->data_ptr();
         }
-        LaunchCfg<KernelMode::Masked, MmaKind::MXFP8FP4>(
+        LaunchCfg<KernelMode::Masked, MmaKind::MXFP8>(
             params,
             {.m = max_m_per_expert, .n = n, .k = k, .m_grid = m,
              .sm_count = sm, .has_bias = bias.has_value()},

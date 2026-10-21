@@ -43,22 +43,25 @@ def group_contiguous_gemm(
 
     Args:
         input: [M, K] CUDA tensor. All tokens packed contiguously.
-            w8a8: dtype float8_e4m3fn. w4a4: dtype uint8 (packed FP4).
+            w8a8: dtype float8_e4m3fn. w4a4-nvfp4: dtype uint8 (packed FP4).
         weight: [num_experts, N, K] 3D CUDA tensor. Per-expert weights.
         sfa: Scale factor for A, dtype uint8, CUTLASS SfAtom 128x4 swizzled layout.
-            shape: [M, K // 32] (w8a8) or [M, K // 16] (w4a4).
+            shape: [M, K // 32] (w8a8) or [M, K // 16] (w4a4-nvfp4).
             w8a8: UE8M0 encoding (block_size=32).
-            w4a4: UE4M3 encoding (block_size=16).
+            w4a4-nvfp4: UE4M3 encoding (block_size=16).
         sfb: Scale factor for B, dtype uint8, same SfAtom layout as sfa.
             shape: [num_experts, N, K // 32] (w8a8) or
-            [num_experts, N, K // 16] (w4a4).
+            [num_experts, N, K // 16] (w4a4-nvfp4).
         expert_ids: [M] int32. Maps each row to an expert index in
             [0, num_experts). Must be sorted in non-decreasing order.
         output: [M, N] bfloat16 output. Written in-place.
-        bias: Optional bfloat16 bias. Only supported in w8a8 mode.
-        alpha: Optional float32 per-expert scale. Required for w4a4.
+        bias: Optional [num_experts, N] bfloat16 bias. Only supported in
+            w8a8 mode.
+        alpha: Optional float32 per-expert scale with shape [num_experts].
+            Required for ``w4a4-nvfp4``.
         sm_count: Number of SMs to use (-1 for all available).
-        mode: ``"w8a8"`` or ``"w4a4"``.
+        mode: ``"w8a8"`` or ``"w4a4-nvfp4"``. ``"w4a4-mxfp4"`` is not
+            supported by this kernel yet.
 
     Returns:
         None. The result is written in-place to output.
@@ -79,6 +82,14 @@ def group_contiguous_gemm(
         >>> out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
         >>> group_contiguous_gemm(x, w, sfa, sfb, expert_ids, out, mode="w8a8")
     """
+    assert mode in ["w8a8", "w4a4-nvfp4"], (
+        f"Unsupported mode: {mode!r}. "
+        "group_contiguous_gemm does not support 'w4a4-mxfp4'."
+    )
+    assert mode != "w4a4-nvfp4" or alpha is not None, (
+        "W4A4 mode requires alpha input (per-expert scaling factor) "
+        f"for mode {mode!r}."
+    )
     halops_kernel.group_contiguous_gemm(
         input,
         weight,

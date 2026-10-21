@@ -40,14 +40,17 @@ from kernel.gemm.backends.deepgemm import (
     make_dense_inputs as make_deepgemm_inputs,
 )
 
-# Scale block size: FP8 W8A8 uses k//32, FP4 W4A4 uses k//16.
+# Scale block size: FP8 W8A8 uses k//32, FP4 NVFP4 uses k//16.
 FP8_SF_BLOCK = 32
 FP4_SF_BLOCK = 16
+# group_wise_quant only produces FP8 or NVFP4 inputs, so the benchmark covers
+# those two recipes (the kernel itself also supports w4a4-mxfp4).
+DENSE_MODES = ("w8a8", "w4a4-nvfp4")
 
 
 @dataclass
 class GemmInput:
-    """Dense GEMM inputs for W8A8 or W4A4 modes."""
+    """Dense GEMM inputs for W8A8 or W4A4-NVFP4 modes."""
 
     x: torch.Tensor
     w: torch.Tensor
@@ -71,7 +74,12 @@ def _build_inputs(
     from halops.gemm.group_wise_quant import group_wise_quant
 
     dev = "cuda"
-    is_fp4 = mode == "w4a4"
+    if mode not in DENSE_MODES:
+        raise ValueError(
+            f"Unsupported dense benchmark mode: {mode!r}. "
+            f"Expected one of {DENSE_MODES}."
+        )
+    is_fp4 = mode == "w4a4-nvfp4"
 
     if is_fp4:
         assert k % (2 * FP4_SF_BLOCK) == 0, f"k={k} must be divisible by 32"
@@ -120,7 +128,7 @@ def adapt_halops(inp: GemmInput) -> dict:
 
 def adapt_fi(inp: GemmInput) -> dict:
     """Adapt inputs for FlashInfer backend."""
-    if inp.mode == "w4a4":
+    if inp.mode == "w4a4-nvfp4":
         return {
             "x": inp.x,
             "w": inp.w,
@@ -128,7 +136,7 @@ def adapt_fi(inp: GemmInput) -> dict:
             "sfb": inp.sfb,
             "alpha": inp.alpha,
             "out": inp.out,
-            "mode": "w4a4",
+            "mode": inp.mode,
         }
     else:
         return {
@@ -177,6 +185,18 @@ def _get_backends(names: list[str]) -> dict:
     return backends
 
 
+def _apply_fi_backend(cfg: dict, inp_dicts: dict) -> None:
+    """Let the YAML ``fi_backend`` key override FlashInfer's kernel backend.
+
+    Values are FlashInfer backend names such as ``cudnn``, ``cutlass``,
+    ``cute-dsl`` or ``auto``. When unset, the backend module picks its
+    per-mode default (cuDNN for MXFP8, CuTe-DSL for NVFP4).
+    """
+    fi_backend = cfg.get("fi_backend")
+    if fi_backend and "fi" in inp_dicts:
+        inp_dicts["fi"]["backend"] = fi_backend
+
+
 def _refcheck_entry(
     cfg, ordered_names, refcheck_reference, refcheck_atol=1e-2, refcheck_rtol=1e-2
 ):
@@ -192,6 +212,7 @@ def _refcheck_entry(
     backends = _get_backends(ordered)
     run_fns = {n_: entry[1] for n_, entry in backends.items()}
     inp_dicts = {n_: entry[0](raw_inp) for n_, entry in backends.items()}
+    _apply_fi_backend(cfg, inp_dicts)
     return run_refcheck(
         [n_ for n_ in ordered if n_ in backends],
         run_fns,
@@ -220,6 +241,7 @@ def _bench_entry(
         raise RuntimeError(f"backend '{name}' not found")
     adapt_fn, run_fn = backends[name]
     inp = adapt_fn(raw_inp)
+    _apply_fi_backend(cfg, {name: inp})
 
     return bench_gpu_time(
         run_fn,
@@ -251,8 +273,8 @@ def run_scenario(cfg: dict) -> None:
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     # Bytes per operand element for the bandwidth metric: FP8 = 1, FP4 = 0.5.
-    dtype_bytes = 0.5 if mode == "w4a4" else 1
-    dtype_str = "fp4_e2m1" if mode == "w4a4" else "fp8_e4m3"
+    dtype_bytes = 0.5 if mode == "w4a4-nvfp4" else 1
+    dtype_str = "fp4_e2m1" if mode == "w4a4-nvfp4" else "fp8_e4m3"
 
     for shape in cfg["shapes"]:
         m, n, k = shape

@@ -47,9 +47,10 @@ from kernel.gemm.backends.deepgemm import (
     make_grouped_contiguous_inputs as make_deepgemm_contiguous_inputs,
 )
 
-# Scale block size: FP8 W8A8 uses k//32, FP4 W4A4 uses k//16.
+# Scale block size: FP8 W8A8 uses k//32, FP4 NVFP4 uses k//16.
 FP8_SF_BLOCK = 32
 FP4_SF_BLOCK = 16
+GROUPED_MODES = ("w8a8", "w4a4-nvfp4")
 
 
 @dataclass
@@ -83,13 +84,18 @@ def _make_grouped_tensors(num_experts: int, max_m: int, n: int, k: int, mode: st
     layout). Keeping the BF16 source explicit lets comparison backends quantize
     from the same data so cross-backend comparisons stay fair.
       - w8a8: x/w float8_e4m3fn [.,K], scales [.,K//32], no alpha.
-      - w4a4: x/w uint8-packed FP4 [.,K//2], scales [.,K//16], alpha=ones[E].
+      - w4a4-nvfp4: x/w uint8-packed FP4 [.,K//2], scales [.,K//16], alpha=ones[E].
     """
     from halops.gemm.group_wise_quant import group_wise_quant
 
     dev = "cuda"
     m = num_experts * max_m
-    is_fp4 = mode == "w4a4"
+    if mode not in GROUPED_MODES:
+        raise ValueError(
+            f"Unsupported grouped benchmark mode: {mode!r}. "
+            f"Expected one of {GROUPED_MODES}."
+        )
+    is_fp4 = mode == "w4a4-nvfp4"
 
     if is_fp4:
         assert k % (2 * FP4_SF_BLOCK) == 0, f"k={k} must be divisible by 32"
@@ -384,8 +390,8 @@ def run_group_masked(cfg: dict) -> None:
     refcheck_rtol = cfg.get("refcheck_rtol", 1e-2)
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    dtype_bytes = 0.5 if mode == "w4a4" else 1
-    dtype_str = "fp4_e2m1" if mode == "w4a4" else "fp8_e4m3"
+    dtype_bytes = 0.5 if mode == "w4a4-nvfp4" else 1
+    dtype_str = "fp4_e2m1" if mode == "w4a4-nvfp4" else "fp8_e4m3"
 
     for num_experts, max_m, n, k in cfg["shapes"]:
         active_m = num_experts * max_m
@@ -488,8 +494,8 @@ def run_group_contiguous(cfg: dict) -> None:
     refcheck_rtol = cfg.get("refcheck_rtol", 1e-2)
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    dtype_bytes = 0.5 if mode == "w4a4" else 1
-    dtype_str = "fp4_e2m1" if mode == "w4a4" else "fp8_e4m3"
+    dtype_bytes = 0.5 if mode == "w4a4-nvfp4" else 1
+    dtype_str = "fp4_e2m1" if mode == "w4a4-nvfp4" else "fp8_e4m3"
 
     for requested_experts, max_m, n, k in cfg["shapes"]:
         m = requested_experts * max_m

@@ -417,7 +417,7 @@ class TestGroupedGemmMaskedW4A4:
         self.num_experts = 20
         self.full_x = True
         self.sm_count = -1
-        self.mode = "w4a4"
+        self.mode = "w4a4-nvfp4"
         self.pad_n_224_to_256 = (
             False  # Whether to pad sfb scale from 224 rows to 256 rows
         )
@@ -481,7 +481,7 @@ class TestGroupedGemmMaskedW4A4:
             alpha=self.alpha_tensor,
         )
 
-        # Kernel: pass packed uint8 + CUTLASS reordered UE4M3 scale, mode="w4a4"
+        # Kernel: pass packed uint8 + CUTLASS reordered UE4M3 scale, mode="w4a4-nvfp4"
         for _ in range(3):
             output = group_masked_gemm_wrapper(
                 self.x_packed,
@@ -640,7 +640,7 @@ def test_group_masked_unsupported_shapes():
         out = torch.empty([num_experts * max_m, n], dtype=torch.bfloat16)
         bias = torch.empty([num_experts, n], dtype=torch.bfloat16)
         alpha = torch.ones([num_experts], dtype=torch.float32)
-        group_masked_gemm(x, w, sfa, sfb, masked_m, out, bias, alpha, max_m, -1, "w4a4")
+        group_masked_gemm(x, w, sfa, sfb, masked_m, out, bias, alpha, max_m, -1, "w4a4-nvfp4")
 
     _expect_runtime_error(run_w4a4_bias, "W4A4 mode does not support bias yet")
 

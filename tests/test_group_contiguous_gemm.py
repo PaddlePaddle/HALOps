@@ -339,7 +339,7 @@ class TestGroupedGemmContiguousW4A4:
         self.k = 3584
         self.num_experts = 20
         self.sm_count = -1
-        self.mode = "w4a4"
+        self.mode = "w4a4-nvfp4"
         self.tile_m = 256
 
     def init_input(self):
@@ -518,7 +518,7 @@ def test_group_contiguous_unsupported_shapes():
         out = torch.empty([m, n], dtype=torch.bfloat16)
         bias = torch.empty([num_experts, n], dtype=torch.bfloat16)
         alpha = torch.ones([num_experts], dtype=torch.float32)
-        group_contiguous_gemm(x, w, sfa, sfb, expert_ids, out, bias, alpha, -1, "w4a4")
+        group_contiguous_gemm(x, w, sfa, sfb, expert_ids, out, bias, alpha, -1, "w4a4-nvfp4")
 
     _expect_runtime_error(run_w4a4_bias, "W4A4 mode does not support bias yet")
 

@@ -25,8 +25,10 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                torch::Tensor& output, const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha,
                const int sm_count_arg, const std::string& mode) {
-    TORCH_CHECK(mode == "w8a8" || mode == "w4a4", "Unsupported mode: ", mode,
-                ". Expected 'w8a8' or 'w4a4'.");
+    TORCH_CHECK(mode == "w8a8" || mode == "w4a4-mxfp4" ||
+                    mode == "w4a4-nvfp4",
+                "Unsupported mode: ", mode,
+                ". Expected 'w8a8', 'w4a4-mxfp4' or 'w4a4-nvfp4'.");
     TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor of shape [M, K]");
     TORCH_CHECK(weight.dim() == 2,
                 "weight must be a 2D tensor of shape [N, K]");
@@ -66,7 +68,7 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
         if (bias.has_value()) {
             params.ptr_c = bias->data_ptr();
         }
-        LaunchCfg<KernelMode::Dense, MmaKind::MXFP8FP4>(
+        LaunchCfg<KernelMode::Dense, MmaKind::MXFP8>(
             params,
             {.m = m, .n = n, .k = k, .m_grid = m, .sm_count = sm,
              .has_bias = bias.has_value()},
@@ -90,18 +92,16 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
             alpha.has_value() ? alpha->data_ptr<float>() : nullptr;
         TORCH_CHECK(!bias.has_value(), "W4A4 mode does not support bias yet.");
 
-        // Alpha selects the recipe: absent -> MXFP4 (UE8M0 per 32), present ->
-        // NVFP4 (UE4M3 per 16).
-        const bool mxfp4 = !alpha.has_value();
+        // mode selects the recipe: w4a4-mxfp4 (UE8M0 per 32) or
+        // w4a4-nvfp4 (UE4M3 per 16).
+        const bool mxfp4 = mode == "w4a4-mxfp4";
         const int sf_k = k / (mxfp4 ? 32 : 16);
         TORCH_CHECK(sfa.size(1) == sf_k && sfb.size(1) == sf_k,
-                    "W4A4 scale-factor shape does not match the recipe "
-                    "selected by alpha: ",
-                    mxfp4 ? "alpha absent -> MXFP4 (UE8M0 per 32)"
-                          : "alpha present -> NVFP4 (UE4M3 per 16)",
+                    "W4A4 scale-factor shape does not match mode ",
+                    mxfp4 ? "'w4a4-mxfp4' (UE8M0 per 32)"
+                          : "'w4a4-nvfp4' (UE4M3 per 16)",
                     " requires SF K = ", sf_k, ", got sfa K=", sfa.size(1),
-                    " and sfb K=", sfb.size(1),
-                    ". Pass alpha for NVFP4, omit it for MXFP4.");
+                    " and sfb K=", sfb.size(1), ".");
 
         const GemmShape shape = {.m = m,      .n = n,       .k = k,
                                  .m_grid = m, .sm_count = sm,

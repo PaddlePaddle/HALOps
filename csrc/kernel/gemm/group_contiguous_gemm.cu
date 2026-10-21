@@ -27,8 +27,9 @@ void GroupContiguousGemm(const torch::Tensor& input,
                          const std::optional<torch::Tensor>& bias,
                          const std::optional<torch::Tensor>& alpha,
                          const int sm_count, const std::string& mode = "w8a8") {
-    TORCH_CHECK(mode == "w8a8" || mode == "w4a4", "Unsupported mode: ", mode,
-                ". Expected 'w8a8' or 'w4a4'.");
+    TORCH_CHECK(mode == "w8a8" || mode == "w4a4-nvfp4",
+                "Unsupported mode: ", mode,
+                ". Expected 'w8a8' or 'w4a4-nvfp4'.");
     TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor of shape [M, K]");
     TORCH_CHECK(weight.dim() == 3,
                 "weight must be a 3D tensor of shape [num_experts, N, K]");
@@ -71,7 +72,7 @@ void GroupContiguousGemm(const torch::Tensor& input,
             params.ptr_c = bias->data_ptr();
         }
 
-        LaunchCfg<KernelMode::Contiguous, MmaKind::MXFP8FP4>(
+        LaunchCfg<KernelMode::Contiguous, MmaKind::MXFP8>(
             params,
             {.m = m / num_experts, .n = n, .k = k, .m_grid = m,
              .sm_count = sm, .has_bias = bias.has_value()},

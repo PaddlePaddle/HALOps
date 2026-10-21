@@ -1,6 +1,6 @@
 # Dense W4A4 (FP4) GEMM across halops, flashinfer (fi), and deepgemm.
 scenario: dense_gemm
-mode: w4a4
+mode: w4a4-nvfp4
 
 # [M, N, K] shapes (dsv4 sweep + small-M refactor sweep, deduplicated).
 shapes:
