@@ -71,7 +71,11 @@ struct CollectiveMainloop {
 
     static constexpr bool IsSfbUnaligned = KernelTraits::IsSfbUnaligned;
     static constexpr int KSfbAtoms = KernelTraits::KSfbAtoms;
-    static constexpr bool IsPackedSfb = KernelTraits::IsPackedSfb;
+    // Bytes of one SfAtom: 128 MN rows x four scale values.
+    static constexpr int kSfbAtomBytes = 512;
+    // 224-column tiles: half of them start on an odd TMEM column, so a warp in
+    // every CTA rewrites the stage (a 32-row rotation) before UTCCP reads it.
+    static constexpr bool IsSfbRowShift = KernelTraits::IsSfbRowShift;
     using GmemTiledLoadSfb =
         cute::conditional_t<KernelTraits::IsSfbUnaligned &&
                                 KernelTraits::KNumCTA == 2,
@@ -105,11 +109,21 @@ struct CollectiveMainloop {
         SmemLayoutSFA{}(cute::_, cute::_, cute::_, cute::Int<0>{}), TileShape{},
         TiledMma{}, ClusterLayout_VMNK{}));
 
-    using TMALoad_SFB = decltype(cute::make_tma_atom_B_sm100<uint16_t>(
-        GmemTiledLoadSfb{},
-        cute::make_tensor(static_cast<TypeSF const*>(nullptr), LayoutSFB{}),
-        SmemLayoutSFB{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
-        TileShape_SF{}, TiledMma_SF{}, ClusterLayoutSfb_VMNK{}));
+    // Unaligned-N SFB loads through `sfb_run_desc`.
+    struct NoSfbTma {};
+    static auto make_sfb_tma_atom() {
+        if constexpr (IsSfbUnaligned) {
+            return NoSfbTma{};
+        } else {
+            return cute::make_tma_atom_B_sm100<uint16_t>(
+                GmemTiledLoadSfb{},
+                cute::make_tensor(static_cast<TypeSF const*>(nullptr),
+                                  LayoutSFB{}),
+                SmemLayoutSFB{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
+                TileShape_SF{}, TiledMma_SF{}, ClusterLayoutSfb_VMNK{});
+        }
+    }
+    using TMALoad_SFB = decltype(make_sfb_tma_atom());
 
     static constexpr bool SwapAB = KernelTraits::SwapAB;
 
@@ -124,13 +138,14 @@ struct CollectiveMainloop {
     using AccumulatorPipelineState =
         typename KernelTraits::AccumulatorPipelineState;
 
+    // With a narrow A box the pipeline must expect the bytes the TMA actually
+    // delivers, not the full stage.
     static constexpr uint32_t TmaTransactionBytesAFull =
         cutlass::bits_to_bytes(static_cast<uint32_t>(
             cute::cosize(cute::take<0, 3>(SmemLayoutA{})) *
             cute::sizeof_bits_v<TypeA> * cute::size(AtomThrShapeMNK{})));
     static constexpr uint32_t TmaTransactionBytesA = TmaTransactionBytesAFull;
-    // A narrow A box delivers fewer bytes than a full stage; expect exactly
-    // what the TMA writes.
+    // Bytes the A/B/SF TMA actually delivers for this launch.
     CUTLASS_DEVICE static uint32_t TmaTransactionBytesABFor(int m) {
         if constexpr (KernelTraits::KNarrowA) {
             if (m > 0 && m < static_cast<int>(KernelTraits::KBlockM)) {
@@ -149,13 +164,21 @@ struct CollectiveMainloop {
         cutlass::bits_to_bytes(static_cast<uint32_t>(
             cute::cosize(cute::take<0, 3>(SmemLayoutSFA{})) *
             cute::sizeof_bits_v<TypeSF> * cute::size(AtomThrShapeMNK{})));
-    static constexpr uint32_t TmaTransactionBytesSFB =
+    // Bytes one stage's SFB contributes to this CTA's own SMEM.
+    static constexpr uint32_t TmaTransactionBytesSfbStage =
         cutlass::bits_to_bytes(static_cast<uint32_t>(
             cute::cosize(cute::take<0, 3>(SmemLayoutSFB{})) *
-            cute::sizeof_bits_v<TypeSF> * cute::size(AtomThrShapeMNK{})));
+            cute::sizeof_bits_v<TypeSF>));
+
+    static constexpr uint32_t TmaTransactionBytesSFB =
+        TmaTransactionBytesSfbStage * cute::size(AtomThrShapeMNK{});
+    // 224-column tiles: each CTA's rewriter signals its own copy (and rewrite)
+    // with 16 transaction bytes, so the barrier's arrival count is unchanged.
+    static constexpr uint32_t KSfbReadyTx = 16;
     static constexpr uint32_t TmaTransactionBytesAB =
         TmaTransactionBytesA + TmaTransactionBytesB + TmaTransactionBytesSFA +
-        TmaTransactionBytesSFB;
+        (IsSfbRowShift ? KSfbReadyTx * KernelTraits::KNumCTA
+                       : TmaTransactionBytesSFB);
 
     struct Arguments {
         TypeA const* ptr_a;
@@ -169,6 +192,7 @@ struct CollectiveMainloop {
         LayoutSFB layout_SFB;
         int k;
         int m;
+        int num_experts = 1;
     };
 
     struct Params {
@@ -180,13 +204,15 @@ struct CollectiveMainloop {
         TMALoad_B tma_load_B;
         TMALoad_SFA tma_load_SFA;
         TMALoad_SFB tma_load_SFB;
-        // IsSfbUnaligned: SFB as (512-byte atom, k-block, n-atom), box of
-        // KSfbAtoms atoms.
+        // IsSfbUnaligned only: SFB as (512-byte atom, k-block, n-atom), boxed
+        // to a run of KSfbAtoms atoms.  Unused otherwise.
         cute::TmaDescriptor sfb_run_desc;
-        // KNarrowA: A descriptor with box M = min(m, KBlockM).
+        // Hand-built A descriptor whose box M is min(m, KBlockM) rows.
+        // Used when KernelTraits::KNarrowA and m < KBlockM.
         cute::TmaDescriptor a_run_desc;
         int m;
         int k;
+        int num_experts;
     };
 
     CUTLASS_DEVICE static auto init_tmem_tensors() {
@@ -199,6 +225,7 @@ struct CollectiveMainloop {
             (OverlapCols > 0 && KernelTraits::KEpilogueStages > 1);
         static constexpr bool IsOverlappingAccum = UseCustomOverlap;
 
+        // When using custom overlap, substitute N with KTmemOverlapCols.
         using OverlapTile = cute::conditional_t<
             UseCustomOverlap,
             cute::Shape<decltype(cute::size<0>(EpilogueTile{})),
@@ -278,10 +305,13 @@ struct CollectiveMainloop {
             SmemLayoutSFA{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
             TileShape{}, TiledMma{}, cluster_layout_vmnk);
 
-        TMALoad_SFB tma_load_sfb = cute::make_tma_atom_B_sm100<uint16_t>(
-            GmemTiledLoadSfb{}, tensor_sfb,
-            SmemLayoutSFB{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
-            TileShape_SF{}, TiledMma_SF{}, cluster_layout_sfb_vmnk);
+        TMALoad_SFB tma_load_sfb{};
+        if constexpr (!IsSfbUnaligned) {
+            tma_load_sfb = cute::make_tma_atom_B_sm100<uint16_t>(
+                GmemTiledLoadSfb{}, tensor_sfb,
+                SmemLayoutSFB{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
+                TileShape_SF{}, TiledMma_SF{}, cluster_layout_sfb_vmnk);
+        }
 
         cute::TmaDescriptor a_run_desc{};
         if constexpr (KernelTraits::KNarrowA) {
@@ -312,17 +342,16 @@ struct CollectiveMainloop {
         if constexpr (IsSfbUnaligned) {
             // tile_atom_to_shape_SFB orders atoms K-block first, then N.
             const uint64_t k_blks = cute::size<1, 1>(args.layout_SFB);
-            constexpr uint32_t kAtomBytes = 512;
 
-            const uint64_t n_atoms =
-                IsPackedSfb
-                    ? static_cast<uint64_t>(cute::size<0, 1>(args.layout_SFB))
-                    : static_cast<uint64_t>(
-                          cute::ceil_div(cute::size<0>(args.layout_B), 128));
-            cuuint64_t dims[3] = {kAtomBytes / 2, k_blks, n_atoms};
-            cuuint64_t strides[2] = {kAtomBytes, k_blks * kAtomBytes};
-            cuuint32_t box[3] = {kAtomBytes / 2, 1,
-                                 IsPackedSfb ? 2u : KSfbAtoms};
+            // Grouped modes lay the experts out after the N atoms, so they fold
+            // into the same run dimension (one stride per atom).
+            const uint64_t n_atoms = static_cast<uint64_t>(
+                cute::ceil_div(cute::size<0>(args.layout_B), 128));
+            const uint64_t n_atoms_all =
+                n_atoms * static_cast<uint64_t>(args.num_experts);
+            cuuint64_t dims[3] = {kSfbAtomBytes / 2, k_blks, n_atoms_all};
+            cuuint64_t strides[2] = {kSfbAtomBytes, k_blks * kSfbAtomBytes};
+            cuuint32_t box[3] = {kSfbAtomBytes / 2, 1, KSfbAtoms};
             cuuint32_t elem_strides[3] = {1, 1, 1};
             CUresult r = cuTensorMapEncodeTiled(
                 reinterpret_cast<CUtensorMap*>(&sfb_run_desc),
@@ -335,9 +364,11 @@ struct CollectiveMainloop {
                         "cuTensorMapEncodeTiled(SFB atom run) failed: ", r);
         }
 
-        return {args.layout_A, args.layout_B, args.layout_SFA, args.layout_SFB,
-                tma_load_A,    tma_load_B,    tma_load_sfa,    tma_load_sfb,
-                sfb_run_desc,  a_run_desc,    args.m,          k};
+        return {args.layout_A,  args.layout_B,    args.layout_SFA,
+                args.layout_SFB, tma_load_A,     tma_load_B,
+                tma_load_sfa,   tma_load_sfb,   sfb_run_desc,
+                a_run_desc,     args.m,         k,
+                args.num_experts};
     }
 
     CUTLASS_DEVICE void tma_loadAB(Params const& mainloop_params,
@@ -374,6 +405,7 @@ struct CollectiveMainloop {
         auto cta_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(
             IsSfbUnaligned ? 0 : block_rank_in_cluster);
 
+        // Each warp only computes its own multicast mask
         const bool narrow_a =
             KernelTraits::KNarrowA &&
             mainloop_params.m < static_cast<int>(KernelTraits::KBlockM);
@@ -386,6 +418,7 @@ struct CollectiveMainloop {
         uint16_t mcast_mask_sfb = cute::create_tma_multicast_mask<1>(
             cluster_layout_sfb_vmnk, cta_coord_sfb_vmnk);
 
+        // --- AB tensors ---
         cute::Tensor A = [&]() {
             if constexpr (SwapAB) {
                 return mainloop_params.tma_load_A.get_tma_tensor(
@@ -429,6 +462,7 @@ struct CollectiveMainloop {
             cute::make_layout(cute::size<1>(cluster_layout_vmnk)),
             cute::group_modes<0, 3>(cta_sB), cute::group_modes<0, 3>(cta_gB));
 
+        // --- SF tensors ---
         cute::Tensor SFA = [&]() {
             if constexpr (SwapAB) {
                 return mainloop_params.tma_load_SFA.get_tma_tensor(
@@ -439,8 +473,11 @@ struct CollectiveMainloop {
                                                         cute::Int<0>{});
             }
         }();
-        cute::Tensor SFB = [&]() {
-            if constexpr (SwapAB) {
+        // Unaligned-N SFB never goes through the CuTe atom.
+        auto SFB = [&]() {
+            if constexpr (IsSfbUnaligned) {
+                return 0;
+            } else if constexpr (SwapAB) {
                 if constexpr (IsCtaN64) {
                     cute::Tensor mSFB_tmp =
                         mainloop_params.tma_load_SFB.get_tma_tensor(
@@ -508,7 +545,8 @@ struct CollectiveMainloop {
             cute::make_layout(cute::size<2>(cluster_layout_vmnk)),
             cute::group_modes<0, 3>(cta_sSFA),
             cute::group_modes<0, 3>(cta_gSFA));
-        // Unaligned-N SFB is loaded through sfb_run_desc instead.
+        // Unaligned-N SFB is loaded through sfb_run_desc; the CuTe atom serves
+        // the aligned SfAtom path only.
         auto [tma_gSFB, tma_sSFB] = [&]() {
             if constexpr (IsSfbUnaligned) {
                 return cute::make_tuple(0, 0);
@@ -527,6 +565,7 @@ struct CollectiveMainloop {
             }
         }();
 
+        // --- Pipeline state ---
         using BarrierType = typename ABPipeline::ProducerBarrierType;
 
         using ActivePipeline = ABPipeline;
@@ -571,8 +610,36 @@ struct CollectiveMainloop {
                                    tma_sSFB(cute::_, (cute::Int<0>{},
                                                       prologue_stage_idx)));
                     } else {
-                        // NarrowA: UMMA still reads KBlockM rows; the stale
-                        // tail rows' D is dropped by the epilogue.
+                        // Per-CTA SFB copy on `sf_full` (a rewriter warp fixes
+                        // it up); issued first to overlap the A/B transfer.
+                        if constexpr (IsSfbRowShift) {
+                            constexpr int kSfbStageElems = cute::size(
+                                cute::filter_zeros(SmemLayoutAtomSFB{}));
+                            cutlass::arch::ClusterTransactionBarrier::
+                                arrive_and_expect_tx(
+                                    &shared_storage.sf_full[prologue_stage_idx],
+                                    TmaTransactionBytesSfbStage);
+                            cute::SM90_TMA_LOAD_3D::copy(
+                                &mainloop_params.sfb_run_desc,
+                                reinterpret_cast<uint64_t*>(
+                                    &shared_storage
+                                         .sf_full[prologue_stage_idx]),
+                                static_cast<uint64_t>(
+                                    cute::TMA::CacheHintSm90::EVICT_NORMAL),
+                                shared_storage.SFB.begin() +
+                                    prologue_stage_idx * kSfbStageElems, 0,
+                                static_cast<int32_t>(k_tile_id),
+                                static_cast<int32_t>(
+                                    expert_idx *
+                                        cute::ceil_div(
+                                            cute::size<0>(
+                                                mainloop_params.layout_B),
+                                            128) +
+                                    n_idx * cute::size<1>(TileShape{}) / 128));
+                        }
+                        // When NarrowA is used, the UMMA still
+                        // reads KBlockM rows, so the tail rows are stale and
+                        // their D rows are discarded by the epilogue.
                         auto issue_full_a = [&]() {
                             cute::copy(mainloop_params.tma_load_A.with(
                                            *tma_barrier, mcast_mask_a),
@@ -612,7 +679,9 @@ struct CollectiveMainloop {
                                    tma_gSFA(cute::_, m_idx, k_tile_id),
                                    tma_sSFA(cute::_, (cute::Int<0>{},
                                                       prologue_stage_idx)));
-                        if constexpr (IsSfbUnaligned) {
+                        if constexpr (IsSfbRowShift) {
+                            // Issued first, see above.
+                        } else if constexpr (IsSfbUnaligned) {
                             // Atoms past N are out of bounds (zero-filled);
                             // they only feed overhang columns never stored.
                             constexpr int kSfbStageElems = cute::size(
@@ -630,11 +699,8 @@ struct CollectiveMainloop {
                                         prologue_stage_idx * kSfbStageElems,
                                     0, static_cast<int32_t>(k_tile_id),
                                     static_cast<int32_t>(
-                                        IsPackedSfb
-                                            ? n_idx * 2
-                                            : n_idx *
-                                                  cute::size<1>(TileShape{}) /
-                                                  128));
+                                        n_idx * cute::size<1>(TileShape{}) /
+                                        128));
                             }
                         } else {
                             cute::copy(
@@ -654,6 +720,75 @@ struct CollectiveMainloop {
     }
 
   public:
+    // Shift one SFB stage up by 32 rows (odd in-atom offset -> even): rotate
+    // the atom's four 32-row words, the tail one coming from the next atom.
+    CUTLASS_DEVICE static void sfb_shift_rows_stage(SharedStorage& storage,
+                                                   uint32_t stage_idx) {
+        const int lane = cutlass::canonical_lane_idx();
+        char* base = reinterpret_cast<char*>(storage.SFB.begin()) +
+                     stage_idx * (KSfbAtoms * kSfbAtomBytes);
+        // Read every atom before writing any: one warp sync for the stage.
+        uint4 v[KSfbAtoms];
+        CUTLASS_PRAGMA_UNROLL
+        for (int atom = 0; atom < KSfbAtoms; ++atom) {
+            v[atom] = *reinterpret_cast<uint4 const*>(
+                base + atom * kSfbAtomBytes + lane * 16);
+        }
+        __syncwarp();
+        CUTLASS_PRAGMA_UNROLL
+        for (int atom = 0; atom < KSfbAtoms; ++atom) {
+            uint4 w;
+            w.x = v[atom].y;
+            w.y = v[atom].z;
+            w.z = v[atom].w;
+            w.w = (atom + 1 < KSfbAtoms) ? v[atom + 1].x : 0u;
+            *reinterpret_cast<uint4*>(base + atom * kSfbAtomBytes + lane * 16) =
+                w;
+        }
+    }
+
+    // Rewriter warps split the stages: wait each owned one on `sf_full`, then
+    // shift it on an odd starting column and complete `KSfbReadyTx`.
+    CUTLASS_DEVICE void sfb_shift_rows(Params const& mainloop_params,
+                                       SharedStorage& shared_storage,
+                                       TileScheduler<KernelTraits>& scheduler,
+                                       uint32_t xpose) {
+        static_assert(IsSfbRowShift,
+                      "only the 224-column tiles rewrite their SFB stage");
+        constexpr uint32_t kWarps = KernelTraits::KSfbTransposeWarps;
+        const uint32_t tile_num_k =
+            cute::ceil_div(mainloop_params.k, cute::size<2>(TileShape{}));
+        const uint32_t leader_rank =
+            cute::block_rank_in_cluster() - scheduler.cta_v();
+        MainloopPipelineState stage;
+        for (auto walk = scheduler; walk.is_valid(); walk.advance()) {
+            // The tile's start column inside the window, in 32-row columns.
+            const bool odd =
+                (((walk.n_idx() * cute::size<1>(TileShape{})) % 128) / 32) & 1;
+            for (uint32_t k_tile_id = 0; k_tile_id < tile_num_k; ++k_tile_id) {
+                const uint32_t s = stage.index();
+                if (s % kWarps == xpose) {
+                    cutlass::arch::ClusterTransactionBarrier::wait(
+                        &shared_storage.sf_full[s], stage.phase());
+                    if (odd) {
+                        sfb_shift_rows_stage(shared_storage, s);
+                        __syncwarp();
+                        cutlass::arch::fence_view_async_shared();
+                    }
+                    if (cute::elect_one_sync()) {
+                        cutlass::arch::ClusterTransactionBarrier::
+                            complete_transaction(
+                                reinterpret_cast<uint64_t const*>(
+                                    &shared_storage.mainloop.full_barrier_[s]),
+                                leader_rank, KSfbReadyTx);
+                    }
+                    __syncwarp();
+                }
+                ++stage;
+            }
+        }
+    }
+
     template <class TmemStorage>
     CUTLASS_DEVICE void mma(Params const& mainloop_params,
                             MainloopPipeline& mainloop_pipeline,
@@ -673,7 +808,8 @@ struct CollectiveMainloop {
 
         uint32_t prologue_stage_idx = 0;
         uint32_t epilogue_stage_idx = 0;
-        // Parity of the pair-UMMA overlap cluster barrier.
+        // Phase parity for the cluster-scope overlap barrier (pair-UMMA only).
+        // mbarrier.try_wait.parity uses this to detect phase completion.
         [[maybe_unused]] int overlap_phase = 0;
         cute::Tensor cta_sA = shared_storage.tensor_sA();
         cute::Tensor cta_sB = shared_storage.tensor_sB();
@@ -718,8 +854,9 @@ struct CollectiveMainloop {
         AccumulatorPipelineState accumulator_pipe_producer_state =
             cutlass::make_producer_start_state<AccumulatorPipeline>();
 
-        // The next tile's accumulator stage and first k-block are acquired
-        // before blocking on the TMEM overlap barrier.
+        // The next tile's accumulator stage and first k-block are waited on
+        // right after the current tile's MMAs are issued, before the TMEM
+        // overlap barrier.
         bool next_tile_ready = false;
 
         while (scheduler.is_valid()) {
@@ -730,26 +867,24 @@ struct CollectiveMainloop {
             epilogue_stage_idx = accumulator_pipe_producer_state.index();
 
             int n_idx = scheduler.n_idx();
-            [[maybe_unused]] uint32_t sfb_copy_col = 0;
             [[maybe_unused]] uint32_t sfb_mma_col = 0;
-            if constexpr (IsSfbUnaligned && !IsPackedSfb) {
+            if constexpr (IsSfbUnaligned) {
+                // The window lands from column 0 and the MMA starts at the
+                // tile's own column (already moved to the even one by 224).
                 const uint32_t sfb_row_col =
                     (n_idx * cute::size<1>(TileShape{}) % 128) / 32;
-                sfb_copy_col = sfb_row_col & 1;
-                sfb_mma_col = sfb_row_col + sfb_copy_col;
+                sfb_mma_col = sfb_row_col & ~1u;
             }
             auto thr_tSFB_s2t_tile = thr_tSFB_s2t;
-            if constexpr (IsSfbUnaligned && !IsPackedSfb) {
-                thr_tSFB_s2t_tile.data() =
-                    thr_tSFB_s2t.data().get() + sfb_copy_col;
-            }
             auto tmem_SFB_mma = [&]() {
+                // A 64-column SfAtom tile is half of a 128-column atom, so the
+                // TMEM column depends on which half it is.
                 if constexpr (IsCtaN64) {
                     auto tmem_SFB_tmp = tmem_SFB;
                     tmem_SFB_tmp.data() =
                         tmem_SFB_tmp.data().get() + (n_idx % VSPerCtaN) * 2;
                     return tmem_SFB_tmp;
-                } else if constexpr (IsSfbUnaligned && !IsPackedSfb) {
+                } else if constexpr (IsSfbUnaligned) {
                     auto tmem_SFB_tmp = tmem_SFB;
                     tmem_SFB_tmp.data() =
                         tmem_SFB_tmp.data().get() + sfb_mma_col;
@@ -813,9 +948,15 @@ struct CollectiveMainloop {
                 mainloop_pipeline.consumer_wait(mainloop_pipe_consumer_state);
             }
 
-            // The overlap WG must finish reading the shared TMEM columns before
-            // the next MMA overwrites them: named barrier (WG arrives, MMA warp
-            // syncs), plus the cluster barrier for the peer CTA in pair-UMMA.
+            // TMEM overlap sync: wait for the overlap warp-group to finish
+            // reading the shared TMEM columns before MMA zeroes the next stage.
+            //
+            // CTA-local part: 1 wg (128 thr) + MMA warp (32 thr) = 160 threads.
+            // The overlap wg does bar.arrive (non-blocking) in the epilogue;
+            // MMA does bar.sync here (blocking, released once the wg arrives).
+            //
+            // Cluster part (pair-UMMA only): additionally wait on the cluster-
+            // scope mbarrier so the non-leader CTA's overlap wg is also done.
             if constexpr (KernelTraits::KTmemOverlapCols > 0) {
                 constexpr int overlap_bar_threads = 4 * 32 + 32;
                 cutlass::arch::NamedBarrier overlap_barrier(
@@ -823,6 +964,8 @@ struct CollectiveMainloop {
                 overlap_barrier.arrive_and_wait();
 
                 if constexpr (KernelTraits::KNumCTA > 1) {
+                    // Wait for all CTAs' overlap wgs to arrive.
+                    // Phase parity alternates each tile iteration.
                     cutlass::arch::ClusterBarrier::wait(
                         &shared_storage.overlap_cluster_bar, overlap_phase);
                     overlap_phase ^= 1;

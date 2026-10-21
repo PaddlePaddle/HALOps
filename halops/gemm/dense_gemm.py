@@ -33,7 +33,6 @@ def dense_gemm(
     alpha: Optional[torch.Tensor] = None,
     sm_count: int = -1,
     mode: str = "w8a8",
-    sfb_packed: Optional[torch.Tensor] = None,
 ) -> None:
     """Dense GEMM on Blackwell SM100 tensor cores.
 
@@ -60,14 +59,6 @@ def dense_gemm(
         alpha: Optional float32 scaling factor with shape [1]. Required for w4a4 mode.
         sm_count: Number of SMs to use (-1 for all available).
         mode: ``"w8a8"`` for FP8 E4M3 GEMM; ``"w4a4"`` for FP4 E2M1 GEMM.
-        sfb_packed: Optional ``pack_sfb_224(sfb, N, K)`` copy of the weight
-            scales (w8a8, no bias). When given, the heuristic may choose the
-            224-column single-CTA or pair tile per call; ``sfb`` is used by
-            the other tiles. Prepare this once when loading the weight, keep
-            it alive for asynchronous calls, and repack when scales change.
-            Keep both formats when one weight serves small and large M: small-M
-            ordinary tiles consume ``sfb`` while selected large-M tiles consume
-            this packed copy.
 
     Returns:
         None. The result is written in-place to output.
@@ -93,5 +84,4 @@ def dense_gemm(
         alpha,
         sm_count,
         mode,
-        sfb_packed,
     )

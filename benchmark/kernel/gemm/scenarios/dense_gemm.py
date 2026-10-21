@@ -135,7 +135,7 @@ def adapt_fi(inp: GemmInput) -> dict:
             "x": inp.x,
             "w": inp.w,
             "a_descale": inp.sfa,
-            "b_descale": inp.sfb.T.contiguous(),
+            "b_descale": inp.sfb,
             "out": inp.out,
             "mode": "w8a8",
         }

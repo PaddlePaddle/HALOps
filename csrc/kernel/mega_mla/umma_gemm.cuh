@@ -45,7 +45,7 @@ struct MegaMlaGemmConfigT : halops::GemmKernelConfig {
     static constexpr int KBiasStages = 1;
     static constexpr int KTmemOverlapCols = 0;
     static constexpr bool UseTileSwizzle = false;
-    static constexpr halops::KernelMode KernelType = halops::KernelMode::Naive;
+    static constexpr halops::KernelMode KernelType = halops::KernelMode::Dense;
     static constexpr bool AddBias = false;
     static constexpr bool SwapAB = true;
     static constexpr bool KIsFP4 = false;

@@ -20,44 +20,7 @@ import torch
 
 import halops.halops_kernel as halops_kernel
 
-__all__ = ["group_wise_quant", "pack_sfb_224"]
-
-
-def pack_sfb_224(sfb: torch.Tensor, n: int, k: int) -> torch.Tensor:
-    """Prepare weight scales for the dense W8A8 224-column tiles.
-
-    Each logical 224-column tile is stored as two aligned 128-row atoms.  The
-    resulting tensor is a one-time weight format with physical shape
-    ``(ceil(n/224)*256, k//32)``. Keep the ordinary SFB as the primary
-    ``dense_gemm`` scale and pass this packed copy through ``sfb_packed`` so
-    dispatch can choose the best format for each M. Repack if scales change.
-
-    ``sfb`` must come from W8A8 ``group_wise_quant(..., use_swizzle=True)``;
-    row-major scales and FP4 scales are incompatible. The returned tensor has
-    the same device and uint8 dtype, owns its storage, and is contiguous.
-    """
-    if sfb.dtype != torch.uint8 or not sfb.is_contiguous():
-        raise ValueError("sfb must be contiguous uint8")
-    if n <= 0 or k <= 0 or n % 128 or k % 128:
-        raise ValueError("n and k must be positive and divisible by 128")
-    if sfb.ndim != 2 or tuple(sfb.shape) != (n, k // 32):
-        raise ValueError("sfb must have shape (n, k//32) in W8A8 SfAtom layout")
-    k_tiles = k // 128
-    n_tiles = (n + 223) // 224
-    src = sfb.view(n // 128, k_tiles, 32, 4, 4)
-    logical = src.permute(0, 3, 2, 1, 4).contiguous().view(n, k // 32)
-    rows = (
-        torch.arange(n_tiles, device=sfb.device)[:, None] * 224
-        + torch.arange(256, device=sfb.device)[None, :]
-    )
-    tile = logical[rows.clamp_max(n - 1)].clone()
-    tile.masked_fill_(rows[:, :, None] >= n, 0)
-    return (
-        tile.view(n_tiles, 2, 4, 32, k_tiles, 4)
-        .permute(0, 1, 4, 3, 2, 5)
-        .contiguous()
-        .view(n_tiles * 256, k // 32)
-    )
+__all__ = ["group_wise_quant"]
 
 
 def group_wise_quant(

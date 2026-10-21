@@ -130,6 +130,16 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
         CollectiveMainloop::TmaTransactionBytesABFor(mainloop_params.m);
 
     mainloop_pipeline_params.initializing_warp = KernelTraits::KLoadABWarpId;
+
+    if constexpr (KernelTraits::IsSfbRowShift) {
+        if (warp_idx == KernelTraits::KSfbTransposeWarpId && lane_predicate) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int s = 0; s < KernelTraits::KPrologueStages; ++s) {
+                cutlass::arch::ClusterTransactionBarrier::init(
+                    &shared_storage.sf_full[s], 1);
+            }
+        }
+    }
     MainloopPipeline mainloop_pipeline(
         shared_storage.mainloop, mainloop_pipeline_params, cluster_shape,
         cute::true_type{},    // Perform barrier init
@@ -214,6 +224,17 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
         }
         main_loop.mma(mainloop_params, mainloop_pipeline, accumulator_pipeline,
                       shared_storage, tmem_storage, tiled_mma, scheduler);
+    // 224-column SFB rewriter, in every CTA. 
+    } else if (KernelTraits::IsSfbRowShift &&
+               warp_idx >= KernelTraits::KSfbTransposeWarpId) {
+        if constexpr (KEpilogueWarpGroupCount != 1) {
+            cutlass::arch::warpgroup_reg_dealloc<KernelTraits::KNumRegsOther>();
+        }
+        if constexpr (KernelTraits::IsSfbRowShift) {
+            main_loop.sfb_shift_rows(
+                mainloop_params, shared_storage, scheduler,
+                warp_idx - KernelTraits::KSfbTransposeWarpId);
+        }
     } else if (warp_idx <= KernelTraits::KEpilogueWarpEndId) {
         if constexpr (KEpilogueWarpGroupCount != 1) {
             cutlass::arch::warpgroup_reg_alloc<
@@ -294,18 +315,18 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
                     " when HasAlpha is true, got ", params.num_experts);
     }
 
-    if constexpr (KernelTraits::KernelType == KernelMode::Naive) {
+    if constexpr (KernelTraits::KernelType == KernelMode::Dense) {
         TORCH_CHECK(params.num_experts == 1,
-                    "Naive gemm_impl requires num_experts == 1, got ",
+                    "Dense gemm_impl requires num_experts == 1, got ",
                     params.num_experts);
         TORCH_CHECK(params.max_m_per_expert == params.m,
-                    "Naive gemm_impl requires max_m_per_expert == M, got "
+                    "Dense gemm_impl requires max_m_per_expert == M, got "
                     "max_m_per_expert=",
                     params.max_m_per_expert, ", M=", params.m);
         TORCH_CHECK(params.masked_m == nullptr,
-                    "Naive gemm_impl requires masked_m to be null");
+                    "Dense gemm_impl requires masked_m to be null");
         TORCH_CHECK(params.expert_ids == nullptr,
-                    "Naive gemm_impl requires expert_ids to be null");
+                    "Dense gemm_impl requires expert_ids to be null");
     } else if constexpr (KernelTraits::KernelType == KernelMode::Masked) {
         TORCH_CHECK(params.max_m_per_expert > 0,
                     "Masked gemm_impl requires max_m_per_expert > 0, got ",
@@ -353,10 +374,17 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
                 "Masked gemm_impl requires max_m_per_expert to be divisible "
                 "by KBlockM=",
                 KernelTraits::KBlockM, ", got ", params.max_m_per_expert);
-            TORCH_CHECK(
-                params.n % KernelTraits::KBlockN == 0,
-                "Masked gemm_impl requires N to be divisible by KBlockN=",
-                KernelTraits::KBlockN, ", got ", params.n);
+            if constexpr (KernelTraits::IsSfbUnaligned) {
+                TORCH_CHECK(params.n % 128 == 0 && params.n >= 384,
+                            "Masked gemm_impl requires N to be a multiple of "
+                            "128 and >= 384 for KBlockN=",
+                            KernelTraits::KBlockN, ", got ", params.n);
+            } else {
+                TORCH_CHECK(
+                    params.n % KernelTraits::KBlockN == 0,
+                    "Masked gemm_impl requires N to be divisible by KBlockN=",
+                    KernelTraits::KBlockN, ", got ", params.n);
+            }
         }
     } else {
         if constexpr (KernelTraits::SwapAB) {
@@ -473,7 +501,8 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
                     : static_cast<TypeSF const*>(params.ptr_sfa),
              SwapAB ? static_cast<TypeSF const*>(params.ptr_sfa)
                     : static_cast<TypeSF const*>(params.ptr_sfb),
-             layout_A, layout_B, layout_SFA, layout_SFB, params.k, params.m});
+             layout_A, layout_B, layout_SFA, layout_SFB, params.k, params.m,
+             num_experts});
 
     EpilogueParams epilogue_params =
         CollectiveEpilogue<KernelTraits>::to_underlying_arguments(

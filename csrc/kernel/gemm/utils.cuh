@@ -43,7 +43,7 @@ namespace halops {
 enum class KernelMode : int32_t {
     Masked = 0,
     Contiguous = 1,
-    Naive = 2,
+    Dense = 2,
     Batch = 3
 };
 
@@ -59,7 +59,7 @@ struct GemmKernelConfig {
     static constexpr int KBiasStages = 2;
     static constexpr int KTmemOverlapCols = 0;
     static constexpr bool UseTileSwizzle = false;
-    static constexpr KernelMode KernelType = KernelMode::Naive;
+    static constexpr KernelMode KernelType = KernelMode::Dense;
     static constexpr bool AddBias = false;
     static constexpr bool SwapAB = false;
     static constexpr bool KIsFP4 = false;
@@ -69,7 +69,6 @@ struct GemmKernelConfig {
     static constexpr int KSfVecSize = 16;
     static constexpr int KNumRegsEpilogue = 208;
     static constexpr bool SkipTmemFence = false;
-    static constexpr bool IsPackedSfb = false;
 };
 
 static constexpr int get_num_warps(int load_c_warp_id, bool add_bias) {

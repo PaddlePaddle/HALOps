@@ -15,9 +15,8 @@
 #include <optional>
 #include <string>
 
-#include "kernel/gemm/gemm_kernel.cuh"
+#include "kernel/gemm/gemm_dispatch.cuh"
 #include "kernel/gemm/gemm_utils.h"
-#include "kernel/gemm/kernel_traits.cuh"
 
 namespace halops {
 
@@ -30,7 +29,6 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
                      const std::string& mode = "w8a8") {
     TORCH_CHECK(mode == "w8a8" || mode == "w4a4", "Unsupported mode: ", mode,
                 ". Expected 'w8a8' or 'w4a4'.");
-
     TORCH_CHECK(input.dim() == 2,
                 "input must be a 2D tensor of shape [num_experts * "
                 "max_m_per_expert, K]");
@@ -46,8 +44,6 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
                 "max_m_per_expert must be greater than 0, got ",
                 max_m_per_expert);
 
-    using OutT = c10::BFloat16;
-    using TypeD = cutlass::bfloat16_t;
     const int m = input.size(0);
     const int n = weight.size(1);
     const int num_experts = weight.size(0);
@@ -61,126 +57,56 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
                 "output shape must be [M, N], got [", output.size(0), ", ",
                 output.size(1), "], expected [", m, ", ", n, "]");
     const cudaStream_t stream = GetCurrentCUDAStream(input);
+    const int sm = sm_count > 0 ? sm_count : GetSmCount();
 
     GemmParams params;
     params.masked_m = masked_m.mutable_data_ptr<int>();
-    params.ptr_d = reinterpret_cast<TypeD*>(output.mutable_data_ptr<OutT>());
+    params.ptr_d = output.data_ptr();
     params.m = m;
     params.n = n;
     params.num_experts = num_experts;
     params.max_m_per_expert = max_m_per_expert;
 
     if (mode == "w8a8") {
-        using T = c10::Float8_e4m3fn;
-        using TypeA = cutlass::float_e4m3_t;
-        using TypeB = cutlass::float_e4m3_t;
-        using TypeC = cutlass::bfloat16_t;
-        using TypeSF = cutlass::float_ue8m0_t;
-        using TypeAccumulate = float;
-
         const int k = weight.size(2);
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),
                     ", weight K=", k);
         params.k = k;
-        params.ptr_a = reinterpret_cast<TypeA*>(input.mutable_data_ptr<T>());
-        params.ptr_b = reinterpret_cast<TypeB*>(weight.mutable_data_ptr<T>());
-        params.ptr_sfa =
-            reinterpret_cast<TypeSF*>(sfa.mutable_data_ptr<uint8_t>());
-        params.ptr_sfb =
-            reinterpret_cast<TypeSF*>(sfb.mutable_data_ptr<uint8_t>());
-
+        params.ptr_a = input.data_ptr();
+        params.ptr_b = weight.data_ptr();
+        params.ptr_sfa = sfa.data_ptr();
+        params.ptr_sfb = sfb.data_ptr();
         if (bias.has_value()) {
-            CheckGemmTileShape(max_m_per_expert, n, k, 256, 128, 128,
-                               "W8A8 masked GEMM bias");
-            using KernelConfig = GemmKernelConfigMaskedBias256x128x128_2CTA;
-            params.ptr_c =
-                reinterpret_cast<TypeC*>(bias.value().mutable_data_ptr<OutT>());
-            gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                      KernelConfig>(params, sm_count, stream);
-        } else {
-            if (max_m_per_expert >= 4096) {
-                CheckGemmTileShape(max_m_per_expert, n, k, 256, 256, 128,
-                                   "W8A8 masked GEMM large M");
-                using KernelConfig =
-                    GemmKernelConfigMaskedNoBias256x256x128_2CTA;
-                gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                          KernelConfig>(params, sm_count, stream);
-            } else if (max_m_per_expert >= 128) {
-                CheckGemmTileShape(max_m_per_expert, n, k, 128, 256, 128,
-                                   "W8A8 masked GEMM mid M");
-                using KernelConfig =
-                    GemmKernelConfigMaskedNoBias128x256x128_1CTA;
-                gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                          KernelConfig>(params, sm_count, stream);
-            } else {
-                CheckDivisible(n, 128, "W8A8 masked GEMM SwapAB N");
-                CheckDivisible(max_m_per_expert, 64,
-                               "W8A8 masked GEMM SwapAB max_m_per_expert");
-                CheckDivisible(k, 256, "W8A8 masked GEMM SwapAB K");
-                using KernelConfig =
-                    GemmKernelConfigMaskedNoBias128x64x256_SwapAB_1CTA;
-                gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                          KernelConfig>(params, sm_count, stream);
-            }
+            params.ptr_c = bias->data_ptr();
         }
+        LaunchCfg<KernelMode::Masked, MmaKind::MXFP8FP4>(
+            params,
+            {.m = max_m_per_expert, .n = n, .k = k, .m_grid = m,
+             .sm_count = sm, .has_bias = bias.has_value()},
+            stream);
     } else {
-        using TypeA = cutlass::float_e2m1_t;
-        using TypeB = cutlass::float_e2m1_t;
-        using TypeC = cutlass::bfloat16_t;
-        using TypeSF = cutlass::float_ue4m3_t;
-        using TypeAccumulate = float;
-        using PackedT = uint8_t;
-
-        // K in elements = packed_bytes * 2 (2 FP4 per byte)
-        const int k = weight.size(2) * 2;
+        const int k = weight.size(2) * 2;  // 2 FP4 per packed byte
         TORCH_CHECK(
             input.size(1) == weight.size(2),
             "packed input K/2 must match packed weight K/2, got input K/2=",
             input.size(1), ", weight K/2=", weight.size(2));
         CheckDivisible(k, 64, "W4A4 masked GEMM K");
         params.k = k;
-        params.ptr_a =
-            reinterpret_cast<TypeA*>(input.mutable_data_ptr<PackedT>());
-        params.ptr_b =
-            reinterpret_cast<TypeB*>(weight.mutable_data_ptr<PackedT>());
-        params.ptr_sfa =
-            reinterpret_cast<TypeSF*>(sfa.mutable_data_ptr<uint8_t>());
-        params.ptr_sfb =
-            reinterpret_cast<TypeSF*>(sfb.mutable_data_ptr<uint8_t>());
+        params.ptr_a = input.data_ptr();
+        params.ptr_b = weight.data_ptr();
+        params.ptr_sfa = sfa.data_ptr();
+        params.ptr_sfb = sfb.data_ptr();
         TORCH_CHECK(
             alpha.has_value(),
             "W4A4 mode requires alpha input (per-expert scaling factor).");
-        params.ptr_alpha = alpha.value().data_ptr<float>();
-
-        if (!bias.has_value()) {
-            if (max_m_per_expert >= 4096) {
-                CheckGemmTileShape(max_m_per_expert, n, k, 256, 256, 256,
-                                   "W4A4 masked GEMM large M");
-                using KernelConfig =
-                    GemmKernelConfigW4A4MaskedNoBias256x256x256_2CTA;
-                gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                          KernelConfig>(params, sm_count, stream);
-            } else if (max_m_per_expert > 128) {
-                CheckGemmTileShape(max_m_per_expert, n, k, 128, 256, 256,
-                                   "W4A4 masked GEMM mid M");
-                using KernelConfig =
-                    GemmKernelConfigW4A4MaskedNoBias128x256x256_1CTA;
-                gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                          KernelConfig>(params, sm_count, stream);
-            } else {
-                CheckDivisible(n, 128, "W4A4 masked GEMM SwapAB N");
-                CheckDivisible(max_m_per_expert, 64,
-                               "W4A4 masked GEMM SwapAB max_m_per_expert");
-                CheckDivisible(k, 512, "W4A4 masked GEMM SwapAB K");
-                using KernelConfig =
-                    GemmKernelConfigW4A4MaskedNoBias128x64x512_1CTA;
-                gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                          KernelConfig>(params, sm_count, stream);
-            }
-        } else {
-            TORCH_CHECK(false, "W4A4 mode does not support bias yet.");
-        }
+        params.ptr_alpha = alpha->data_ptr<float>();
+        TORCH_CHECK(!bias.has_value(), "W4A4 mode does not support bias yet.");
+        LaunchCfg<KernelMode::Masked, MmaKind::NVFP4>(
+            params,
+            {.m = max_m_per_expert, .n = n, .k = k, .m_grid = m,
+             .sm_count = sm, .has_bias = false},
+            stream);
     }
 }
 

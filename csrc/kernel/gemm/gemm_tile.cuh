@@ -12,32 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// GEMM tile configs: `GemmTile` parameter lists named by `GemmKernelConfig...`
-// aliases. Dispatch catalogs and selectors live in dense_cfgs.cuh.
-
 #pragma once
+
+#include <array>
+#include <cstdint>
 
 #include "kernel/gemm/utils.cuh"
 
 namespace halops {
 
-//   BM, BN, BK    KBlockM/N/K; for SwapAB, BM is the weight's M and BN the
-//                 activation extent.
-//   PST, EST      prologue (mainloop) / epilogue pipeline depth.
-//   CM, CN        cluster shape; IsPairUmma = CM*CN > 1.
-//   OVLP          KTmemOverlapCols.
-//   REG           KNumRegsEpilogue; 160 is the Reg160 occupancy variant.
-//   SWZ, PSFB     UseTileSwizzle, IsPackedSfb.
-//   FENCE         SkipTmemFence.
-//   SWAP, FP4     SwapAB, KIsFP4.
-//   SFVS          KSfVecSize: 16 = NVFP4, 32 = MXFP4.
-//   ALPHA, BIAS   HasAlpha, AddBias.
-//   MODE          KernelType.
 template <int BM, int BN, int BK, int PST, int EST, int CM = 1, int CN = 1,
-          int OVLP = 0, int REG = 208, bool SWZ = false, bool PSFB = false,
-          bool FENCE = false, bool SWAP = false, bool FP4 = false,
-          int SFVS = 16, bool ALPHA = false, bool BIAS = false,
-          KernelMode MODE = KernelMode::Naive>
+          int OVLP = 0, int REG = 208, bool SWZ = false, bool FENCE = false,
+          bool SWAP = false, bool FP4 = false, int SFVS = 16,
+          bool ALPHA = false, bool BIAS = false,
+          KernelMode MODE = KernelMode::Dense>
 struct GemmTile : GemmKernelConfig {
     static constexpr int KBlockM = BM;
     static constexpr int KBlockN = BN;
@@ -50,7 +38,6 @@ struct GemmTile : GemmKernelConfig {
     static constexpr int KNumRegsEpilogue = REG;
     static constexpr bool SkipTmemFence = FENCE;
     static constexpr bool UseTileSwizzle = SWZ;
-    static constexpr bool IsPackedSfb = PSFB;
     static constexpr bool SwapAB = SWAP;
     static constexpr bool KIsFP4 = FP4;
     static constexpr int KSfVecSize = SFVS;
@@ -60,214 +47,206 @@ struct GemmTile : GemmKernelConfig {
     static constexpr bool IsPairUmma = (CM * CN) > 1;
 };
 
-using GemmKernelConfigNaiveNoBias256x256x128_2CTA =
-    GemmTile<256, 256, 128, 6, 2, 2, 1, 16>;
+struct TileSpec {
+    int block_m = 0;           // KBlockM
+    int block_n = 0;           // KBlockN
+    int block_k = 0;           // KBlockK
+    int main_stages = 2;       // KPrologueStages
+    int epi_stages = 2;        // KEpilogueStages
+    int cluster_m = 1;         // KClusterM
+    int cluster_n = 1;         // KClusterN
+    int tmem_overlap = 0;      // KTmemOverlapCols
+    int epi_regs = 208;        // KNumRegsEpilogue; 160 trades regs for occ.
+    bool swap_ab = false;      // SwapAB: the activation moves to the MMA's N
+    bool skip_fence = false;   // SkipTmemFence
+    bool swizzle = false;      // UseTileSwizzle
+    bool bias = false;         // AddBias
 
-using GemmKernelConfigNaiveNoBias256x192x128_2CTA =
-    GemmTile<256, 192, 128, 7, 2, 2, 1, 0, 208, false, false, true>;
+    // Dispatch policy, not kernel parameters.
+    bool dense_only = false;   // only tuned/allowed for the dense launcher
+    bool searchable = true;    // may the cost model pick it?
 
-struct GemmKernelConfigNaiveNoBias256x192x128_2CTA_Reg160
-    : GemmKernelConfigNaiveNoBias256x192x128_2CTA {
-    static constexpr int KNumRegsEpilogue = 160;
+    constexpr bool pair() const { return cluster_m * cluster_n > 1; }
+    // Activation-tile rows/cols; SwapAB swaps the two MMA dimensions.
+    constexpr int act_m() const { return swap_ab ? block_n : block_m; }
+    constexpr int act_n() const { return swap_ab ? block_m : block_n; }
+
+    friend constexpr bool operator==(const TileSpec&,
+                                     const TileSpec&) = default;
 };
 
-using GemmKernelConfigNaiveNoBias256x224x128_2CTA =
-    GemmTile<256, 224, 128, 6, 2, 2>;
-
-// SFB prepacked per 224-column tile as two aligned 128-row atoms (no remap).
-struct GemmKernelConfigNaiveNoBias256x224x128_2CTA_PackedSfb
-    : GemmKernelConfigNaiveNoBias256x224x128_2CTA {
-    static constexpr bool IsPackedSfb = true;
+enum class MmaKind : int32_t {
+    BF16 = 0,
+    MXFP8FP4 = 1,
+    MXFP4 = 2,
+    NVFP4 = 3,
 };
 
-struct GemmKernelConfigNaiveNoBias256x224x128_2CTA_PackedSfb_Reg160
-    : GemmKernelConfigNaiveNoBias256x224x128_2CTA_PackedSfb {
-    static constexpr int KNumRegsEpilogue = 160;
-    static constexpr bool SkipTmemFence = true;
+template <MmaKind Kind>
+struct MmaTraits;
+
+template <>
+struct MmaTraits<MmaKind::MXFP8FP4> {
+    using Operand = cutlass::float_e4m3_t;
+    using Output = cutlass::bfloat16_t;
+    using Scale = cutlass::float_ue8m0_t;
+    static constexpr bool kFp4 = false;
+    static constexpr int kSfVecSize = 16;
+    static constexpr bool kHasAlpha = false;
+    static constexpr const char* kName = "w8a8";
 };
 
-// Packed SFB frees enough SMEM for a 7th prologue stage.
-struct GemmKernelConfigNaiveNoBias256x224x128_2CTA_PackedSfb_Reg160_Stage7
-    : GemmKernelConfigNaiveNoBias256x224x128_2CTA_PackedSfb_Reg160 {
-    static constexpr int KPrologueStages = 7;
+template <>
+struct MmaTraits<MmaKind::NVFP4> {
+    using Operand = cutlass::float_e2m1_t;
+    using Output = cutlass::bfloat16_t;
+    using Scale = cutlass::float_ue4m3_t;
+    static constexpr bool kFp4 = true;
+    static constexpr int kSfVecSize = 16;
+    static constexpr bool kHasAlpha = true;
+    static constexpr const char* kName = "nvfp4";
 };
 
-using GemmKernelConfigNaiveNoBias128x256x128_1CTA =
-    GemmTile<128, 256, 128, 4, 2, 1, 1, 16>;
-
-// Half-N variant for problems whose 128x256 grid underfills the GPU.
-using GemmKernelConfigNaiveNoBias128x128x128_1CTA =
-    GemmTile<128, 128, 128, 6, 2>;
-
-// Half-N pair-UMMA tile: twice the tiles and room for 8 mainloop stages.
-using GemmKernelConfigNaiveNoBias256x128x128_2CTA =
-    GemmTile<256, 128, 128, 8, 2, 2>;
-
-using GemmKernelConfigNaiveNoBias128x64x256_SwapAB_1CTA =
-    GemmTile<128, 64, 256, 4, 7, 1, 1, 0, 208, false, false, false, true>;
-
-// SwapAB with a 16-row activation tile for M <= 16.
-using GemmKernelConfigNaiveNoBias128x16x256_SwapAB_1CTA =
-    GemmTile<128, 16, 256, 5, 7, 1, 1, 0, 208, false, false, false, true>;
-
-struct
-    GemmKernelConfigNaiveNoBias256x224x128_2CTA_PackedSfb_Reg160_Stage7_Swizzle
-    : GemmKernelConfigNaiveNoBias256x224x128_2CTA_PackedSfb_Reg160_Stage7 {
-    static constexpr bool UseTileSwizzle = true;
+template <>
+struct MmaTraits<MmaKind::MXFP4> {
+    using Operand = cutlass::float_e2m1_t;
+    using Output = cutlass::bfloat16_t;
+    using Scale = cutlass::float_ue8m0_t;
+    static constexpr bool kFp4 = true;
+    static constexpr int kSfVecSize = 32;
+    static constexpr bool kHasAlpha = false;
+    static constexpr const char* kName = "mxfp4";
 };
 
-using GemmKernelConfigNaiveNoBias128x64x128_1CTA = GemmTile<128, 64, 128, 9, 2>;
+template <MmaKind Kind, KernelMode Mode, TileSpec S>
+using MakeTile = GemmTile<S.block_m, S.block_n, S.block_k, S.main_stages,
+                          S.epi_stages, S.cluster_m, S.cluster_n,
+                          S.tmem_overlap, S.epi_regs, S.swizzle, S.skip_fence,
+                          S.swap_ab, MmaTraits<Kind>::kFp4,
+                          MmaTraits<Kind>::kSfVecSize,
+                          MmaTraits<Kind>::kHasAlpha, S.bias, Mode>;
 
-using GemmKernelConfigNaiveNoBias256x64x128_2CTA =
-    GemmTile<256, 64, 128, 8, 2, 2>;
+// Fp8
+constexpr TileSpec kFp8_128x256 = {
+    .block_m = 128, .block_n = 256, .block_k = 128, .main_stages = 4,
+    .tmem_overlap = 16};
+constexpr TileSpec kFp8_256x256_pair = {
+    .block_m = 256, .block_n = 256, .block_k = 128, .main_stages = 6,
+    .cluster_m = 2, .tmem_overlap = 16};
+constexpr TileSpec kFp8_256x128_pair = {
+    .block_m = 256, .block_n = 128, .block_k = 128, .main_stages = 8,
+    .cluster_m = 2, .dense_only = true};
+constexpr TileSpec kFp8_128x128 = {
+    .block_m = 128, .block_n = 128, .block_k = 128, .main_stages = 6,
+    .dense_only = true};
+constexpr TileSpec kFp8_256x192_pair_reg160 = {
+    .block_m = 256, .block_n = 192, .block_k = 128, .main_stages = 7,
+    .cluster_m = 2, .epi_regs = 160, .skip_fence = true, .dense_only = true};
+constexpr TileSpec kFp8_128x64x256_swap = {
+    .block_m = 128, .block_n = 64, .block_k = 256, .main_stages = 4,
+    .epi_stages = 7, .swap_ab = true};
+constexpr TileSpec kFp8_128x16x256_swap = {
+    .block_m = 128, .block_n = 16, .block_k = 256, .main_stages = 5,
+    .epi_stages = 7, .swap_ab = true, .dense_only = true, .searchable = false};
+constexpr TileSpec kFp8_128x64 = {
+    .block_m = 128, .block_n = 64, .block_k = 128, .main_stages = 9,
+    .dense_only = true};
+constexpr TileSpec kFp8_256x64_pair = {
+    .block_m = 256, .block_n = 64, .block_k = 128, .main_stages = 8,
+    .cluster_m = 2, .dense_only = true};
+constexpr TileSpec kFp8_128x224 = {
+    .block_m = 128, .block_n = 224, .block_k = 128, .main_stages = 4,
+    .epi_regs = 160};
+constexpr TileSpec kFp8_256x224_pair_reg160 = {
+    .block_m = 256, .block_n = 224, .block_k = 128, .main_stages = 7,
+    .cluster_m = 2, .epi_regs = 160, .skip_fence = true};
+constexpr TileSpec kFp8_256x224_pair_reg160_swizzle = {
+    .block_m = 256, .block_n = 224, .block_k = 128, .main_stages = 7,
+    .cluster_m = 2, .epi_regs = 160, .skip_fence = true, .swizzle = true,
+    .dense_only = true};
+constexpr TileSpec kFp8_256x128_bias = {
+    .block_m = 256, .block_n = 128, .block_k = 128, .main_stages = 6,
+    .epi_stages = 3, .cluster_m = 2, .bias = true, .searchable = false};
 
-// One wave (8 x 19 tiles) on 152 SMs for 1024 x 4096; packed SFB.
-using GemmKernelConfig128x224x128_1CTA_PackedSfb =
-    GemmTile<128, 224, 128, 4, 2, 1, 1, 0, 160, false, true>;
+// Fp4 (shared by NVFP4 and MXFP4)
+constexpr TileSpec kFp4_128x256 = {
+    .block_m = 128, .block_n = 256, .block_k = 256, .main_stages = 4,
+    .tmem_overlap = 48};
+constexpr TileSpec kFp4_128x256_reg160 = {
+    .block_m = 128, .block_n = 256, .block_k = 256, .main_stages = 4,
+    .tmem_overlap = 48, .epi_regs = 160, .skip_fence = true,
+    .dense_only = true};
+constexpr TileSpec kFp4_128x64x512_swap = {
+    .block_m = 128, .block_n = 64, .block_k = 512, .main_stages = 4,
+    .epi_stages = 7, .swap_ab = true};
+constexpr TileSpec kFp4_128x64x512_swap_reg160 = {
+    .block_m = 128, .block_n = 64, .block_k = 512, .main_stages = 4,
+    .epi_stages = 7, .epi_regs = 160, .swap_ab = true, .skip_fence = true,
+    .dense_only = true};
+constexpr TileSpec kFp4_128x32x256_swap = {
+    .block_m = 128, .block_n = 32, .block_k = 256, .main_stages = 9,
+    .epi_stages = 7, .swap_ab = true, .dense_only = true};
+constexpr TileSpec kFp4_128x16x256_swap_reg160 = {
+    .block_m = 128, .block_n = 16, .block_k = 256, .main_stages = 10,
+    .epi_stages = 7, .epi_regs = 160, .swap_ab = true, .skip_fence = true,
+    .dense_only = true};
+constexpr TileSpec kFp4_128x128x256_swap = {
+    .block_m = 128, .block_n = 128, .block_k = 256, .main_stages = 6,
+    .epi_stages = 3, .swap_ab = true, .dense_only = true};
+constexpr TileSpec kFp4_256x128_pair = {
+    .block_m = 256, .block_n = 128, .block_k = 256, .main_stages = 8,
+    .epi_stages = 3, .cluster_m = 2, .dense_only = true};
+constexpr TileSpec kFp4_256x256_pair = {
+    .block_m = 256, .block_n = 256, .block_k = 256, .main_stages = 5,
+    .cluster_m = 2, .tmem_overlap = 48};
+constexpr TileSpec kFp4_256x256_pair_reg160 = {
+    .block_m = 256, .block_n = 256, .block_k = 256, .main_stages = 5,
+    .cluster_m = 2, .tmem_overlap = 48, .epi_regs = 160, .skip_fence = true,
+    .dense_only = true};
 
-using GemmKernelConfigNaiveBias256x128x128_2CTA =
-    GemmTile<256, 128, 128, 6, 3, 2, 1, 0, 208, false, false, false, false,
-             false, 16, false, true>;
+// Candidate tiles per MmaKind.
+inline constexpr std::array<TileSpec, 13> kFp8Tiles = {
+    kFp8_128x256,
+    kFp8_256x256_pair,
+    kFp8_256x128_pair,
+    kFp8_128x128,
+    kFp8_256x192_pair_reg160,
+    kFp8_128x64x256_swap,
+    kFp8_128x16x256_swap,
+    kFp8_128x64,
+    kFp8_256x64_pair,
+    kFp8_128x224,
+    kFp8_256x224_pair_reg160,
+    kFp8_256x224_pair_reg160_swizzle,
+    kFp8_256x128_bias,
+};
 
-using GemmKernelConfigContiguousNoBias256x256x128_2CTA =
-    GemmTile<256, 256, 128, 6, 2, 2, 1, 16, 208, false, false, false, false,
-             false, 16, false, false, KernelMode::Contiguous>;
+inline constexpr std::array<TileSpec, 10> kFp4Tiles = {
+    kFp4_128x256,
+    kFp4_128x256_reg160,
+    kFp4_128x64x512_swap,
+    kFp4_128x64x512_swap_reg160,
+    kFp4_128x32x256_swap,
+    kFp4_128x16x256_swap_reg160,
+    kFp4_128x128x256_swap,
+    kFp4_256x128_pair,
+    kFp4_256x256_pair,
+    kFp4_256x256_pair_reg160,
+};
 
-using GemmKernelConfigContiguousNoBias128x256x128_1CTA =
-    GemmTile<128, 256, 128, 4, 2, 1, 1, 16, 208, false, false, false, false,
-             false, 16, false, false, KernelMode::Contiguous>;
-
-using GemmKernelConfigContiguousNoBias128x64x256_SwapAB_1CTA =
-    GemmTile<128, 64, 256, 4, 7, 1, 1, 0, 208, false, false, false, true, false,
-             16, false, false, KernelMode::Contiguous>;
-
-using GemmKernelConfigContiguousBias256x128x128_2CTA =
-    GemmTile<256, 128, 128, 6, 3, 2, 1, 0, 208, false, false, false, false,
-             false, 16, false, true, KernelMode::Contiguous>;
-
-using GemmKernelConfigMaskedNoBias128x64x256_SwapAB_1CTA =
-    GemmTile<128, 64, 256, 4, 7, 1, 1, 0, 208, false, false, false, true, false,
-             16, false, false, KernelMode::Masked>;
-
-using GemmKernelConfigMaskedNoBias128x256x128_1CTA =
-    GemmTile<128, 256, 128, 4, 2, 1, 1, 16, 208, false, false, false, false,
-             false, 16, false, false, KernelMode::Masked>;
-
-using GemmKernelConfigMaskedBias256x128x128_2CTA =
-    GemmTile<256, 128, 128, 6, 3, 2, 1, 0, 208, false, false, false, false,
-             false, 16, false, true, KernelMode::Masked>;
-
-using GemmKernelConfigMaskedNoBias256x256x128_2CTA =
-    GemmTile<256, 256, 128, 6, 2, 2, 1, 16, 208, false, false, false, false,
-             false, 16, false, false, KernelMode::Masked>;
-
-// W4A4 (NVFP4): e2m1 inputs, SF vector size 16, MMA K = 64.
-
-using GemmKernelConfigW4A4NaiveNoBias256x256x256_2CTA =
-    GemmTile<256, 256, 256, 5, 2, 2, 1, 48, 208, false, false, false, false,
-             true, 16, true>;
-
-using GemmKernelConfigW4A4NaiveNoBias128x256x256_1CTA =
-    GemmTile<128, 256, 256, 4, 2, 1, 1, 48, 208, false, false, false, false,
-             true, 16, true>;
-
-using GemmKernelConfigW4A4NaiveNoBias128x64x512_1CTA =
-    GemmTile<128, 64, 512, 4, 7, 1, 1, 0, 208, false, false, false, true, true,
-             16, true>;
-
-using GemmKernelConfigW4A4ContiguousNoBias256x256x256_2CTA =
-    GemmTile<256, 256, 256, 5, 2, 2, 1, 48, 208, false, false, false, false,
-             true, 16, true, false, KernelMode::Contiguous>;
-
-using GemmKernelConfigW4A4ContiguousNoBias128x256x256_1CTA =
-    GemmTile<128, 256, 256, 4, 2, 1, 1, 48, 208, false, false, false, false,
-             true, 16, true, false, KernelMode::Contiguous>;
-
-using GemmKernelConfigW4A4ContiguousNoBias128x64x512_1CTA =
-    GemmTile<128, 64, 512, 4, 7, 1, 1, 0, 208, false, false, false, true, true,
-             16, true, false, KernelMode::Contiguous>;
-
-// Batch mode: Contiguous tiles, expert index derived arithmetically (no
-// expert_ids).
-
-using GemmKernelConfigBatchNoBias256x256x128_2CTA =
-    GemmTile<256, 256, 128, 6, 2, 2, 1, 16, 208, false, false, false, false,
-             false, 16, false, false, KernelMode::Batch>;
-
-using GemmKernelConfigBatchNoBias128x256x128_1CTA =
-    GemmTile<128, 256, 128, 4, 2, 1, 1, 16, 208, false, false, false, false,
-             false, 16, false, false, KernelMode::Batch>;
-
-using GemmKernelConfigBatchNoBias128x64x256_SwapAB_1CTA =
-    GemmTile<128, 64, 256, 4, 7, 1, 1, 0, 208, false, false, false, true, false,
-             16, false, false, KernelMode::Batch>;
-
-using GemmKernelConfigBatchBias256x128x128_2CTA =
-    GemmTile<256, 128, 128, 6, 3, 2, 1, 0, 208, false, false, false, false,
-             false, 16, false, true, KernelMode::Batch>;
-
-using GemmKernelConfigW4A4BatchNoBias256x256x256_2CTA =
-    GemmTile<256, 256, 256, 5, 2, 2, 1, 48, 208, false, false, false, false,
-             true, 16, true, false, KernelMode::Batch>;
-
-using GemmKernelConfigW4A4BatchNoBias128x256x256_1CTA =
-    GemmTile<128, 256, 256, 4, 2, 1, 1, 48, 208, false, false, false, false,
-             true, 16, true, false, KernelMode::Batch>;
-
-using GemmKernelConfigW4A4BatchNoBias128x64x512_1CTA =
-    GemmTile<128, 64, 512, 4, 7, 1, 1, 0, 208, false, false, false, true, true,
-             16, true, false, KernelMode::Batch>;
-
-using GemmKernelConfigW4A4MaskedNoBias256x256x256_2CTA =
-    GemmTile<256, 256, 256, 5, 2, 2, 1, 48, 208, false, false, false, false,
-             true, 16, true, false, KernelMode::Masked>;
-
-using GemmKernelConfigW4A4MaskedNoBias128x256x256_1CTA =
-    GemmTile<128, 256, 256, 4, 2, 1, 1, 48, 208, false, false, false, false,
-             true, 16, true, false, KernelMode::Masked>;
-
-using GemmKernelConfigW4A4MaskedNoBias128x64x512_1CTA =
-    GemmTile<128, 64, 512, 4, 7, 1, 1, 0, 208, false, false, false, true, true,
-             16, true, false, KernelMode::Masked>;
-
-// W4A4 tile variants derived from the base aliases above.
-
-#define IR_W4A4_SWAPAB(NAME, ACT, KB, PST, EST)                             \
-    using NAME =                                                            \
-        GemmTile<128, ACT, KB, PST, EST, 1, 1, 0, 208, false, false, false, \
-                 /*SWAP=*/true, /*FP4=*/true, 16, /*ALPHA=*/true>;
-#define IR_W4A4_PLAIN(NAME, BM, BN, KB, PAIR, PST, EST, OVLP)               \
-    using NAME =                                                            \
-        GemmTile<BM, BN, KB, PST, EST, (PAIR) ? 2 : 1, 1, OVLP, 208, false, \
-                 false, false, false, /*FP4=*/true, 16, /*ALPHA=*/true>;
-#define IR_W4A4_REG160(NAME, BASE)                   \
-    struct NAME : BASE {                             \
-        static constexpr int KNumRegsEpilogue = 160; \
-        static constexpr bool SkipTmemFence = true;  \
-    };
-#define IR_W4A4_EPI(NAME, BASE, EST)                \
-    struct NAME : BASE {                            \
-        static constexpr int KEpilogueStages = EST; \
-    };
-
-IR_W4A4_REG160(GemmKernelConfigW4A4NaiveNoBias256x256x256_2CTA_Reg160,
-               GemmKernelConfigW4A4NaiveNoBias256x256x256_2CTA)
-IR_W4A4_REG160(GemmKernelConfigW4A4NaiveNoBias128x256x256_1CTA_Reg160,
-               GemmKernelConfigW4A4NaiveNoBias128x256x256_1CTA)
-IR_W4A4_REG160(GemmKernelConfigW4A4NaiveNoBias128x64x512_1CTA_Reg160,
-               GemmKernelConfigW4A4NaiveNoBias128x64x512_1CTA)
-IR_W4A4_SWAPAB(GemmKernelConfigW4A4NaiveNoBiasSwA128x32x256_S9, 32, 256, 9, 7)
-IR_W4A4_SWAPAB(GemmKernelConfigW4A4NaiveNoBiasSwA128x128x256_S6, 128, 256, 6, 3)
-IR_W4A4_SWAPAB(GemmKernelConfigW4A4NaiveNoBiasSwA128x16x256_S10, 16, 256, 10, 7)
-IR_W4A4_REG160(GemmKernelConfigW4A4NaiveNoBiasSwA128x16x256_S10_Reg160,
-               GemmKernelConfigW4A4NaiveNoBiasSwA128x16x256_S10)
-IR_W4A4_PLAIN(GemmKernelConfigW4A4NaiveNoBias256x128x256_2CTA_S8, 256, 128, 256,
-              true, 8, 2, 0)
-IR_W4A4_EPI(GemmKernelConfigW4A4NaiveNoBias256x128x256_2CTA_S8_E3,
-            GemmKernelConfigW4A4NaiveNoBias256x128x256_2CTA_S8, 3)
-#undef IR_W4A4_SWAPAB
-#undef IR_W4A4_PLAIN
-#undef IR_W4A4_REG160
-#undef IR_W4A4_EPI
+template <MmaKind Kind>
+struct CandidateTiles;
+template <>
+struct CandidateTiles<MmaKind::MXFP8FP4> {
+    static constexpr const auto& tiles = kFp8Tiles;
+};
+template <>
+struct CandidateTiles<MmaKind::NVFP4> {
+    static constexpr const auto& tiles = kFp4Tiles;
+};
+template <>
+struct CandidateTiles<MmaKind::MXFP4> {
+    static constexpr const auto& tiles = kFp4Tiles;
+};
 
 }  // namespace halops
