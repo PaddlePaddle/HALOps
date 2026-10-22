@@ -32,23 +32,24 @@ constexpr float FP8_E4M3_MAX = 448.0f;
 constexpr float FP4_E2M1_MAX = 6.0f;
 
 enum class QuantMode : int32_t {
-    W8A8 = 0,
+    W8A8MXFP8 = 0,
     W4A4MXFP4 = 1,
     W4A4NVFP4 = 2,
 };
 
-constexpr bool IsFp4(QuantMode mode) { return mode != QuantMode::W8A8; }
+constexpr bool IsFp4(QuantMode mode) { return mode != QuantMode::W8A8MXFP8; }
 
 constexpr int GroupSize(QuantMode mode) {
     return mode == QuantMode::W4A4NVFP4 ? 16 : 32;
 }
 
 QuantMode ParseQuantMode(const std::string& mode) {
-    TORCH_CHECK(mode == "w8a8" || mode == "w4a4-mxfp4" || mode == "w4a4-nvfp4",
-                "Unsupported quantization mode: ", mode,
-                ". Expected 'w8a8', 'w4a4-mxfp4' or 'w4a4-nvfp4'.");
-    if (mode == "w8a8") {
-        return QuantMode::W8A8;
+    TORCH_CHECK(
+        mode == "w8a8-mxfp8" || mode == "w4a4-mxfp4" || mode == "w4a4-nvfp4",
+        "Unsupported quantization mode: ", mode,
+        ". Expected 'w8a8-mxfp8', 'w4a4-mxfp4' or 'w4a4-nvfp4'.");
+    if (mode == "w8a8-mxfp8") {
+        return QuantMode::W8A8MXFP8;
     }
     if (mode == "w4a4-mxfp4") {
         return QuantMode::W4A4MXFP4;
@@ -264,10 +265,10 @@ void LaunchGroupWiseQuantForMode(const T* input, void* output_quant,
                                  void* output_sf, int m, int k, int kb_dim,
                                  QuantMode mode, bool use_swizzle, int grid_dim,
                                  int block_dim, cudaStream_t stream) {
-    if (mode == QuantMode::W8A8) {
-        LaunchGroupWiseQuant<T, QuantMode::W8A8>(input, output_quant, output_sf,
-                                                 m, k, kb_dim, use_swizzle,
-                                                 grid_dim, block_dim, stream);
+    if (mode == QuantMode::W8A8MXFP8) {
+        LaunchGroupWiseQuant<T, QuantMode::W8A8MXFP8>(
+            input, output_quant, output_sf, m, k, kb_dim, use_swizzle, grid_dim,
+            block_dim, stream);
     } else if (mode == QuantMode::W4A4MXFP4) {
         LaunchGroupWiseQuant<T, QuantMode::W4A4MXFP4>(
             input, output_quant, output_sf, m, k, kb_dim, use_swizzle, grid_dim,

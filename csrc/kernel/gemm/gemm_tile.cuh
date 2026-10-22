@@ -93,7 +93,7 @@ struct MmaTraits<MmaKind::MXFP8> {
     static constexpr bool kFp4 = false;
     static constexpr int kSfVecSize = 16;
     static constexpr bool kHasAlpha = false;
-    static constexpr const char* kName = "w8a8";
+    static constexpr const char* kName = "w8a8-mxfp8";
 };
 
 template <>

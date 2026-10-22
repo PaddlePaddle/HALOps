@@ -163,7 +163,7 @@ def _make_weight(n: int, k: int, gen: torch.Generator, dev: str) -> Weight:
     from halops.gemm.group_wise_quant import group_wise_quant
 
     w = torch.randn((n, k), generator=gen, device=dev, dtype=torch.bfloat16) * 0.02
-    q, sf = group_wise_quant(w, mode="w8a8", use_swizzle=True)
+    q, sf = group_wise_quant(w, mode="w8a8-mxfp8", use_swizzle=True)
     return Weight(q=q, sf=sf)
 
 
@@ -397,7 +397,9 @@ def _gemm(a: torch.Tensor, w: Weight) -> torch.Tensor:
     if tp != t:
         a_pad = torch.zeros((tp, k), dtype=torch.bfloat16, device=a.device)
         a_pad[:t] = a
-    aq, asf = group_wise_quant(a_pad.to(torch.bfloat16), mode="w8a8", use_swizzle=True)
+    aq, asf = group_wise_quant(
+        a_pad.to(torch.bfloat16), mode="w8a8-mxfp8", use_swizzle=True
+    )
     out = torch.zeros((tp, w.q.shape[0]), dtype=torch.bfloat16, device=a.device)
     dense_gemm(aq, w.q, asf, w.sf, out)
     return out[:t]

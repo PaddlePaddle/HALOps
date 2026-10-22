@@ -400,7 +400,7 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
                 KernelTraits::KBlockN, ", got ", params.m);
         } else {
             TORCH_CHECK(params.m % KernelTraits::KBlockM == 0 ||
-                            (KernelTraits::KDenseW8A8 &&
+                            (KernelTraits::KDenseW8A8MXFP8 &&
                              params.m <= KernelTraits::KBlockM),
                         "gemm_impl requires M to be divisible by KBlockM=",
                         KernelTraits::KBlockM, ", got ", params.m);

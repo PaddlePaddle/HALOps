@@ -33,11 +33,11 @@ from tests.utils.fp4_utils import (
 )
 
 # Comparison tolerances shared by the GEMM tests.
-W8A8_TOL = dict(rtol=2e-2, atol=2e-3)
+W8A8_MXFP8_TOL = dict(rtol=2e-2, atol=2e-3)
 W4A4_TOL = dict(rtol=5e-2, atol=5e-2)
 
 # =====================================================================
-# FP8 (W8A8) quantization helpers
+# FP8 (W8A8-MXFP8) quantization helpers
 # =====================================================================
 
 

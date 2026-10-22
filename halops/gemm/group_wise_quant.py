@@ -25,13 +25,13 @@ __all__ = ["group_wise_quant"]
 
 def group_wise_quant(
     input: torch.Tensor,
-    mode: str = "w8a8",
+    mode: str = "w8a8-mxfp8",
     use_swizzle: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Group-wise quantization from BF16/FP16 to FP8/FP4 with scale factors.
 
     Quantizes a 2D BF16/FP16 tensor per group along K, producing both the
-    quantized data and the block-scale tensor. Supports FP8 (W8A8) and
+    quantized data and the block-scale tensor. Supports FP8 (W8A8-MXFP8) and
     FP4 (W4A4) quantization. The FP4 recipe is selected explicitly by
     ``mode``.
 
@@ -40,7 +40,7 @@ def group_wise_quant(
 
     Args:
         input: [m, k] CUDA tensor, dtype bfloat16 or float16. Source tensor.
-        mode: ``"w8a8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``. Selects both
+        mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``. Selects both
             the value encoding and the scale recipe.
         use_swizzle: ``True`` to output scales in the CUTLASS SfAtom 128x4
             interleaved layout consumed by the GEMM kernels; ``False`` for a
@@ -54,7 +54,7 @@ def group_wise_quant(
           ``m_tile`` is ``m`` for ``use_swizzle=False`` and for ``m < 128``;
           with ``use_swizzle=True`` it is padded up to the next multiple of 128.
         - ``output_sf``: [ceil(m/128)*128, k / group_size] uint8
-            w8a8, w4a4-mxfp4: UE8M0 encoding (power-of-2 biased exponent)
+            w8a8-mxfp8, w4a4-mxfp4: UE8M0 encoding (power-of-2 biased exponent)
             w4a4-nvfp4: UE4M3 encoding (fp8_e4m3fn bit pattern as unsigned byte)
 
     Example:
@@ -62,8 +62,8 @@ def group_wise_quant(
         >>>
         >>> m, k = 256, 512
         >>> x_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
-        >>> # FP8 (W8A8) quantization
-        >>> x_fp8, sf = group_wise_quant(x_bf16, mode="w8a8")
+        >>> # FP8 (W8A8-MXFP8) quantization
+        >>> x_fp8, sf = group_wise_quant(x_bf16, mode="w8a8-mxfp8")
         >>> # FP4 with UE8M0 scales, one per 32 elements (MXFP4)
         >>> x_mxfp4, sf = group_wise_quant(x_bf16, mode="w4a4-mxfp4")
         >>> # FP4 with UE4M3 scales, one per 16 elements (NVFP4)

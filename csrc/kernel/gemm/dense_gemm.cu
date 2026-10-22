@@ -26,9 +26,10 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const std::optional<torch::Tensor>& alpha,
                const int sm_count_arg, const std::string& mode) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    TORCH_CHECK(mode == "w8a8" || mode == "w4a4-mxfp4" || mode == "w4a4-nvfp4",
-                "Unsupported mode: ", mode,
-                ". Expected 'w8a8', 'w4a4-mxfp4' or 'w4a4-nvfp4'.");
+    TORCH_CHECK(
+        mode == "w8a8-mxfp8" || mode == "w4a4-mxfp4" || mode == "w4a4-nvfp4",
+        "Unsupported mode: ", mode,
+        ". Expected 'w8a8-mxfp8', 'w4a4-mxfp4' or 'w4a4-nvfp4'.");
     TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor of shape [M, K]");
     TORCH_CHECK(weight.dim() == 2,
                 "weight must be a 2D tensor of shape [N, K]");
@@ -50,7 +51,7 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.num_experts = 1;
     params.max_m_per_expert = m;
 
-    if (mode == "w8a8") {
+    if (mode == "w8a8-mxfp8") {
         const int k = weight.size(1);
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),

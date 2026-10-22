@@ -74,7 +74,7 @@ description: Generate benchmark config YAML for the HALOps kernel benchmark (bai
 - `scenario` 必须在该 op 的 `SCENARIOS` 中。
 - `backends` 里每个名字都要在该场景 `_get_backends()` registry 中；`halops` 应置于首位。attention 场景 `run_scenario` 会用 `_move_to_front` 强制把它提前，顺序错也安全；grouped GEMM 则以首个成功 backend 为基准，`halops` 不在首位会导致基准静默变成别的 backend，务必置首。
 - **dtype ↔ backend 兼容性**：backend 名合法不代表支持所选 dtype。典型：`decode_gqa` 用 FP8 时，`fa2`/`fa4`/`fa4_paged`/`cudnn` 的 `adapt_*` 会直接 `raise`，FP8 应改用 `halops`、`fi`/`fi(trtllm-gen)`/`fi_trtllm`、`golden`。生成 FP8 配置前回到对应 `adapt_*` 确认。
-- GEMM：dense 的 `shapes` 为 `[M, N, K]`，grouped 为 `[num_experts, max_m, N, K]`；`K` 的对齐来自 `_make_*` 里按 `mode` 分支的断言（当前 W8A8/W4A4 都归结为 `K % 32 == 0`），以断言为准，不要把 32 当固定常量硬记。
+- GEMM：dense 的 `shapes` 为 `[M, N, K]`，grouped 为 `[num_experts, max_m, N, K]`；`K` 的对齐来自 `_make_*` 里按 `mode` 分支的断言（当前 W8A8-MXFP8/W4A4 都归结为 `K % 32 == 0`），以断言为准，不要把 32 当固定常量硬记。
 - decode_gqa：`num_q_heads % num_kv_heads == 0`，且 `(1 + max(mtp_steps_list)) × (num_q_heads / num_kv_heads) <= 64`。
 - attention：应设置 `batch_sizes`（或 `batch_size`），否则默认只跑 batch=1。
 - `gpu_type` 应在 `GPU_SPECS` 中；未知值会静默回退到 `b200`。

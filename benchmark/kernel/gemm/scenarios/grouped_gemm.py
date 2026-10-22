@@ -47,12 +47,12 @@ from kernel.gemm.backends.deepgemm import (
     make_grouped_contiguous_inputs as make_deepgemm_contiguous_inputs,
 )
 
-# Scale block size: FP8 W8A8 uses k//32, FP4 NVFP4 uses k//16.
+# Scale block size: FP8 W8A8-MXFP8 uses k//32, FP4 NVFP4 uses k//16.
 FP8_SF_BLOCK = 32
 NVFP4_SF_BLOCK = 16
 # The grouped kernels also support w4a4-mxfp4; this benchmark only generates
 # the FP8 and NVFP4 recipes.
-GROUPED_MODES = ("w8a8", "w4a4-nvfp4")
+GROUPED_MODES = ("w8a8-mxfp8", "w4a4-nvfp4")
 
 
 @dataclass
@@ -69,7 +69,7 @@ class GroupGemmInput:
     n: int
     k: int
     sm_count: int
-    mode: str = "w8a8"
+    mode: str = "w8a8-mxfp8"
     x_bf16: torch.Tensor | None = None
     w_bf16: torch.Tensor | None = None
     alpha: torch.Tensor | None = None
@@ -85,7 +85,7 @@ def _make_grouped_tensors(num_experts: int, max_m: int, n: int, k: int, mode: st
     group_wise_quant (group_size=32 for FP8, 16 for FP4, CUTLASS SfAtom scale
     layout). Keeping the BF16 source explicit lets comparison backends quantize
     from the same data so cross-backend comparisons stay fair.
-      - w8a8: x/w float8_e4m3fn [.,K], scales [.,K//32], no alpha.
+      - w8a8-mxfp8: x/w float8_e4m3fn [.,K], scales [.,K//32], no alpha.
       - w4a4-nvfp4: x/w uint8-packed FP4 [.,K//2], scales [.,K//16], alpha=ones[E].
     """
     from halops.gemm.group_wise_quant import group_wise_quant
@@ -326,7 +326,7 @@ def _refcheck_entry(
     max_m = cfg["max_m"]
     n, k = cfg["n"], cfg["k"]
     sm_count = cfg.get("sm_count", -1)
-    mode = cfg.get("mode", "w8a8")
+    mode = cfg.get("mode", "w8a8-mxfp8")
     scenario = cfg.get("scenario", "masked")
     ordered = [refcheck_reference] + [
         n_ for n_ in ordered_names if n_ != refcheck_reference
@@ -358,7 +358,7 @@ def _bench_entry(
     max_m = cfg["max_m"]
     n, k = cfg["n"], cfg["k"]
     sm_count = cfg.get("sm_count", -1)
-    mode = cfg.get("mode", "w8a8")
+    mode = cfg.get("mode", "w8a8-mxfp8")
     scenario = cfg.get("scenario", "masked")
     inp = _build_inputs(num_experts, max_m, n, k, sm_count, mode, scenario)
     backends = _get_backends(scenario, [backend_name])
@@ -378,7 +378,7 @@ def _bench_entry(
 
 def run_group_masked(cfg: dict) -> None:
     """Run the grouped masked GEMM benchmark scenario."""
-    mode = cfg.get("mode", "w8a8")
+    mode = cfg.get("mode", "w8a8-mxfp8")
     out_path = cfg.get("output_path", "results/group_masked_fp8.csv")
     case_tag = cfg.get("case_tag", "")
     gpu_type = cfg.get("gpu_type", "b200")
@@ -482,7 +482,7 @@ def run_group_masked(cfg: dict) -> None:
 
 def run_group_contiguous(cfg: dict) -> None:
     """Run the grouped contiguous GEMM benchmark scenario."""
-    mode = cfg.get("mode", "w8a8")
+    mode = cfg.get("mode", "w8a8-mxfp8")
     out_path = cfg.get("output_path", "results/group_contiguous_fp8.csv")
     case_tag = cfg.get("case_tag", "")
     gpu_type = cfg.get("gpu_type", "b200")

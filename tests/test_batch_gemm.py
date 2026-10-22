@@ -22,7 +22,7 @@ from tests.utils.fp4_utils import MXFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE
 
 from tests.utils.gemm_utils import (
     W4A4_TOL,
-    W8A8_TOL,
+    W8A8_MXFP8_TOL,
     per_block_cast_to_nvfp4,
     per_block_cast_to_fp8,
     per_block_cast_to_mxfp4,
@@ -100,7 +100,7 @@ def ref_batch_gemm_fp4(x_fp4_float, w_fp4_float):
 # =====================================================================
 
 
-def make_w8a8_inputs(B, M, N, K, add_bias=False):
+def make_w8a8_mxfp8_inputs(B, M, N, K, add_bias=False):
     """Quantize random BF16 tensors to FP8 and return kernel + reference inputs."""
     x_origin = torch.randn([B, M, K], dtype=torch.bfloat16)
     w_origin = torch.randn([B, N, K], dtype=torch.bfloat16)
@@ -223,7 +223,7 @@ def assert_close_per_batch(output, ref_out, tol, label):
 
 
 # =====================================================================
-# W8A8 correctness tests
+# W8A8-MXFP8 correctness tests
 # =====================================================================
 
 
@@ -244,8 +244,8 @@ def assert_close_per_batch(output, ref_out, tol, label):
         pytest.param(2, 128, 256, 512, False, id="larger_k"),
     ],
 )
-def test_batch_gemm_w8a8(B, M, N, K, add_bias):
-    inp = make_w8a8_inputs(B, M, N, K, add_bias=add_bias)
+def test_batch_gemm_w8a8_mxfp8(B, M, N, K, add_bias):
+    inp = make_w8a8_mxfp8_inputs(B, M, N, K, add_bias=add_bias)
     ref_out = ref_batch_gemm_fp8(
         inp["input_fp8"],
         inp["weight_fp8"],
@@ -264,23 +264,26 @@ def test_batch_gemm_w8a8(B, M, N, K, add_bias):
         output,
         bias=inp["bias"],
         sm_count=-1,
-        mode="w8a8",
+        mode="w8a8-mxfp8",
     )
 
     assert_close_per_batch(
-        output, ref_out, W8A8_TOL, f"W8A8 B={B}, M={M}, N={N}, K={K}, bias={add_bias}"
+        output,
+        ref_out,
+        W8A8_MXFP8_TOL,
+        f"W8A8-MXFP8 B={B}, M={M}, N={N}, K={K}, bias={add_bias}",
     )
 
 
 # =====================================================================
-# W8A8 error input tests
+# W8A8-MXFP8 error input tests
 # =====================================================================
 
-_W8A8_ERR_SHAPE = dict(B=2, M=128, N=256, K=128)
+_W8A8_MXFP8_ERR_SHAPE = dict(B=2, M=128, N=256, K=128)
 
 
-def make_empty_w8a8(B, M, N, K, x_shape=None, w_shape=None):
-    """Uninitialized W8A8 kernel inputs for argument-validation tests."""
+def make_empty_w8a8_mxfp8(B, M, N, K, x_shape=None, w_shape=None):
+    """Uninitialized W8A8-MXFP8 kernel inputs for argument-validation tests."""
     x = torch.empty(x_shape or [B, M, K], dtype=torch.float8_e4m3fn)
     w = torch.empty(w_shape or [B, N, K], dtype=torch.float8_e4m3fn)
     sfa = torch.empty([B * M, K // 32], dtype=torch.uint8)
@@ -297,7 +300,7 @@ def make_empty_w8a8(B, M, N, K, x_shape=None, w_shape=None):
             128,
             [256, 128],
             None,
-            "w8a8",
+            "w8a8-mxfp8",
             "input must be a 3D tensor",
             id="bad_input_rank",
         ),
@@ -305,7 +308,7 @@ def make_empty_w8a8(B, M, N, K, x_shape=None, w_shape=None):
             128,
             None,
             [3, 256, 128],
-            "w8a8",
+            "w8a8-mxfp8",
             "weight batch dim must match",
             id="bad_weight_batch",
         ),
@@ -314,34 +317,36 @@ def make_empty_w8a8(B, M, N, K, x_shape=None, w_shape=None):
             96,
             None,
             None,
-            "w8a8",
-            "No batch w8a8 tile for M=128 (grid M=256), N=256, K=96",
+            "w8a8-mxfp8",
+            "No batch w8a8-mxfp8 tile for M=128 (grid M=256), N=256, K=96",
             id="bad_k",
         ),
     ],
 )
-def test_batch_gemm_w8a8_errors(K, x_shape, w_shape, mode, expected):
-    shape = dict(_W8A8_ERR_SHAPE, K=K)
-    x, w, sfa, sfb, out = make_empty_w8a8(**shape, x_shape=x_shape, w_shape=w_shape)
+def test_batch_gemm_w8a8_mxfp8_errors(K, x_shape, w_shape, mode, expected):
+    shape = dict(_W8A8_MXFP8_ERR_SHAPE, K=K)
+    x, w, sfa, sfb, out = make_empty_w8a8_mxfp8(
+        **shape, x_shape=x_shape, w_shape=w_shape
+    )
     with pytest.raises(RuntimeError, match=re.escape(expected)):
         batch_gemm(x, w, sfa, sfb, out, None, None, -1, mode)
 
 
 # =====================================================================
-# W8A8 determinism test
+# W8A8-MXFP8 determinism test
 # =====================================================================
 
 
-def test_batch_gemm_w8a8_determinism():
+def test_batch_gemm_w8a8_mxfp8_determinism():
     """Determinism: identical inputs must produce bitwise-identical outputs."""
     B, M, N, K = 4, 128, 256, 128
-    inp = make_w8a8_inputs(B, M, N, K)
+    inp = make_w8a8_mxfp8_inputs(B, M, N, K)
     args = (inp["input_fp8"], inp["weight_fp8"], inp["sfa"], inp["sfb"])
     out1 = torch.zeros([B, M, N], dtype=torch.bfloat16)
     out2 = torch.zeros([B, M, N], dtype=torch.bfloat16)
-    batch_gemm(*args, out1, None, None, -1, "w8a8")
-    batch_gemm(*args, out2, None, None, -1, "w8a8")
-    assert torch.equal(out1, out2), "W8A8 batch_gemm output is not deterministic"
+    batch_gemm(*args, out1, None, None, -1, "w8a8-mxfp8")
+    batch_gemm(*args, out2, None, None, -1, "w8a8-mxfp8")
+    assert torch.equal(out1, out2), "W8A8-MXFP8 batch_gemm output is not deterministic"
 
 
 # =====================================================================

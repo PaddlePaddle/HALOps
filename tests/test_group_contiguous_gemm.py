@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for group_contiguous_gemm (W8A8 FP8, W4A4 NVFP4 and W4A4 MXFP4).
+"""Tests for group_contiguous_gemm (W8A8-MXFP8 FP8, W4A4 NVFP4 and W4A4 MXFP4).
 
 Differences from the masked version:
 - No padding: tokens of different experts are packed contiguously in the input
@@ -38,7 +38,7 @@ from tests.utils.fp4_utils import MXFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE
 
 from tests.utils.gemm_utils import (
     W4A4_TOL,
-    W8A8_TOL,
+    W8A8_MXFP8_TOL,
     per_block_cast_to_nvfp4,
     per_block_cast_to_fp8,
     per_block_cast_to_mxfp4,
@@ -151,7 +151,7 @@ def ref_group_contiguous_gemm_w4a4(x_fp4_float, w_fp4_float, expert_ids, num_exp
 
 
 def group_contiguous_gemm_wrapper(
-    x, w, sfa, sfb, expert_ids, bias=None, alpha=None, sm_count=-1, mode="w8a8"
+    x, w, sfa, sfb, expert_ids, bias=None, alpha=None, sm_count=-1, mode="w8a8-mxfp8"
 ):
     output = torch.zeros([x.shape[0], w.shape[1]], dtype=torch.bfloat16)
     group_contiguous_gemm(
@@ -197,8 +197,8 @@ def make_contiguous_expert_ids(m, num_experts, tile_m):
     return expert_ids, token_nums_per_expert, actual_experts
 
 
-def make_w8a8_inputs(m, n, k, num_experts, tile_m, add_bias=False):
-    """Build W8A8 inputs; m/num_experts are adjusted to the tile-aligned layout."""
+def make_w8a8_mxfp8_inputs(m, n, k, num_experts, tile_m, add_bias=False):
+    """Build W8A8-MXFP8 inputs; m/num_experts are adjusted to the tile-aligned layout."""
     expert_ids, token_nums, num_experts = make_contiguous_expert_ids(
         m, num_experts, tile_m
     )
@@ -228,7 +228,7 @@ def make_w8a8_inputs(m, n, k, num_experts, tile_m, add_bias=False):
         sfb=sfb,
         bias=bias,
         sm_count=-1,
-        mode="w8a8",
+        mode="w8a8-mxfp8",
     )
 
 
@@ -342,8 +342,8 @@ FULL_N, FULL_K = 7168, 3584
         pytest.param(128, 256, 256, 1, 128, id="m128_n256_k256_e1"),
     ],
 )
-def test_group_contiguous_w8a8(m, n, k, num_experts, tile_m):
-    inp = make_w8a8_inputs(m, n, k, num_experts, tile_m)
+def test_group_contiguous_w8a8_mxfp8(m, n, k, num_experts, tile_m):
+    inp = make_w8a8_mxfp8_inputs(m, n, k, num_experts, tile_m)
     ref_out = ref_group_contiguous_gemm(
         inp.x,
         inp.w,
@@ -364,7 +364,7 @@ def test_group_contiguous_w8a8(m, n, k, num_experts, tile_m):
         sm_count=inp.sm_count,
         mode=inp.mode,
     )
-    assert_close_per_expert(output, ref_out, inp.token_nums, W8A8_TOL)
+    assert_close_per_expert(output, ref_out, inp.token_nums, W8A8_MXFP8_TOL)
 
 
 @pytest.mark.parametrize(
@@ -475,7 +475,7 @@ def test_group_contiguous_mxfp4_errors(launch, expected):
         launch()
 
 
-def run_w8a8_bad_m():
+def run_w8a8_mxfp8_bad_m():
     m, n, k, num_experts = 129, 256, 128, 1
     x = torch.empty([m, k], dtype=torch.float8_e4m3fn)
     w = torch.empty([num_experts, n, k], dtype=torch.float8_e4m3fn)
@@ -483,7 +483,7 @@ def run_w8a8_bad_m():
     sfb = torch.empty([num_experts, n, k // 32], dtype=torch.uint8)
     expert_ids = torch.zeros([m], dtype=torch.int32)
     out = torch.empty([m, n], dtype=torch.bfloat16)
-    group_contiguous_gemm(x, w, sfa, sfb, expert_ids, out, None, None, -1, "w8a8")
+    group_contiguous_gemm(x, w, sfa, sfb, expert_ids, out, None, None, -1, "w8a8-mxfp8")
 
 
 def run_nvfp4_bias():
@@ -509,7 +509,7 @@ def run_expert_ids_int64():
     sfb = torch.empty([num_experts, n, k // 32], dtype=torch.uint8)
     expert_ids = torch.zeros([m], dtype=torch.int64)
     out = torch.empty([m, n], dtype=torch.bfloat16)
-    group_contiguous_gemm(x, w, sfa, sfb, expert_ids, out, None, None, -1, "w8a8")
+    group_contiguous_gemm(x, w, sfa, sfb, expert_ids, out, None, None, -1, "w8a8-mxfp8")
 
 
 def run_bad_rank_output():
@@ -520,14 +520,16 @@ def run_bad_rank_output():
     sfb = torch.empty([num_experts, n, k // 32], dtype=torch.uint8)
     expert_ids = torch.zeros([m], dtype=torch.int32)
     out = torch.empty([m, n, 1], dtype=torch.bfloat16)
-    group_contiguous_gemm(x, w, sfa, sfb, expert_ids, out, None, None, -1, "w8a8")
+    group_contiguous_gemm(x, w, sfa, sfb, expert_ids, out, None, None, -1, "w8a8-mxfp8")
 
 
 @pytest.mark.parametrize(
     "launch, expected",
     [
         pytest.param(
-            run_w8a8_bad_m, "No contiguous w8a8 tile for M=129", id="w8a8_bad_m"
+            run_w8a8_mxfp8_bad_m,
+            "No contiguous w8a8-mxfp8 tile for M=129",
+            id="w8a8_mxfp8_bad_m",
         ),
         pytest.param(
             run_nvfp4_bias, "W4A4 mode does not support bias yet", id="w4a4_bias"
@@ -552,9 +554,9 @@ def test_group_contiguous_unsupported_shapes(launch, expected):
 # =====================================================================
 
 
-def test_group_contiguous_w8a8_determinism():
+def test_group_contiguous_w8a8_mxfp8_determinism():
     """Determinism: identical inputs must produce bitwise-identical outputs."""
-    inp = make_w8a8_inputs(512, FULL_N, FULL_K, 2, 256)
+    inp = make_w8a8_mxfp8_inputs(512, FULL_N, FULL_K, 2, 256)
     out1, out2 = (
         group_contiguous_gemm_wrapper(
             inp.x,
@@ -570,7 +572,7 @@ def test_group_contiguous_w8a8_determinism():
     )
     assert torch.equal(
         out1, out2
-    ), "W8A8 group_contiguous_gemm output is not deterministic"
+    ), "W8A8-MXFP8 group_contiguous_gemm output is not deterministic"
 
 
 def test_group_contiguous_mxfp4_determinism():

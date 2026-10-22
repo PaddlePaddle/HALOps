@@ -32,36 +32,36 @@ def dense_gemm(
     bias: Optional[torch.Tensor] = None,
     alpha: Optional[torch.Tensor] = None,
     sm_count: int = -1,
-    mode: str = "w8a8",
+    mode: str = "w8a8-mxfp8",
 ) -> None:
     """Dense GEMM on Blackwell SM100 tensor cores.
 
-    Computes ``output = input @ weight^T + bias``. Supports FP8 (W8A8) and
+    Computes ``output = input @ weight^T + bias``. Supports FP8 (W8A8-MXFP8) and
     FP4 (W4A4) quantized GEMM via CUTLASS, where the FP4 recipe is selected
     explicitly by ``mode``.
 
     Args:
         input: [M, K] CUDA tensor.
-            w8a8: dtype float8_e4m3fn.
+            w8a8-mxfp8: dtype float8_e4m3fn.
             w4a4-*: dtype uint8 (packed FP4, physical shape [M, K // 2]).
         weight: [N, K] CUDA tensor. Same dtype and packing rules as input.
         sfa: Scale factor for A, dtype uint8, CUTLASS SfAtom 128x4 swizzled
             layout.  The layout covers whole 128-row atoms, so the shape is
-            ``[ceil(M / 128) * 128, K // 32]`` (w8a8, w4a4-mxfp4) or
+            ``[ceil(M / 128) * 128, K // 32]`` (w8a8-mxfp8, w4a4-mxfp4) or
             ``[ceil(M / 128) * 128, K // 16]`` (w4a4-nvfp4) -- exactly what
             ``group_wise_quant`` returns.  The rows past M are read but
             discarded, and are zero so the values stay finite.
-            w8a8, w4a4-mxfp4: UE8M0 encoding.
+            w8a8-mxfp8, w4a4-mxfp4: UE8M0 encoding.
             w4a4-nvfp4: UE4M3 encoding.
         sfb: Scale factor for B, dtype uint8, in the same ordinary SfAtom
-            layout as sfa. Shape [N, K // 32] (w8a8, w4a4-mxfp4) or
+            layout as sfa. Shape [N, K // 32] (w8a8-mxfp8, w4a4-mxfp4) or
             [N, K // 16] (w4a4-nvfp4).
         output: [M, N] pre-allocated output tensor, dtype bfloat16. Written in-place.
-        bias: Optional [N] bfloat16 bias vector. Only supported in w8a8 mode.
+        bias: Optional [N] bfloat16 bias vector. Only supported in w8a8-mxfp8 mode.
         alpha: Optional float32 scaling factor with shape [1]. Required for
             ``w4a4-nvfp4``; not accepted for ``w4a4-mxfp4``.
         sm_count: Number of SMs to use (-1 for all available).
-        mode: Quantization mode: ``"w8a8"``, ``"w4a4-mxfp4"`` or
+        mode: Quantization mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or
             ``"w4a4-nvfp4"``.
 
     Returns:
@@ -73,10 +73,10 @@ def dense_gemm(
         >>> m = n = k = 256
         >>> x_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
         >>> w_bf16 = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
-        >>> x, sfa = group_wise_quant(x_bf16, mode="w8a8")
-        >>> w, sfb = group_wise_quant(w_bf16, mode="w8a8")
+        >>> x, sfa = group_wise_quant(x_bf16, mode="w8a8-mxfp8")
+        >>> w, sfb = group_wise_quant(w_bf16, mode="w8a8-mxfp8")
         >>> out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
-        >>> dense_gemm(x, w, sfa, sfb, out, mode="w8a8")
+        >>> dense_gemm(x, w, sfa, sfb, out, mode="w8a8-mxfp8")
     """
     halops_kernel.dense_gemm(
         input,

@@ -212,7 +212,7 @@ def ref_per_token_cast_to_mxfp4(x, group_size=32):
 
 
 # ============================================================================
-# CUTLASS SfAtom interleaved reorder (shared by W8A8 and W4A4)
+# CUTLASS SfAtom interleaved reorder (shared by W8A8-MXFP8 and W4A4)
 # ============================================================================
 
 
@@ -279,7 +279,7 @@ NO_SWIZZLE_CASES = SWIZZLE_CASES + [(64, 1024), (192, 2048), (320, 3584)]
 # (mode, use_swizzle) combinations: every recipe, swizzled and linear.
 QUANT_MODES = [
     (mode, use_swizzle)
-    for mode in ("w8a8", "w4a4-nvfp4", "w4a4-mxfp4")
+    for mode in ("w8a8-mxfp8", "w4a4-nvfp4", "w4a4-mxfp4")
     for use_swizzle in (False, True)
 ]
 
@@ -295,7 +295,7 @@ def _mode_id(entry):
 
 
 _QUANT_GROUP_SIZES = {
-    "w8a8": 32,
+    "w8a8-mxfp8": 32,
     "w4a4-nvfp4": NVFP4_BLOCK_SIZE,
     "w4a4-mxfp4": MXFP4_BLOCK_SIZE,
 }
@@ -314,14 +314,14 @@ def _unpack_fp4_values(packed, m, k):
 
 @pytest.mark.parametrize("m,k", SWIZZLE_CASES, ids=[_mk_id(c) for c in SWIZZLE_CASES])
 def test_correctness_fp8(m, k):
-    """Test mode="w8a8" (UE8M0 scale, group_size=32)."""
+    """Test mode="w8a8-mxfp8" (UE8M0 scale, group_size=32)."""
     group_size = 32
     x = torch.randn([m, k], dtype=torch.bfloat16)
 
     ref_fp8, ref_sf_logical = ref_per_token_cast_to_fp8(x, group_size)
     ref_sf_cutlass = ref_reorder_sf_to_cutlass(ref_sf_logical, m, k // group_size)
 
-    cuda_fp8, cuda_sf = group_wise_quant(x, mode="w8a8")
+    cuda_fp8, cuda_sf = group_wise_quant(x, mode="w8a8-mxfp8")
 
     torch.testing.assert_close(
         cuda_fp8.to(torch.float32),
@@ -375,14 +375,14 @@ def test_correctness_nvfp4(m, k):
     "m,k", NO_SWIZZLE_CASES, ids=[_mk_id(c) for c in NO_SWIZZLE_CASES]
 )
 def test_correctness_fp8_no_swizzle(m, k):
-    """Test mode="w8a8", use_swizzle=False (UE8M0 scale, linear layout)."""
+    """Test mode="w8a8-mxfp8", use_swizzle=False (UE8M0 scale, linear layout)."""
     group_size = 32
     x = torch.randn([m, k], dtype=torch.bfloat16)
 
     # No swizzle: compare against the logical layout directly
     ref_fp8, ref_sf_logical = ref_per_token_cast_to_fp8(x, group_size)
 
-    cuda_fp8, cuda_sf = group_wise_quant(x, mode="w8a8", use_swizzle=False)
+    cuda_fp8, cuda_sf = group_wise_quant(x, mode="w8a8-mxfp8", use_swizzle=False)
 
     torch.testing.assert_close(
         cuda_fp8.to(torch.float32),
@@ -457,7 +457,7 @@ def test_correctness_mxfp4_no_swizzle(m, k):
 @pytest.mark.parametrize(
     "mode, dtype, packed_k, group_size",
     [
-        pytest.param("w8a8", torch.float8_e4m3fn, 1024, 32, id="w8a8"),
+        pytest.param("w8a8-mxfp8", torch.float8_e4m3fn, 1024, 32, id="w8a8-mxfp8"),
         pytest.param("w4a4-mxfp4", torch.uint8, 512, 32, id="w4a4-mxfp4"),
         pytest.param("w4a4-nvfp4", torch.uint8, 512, 16, id="w4a4-nvfp4"),
     ],
@@ -483,11 +483,11 @@ def test_quant_unsupported_mode():
 def test_small_m_swizzle_shapes(m):
     """Small m is legal under use_swizzle=True: the data keeps its own row
     count and only the scale tensor is rounded up to whole 128-row atoms.
-    The dense W8A8 GEMM relies on that (it dispatches on the activation's
+    The dense W8A8-MXFP8 GEMM relies on that (it dispatches on the activation's
     row count and narrows its A TMA box to it)."""
     k = 1024
     x = torch.randn([m, k], dtype=torch.bfloat16)
-    data, sf = group_wise_quant(x, mode="w8a8")
+    data, sf = group_wise_quant(x, mode="w8a8-mxfp8")
     assert list(data.shape) == [
         m,
         k,
@@ -504,7 +504,7 @@ def test_unsupported_swizzle_shapes():
     with pytest.raises(
         RuntimeError, match=re.escape("scale kb_dim must be divisible by 4")
     ):
-        group_wise_quant(x_bad_k, mode="w8a8")
+        group_wise_quant(x_bad_k, mode="w8a8-mxfp8")
 
 
 @pytest.mark.parametrize(
@@ -516,7 +516,7 @@ def test_empty_input(mode, use_swizzle):
     x = torch.empty([0, k], dtype=torch.bfloat16)
     cuda_out, cuda_sf = group_wise_quant(x, mode=mode, use_swizzle=use_swizzle)
     group_size = _QUANT_GROUP_SIZES[mode]
-    is_nvfp4 = mode != "w8a8"
+    is_nvfp4 = mode != "w8a8-mxfp8"
     expected_quant_shape = [0, k // 2] if is_nvfp4 else [0, k]
     assert list(cuda_out.shape) == expected_quant_shape, (
         f"empty-input quant shape mismatch (mode={mode}, "

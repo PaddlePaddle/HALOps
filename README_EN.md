@@ -25,7 +25,7 @@ HALOps (High-performance Accelerated LLM Operators) is a high-performance operat
 
 The core CUDA kernels are built on CUTLASS and cover the Attention, MLA and MoE inference paths.
 - **Attention**: variable-length BF16 prefill, BF16/FP8 paged-KV decode, GQA/MTP, and fused RoPE, RMSNorm and KV cache writes.
-- **GEMM**: W8A8 FP8 and W4A4 FP4 (NVFP4 / MXFP4) dense, batched, and MoE masked/contiguous GEMM.
+- **GEMM**: W8A8-MXFP8 FP8 and W4A4 FP4 (NVFP4 / MXFP4) dense, batched, and MoE masked/contiguous GEMM.
 - **MLA**: an MLA MegaKernel that fuses the Q projection (including norm and RoPE), attention and the KV cache write into a single kernel.
 - **Quantization**: group-wise quantization (FP8 / NVFP4 / MXFP4), SwiGLU + quantization.
 
@@ -45,10 +45,10 @@ The core CUDA kernels are built on CUTLASS and cover the Attention, MLA and MoE 
 
 | Python API | Description |
 | --- | --- |
-| [`dense_gemm`](halops/gemm/dense_gemm.py) | W8A8 FP8 / W4A4 FP4 (NVFP4, MXFP4) dense GEMM with BF16 output |
-| [`batch_gemm`](halops/gemm/batch_gemm.py) | W8A8 / W4A4 (NVFP4, MXFP4) batched GEMM |
-| [`group_masked_gemm`](halops/gemm/group_masked_gemm.py) | Padded MoE grouped GEMM, W8A8 / W4A4 (NVFP4, MXFP4) |
-| [`group_contiguous_gemm`](halops/gemm/group_contiguous_gemm.py) | Contiguous-token MoE grouped GEMM, W8A8 / W4A4 (NVFP4, MXFP4) |
+| [`dense_gemm`](halops/gemm/dense_gemm.py) | W8A8-MXFP8 FP8 / W4A4 FP4 (NVFP4, MXFP4) dense GEMM with BF16 output |
+| [`batch_gemm`](halops/gemm/batch_gemm.py) | W8A8-MXFP8 / W4A4 (NVFP4, MXFP4) batched GEMM |
+| [`group_masked_gemm`](halops/gemm/group_masked_gemm.py) | Padded MoE grouped GEMM, W8A8-MXFP8 / W4A4 (NVFP4, MXFP4) |
+| [`group_contiguous_gemm`](halops/gemm/group_contiguous_gemm.py) | Contiguous-token MoE grouped GEMM, W8A8-MXFP8 / W4A4 (NVFP4, MXFP4) |
 | [`prefill_permute_to_masked_gemm`](halops/gemm/prefill_permute_to_masked_gemm.py) | Permute tokens by expert and convert the scale layout to build masked GEMM inputs |
 
 ### MLA
@@ -88,7 +88,7 @@ python -m pip install --no-build-isolation --no-deps -v .
 
 The build target is fixed to `compute_100f/sm_100f`. See the [Build Guide](docs/build_guide_EN.md) for wheel builds, CUDA path configuration and development builds.
 
-After installation, the W8A8 dense GEMM example below checks the quantization and GEMM path. It should print `torch.Size([128, 256]) torch.bfloat16`.
+After installation, the W8A8-MXFP8 dense GEMM example below checks the quantization and GEMM path. It should print `torch.Size([128, 256]) torch.bfloat16`.
 
 ```python
 import torch
@@ -99,11 +99,11 @@ M, N, K = 128, 256, 512
 a = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
 b = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
 
-a_fp8, scale_a = group_wise_quant(a, mode="w8a8", use_swizzle=True)
-b_fp8, scale_b = group_wise_quant(b, mode="w8a8", use_swizzle=True)
+a_fp8, scale_a = group_wise_quant(a, mode="w8a8-mxfp8", use_swizzle=True)
+b_fp8, scale_b = group_wise_quant(b, mode="w8a8-mxfp8", use_swizzle=True)
 output = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
 
-dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8")
+dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8-mxfp8")
 print(output.shape, output.dtype)
 ```
 

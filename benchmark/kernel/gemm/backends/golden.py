@@ -51,14 +51,14 @@ def _dequant_to_bf16(src_bf16: torch.Tensor, mode: str) -> torch.Tensor:
     """
     from halops.gemm.group_wise_quant import group_wise_quant
 
-    if mode == "w8a8":
+    if mode == "w8a8-mxfp8":
         group = 32
     elif mode == "w4a4-nvfp4":
         group = 16
     else:
         raise ValueError(
             f"golden backend does not support mode {mode!r}. "
-            "Expected 'w8a8' or 'w4a4-nvfp4'."
+            "Expected 'w8a8-mxfp8' or 'w4a4-nvfp4'."
         )
     is_nvfp4 = mode == "w4a4-nvfp4"
     rows, k = src_bf16.shape
@@ -89,9 +89,9 @@ def run_dense_golden(inp: dict) -> torch.Tensor:
     the golden is a neutral baseline that excludes quantization noise and shares
     the kernels' compute and output dtype.
 
-    inp keys: x_bf16 [M, K], w_bf16 [N, K], mode ("w8a8" | "w4a4-nvfp4").
+    inp keys: x_bf16 [M, K], w_bf16 [N, K], mode ("w8a8-mxfp8" | "w4a4-nvfp4").
     """
-    mode = inp.get("mode", "w8a8")
+    mode = inp.get("mode", "w8a8-mxfp8")
     x = _dequant_to_bf16(inp["x_bf16"], mode)
     w = _dequant_to_bf16(inp["w_bf16"], mode)
     return torch.matmul(x, w.t())
@@ -110,12 +110,12 @@ def run_grouped_golden(inp: dict) -> torch.Tensor:
             x_bf16   [M, K]      unquantized activation source (bfloat16)
             w_bf16   [E, N, K]   unquantized per-expert weight source (bfloat16)
             m_indptr [E+1]       per-group row offsets (prefix sum)
-            mode     str         "w8a8" (fp8) or "w4a4-nvfp4" (fp4)
+            mode     str         "w8a8-mxfp8" (fp8) or "w4a4-nvfp4" (fp4)
 
     Returns:
         torch.Tensor [M, N] bfloat16 reference output.
     """
-    mode = inp.get("mode", "w8a8")
+    mode = inp.get("mode", "w8a8-mxfp8")
     x = _dequant_to_bf16(inp["x_bf16"], mode)  # [M, K]
     w_src = inp["w_bf16"]  # [E, N, K]
     num_groups, n, k = w_src.shape

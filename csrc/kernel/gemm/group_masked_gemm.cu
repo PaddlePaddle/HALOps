@@ -26,11 +26,12 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
                      const std::optional<torch::Tensor>& bias,
                      const std::optional<torch::Tensor>& alpha,
                      const int max_m_per_expert, const int sm_count,
-                     const std::string& mode = "w8a8") {
+                     const std::string& mode = "w8a8-mxfp8") {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    TORCH_CHECK(mode == "w8a8" || mode == "w4a4-nvfp4" || mode == "w4a4-mxfp4",
-                "Unsupported mode: ", mode,
-                ". Expected 'w8a8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
+    TORCH_CHECK(
+        mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" || mode == "w4a4-mxfp4",
+        "Unsupported mode: ", mode,
+        ". Expected 'w8a8-mxfp8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
     TORCH_CHECK(input.dim() == 2,
                 "input must be a 2D tensor of shape [num_experts * "
                 "max_m_per_expert, K]");
@@ -69,7 +70,7 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.num_experts = num_experts;
     params.max_m_per_expert = max_m_per_expert;
 
-    if (mode == "w8a8") {
+    if (mode == "w8a8-mxfp8") {
         const int k = weight.size(2);
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),
