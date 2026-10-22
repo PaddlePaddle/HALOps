@@ -25,28 +25,37 @@ __all__ = ["group_wise_quant"]
 
 def group_wise_quant(
     input: torch.Tensor,
-    is_fp4: bool = False,
+    mode: str = "w8a8",
     use_swizzle: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Group-wise quantization from BF16 to FP8/FP4 with scale factors.
+    """Group-wise quantization from BF16/FP16 to FP8/FP4 with scale factors.
 
-    Quantizes a 2D BF16 tensor per group (block_size=32 for FP8, block_size=16
-    for FP4), producing both the quantized data and the scale factor tensor.
+    Quantizes a 2D BF16/FP16 tensor per group along K, producing both the
+    quantized data and the block-scale tensor. Supports FP8 (W8A8) and
+    FP4 (W4A4) quantization. The FP4 recipe is selected explicitly by
+    ``mode``.
+
+    The output pairs feed ``dense_gemm`` / ``batch_gemm`` /
+    ``group_masked_gemm`` / ``group_contiguous_gemm`` of the same ``mode``.
 
     Args:
-        input: [m, k] CUDA tensor, dtype bfloat16. Source tensor.
-        is_fp4: ``True`` for FP4 E2M1 output (group_size=16);
-            ``False`` for FP8 E4M3 output (group_size=32).
-        use_swizzle: ``True`` to output scale in CUTLASS SfAtom 128x4 interleaved
-            layout; ``False`` for linear row-major scale layout.
+        input: [m, k] CUDA tensor, dtype bfloat16 or float16. Source tensor.
+        mode: ``"w8a8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``. Selects both
+            the value encoding and the scale recipe.
+        use_swizzle: ``True`` to output scales in the CUTLASS SfAtom 128x4
+            interleaved layout consumed by the GEMM kernels; ``False`` for a
+            plain row-major scale layout.
+
     Returns:
         A tuple ``(output_quant, output_sf)`` where:
         - ``output_quant``:
-            FP8: [m, k] float8_e4m3fn
-            FP4: [m, k/2] uint8 (packed nibbles, even index = low nibble)
-        - ``output_sf``: [ceil(m/128)*128, k/group_size] uint8
-            FP8: UE8M0 encoding (power-of-2 biased exponent)
-            FP4: UE4M3 encoding (fp8_e4m3fn bit pattern as unsigned byte)
+            FP8: [m_tile, k] float8_e4m3fn
+            FP4: [m_tile, k/2] uint8 (packed nibbles, even index = low nibble)
+          ``m_tile`` is ``m`` for ``use_swizzle=False`` and for ``m < 128``;
+          with ``use_swizzle=True`` it is padded up to the next multiple of 128.
+        - ``output_sf``: [ceil(m/128)*128, k / group_size] uint8
+            w8a8, w4a4-mxfp4: UE8M0 encoding (power-of-2 biased exponent)
+            w4a4-nvfp4: UE4M3 encoding (fp8_e4m3fn bit pattern as unsigned byte)
 
     Example:
         >>> from halops import group_wise_quant
@@ -54,8 +63,10 @@ def group_wise_quant(
         >>> m, k = 256, 512
         >>> x_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
         >>> # FP8 (W8A8) quantization
-        >>> x_fp8, sf = group_wise_quant(x_bf16, is_fp4=False)
-        >>> # FP4 (W4A4) quantization
-        >>> x_fp4, sf = group_wise_quant(x_bf16, is_fp4=True)
+        >>> x_fp8, sf = group_wise_quant(x_bf16, mode="w8a8")
+        >>> # FP4 with UE8M0 scales, one per 32 elements (MXFP4)
+        >>> x_mxfp4, sf = group_wise_quant(x_bf16, mode="w4a4-mxfp4")
+        >>> # FP4 with UE4M3 scales, one per 16 elements (NVFP4)
+        >>> x_nvfp4, sf = group_wise_quant(x_bf16, mode="w4a4-nvfp4")
     """
-    return halops_kernel.group_wise_quant(input, is_fp4, use_swizzle)
+    return halops_kernel.group_wise_quant(input, mode, use_swizzle)

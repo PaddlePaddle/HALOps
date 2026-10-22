@@ -52,20 +52,19 @@ def _dequant_to_bf16(src_bf16: torch.Tensor, mode: str) -> torch.Tensor:
     from halops.gemm.group_wise_quant import group_wise_quant
 
     if mode == "w8a8":
-        is_fp4 = False
         group = 32
     elif mode == "w4a4-nvfp4":
-        is_fp4 = True
         group = 16
     else:
         raise ValueError(
             f"golden backend does not support mode {mode!r}. "
             "Expected 'w8a8' or 'w4a4-nvfp4'."
         )
+    is_nvfp4 = mode == "w4a4-nvfp4"
     rows, k = src_bf16.shape
-    q, sf = group_wise_quant(src_bf16, is_fp4=is_fp4, use_swizzle=False)
+    q, sf = group_wise_quant(src_bf16, mode=mode, use_swizzle=False)
 
-    if is_fp4:
+    if is_nvfp4:
         # q: [rows, k//2] uint8, two 4-bit codes per byte (even idx = low nibble).
         codes = torch.empty(rows, k, dtype=torch.uint8, device=q.device)
         codes[:, 0::2] = q & 0x0F

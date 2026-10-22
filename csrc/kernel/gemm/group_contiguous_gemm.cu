@@ -28,9 +28,9 @@ void GroupContiguousGemm(const torch::Tensor& input,
                          const std::optional<torch::Tensor>& alpha,
                          const int sm_count, const std::string& mode = "w8a8") {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    TORCH_CHECK(mode == "w8a8" || mode == "w4a4-nvfp4",
+    TORCH_CHECK(mode == "w8a8" || mode == "w4a4-nvfp4" || mode == "w4a4-mxfp4",
                 "Unsupported mode: ", mode,
-                ". Expected 'w8a8' or 'w4a4-nvfp4'.");
+                ". Expected 'w8a8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
     TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor of shape [M, K]");
     TORCH_CHECK(weight.dim() == 3,
                 "weight must be a 3D tensor of shape [num_experts, N, K]");
@@ -93,19 +93,39 @@ void GroupContiguousGemm(const torch::Tensor& input,
         params.ptr_b = weight.data_ptr();
         params.ptr_sfa = sfa.data_ptr();
         params.ptr_sfb = sfb.data_ptr();
-        TORCH_CHECK(
-            alpha.has_value(),
-            "W4A4 mode requires alpha input (per-expert scaling factor).");
-        params.ptr_alpha = alpha->data_ptr<float>();
         TORCH_CHECK(!bias.has_value(), "W4A4 mode does not support bias yet.");
-        LaunchCfg<KernelMode::Contiguous, MmaKind::NVFP4>(params,
-                                                          {.m = m / num_experts,
-                                                           .n = n,
-                                                           .k = k,
-                                                           .m_grid = m,
-                                                           .sm_count = sm,
-                                                           .has_bias = false},
-                                                          stream);
+
+        const bool mxfp4 = mode == "w4a4-mxfp4";
+        const int sf_k = k / (mxfp4 ? 32 : 16);
+        TORCH_CHECK(sfa.size(-1) == sf_k && sfb.size(-1) == sf_k,
+                    "W4A4 scale-factor shape does not match mode ",
+                    mxfp4 ? "'w4a4-mxfp4' (UE8M0 per 32)"
+                          : "'w4a4-nvfp4' (UE4M3 per 16)",
+                    " requires SF K = ", sf_k, ", got sfa K=", sfa.size(-1),
+                    " and sfb K=", sfb.size(-1), ".");
+
+        TORCH_CHECK(!mxfp4 || !alpha.has_value(),
+                    "'w4a4-mxfp4' does not take alpha; the per-expert scaling "
+                    "factor is only used by 'w4a4-nvfp4'.");
+        if (!mxfp4) {
+            TORCH_CHECK(
+                alpha.has_value(),
+                "W4A4-nvfp4 mode requires alpha input (per-expert scaling factor).");
+            params.ptr_alpha = alpha->data_ptr<float>();
+        }
+        const GemmShape shape = {.m = m / num_experts,
+                                 .n = n,
+                                 .k = k,
+                                 .m_grid = m,
+                                 .sm_count = sm,
+                                 .has_bias = false};
+        if (mxfp4) {
+            LaunchCfg<KernelMode::Contiguous, MmaKind::MXFP4>(params, shape,
+                                                              stream);
+        } else {
+            LaunchCfg<KernelMode::Contiguous, MmaKind::NVFP4>(params, shape,
+                                                              stream);
+        }
     }
 }
 

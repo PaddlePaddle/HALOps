@@ -44,19 +44,24 @@ def group_masked_gemm(
 
     Args:
         input: [num_experts * max_m_per_expert, K] CUDA tensor.
-            w8a8: dtype float8_e4m3fn. w4a4-nvfp4: dtype uint8 (packed FP4).
+            w8a8: dtype float8_e4m3fn. w4a4-*: dtype uint8 (packed FP4, logical
+            K is size(1)*2).
         weight: [num_experts, N, K] 3D CUDA tensor. Per-expert weights.
-        sfa: Scale factor for A, dtype uint8, SfAtom layout.
-        sfb: Scale factor for B, dtype uint8, SfAtom layout.
+        sfa: Scale factor for A, dtype uint8, CUTLASS SfAtom 128x4 swizzled
+            layout. sf_k = K // 32 (w8a8, w4a4-mxfp4) or K // 16
+            (w4a4-nvfp4).
+            w8a8, w4a4-mxfp4: UE8M0 encoding.
+            w4a4-nvfp4: UE4M3 encoding.
+        sfb: Scale factor for B, dtype uint8, same SfAtom layout as sfa,
+            shape [num_experts, N, sf_k].
         masked_m: [num_experts] int32. Actual valid token count per expert.
         output: [num_experts * max_m_per_expert, N] bfloat16 output. Written in-place.
         bias: Optional [num_experts, N] bfloat16 bias. Only supported in w8a8 mode.
         alpha: Optional float32 per-expert scale with shape [num_experts].
-            Required for ``w4a4-nvfp4``.
+            Required for ``w4a4-nvfp4``; not accepted for ``w4a4-mxfp4``.
         max_m_per_expert: Maximum tokens per expert (padding bound), must be > 0.
         sm_count: Number of SMs to use (-1 for all available).
-        mode: ``"w8a8"`` or ``"w4a4-nvfp4"``. ``"w4a4-mxfp4"`` is not
-            supported by this kernel yet.
+        mode: ``"w8a8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``.
     """
     halops_kernel.group_masked_gemm(
         input,

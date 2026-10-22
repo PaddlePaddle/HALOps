@@ -58,7 +58,8 @@ def dense_gemm(
             [N, K // 16] (w4a4-nvfp4).
         output: [M, N] pre-allocated output tensor, dtype bfloat16. Written in-place.
         bias: Optional [N] bfloat16 bias vector. Only supported in w8a8 mode.
-        alpha: Optional float32 scaling factor with shape [1]. Required for ``w4a4-nvfp4``.
+        alpha: Optional float32 scaling factor with shape [1]. Required for
+            ``w4a4-nvfp4``; not accepted for ``w4a4-mxfp4``.
         sm_count: Number of SMs to use (-1 for all available).
         mode: Quantization mode: ``"w8a8"``, ``"w4a4-mxfp4"`` or
             ``"w4a4-nvfp4"``.
@@ -72,8 +73,8 @@ def dense_gemm(
         >>> m = n = k = 256
         >>> x_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
         >>> w_bf16 = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
-        >>> x, sfa = group_wise_quant(x_bf16, is_fp4=False)
-        >>> w, sfb = group_wise_quant(w_bf16, is_fp4=False)
+        >>> x, sfa = group_wise_quant(x_bf16, mode="w8a8")
+        >>> w, sfb = group_wise_quant(w_bf16, mode="w8a8")
         >>> out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
         >>> dense_gemm(x, w, sfa, sfb, out, mode="w8a8")
     """

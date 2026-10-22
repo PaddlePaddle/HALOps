@@ -20,8 +20,10 @@ import torch
 
 from halops import group_wise_quant
 from tests.utils.fp4_utils import (
+    NVFP4_BLOCK_SIZE,
     FP4_E2M1_MAX,
     FP4_E2M1_VALUES,
+    MXFP4_BLOCK_SIZE,
     float32_to_ue4m3_rne,
     fp4_abs_to_idx_round_half_up,
 )
@@ -90,7 +92,7 @@ def ue4m3_to_float32(scale_ue4m3):
     return fp8_tensor.to(torch.float32).cpu().numpy()
 
 
-def ref_per_token_cast_to_fp4(x, group_size=16):
+def ref_per_token_cast_to_nvfp4(x, group_size=16):
     """
     FP4 reference implementation: quantize along k dimension with group_size granularity
     to FP4 E2M1 with UE4M3 scale.
@@ -154,6 +156,62 @@ def ref_per_token_cast_to_fp4(x, group_size=16):
 
 
 # ============================================================================
+# MXFP4 reference implementation (FP4 E2M1 with UE8M0 scale)
+# ============================================================================
+
+
+def ref_per_token_cast_to_mxfp4(x, group_size=32):
+    """
+    MXFP4 reference implementation: quantize along k dimension with group_size
+    granularity to FP4 E2M1 with a UE8M0 scale.
+    Returns: (packed_uint8, scale_ue8m0, fp4_dequant_float32)
+    """
+    assert x.dtype == torch.bfloat16
+    m, k = x.shape
+    assert k % group_size == 0
+    assert k % 2 == 0
+
+    x_f32 = x.to(torch.float32).cpu().numpy()
+    num_groups = k // group_size
+    x_blocked = x_f32.reshape(m, num_groups, group_size)
+
+    amax = np.abs(x_blocked).max(axis=-1)
+    amax = np.clip(amax, 1e-12, None)
+
+    scale = amax / FP4_E2M1_MAX
+    # The kernel's UE8M0 encoder (fast-math log2f), reused for exactness.
+    scale_ue8m0 = float32_to_ue8m0(torch.tensor(scale, device="cpu"))
+    scale_ue8m0 = scale_ue8m0.cpu().numpy()
+    scale_decoded = np.exp2(scale_ue8m0.astype(np.float32) - 127.0)
+
+    # Use multiplication (consistent with CUDA kernel: vals[i] * inv_scale).
+    inv_scale = np.float32(1.0) / scale_decoded
+    x_scaled = x_blocked * inv_scale[..., np.newaxis]
+    x_scaled = np.clip(x_scaled, -FP4_E2M1_MAX, FP4_E2M1_MAX)
+
+    flat = x_scaled.reshape(m, k)
+    sign_bits = (flat < 0).astype(np.uint8) << 3
+    mag_idx = fp4_abs_to_idx_round_half_up(np.abs(flat))
+    fp4_codes = sign_bits | mag_idx  # (m, k), 4-bit codes
+
+    fp4_float = (np.where(flat < 0, -1.0, 1.0) * FP4_E2M1_VALUES[mag_idx]).astype(
+        np.float32
+    )
+    scale_expanded = np.repeat(scale_decoded, group_size, axis=-1)
+    fp4_dequant = fp4_float * scale_expanded
+
+    lo = fp4_codes[:, 0::2]
+    hi = fp4_codes[:, 1::2]
+    packed = (hi << 4) | lo  # (m, k // 2)
+
+    return (
+        torch.tensor(packed, dtype=torch.uint8),
+        torch.tensor(scale_ue8m0, dtype=torch.uint8),
+        torch.tensor(fp4_dequant, dtype=torch.float32),
+    )
+
+
+# ============================================================================
 # CUTLASS SfAtom interleaved reorder (shared by W8A8 and W4A4)
 # ============================================================================
 
@@ -202,7 +260,7 @@ def ref_reorder_sf_to_cutlass(sf_logical, mn_dim, kb_dim):
 # Bit-exact FP8 data comparison (as float32).
 FP8_EXACT_TOL = dict(rtol=0, atol=0)
 # FP4 dequantized-value comparison (UE4M3 rounding differences).
-FP4_DEQUANT_TOL = dict(rtol=0.01, atol=0.01)
+NVFP4_DEQUANT_TOL = dict(rtol=0.01, atol=0.01)
 
 # (m, k) - various sizes
 SWIZZLE_CASES = [
@@ -218,7 +276,12 @@ SWIZZLE_CASES = [
 # use_swizzle=False does not require m%128, add non-aligned sizes
 NO_SWIZZLE_CASES = SWIZZLE_CASES + [(64, 1024), (192, 2048), (320, 3584)]
 
-QUANT_MODES = [(False, False), (False, True), (True, False), (True, True)]
+# (mode, use_swizzle) combinations: every recipe, swizzled and linear.
+QUANT_MODES = [
+    (mode, use_swizzle)
+    for mode in ("w8a8", "w4a4-nvfp4", "w4a4-mxfp4")
+    for use_swizzle in (False, True)
+]
 
 
 def _mk_id(case):
@@ -226,9 +289,16 @@ def _mk_id(case):
     return f"m{m}_k{k}"
 
 
-def _mode_id(mode):
-    is_fp4, use_swizzle = mode
-    return f"{'fp4' if is_fp4 else 'fp8'}_{'swizzle' if use_swizzle else 'linear'}"
+def _mode_id(entry):
+    mode, use_swizzle = entry
+    return f"{mode}_{'swizzle' if use_swizzle else 'linear'}"
+
+
+_QUANT_GROUP_SIZES = {
+    "w8a8": 32,
+    "w4a4-nvfp4": NVFP4_BLOCK_SIZE,
+    "w4a4-mxfp4": MXFP4_BLOCK_SIZE,
+}
 
 
 def _unpack_fp4_values(packed, m, k):
@@ -244,15 +314,14 @@ def _unpack_fp4_values(packed, m, k):
 
 @pytest.mark.parametrize("m,k", SWIZZLE_CASES, ids=[_mk_id(c) for c in SWIZZLE_CASES])
 def test_correctness_fp8(m, k):
-    """Test is_fp4=False mode (UE8M0 scale, group_size=32)"""
+    """Test mode="w8a8" (UE8M0 scale, group_size=32)."""
     group_size = 32
     x = torch.randn([m, k], dtype=torch.bfloat16)
 
     ref_fp8, ref_sf_logical = ref_per_token_cast_to_fp8(x, group_size)
     ref_sf_cutlass = ref_reorder_sf_to_cutlass(ref_sf_logical, m, k // group_size)
 
-    # CUDA operator: is_fp4=False, use_swizzle=True
-    cuda_fp8, cuda_sf = group_wise_quant(x, False, True)
+    cuda_fp8, cuda_sf = group_wise_quant(x, mode="w8a8")
 
     torch.testing.assert_close(
         cuda_fp8.to(torch.float32),
@@ -266,16 +335,15 @@ def test_correctness_fp8(m, k):
 
 
 @pytest.mark.parametrize("m,k", SWIZZLE_CASES, ids=[_mk_id(c) for c in SWIZZLE_CASES])
-def test_correctness_fp4(m, k):
-    """Test is_fp4=True mode (UE4M3 scale, group_size=16, packed uint8)"""
+def test_correctness_nvfp4(m, k):
+    """Test mode="w4a4-nvfp4" (UE4M3 scale, group_size=16, packed uint8)."""
     group_size = 16
     x = torch.randn([m, k], dtype=torch.bfloat16)
 
-    ref_packed, ref_sf_logical, ref_dequant = ref_per_token_cast_to_fp4(x, group_size)
+    ref_packed, ref_sf_logical, ref_dequant = ref_per_token_cast_to_nvfp4(x, group_size)
     ref_sf_cutlass = ref_reorder_sf_to_cutlass(ref_sf_logical, m, k // group_size)
 
-    # CUDA operator: is_fp4=True, use_swizzle=True
-    cuda_packed, cuda_sf = group_wise_quant(x, True, True)
+    cuda_packed, cuda_sf = group_wise_quant(x, mode="w4a4-nvfp4")
 
     # Packed FP4 data (uint8, byte-by-byte)
     assert torch.equal(
@@ -297,7 +365,7 @@ def test_correctness_fp4(m, k):
     torch.testing.assert_close(
         torch.from_numpy(cuda_fp4_vals.reshape(m, k // group_size, group_size)),
         torch.from_numpy(ref_fp4_vals),
-        **FP4_DEQUANT_TOL,
+        **NVFP4_DEQUANT_TOL,
         check_dtype=False,
         msg=lambda m_: f"FP4 dequant mismatch for m={m}, k={k}: {m_}",
     )
@@ -307,15 +375,14 @@ def test_correctness_fp4(m, k):
     "m,k", NO_SWIZZLE_CASES, ids=[_mk_id(c) for c in NO_SWIZZLE_CASES]
 )
 def test_correctness_fp8_no_swizzle(m, k):
-    """Test is_fp4=False, use_swizzle=False mode (UE8M0 scale, linear layout)"""
+    """Test mode="w8a8", use_swizzle=False (UE8M0 scale, linear layout)."""
     group_size = 32
     x = torch.randn([m, k], dtype=torch.bfloat16)
 
     # No swizzle: compare against the logical layout directly
     ref_fp8, ref_sf_logical = ref_per_token_cast_to_fp8(x, group_size)
 
-    # CUDA operator: is_fp4=False, use_swizzle=False
-    cuda_fp8, cuda_sf = group_wise_quant(x, False, False)
+    cuda_fp8, cuda_sf = group_wise_quant(x, mode="w8a8", use_swizzle=False)
 
     torch.testing.assert_close(
         cuda_fp8.to(torch.float32),
@@ -331,15 +398,14 @@ def test_correctness_fp8_no_swizzle(m, k):
 @pytest.mark.parametrize(
     "m,k", NO_SWIZZLE_CASES, ids=[_mk_id(c) for c in NO_SWIZZLE_CASES]
 )
-def test_correctness_fp4_no_swizzle(m, k):
-    """Test is_fp4=True, use_swizzle=False mode (UE4M3 scale, linear layout)"""
+def test_correctness_nvfp4_no_swizzle(m, k):
+    """Test mode="w4a4-nvfp4", use_swizzle=False (UE4M3 scale, linear)."""
     group_size = 16
     x = torch.randn([m, k], dtype=torch.bfloat16)
 
-    ref_packed, ref_sf_logical, _ = ref_per_token_cast_to_fp4(x, group_size)
+    ref_packed, ref_sf_logical, _ = ref_per_token_cast_to_nvfp4(x, group_size)
 
-    # CUDA operator: is_fp4=True, use_swizzle=False
-    cuda_packed, cuda_sf = group_wise_quant(x, True, False)
+    cuda_packed, cuda_sf = group_wise_quant(x, mode="w4a4-nvfp4", use_swizzle=False)
 
     assert torch.equal(
         cuda_packed, ref_packed
@@ -347,6 +413,70 @@ def test_correctness_fp4_no_swizzle(m, k):
     assert torch.equal(
         cuda_sf, ref_sf_logical
     ), f"FP4 no-swizzle scale mismatch for m={m}, k={k}"
+
+
+@pytest.mark.parametrize("m,k", SWIZZLE_CASES, ids=[_mk_id(c) for c in SWIZZLE_CASES])
+def test_correctness_mxfp4(m, k):
+    """Test mode="w4a4-mxfp4" (UE8M0 scale, group_size=32, packed uint8)."""
+    group_size = MXFP4_BLOCK_SIZE
+    x = torch.randn([m, k], dtype=torch.bfloat16)
+
+    ref_packed, ref_sf_logical, _ = ref_per_token_cast_to_mxfp4(x, group_size)
+    ref_sf_cutlass = ref_reorder_sf_to_cutlass(ref_sf_logical, m, k // group_size)
+
+    cuda_packed, cuda_sf = group_wise_quant(x, mode="w4a4-mxfp4")
+
+    assert torch.equal(
+        cuda_packed, ref_packed
+    ), f"MXFP4 packed data mismatch for m={m}, k={k}"
+    assert torch.equal(
+        cuda_sf, ref_sf_cutlass
+    ), f"MXFP4 swizzled scale mismatch for m={m}, k={k}"
+
+
+@pytest.mark.parametrize(
+    "m,k", NO_SWIZZLE_CASES, ids=[_mk_id(c) for c in NO_SWIZZLE_CASES]
+)
+def test_correctness_mxfp4_no_swizzle(m, k):
+    """Test mode="w4a4-mxfp4", use_swizzle=False (linear scale layout)."""
+    group_size = MXFP4_BLOCK_SIZE
+    x = torch.randn([m, k], dtype=torch.bfloat16)
+
+    ref_packed, ref_sf_logical, _ = ref_per_token_cast_to_mxfp4(x, group_size)
+
+    cuda_packed, cuda_sf = group_wise_quant(x, mode="w4a4-mxfp4", use_swizzle=False)
+
+    assert torch.equal(
+        cuda_packed, ref_packed
+    ), f"MXFP4 no-swizzle packed data mismatch for m={m}, k={k}"
+    assert torch.equal(
+        cuda_sf, ref_sf_logical
+    ), f"MXFP4 no-swizzle scale mismatch for m={m}, k={k}"
+
+
+@pytest.mark.parametrize(
+    "mode, dtype, packed_k, group_size",
+    [
+        pytest.param("w8a8", torch.float8_e4m3fn, 1024, 32, id="w8a8"),
+        pytest.param("w4a4-mxfp4", torch.uint8, 512, 32, id="w4a4-mxfp4"),
+        pytest.param("w4a4-nvfp4", torch.uint8, 512, 16, id="w4a4-nvfp4"),
+    ],
+)
+def test_quant_mode_selection(mode, dtype, packed_k, group_size):
+    """``mode`` selects the value encoding, pack width and scale group size."""
+    m, k = 128, 1024
+    x = torch.randn([m, k], dtype=torch.bfloat16)
+
+    data, sf = group_wise_quant(x, mode=mode)
+    assert data.dtype == dtype, f"mode={mode}: got dtype {data.dtype}"
+    assert list(data.shape) == [m, packed_k], f"mode={mode}: got {data.shape}"
+    assert list(sf.shape) == [m, k // group_size], f"mode={mode}: got {sf.shape}"
+
+
+def test_quant_unsupported_mode():
+    x = torch.randn([128, 1024], dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match=re.escape("Unsupported quantization mode")):
+        group_wise_quant(x, mode="w4a4-fp6")
 
 
 @pytest.mark.parametrize("m", [1, 8, 64, 127], ids=lambda m: f"m{m}")
@@ -357,7 +487,7 @@ def test_small_m_swizzle_shapes(m):
     row count and narrows its A TMA box to it)."""
     k = 1024
     x = torch.randn([m, k], dtype=torch.bfloat16)
-    data, sf = group_wise_quant(x, False, True)
+    data, sf = group_wise_quant(x, mode="w8a8")
     assert list(data.shape) == [
         m,
         k,
@@ -374,49 +504,50 @@ def test_unsupported_swizzle_shapes():
     with pytest.raises(
         RuntimeError, match=re.escape("scale kb_dim must be divisible by 4")
     ):
-        group_wise_quant(x_bad_k, False, True)
+        group_wise_quant(x_bad_k, mode="w8a8")
 
 
 @pytest.mark.parametrize(
-    "is_fp4,use_swizzle", QUANT_MODES, ids=[_mode_id(m) for m in QUANT_MODES]
+    "mode,use_swizzle", QUANT_MODES, ids=[_mode_id(m) for m in QUANT_MODES]
 )
-def test_empty_input(is_fp4, use_swizzle):
+def test_empty_input(mode, use_swizzle):
     """Test m=0 empty input does not error"""
     k = 1024
     x = torch.empty([0, k], dtype=torch.bfloat16)
-    cuda_out, cuda_sf = group_wise_quant(x, is_fp4, use_swizzle)
-    group_size = 16 if is_fp4 else 32
-    expected_quant_shape = [0, k // 2] if is_fp4 else [0, k]
+    cuda_out, cuda_sf = group_wise_quant(x, mode=mode, use_swizzle=use_swizzle)
+    group_size = _QUANT_GROUP_SIZES[mode]
+    is_nvfp4 = mode != "w8a8"
+    expected_quant_shape = [0, k // 2] if is_nvfp4 else [0, k]
     assert list(cuda_out.shape) == expected_quant_shape, (
-        f"empty-input quant shape mismatch (is_fp4={is_fp4}, "
+        f"empty-input quant shape mismatch (mode={mode}, "
         f"use_swizzle={use_swizzle}): got {list(cuda_out.shape)}, "
         f"expected {expected_quant_shape}"
     )
     assert list(cuda_sf.shape) == [0, k // group_size], (
-        f"empty-input sf shape mismatch (is_fp4={is_fp4}, "
+        f"empty-input sf shape mismatch (mode={mode}, "
         f"use_swizzle={use_swizzle}): got {list(cuda_sf.shape)}, "
         f"expected {[0, k // group_size]}"
     )
 
 
 @pytest.mark.parametrize(
-    "is_fp4,use_swizzle", QUANT_MODES, ids=[_mode_id(m) for m in QUANT_MODES]
+    "mode,use_swizzle", QUANT_MODES, ids=[_mode_id(m) for m in QUANT_MODES]
 )
-def test_determinism(is_fp4, use_swizzle):
+def test_determinism(mode, use_swizzle):
     """Determinism: identical inputs must produce bitwise-identical outputs."""
     m, k = 256, 2048
     x = torch.randn([m, k], dtype=torch.bfloat16)
 
-    out1, sf1 = group_wise_quant(x, is_fp4, use_swizzle)
-    out2, sf2 = group_wise_quant(x, is_fp4, use_swizzle)
+    out1, sf1 = group_wise_quant(x, mode=mode, use_swizzle=use_swizzle)
+    out2, sf2 = group_wise_quant(x, mode=mode, use_swizzle=use_swizzle)
 
     assert torch.equal(out1, out2), (
         f"group_wise_quant quant output is not deterministic "
-        f"(is_fp4={is_fp4}, use_swizzle={use_swizzle})"
+        f"(mode={mode}, use_swizzle={use_swizzle})"
     )
     assert torch.equal(sf1, sf2), (
         f"group_wise_quant scale output is not deterministic "
-        f"(is_fp4={is_fp4}, use_swizzle={use_swizzle})"
+        f"(mode={mode}, use_swizzle={use_swizzle})"
     )
 
 

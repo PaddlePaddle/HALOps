@@ -42,9 +42,9 @@ from kernel.gemm.backends.deepgemm import (
 
 # Scale block size: FP8 W8A8 uses k//32, FP4 NVFP4 uses k//16.
 FP8_SF_BLOCK = 32
-FP4_SF_BLOCK = 16
-# group_wise_quant only produces FP8 or NVFP4 inputs, so the benchmark covers
-# those two recipes (the kernel itself also supports w4a4-mxfp4).
+NVFP4_SF_BLOCK = 16
+# group_wise_quant can also produce MXFP4 inputs, but this benchmark only
+# generates the FP8 and NVFP4 recipes (the kernel supports w4a4-mxfp4 too).
 DENSE_MODES = ("w8a8", "w4a4-nvfp4")
 
 
@@ -79,18 +79,18 @@ def _build_inputs(
             f"Unsupported dense benchmark mode: {mode!r}. "
             f"Expected one of {DENSE_MODES}."
         )
-    is_fp4 = mode == "w4a4-nvfp4"
+    is_nvfp4 = mode == "w4a4-nvfp4"
 
-    if is_fp4:
-        assert k % (2 * FP4_SF_BLOCK) == 0, f"k={k} must be divisible by 32"
+    if is_nvfp4:
+        assert k % (2 * NVFP4_SF_BLOCK) == 0, f"k={k} must be divisible by 32"
     else:
         assert k % FP8_SF_BLOCK == 0, f"k={k} must be divisible by {FP8_SF_BLOCK}"
 
     x_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device=dev)
     w_bf16 = torch.randn(n, k, dtype=torch.bfloat16, device=dev)
-    x, sfa = group_wise_quant(x_bf16, is_fp4=is_fp4)
-    w, sfb = group_wise_quant(w_bf16, is_fp4=is_fp4)
-    alpha = torch.ones((1,), dtype=torch.float32, device=dev) if is_fp4 else None
+    x, sfa = group_wise_quant(x_bf16, mode=mode)
+    w, sfb = group_wise_quant(w_bf16, mode=mode)
+    alpha = torch.ones((1,), dtype=torch.float32, device=dev) if is_nvfp4 else None
 
     out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
     return GemmInput(

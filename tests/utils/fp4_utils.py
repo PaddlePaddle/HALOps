@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FP4 E2M1 / UE4M3 constants and reference encoders shared by the tests."""
+"""FP4 constants and reference encoders shared by the tests.
+
+``FP4_E2M1_*`` describe the E2M1 value grid used by both NVFP4 and MXFP4;
+the UE4M3 encoder and ``NVFP4_BLOCK_SIZE`` are NVFP4-specific.
+"""
 
 import numpy as np
 import torch
 
-FP4_BLOCK_SIZE = 16
+NVFP4_BLOCK_SIZE = 16
+MXFP4_BLOCK_SIZE = 32
 FP4_E2M1_MAX = 6.0
 FP4_E2M1_VALUES = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
 FP4_MIDPOINTS = (FP4_E2M1_VALUES[:-1] + FP4_E2M1_VALUES[1:]) / 2.0

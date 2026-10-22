@@ -49,7 +49,9 @@ from kernel.gemm.backends.deepgemm import (
 
 # Scale block size: FP8 W8A8 uses k//32, FP4 NVFP4 uses k//16.
 FP8_SF_BLOCK = 32
-FP4_SF_BLOCK = 16
+NVFP4_SF_BLOCK = 16
+# The grouped kernels also support w4a4-mxfp4; this benchmark only generates
+# the FP8 and NVFP4 recipes.
 GROUPED_MODES = ("w8a8", "w4a4-nvfp4")
 
 
@@ -95,21 +97,21 @@ def _make_grouped_tensors(num_experts: int, max_m: int, n: int, k: int, mode: st
             f"Unsupported grouped benchmark mode: {mode!r}. "
             f"Expected one of {GROUPED_MODES}."
         )
-    is_fp4 = mode == "w4a4-nvfp4"
+    is_nvfp4 = mode == "w4a4-nvfp4"
 
-    if is_fp4:
-        assert k % (2 * FP4_SF_BLOCK) == 0, f"k={k} must be divisible by 32"
+    if is_nvfp4:
+        assert k % (2 * NVFP4_SF_BLOCK) == 0, f"k={k} must be divisible by 32"
     else:
         assert k % FP8_SF_BLOCK == 0, f"k={k} must be divisible by {FP8_SF_BLOCK}"
 
     x_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device=dev)
-    x, sfa = group_wise_quant(x_bf16, is_fp4=is_fp4)
+    x, sfa = group_wise_quant(x_bf16, mode=mode)
 
     # Per-expert weight: quantize each [n, k] slice from its own BF16 source.
     w_bf16_list, w_quant, w_sf = [], [], []
     for _ in range(num_experts):
         w_bf16 = torch.randn(n, k, dtype=torch.bfloat16, device=dev)
-        w_e, sfb_e = group_wise_quant(w_bf16, is_fp4=is_fp4)
+        w_e, sfb_e = group_wise_quant(w_bf16, mode=mode)
         w_bf16_list.append(w_bf16)
         w_quant.append(w_e)
         w_sf.append(sfb_e)
@@ -118,7 +120,9 @@ def _make_grouped_tensors(num_experts: int, max_m: int, n: int, k: int, mode: st
     w_bf16_stacked = torch.stack(w_bf16_list, dim=0)
 
     alpha = (
-        torch.ones((num_experts,), dtype=torch.float32, device=dev) if is_fp4 else None
+        torch.ones((num_experts,), dtype=torch.float32, device=dev)
+        if is_nvfp4
+        else None
     )
     out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
     return x, w, sfa, sfb, out, alpha, x_bf16, w_bf16_stacked
