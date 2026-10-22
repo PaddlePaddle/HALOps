@@ -1,5 +1,5 @@
 scenario: dense_gemm
-mode: w8a8
+mode: w8a8-mxfp8
 
 # [M, N, K] shapes.
 shapes:

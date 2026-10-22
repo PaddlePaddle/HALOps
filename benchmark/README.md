@@ -82,7 +82,7 @@ python benchmark.py \
 | `configs/attention/` | `prefill_dense` | batch、sequence length、Q/KV head、dtype、causal |
 | `configs/attention/` | `prefill_chunked_gqa` | prefix/chunk length、GQA、cache dtype |
 | `configs/attention/` | `decode_gqa` | KV length、MTP steps、GQA、BF16/FP8 cache |
-| `configs/gemm/` | `dense_gemm` | M/N/K shape、W8A8/W4A4、SM 数 |
+| `configs/gemm/` | `dense_gemm` | M/N/K shape、W8A8-MXFP8/W4A4、SM 数 |
 | `configs/gemm/` | `group_masked` / `group_contiguous` | expert 数、per-expert M、N/K、精度模式 |
 
 YAML 负责 workload、backend 和 cache/CUDA Graph 策略；命令行始终覆盖 `timing_method`、`dry_run_iters`、`repeat_iters` 和 subprocess 设置。输出路径与 `case_tag` 由 CLI 根据时间戳和配置文件名生成，YAML 中的同名字段会被忽略。

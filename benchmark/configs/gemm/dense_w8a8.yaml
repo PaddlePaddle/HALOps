@@ -1,6 +1,6 @@
-# Dense W8A8 (FP8) GEMM across halops, flashinfer (fi), and deepgemm.
+# Dense W8A8-MXFP8 (FP8) GEMM across halops, flashinfer (fi), and deepgemm.
 scenario: dense_gemm
-mode: w8a8
+mode: w8a8-mxfp8
 
 # [M, N, K] shapes (dsv4 sweep + small-M refactor sweep, deduplicated).
 shapes:

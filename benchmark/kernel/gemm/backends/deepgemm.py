@@ -52,7 +52,7 @@ def make_dense_inputs(x_bf16: torch.Tensor, w_bf16: torch.Tensor, mode: str) -> 
     """Quantize shared dense bf16 inputs into DeepGEMM layout.
 
     x_bf16 [M, K], w_bf16 [N, K].
-    w8a8: A/B=per-token FP8 gran_k=32.
+    w8a8-mxfp8: A/B=per-token FP8 gran_k=32.
     w4a4: A/B=per-token FP4 gran_k=32.
 
     Both scale factors are converted with `transform_sf_into_required_layout`
@@ -68,7 +68,11 @@ def make_dense_inputs(x_bf16: torch.Tensor, w_bf16: torch.Tensor, mode: str) -> 
     n = w_bf16.shape[0]
     out = torch.empty(m, n, dtype=torch.bfloat16, device=x_bf16.device)
 
-    cast = dg.per_token_cast_to_fp4 if mode.startswith("w4a4") else dg.per_token_cast_to_fp8
+    cast = (
+        dg.per_token_cast_to_fp4
+        if mode.startswith("w4a4")
+        else dg.per_token_cast_to_fp8
+    )
     a_data, a_sf = cast(x_bf16, use_ue8m0=True, gran_k=32)
     b_data, b_sf = cast(w_bf16, use_ue8m0=True, gran_k=32)
     a_sf = dg.transform_sf_into_required_layout(a_sf, m, k, (1, 32))
@@ -91,7 +95,7 @@ def make_grouped_masked_inputs(
     """Quantize shared grouped bf16 inputs into DeepGEMM masked 3D layout.
 
     x_bf16 [E*max_m, K] -> reshaped to [E, max_m, K]; w_bf16 [E, N, K].
-    w8a8: A=per-token FP8, B=per-block FP8.
+    w8a8-mxfp8: A=per-token FP8, B=per-block FP8.
     w4a4: A=per-token FP4 gran_k=32, B=per-token FP4 gran_k=32.
     Output is 3D [E, max_m, N]; flattened it matches the reference's
     [E*max_m, N] numel.
@@ -175,7 +179,7 @@ def make_grouped_contiguous_inputs(
     x_bf16 [M, K]; w_bf16 [E, N, K]. m_indices reuses the reference's
     expert_ids (already tile-aligned to a multiple of 128, satisfying
     DeepGEMM's contiguous alignment requirement). Output is 2D [M, N].
-    w8a8: A=per-token FP8, B=per-block FP8.
+    w8a8-mxfp8: A=per-token FP8, B=per-block FP8.
     w4a4: A=per-token FP4 gran_k=32, B=per-token FP4 gran_k=32.
 
     Scale factors are pre-packed into UE8M0 INT format so that the timed
@@ -235,11 +239,11 @@ def make_grouped_contiguous_inputs(
 
 
 def run_dense_gemm(inp: dict):
-    """Run DeepGEMM dense GEMM (w8a8 fp8_gemm_nt / w4a4 fp8_fp4_gemm_nt)."""
+    """Run DeepGEMM dense GEMM (w8a8-mxfp8 fp8_gemm_nt / w4a4 fp8_fp4_gemm_nt)."""
     _check()
     import deep_gemm as dg
 
-    if inp.get("mode", "w8a8").startswith("w4a4"):
+    if inp.get("mode", "w8a8-mxfp8").startswith("w4a4"):
         dg.fp8_fp4_gemm_nt(
             inp["a"], inp["b"], inp["out"], recipe_a=(1, 32), recipe_b=(1, 32)
         )
@@ -251,11 +255,11 @@ def run_dense_gemm(inp: dict):
 
 
 def run_group_masked_gemm(inp: dict):
-    """Run DeepGEMM grouped masked GEMM (w8a8 / w4a4)."""
+    """Run DeepGEMM grouped masked GEMM (w8a8-mxfp8 / w4a4)."""
     _check()
     import deep_gemm as dg
 
-    if inp.get("mode", "w8a8").startswith("w4a4"):
+    if inp.get("mode", "w8a8-mxfp8").startswith("w4a4"):
         dg.m_grouped_fp8_fp4_gemm_nt_masked(
             inp["a"],
             inp["b"],
@@ -273,11 +277,11 @@ def run_group_masked_gemm(inp: dict):
 
 
 def run_group_contiguous_gemm(inp: dict):
-    """Run DeepGEMM grouped contiguous GEMM (w8a8 / w4a4)."""
+    """Run DeepGEMM grouped contiguous GEMM (w8a8-mxfp8 / w4a4)."""
     _check()
     import deep_gemm as dg
 
-    if inp.get("mode", "w8a8").startswith("w4a4"):
+    if inp.get("mode", "w8a8-mxfp8").startswith("w4a4"):
         dg.m_grouped_fp8_fp4_gemm_nt_contiguous(
             inp["a"],
             inp["b"],

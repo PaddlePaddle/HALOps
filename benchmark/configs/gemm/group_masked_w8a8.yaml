@@ -1,6 +1,6 @@
-# Grouped masked W8A8 (FP8) GEMM across halops, flashinfer (fi), and deepgemm.
+# Grouped masked W8A8-MXFP8 (FP8) GEMM across halops, flashinfer (fi), and deepgemm.
 scenario: group_masked
-mode: w8a8
+mode: w8a8-mxfp8
 
 # [num_experts, max_m, N, K] shapes.
 shapes:

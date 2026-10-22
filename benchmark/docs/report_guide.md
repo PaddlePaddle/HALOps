@@ -59,7 +59,7 @@ Backend versions:
 ```
 
 ```
-scenario: dense_gemm | m=4096 | n=4096 | k=4096 | mode=w8a8
+scenario: dense_gemm | m=4096 | n=4096 | k=4096 | mode=w8a8-mxfp8
 arithmetic intensity: 2730.667 FLOPs/byte  roofline: 4500.00 TFLOPS
 backend         median(us)  std(us)  Speedup  TFLOPS   TB/s   BW%  roof_util%  host(us)  disp(us)  mismatch%  status
 --------------------------------------------------------------------------------------------------------------------
@@ -70,7 +70,7 @@ fi                 61.200    8.100    1.14x  2245.10  0.822 10.7%      49.9%    
 ## Speedup Summary
 | config | m | n | k | IR median(us) | IR TFLOPS | IR BW% | fi |
 |---|---|---|---|---|---|---|---|
-| mode=w8a8 | 4096 | 4096 | 4096 | 53.632 | 2562.63 | 12.2% | 1.14x |
+| mode=w8a8-mxfp8 | 4096 | 4096 | 4096 | 53.632 | 2562.63 | 12.2% | 1.14x |
 
 ## Summary
 | backend | total | valid | mean | P25/P50/P75/P90 | distribution | issues |

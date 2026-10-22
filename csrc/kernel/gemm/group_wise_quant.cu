@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <string>
 
 #include "kernel/gemm/gemm_utils.h"
 
@@ -29,6 +30,32 @@ namespace halops {
 constexpr float FP8_E4M3_MAX = 448.0f;
 
 constexpr float FP4_E2M1_MAX = 6.0f;
+
+enum class QuantMode : int32_t {
+    W8A8MXFP8 = 0,
+    W4A4MXFP4 = 1,
+    W4A4NVFP4 = 2,
+};
+
+constexpr bool IsFp4(QuantMode mode) { return mode != QuantMode::W8A8MXFP8; }
+
+constexpr int GroupSize(QuantMode mode) {
+    return mode == QuantMode::W4A4NVFP4 ? 16 : 32;
+}
+
+QuantMode ParseQuantMode(const std::string& mode) {
+    TORCH_CHECK(
+        mode == "w8a8-mxfp8" || mode == "w4a4-mxfp4" || mode == "w4a4-nvfp4",
+        "Unsupported quantization mode: ", mode,
+        ". Expected 'w8a8-mxfp8', 'w4a4-mxfp4' or 'w4a4-nvfp4'.");
+    if (mode == "w8a8-mxfp8") {
+        return QuantMode::W8A8MXFP8;
+    }
+    if (mode == "w4a4-mxfp4") {
+        return QuantMode::W4A4MXFP4;
+    }
+    return QuantMode::W4A4NVFP4;
+}
 
 // FP4 E2M1 magnitudes {0, 0.5, 1, 1.5, 2, 3, 4, 6}, rounded at the midpoints.
 // Returns the 4-bit code [S M2 M1 M0].
@@ -71,6 +98,14 @@ __device__ __forceinline__ float ue4m3_to_float32(uint8_t bits) {
     return static_cast<float>(fp8_val);
 }
 
+__device__ __forceinline__ uint8_t float32_to_ue8m0(float scale,
+                                                    float& inv_scale) {
+    const float biased_exp =
+        fminf(fmaxf(ceilf(log2f(scale)) + 127.0f, 0.0f), 254.0f);
+    inv_scale = exp2f(127.0f - biased_exp);
+    return static_cast<uint8_t>(biased_exp);
+}
+
 template <typename T>
 struct TypeTraits;
 
@@ -90,15 +125,12 @@ struct TypeTraits<__half> {
     static constexpr int elem_per_float4 = 8;
 };
 
-// One thread per quant group.
-//   GROUP_SIZE=32: FP8 E4M3 values, UE8M0 scale.
-//   GROUP_SIZE=16: FP4 E2M1 values packed two per byte, UE4M3 scale.
-//   USE_SWIZZLE: scales in CUTLASS SfAtom layout, otherwise linear row-major.
-template <typename T, int GROUP_SIZE, bool USE_SWIZZLE>
+template <typename T, QuantMode MODE, bool USE_SWIZZLE>
 __global__ void group_wise_quant_kernel(
     const T* __restrict__ input,
     void* __restrict__ output_quant,  // FP8 e4m3 or packed FP4 bytes
     void* __restrict__ output_sf, int m, int k, int kb_dim) {
+    constexpr int GROUP_SIZE = GroupSize(MODE);
     static_assert(GROUP_SIZE == 16 || GROUP_SIZE == 32,
                   "Only GROUP_SIZE=16 or 32 is supported");
     using Traits = TypeTraits<T>;
@@ -136,7 +168,7 @@ __global__ void group_wise_quant_kernel(
         uint8_t scale_byte;
         float inv_scale;
 
-        if constexpr (GROUP_SIZE == 16) {
+        if constexpr (MODE == QuantMode::W4A4NVFP4) {
             float scale = amax / FP4_E2M1_MAX;
             scale_byte = float32_to_ue4m3(scale);
             // UE4M3 may round a tiny scale to 0; use the smallest positive
@@ -146,16 +178,13 @@ __global__ void group_wise_quant_kernel(
             }
             float scale_decoded = ue4m3_to_float32(scale_byte);
             inv_scale = 1.0f / scale_decoded;
+        } else if constexpr (MODE == QuantMode::W4A4MXFP4) {
+            scale_byte = float32_to_ue8m0(amax / FP4_E2M1_MAX, inv_scale);
         } else {
-            // FP8: UE8M0 scale.
-            float scale = amax / FP8_E4M3_MAX;
-            float biased_exp =
-                fminf(fmaxf(ceilf(log2f(scale)) + 127.0f, 0.0f), 254.0f);
-            scale_byte = static_cast<uint8_t>(biased_exp);
-            inv_scale = exp2f(127.0f - biased_exp);
+            scale_byte = float32_to_ue8m0(amax / FP8_E4M3_MAX, inv_scale);
         }
 
-        if constexpr (GROUP_SIZE == 16) {
+        if constexpr (IsFp4(MODE)) {
             uint8_t fp4_codes[GROUP_SIZE];
 
 #pragma unroll
@@ -216,22 +245,59 @@ __global__ void group_wise_quant_kernel(
     }
 }
 
+template <typename T, QuantMode MODE>
+void LaunchGroupWiseQuant(const T* input, void* output_quant, void* output_sf,
+                          int m, int k, int kb_dim, bool use_swizzle,
+                          int grid_dim, int block_dim, cudaStream_t stream) {
+    if (use_swizzle) {
+        group_wise_quant_kernel<T, MODE, true>
+            <<<grid_dim, block_dim, 0, stream>>>(input, output_quant, output_sf,
+                                                 m, k, kb_dim);
+    } else {
+        group_wise_quant_kernel<T, MODE, false>
+            <<<grid_dim, block_dim, 0, stream>>>(input, output_quant, output_sf,
+                                                 m, k, kb_dim);
+    }
+}
+
+template <typename T>
+void LaunchGroupWiseQuantForMode(const T* input, void* output_quant,
+                                 void* output_sf, int m, int k, int kb_dim,
+                                 QuantMode mode, bool use_swizzle, int grid_dim,
+                                 int block_dim, cudaStream_t stream) {
+    if (mode == QuantMode::W8A8MXFP8) {
+        LaunchGroupWiseQuant<T, QuantMode::W8A8MXFP8>(
+            input, output_quant, output_sf, m, k, kb_dim, use_swizzle, grid_dim,
+            block_dim, stream);
+    } else if (mode == QuantMode::W4A4MXFP4) {
+        LaunchGroupWiseQuant<T, QuantMode::W4A4MXFP4>(
+            input, output_quant, output_sf, m, k, kb_dim, use_swizzle, grid_dim,
+            block_dim, stream);
+    } else {
+        LaunchGroupWiseQuant<T, QuantMode::W4A4NVFP4>(
+            input, output_quant, output_sf, m, k, kb_dim, use_swizzle, grid_dim,
+            block_dim, stream);
+    }
+}
+
 std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
-                                          const bool is_fp4,
+                                          const std::string& mode,
                                           const bool use_swizzle) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
     TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor of shape [m, k]");
     TORCH_CHECK(input.scalar_type() == torch::kBFloat16 ||
                     input.scalar_type() == torch::kHalf,
                 "input dtype must be bfloat16 or float16");
-
-    const int group_size = is_fp4 ? 16 : 32;
+    const QuantMode quant_mode = ParseQuantMode(mode);
+    const int group_size = GroupSize(quant_mode);
 
     const int m = static_cast<int>(input.size(0));
     const int k = static_cast<int>(input.size(1));
     const int kb_dim = k / group_size;
 
-    TORCH_CHECK(k % group_size == 0, "k must be divisible by group_size");
+    TORCH_CHECK(k % group_size == 0,
+                "k must be divisible by the quantization group size (",
+                group_size, ") for mode ", mode, ", got k=", k);
     if (use_swizzle) {
         // m_sf pads the scale rows to whole 128-row atoms, so any m (including
         // 0) is valid; only kb_dim is constrained.
@@ -247,7 +313,7 @@ std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
     // output_quant: (m_tile, k) fp8, or (m_tile, k/2) packed FP4.
     // output_sf: (m_sf, kb_dim) uint8 holding UE8M0 / UE4M3 bits.
     torch::Tensor output_quant;
-    if (is_fp4) {
+    if (IsFp4(quant_mode)) {
         output_quant =
             torch::empty({m_tile, k / 2}, input.options().dtype(torch::kByte));
     } else {
@@ -267,7 +333,7 @@ std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
     const int block_dim = 128;
     const int grid_dim = max((total_groups + block_dim - 1) / block_dim, 1);
     void* quant_data;
-    if (is_fp4) {
+    if (IsFp4(quant_mode)) {
         quant_data = static_cast<void*>(output_quant.data_ptr<uint8_t>());
     } else {
         quant_data =
@@ -279,51 +345,15 @@ std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
     if (input.scalar_type() == torch::kBFloat16) {
         const auto* input_ptr = reinterpret_cast<const __nv_bfloat16*>(
             input.mutable_data_ptr<c10::BFloat16>());
-        if (is_fp4) {
-            if (use_swizzle) {
-                group_wise_quant_kernel<__nv_bfloat16, 16, true>
-                    <<<grid_dim, block_dim, 0, stream>>>(input_ptr, quant_data,
-                                                         sf_data, m, k, kb_dim);
-            } else {
-                group_wise_quant_kernel<__nv_bfloat16, 16, false>
-                    <<<grid_dim, block_dim, 0, stream>>>(input_ptr, quant_data,
-                                                         sf_data, m, k, kb_dim);
-            }
-        } else {
-            if (use_swizzle) {
-                group_wise_quant_kernel<__nv_bfloat16, 32, true>
-                    <<<grid_dim, block_dim, 0, stream>>>(input_ptr, quant_data,
-                                                         sf_data, m, k, kb_dim);
-            } else {
-                group_wise_quant_kernel<__nv_bfloat16, 32, false>
-                    <<<grid_dim, block_dim, 0, stream>>>(input_ptr, quant_data,
-                                                         sf_data, m, k, kb_dim);
-            }
-        }
+        LaunchGroupWiseQuantForMode<__nv_bfloat16>(
+            input_ptr, quant_data, sf_data, m, k, kb_dim, quant_mode,
+            use_swizzle, grid_dim, block_dim, stream);
     } else {
         const auto* input_ptr = reinterpret_cast<const __half*>(
             input.mutable_data_ptr<c10::Half>());
-        if (is_fp4) {
-            if (use_swizzle) {
-                group_wise_quant_kernel<__half, 16, true>
-                    <<<grid_dim, block_dim, 0, stream>>>(input_ptr, quant_data,
-                                                         sf_data, m, k, kb_dim);
-            } else {
-                group_wise_quant_kernel<__half, 16, false>
-                    <<<grid_dim, block_dim, 0, stream>>>(input_ptr, quant_data,
-                                                         sf_data, m, k, kb_dim);
-            }
-        } else {
-            if (use_swizzle) {
-                group_wise_quant_kernel<__half, 32, true>
-                    <<<grid_dim, block_dim, 0, stream>>>(input_ptr, quant_data,
-                                                         sf_data, m, k, kb_dim);
-            } else {
-                group_wise_quant_kernel<__half, 32, false>
-                    <<<grid_dim, block_dim, 0, stream>>>(input_ptr, quant_data,
-                                                         sf_data, m, k, kb_dim);
-            }
-        }
+        LaunchGroupWiseQuantForMode<__half>(input_ptr, quant_data, sf_data, m,
+                                            k, kb_dim, quant_mode, use_swizzle,
+                                            grid_dim, block_dim, stream);
     }
 
     cudaError_t cuda_status = cudaGetLastError();

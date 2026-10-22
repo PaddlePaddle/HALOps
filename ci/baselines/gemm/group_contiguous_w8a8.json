@@ -12,7 +12,7 @@
         "m": 512,
         "n": 256,
         "k": 512,
-        "mode": "w8a8",
+        "mode": "w8a8-mxfp8",
         "case_tag": "group_contiguous_w8a8"
       },
       "median_us": 6.592
@@ -26,7 +26,7 @@
         "m": 40960,
         "n": 4096,
         "k": 4096,
-        "mode": "w8a8",
+        "mode": "w8a8-mxfp8",
         "case_tag": "group_contiguous_w8a8"
       },
       "median_us": 439.957

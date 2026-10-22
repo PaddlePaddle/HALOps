@@ -45,7 +45,7 @@ Unit test conventions:
 - Name files `tests/test_<api>.py`; put shared reference implementations and input builders in `tests/utils/`.
 - Use module-level `test_*` functions. Expand shapes, configs and invalid inputs with `@pytest.mark.parametrize` instead of looping inside one test.
 - Seeding, the default CUDA device and skipping on machines without an `sm_100f` GPU are handled by `tests/conftest.py`; do not set them in test files. Do not allocate CUDA tensors at import time; use fixtures.
-- Compare values with `torch.testing.assert_close` and bit-exact results with `torch.equal`. Define tolerances as named constants; GEMM tests use `W8A8_TOL` / `W4A4_TOL` from `tests/utils/gemm_utils.py`.
+- Compare values with `torch.testing.assert_close` and bit-exact results with `torch.equal`. Define tolerances as named constants; GEMM tests use `W8A8_MXFP8_TOL` / `W4A4_TOL` from `tests/utils/gemm_utils.py`.
 - Assert exceptions with `pytest.raises(<type>, match=...)`. Do not use `print` in tests.
 
 ### Performance Changes
@@ -137,7 +137,7 @@ python tests/test_dense_gemm.py
 - 文件命名为 `tests/test_<api>.py`，公共参考实现和构造函数放在 `tests/utils/`。
 - 使用模块级 `test_*` 函数；shape、配置和非法输入用 `@pytest.mark.parametrize` 展开，不在单个用例内循环。
 - 随机种子、默认 CUDA 设备和无 `sm_100f` GPU 时的跳过由 `tests/conftest.py` 统一处理，测试文件中不再设置；不在 import 时分配 CUDA tensor，改用 fixture。
-- 数值比较使用 `torch.testing.assert_close`，按位比较使用 `torch.equal`；容差定义为具名常量，GEMM 使用 `tests/utils/gemm_utils.py` 中的 `W8A8_TOL` / `W4A4_TOL`。
+- 数值比较使用 `torch.testing.assert_close`，按位比较使用 `torch.equal`；容差定义为具名常量，GEMM 使用 `tests/utils/gemm_utils.py` 中的 `W8A8_MXFP8_TOL` / `W4A4_TOL`。
 - 异常用 `pytest.raises(<类型>, match=...)` 断言；测试中不使用 `print`。
 
 ### 性能变更

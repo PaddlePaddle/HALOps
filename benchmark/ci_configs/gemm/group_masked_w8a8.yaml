@@ -1,5 +1,5 @@
 scenario: group_masked
-mode: w8a8
+mode: w8a8-mxfp8
 
 # [num_experts, max_m, N, K] shapes.
 shapes:

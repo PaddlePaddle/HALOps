@@ -40,17 +40,17 @@ from kernel.gemm.backends.deepgemm import (
     make_dense_inputs as make_deepgemm_inputs,
 )
 
-# Scale block size: FP8 W8A8 uses k//32, FP4 NVFP4 uses k//16.
+# Scale block size: FP8 W8A8-MXFP8 uses k//32, FP4 NVFP4 uses k//16.
 FP8_SF_BLOCK = 32
-FP4_SF_BLOCK = 16
-# group_wise_quant only produces FP8 or NVFP4 inputs, so the benchmark covers
-# those two recipes (the kernel itself also supports w4a4-mxfp4).
-DENSE_MODES = ("w8a8", "w4a4-nvfp4")
+NVFP4_SF_BLOCK = 16
+# group_wise_quant can also produce MXFP4 inputs, but this benchmark only
+# generates the FP8 and NVFP4 recipes (the kernel supports w4a4-mxfp4 too).
+DENSE_MODES = ("w8a8-mxfp8", "w4a4-nvfp4")
 
 
 @dataclass
 class GemmInput:
-    """Dense GEMM inputs for W8A8 or W4A4-NVFP4 modes."""
+    """Dense GEMM inputs for W8A8-MXFP8 or W4A4-NVFP4 modes."""
 
     x: torch.Tensor
     w: torch.Tensor
@@ -61,14 +61,14 @@ class GemmInput:
     n: int
     k: int
     sm_count: int
-    mode: str = "w8a8"
+    mode: str = "w8a8-mxfp8"
     x_bf16: torch.Tensor | None = None
     w_bf16: torch.Tensor | None = None
     alpha: torch.Tensor | None = None
 
 
 def _build_inputs(
-    m: int, n: int, k: int, sm_count: int, mode: str = "w8a8"
+    m: int, n: int, k: int, sm_count: int, mode: str = "w8a8-mxfp8"
 ) -> GemmInput:
     """Build dense GEMM inputs on CUDA for the given quantization mode."""
     from halops.gemm.group_wise_quant import group_wise_quant
@@ -79,18 +79,18 @@ def _build_inputs(
             f"Unsupported dense benchmark mode: {mode!r}. "
             f"Expected one of {DENSE_MODES}."
         )
-    is_fp4 = mode == "w4a4-nvfp4"
+    is_nvfp4 = mode == "w4a4-nvfp4"
 
-    if is_fp4:
-        assert k % (2 * FP4_SF_BLOCK) == 0, f"k={k} must be divisible by 32"
+    if is_nvfp4:
+        assert k % (2 * NVFP4_SF_BLOCK) == 0, f"k={k} must be divisible by 32"
     else:
         assert k % FP8_SF_BLOCK == 0, f"k={k} must be divisible by {FP8_SF_BLOCK}"
 
     x_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device=dev)
     w_bf16 = torch.randn(n, k, dtype=torch.bfloat16, device=dev)
-    x, sfa = group_wise_quant(x_bf16, is_fp4=is_fp4)
-    w, sfb = group_wise_quant(w_bf16, is_fp4=is_fp4)
-    alpha = torch.ones((1,), dtype=torch.float32, device=dev) if is_fp4 else None
+    x, sfa = group_wise_quant(x_bf16, mode=mode)
+    w, sfb = group_wise_quant(w_bf16, mode=mode)
+    alpha = torch.ones((1,), dtype=torch.float32, device=dev) if is_nvfp4 else None
 
     out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
     return GemmInput(
@@ -145,7 +145,7 @@ def adapt_fi(inp: GemmInput) -> dict:
             "a_descale": inp.sfa,
             "b_descale": inp.sfb,
             "out": inp.out,
-            "mode": "w8a8",
+            "mode": "w8a8-mxfp8",
         }
 
 
@@ -203,7 +203,7 @@ def _refcheck_entry(
     """Subprocess entry for refcheck."""
     m, n, k = cfg["m"], cfg["n"], cfg["k"]
     sm_count = cfg.get("sm_count", -1)
-    mode = cfg.get("mode", "w8a8")
+    mode = cfg.get("mode", "w8a8-mxfp8")
     # Put reference backend first so it becomes the comparison baseline
     ordered = [refcheck_reference] + [
         n_ for n_ in ordered_names if n_ != refcheck_reference
@@ -234,7 +234,7 @@ def _bench_entry(
     """Subprocess entry: build inputs, adapt, bench a single backend."""
     m, n, k = cfg["m"], cfg["n"], cfg["k"]
     sm_count = cfg.get("sm_count", -1)
-    mode = cfg.get("mode", "w8a8")
+    mode = cfg.get("mode", "w8a8-mxfp8")
     raw_inp = _build_inputs(m, n, k, sm_count, mode=mode)
     backends = _get_backends([name])
     if name not in backends:
@@ -255,7 +255,7 @@ def _bench_entry(
 
 def run_scenario(cfg: dict) -> None:
     """Run the dense GEMM benchmark scenario."""
-    mode = cfg.get("mode", "w8a8")
+    mode = cfg.get("mode", "w8a8-mxfp8")
     out_path = cfg.get("output_path", "results/dense_fp8.csv")
     dry_run_iters = cfg.get("dry_run_iters", 10)
     repeat_iters = cfg.get("repeat_iters", 50)

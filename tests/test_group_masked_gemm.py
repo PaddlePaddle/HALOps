@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for group_masked_gemm (W8A8 FP8 and W4A4 NVFP4)."""
+"""Tests for group_masked_gemm (W8A8-MXFP8 FP8, W4A4 NVFP4 and W4A4 MXFP4)."""
 
 import re
 from types import SimpleNamespace
@@ -22,15 +22,17 @@ import pytest
 import torch
 
 from halops import group_masked_gemm
-from tests.utils.fp4_utils import FP4_BLOCK_SIZE
+from tests.utils.fp4_utils import MXFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE
 
 from tests.utils.gemm_utils import (
     W4A4_TOL,
-    W8A8_TOL,
-    per_block_cast_to_fp4,
+    W8A8_MXFP8_TOL,
+    per_block_cast_to_nvfp4,
     per_block_cast_to_fp8,
-    per_token_cast_to_fp4,
+    per_block_cast_to_mxfp4,
+    per_token_cast_to_nvfp4,
     per_token_cast_to_fp8,
+    per_token_cast_to_mxfp4,
     reorder_sf_to_cutlass,
     ue8m0_to_float32,
 )
@@ -147,7 +149,8 @@ def ref_group_masked_gemm_w4a4(
 ):
     """
     Reference implementation of W4A4 grouped masked GEMM.
-    Directly uses dequantized float32 values for matmul.
+    Directly uses dequantized float32 values for matmul, so the NVFP4 and
+    MXFP4 tests share it.
 
     Parameters:
       x_fp4_float: (M_total, K), float32 - dequantized activation
@@ -194,7 +197,7 @@ def group_masked_gemm_wrapper(
     bias=None,
     alpha=None,
     sm_count=-1,
-    mode="w8a8",
+    mode="w8a8-mxfp8",
 ):
     output = torch.zeros(
         [x.shape[0], w.shape[1]], dtype=torch.bfloat16, device=x.device
@@ -211,7 +214,7 @@ def make_masked_m(num_experts, max_m_per_expert, full_x):
     return torch.randint(0, max_m_per_expert, [num_experts], dtype=torch.int32)
 
 
-def make_w8a8_inputs(
+def make_w8a8_mxfp8_inputs(
     max_m_per_expert,
     num_experts,
     n,
@@ -221,7 +224,7 @@ def make_w8a8_inputs(
     add_bias=False,
     pad_n_224_to_256=False,
 ):
-    """Build W8A8 inputs. ``masked_m`` (list) overrides the generated row counts."""
+    """Build W8A8-MXFP8 inputs. ``masked_m`` (list) overrides the generated row counts."""
     masked_m_t = make_masked_m(num_experts, max_m_per_expert, full_x)
     x_origin = torch.randn([num_experts * max_m_per_expert, k], dtype=torch.bfloat16)
     w_origin = torch.randn([num_experts, n, k], dtype=torch.bfloat16)
@@ -254,11 +257,11 @@ def make_w8a8_inputs(
         sfa=sfa,
         sfb=sfb,
         bias=bias,
-        mode="w8a8",
+        mode="w8a8-mxfp8",
     )
 
 
-def make_w4a4_inputs(
+def make_nvfp4_inputs(
     max_m_per_expert,
     num_experts,
     n,
@@ -283,11 +286,15 @@ def make_w4a4_inputs(
     w_origin = torch.randn([num_experts, n, k], dtype=torch.bfloat16)
 
     # FP4 quantization: block_size=16, scale uses UE4M3 encoding
-    x_packed, sfa_logical, x_fp4_float = per_token_cast_to_fp4(x_origin, FP4_BLOCK_SIZE)
-    w_packed, sfb_logical, w_fp4_float = per_block_cast_to_fp4(w_origin, FP4_BLOCK_SIZE)
+    x_packed, sfa_logical, x_fp4_float = per_token_cast_to_nvfp4(
+        x_origin, NVFP4_BLOCK_SIZE
+    )
+    w_packed, sfb_logical, w_fp4_float = per_block_cast_to_nvfp4(
+        w_origin, NVFP4_BLOCK_SIZE
+    )
 
     # SF permute: CUTLASS SfAtom interleaved layout
-    kb_dim = k // FP4_BLOCK_SIZE
+    kb_dim = k // NVFP4_BLOCK_SIZE
     sfa = reorder_sf_to_cutlass(sfa_logical, M_total, kb_dim)
     if pad_n_224_to_256:
         # Only pad sfb scale, weight matrix is not padded
@@ -317,6 +324,54 @@ def make_w4a4_inputs(
         alpha=alpha_tensor,
         sm_count=-1,
         mode="w4a4-nvfp4",
+    )
+
+
+def make_mxfp4_inputs(
+    max_m_per_expert,
+    num_experts,
+    n,
+    k,
+    full_x=True,
+    masked_m=None,
+):
+    """
+    Build MXFP4 inputs: FP4 E2M1 with one UE8M0 scale per 32 elements.
+    ``masked_m`` (list) overrides the generated row counts. There is no
+    per-expert alpha: the UE8M0 block scales carry the full scale.
+    """
+    masked_m_t = make_masked_m(num_experts, max_m_per_expert, full_x)
+
+    M_total = num_experts * max_m_per_expert
+    x_origin = torch.randn([M_total, k], dtype=torch.bfloat16)
+    w_origin = torch.randn([num_experts, n, k], dtype=torch.bfloat16)
+
+    x_packed, sfa_logical, x_fp4_float = per_token_cast_to_mxfp4(
+        x_origin, MXFP4_BLOCK_SIZE
+    )
+    w_packed, sfb_logical, w_fp4_float = per_block_cast_to_mxfp4(
+        w_origin, MXFP4_BLOCK_SIZE
+    )
+
+    kb_dim = k // MXFP4_BLOCK_SIZE
+    sfa = reorder_sf_to_cutlass(sfa_logical, M_total, kb_dim)
+    sfb = reorder_sf_to_cutlass(sfb_logical, n, kb_dim)
+
+    if masked_m is not None:
+        masked_m_t = torch.tensor(masked_m, dtype=torch.int32)
+
+    return SimpleNamespace(
+        max_m_per_expert=max_m_per_expert,
+        num_experts=num_experts,
+        masked_m=masked_m_t,
+        x_packed=x_packed,
+        w_packed=w_packed,
+        x_fp4_float=x_fp4_float,
+        w_fp4_float=w_fp4_float,
+        sfa=sfa,
+        sfb=sfb,
+        sm_count=-1,
+        mode="w4a4-mxfp4",
     )
 
 
@@ -358,8 +413,8 @@ FULL_N, FULL_K = 7168, 3584
         ),
     ],
 )
-def test_group_masked_w8a8(max_m_per_expert, num_experts, n, k, full_x, masked_m):
-    inp = make_w8a8_inputs(
+def test_group_masked_w8a8_mxfp8(max_m_per_expert, num_experts, n, k, full_x, masked_m):
+    inp = make_w8a8_mxfp8_inputs(
         max_m_per_expert, num_experts, n, k, full_x=full_x, masked_m=masked_m
     )
     # ref uses logical layout scale, kernel uses CUTLASS reordered scale
@@ -384,7 +439,7 @@ def test_group_masked_w8a8(max_m_per_expert, num_experts, n, k, full_x, masked_m
         mode=inp.mode,
     )
     assert_close_per_expert(
-        output, ref_out, inp.masked_m, inp.max_m_per_expert, W8A8_TOL
+        output, ref_out, inp.masked_m, inp.max_m_per_expert, W8A8_MXFP8_TOL
     )
 
 
@@ -410,7 +465,7 @@ def test_group_masked_w8a8(max_m_per_expert, num_experts, n, k, full_x, masked_m
         ),
     ],
 )
-def test_group_masked_w4a4(
+def test_group_masked_nvfp4(
     max_m_per_expert, num_experts, n, k, full_x, masked_m, random_alpha
 ):
     alpha = None
@@ -422,7 +477,7 @@ def test_group_masked_w4a4(
             .astype(np.float32)
             .tolist()
         )
-    inp = make_w4a4_inputs(
+    inp = make_nvfp4_inputs(
         max_m_per_expert,
         num_experts,
         n,
@@ -457,11 +512,103 @@ def test_group_masked_w4a4(
 
 
 # =====================================================================
+# MXFP4 accuracy tests
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "max_m_per_expert, num_experts, n, k, full_x, masked_m",
+    [
+        pytest.param(128, 4, FULL_N, FULL_K, True, None, id="max_m128_e4"),
+        pytest.param(512, 8, FULL_N, FULL_K, True, None, id="max_m512_e8"),
+        pytest.param(64, 20, FULL_N, FULL_K, True, None, id="small_max_m64_e20"),
+        pytest.param(
+            128,
+            4,
+            128,
+            512,
+            False,
+            [11, 37, 89, 128],
+            id="max_m128_e4_n128_k512_partial",
+        ),
+    ],
+)
+def test_group_masked_mxfp4(max_m_per_expert, num_experts, n, k, full_x, masked_m):
+    inp = make_mxfp4_inputs(
+        max_m_per_expert, num_experts, n, k, full_x=full_x, masked_m=masked_m
+    )
+    ref_out = ref_group_masked_gemm_w4a4(
+        inp.x_fp4_float,
+        inp.w_fp4_float,
+        inp.masked_m,
+        inp.max_m_per_expert,
+        inp.num_experts,
+    )
+    output = group_masked_gemm_wrapper(
+        inp.x_packed,
+        inp.w_packed,
+        inp.sfa,
+        inp.sfb,
+        inp.masked_m,
+        inp.max_m_per_expert,
+        sm_count=inp.sm_count,
+        mode=inp.mode,
+    )
+    assert_close_per_expert(
+        output, ref_out, inp.masked_m, inp.max_m_per_expert, W4A4_TOL
+    )
+
+
+# =====================================================================
 # Unsupported-input checks
 # =====================================================================
 
 
-def run_w8a8_bad_max_m():
+def run_mxfp4_alpha():
+    num_experts, max_m, n, k = 2, 128, 256, 512
+    x = torch.empty([num_experts * max_m, k // 2], dtype=torch.uint8)
+    w = torch.empty([num_experts, n, k // 2], dtype=torch.uint8)
+    sfa = torch.empty([num_experts * max_m, k // 32], dtype=torch.uint8)
+    sfb = torch.empty([num_experts, n, k // 32], dtype=torch.uint8)
+    masked_m = torch.full([num_experts], max_m, dtype=torch.int32)
+    out = torch.empty([num_experts * max_m, n], dtype=torch.bfloat16)
+    alpha = torch.ones([num_experts], dtype=torch.float32)
+    group_masked_gemm(
+        x, w, sfa, sfb, masked_m, out, None, alpha, max_m, -1, "w4a4-mxfp4"
+    )
+
+
+def run_mxfp4_bad_sf_k():
+    num_experts, max_m, n, k = 2, 128, 256, 512
+    x = torch.empty([num_experts * max_m, k // 2], dtype=torch.uint8)
+    w = torch.empty([num_experts, n, k // 2], dtype=torch.uint8)
+    # NVFP4-shaped scales (K // 16) must be rejected for MXFP4.
+    sfa = torch.empty([num_experts * max_m, k // 16], dtype=torch.uint8)
+    sfb = torch.empty([num_experts, n, k // 16], dtype=torch.uint8)
+    masked_m = torch.full([num_experts], max_m, dtype=torch.int32)
+    out = torch.empty([num_experts * max_m, n], dtype=torch.bfloat16)
+    group_masked_gemm(
+        x, w, sfa, sfb, masked_m, out, None, None, max_m, -1, "w4a4-mxfp4"
+    )
+
+
+@pytest.mark.parametrize(
+    "launch, expected",
+    [
+        pytest.param(run_mxfp4_alpha, "does not take alpha", id="mxfp4_alpha"),
+        pytest.param(
+            run_mxfp4_bad_sf_k,
+            "scale-factor shape does not match mode",
+            id="mxfp4_bad_sf_k",
+        ),
+    ],
+)
+def test_group_masked_mxfp4_errors(launch, expected):
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
+        launch()
+
+
+def run_w8a8_mxfp8_bad_max_m():
     num_experts, max_m, n, k = 2, 129, 256, 128
     x = torch.empty([num_experts * max_m, k], dtype=torch.float8_e4m3fn)
     w = torch.empty([num_experts, n, k], dtype=torch.float8_e4m3fn)
@@ -469,10 +616,12 @@ def run_w8a8_bad_max_m():
     sfb = torch.empty([num_experts, n, k // 32], dtype=torch.uint8)
     masked_m = torch.full([num_experts], max_m, dtype=torch.int32)
     out = torch.empty([num_experts * max_m, n], dtype=torch.bfloat16)
-    group_masked_gemm(x, w, sfa, sfb, masked_m, out, None, None, max_m, -1, "w8a8")
+    group_masked_gemm(
+        x, w, sfa, sfb, masked_m, out, None, None, max_m, -1, "w8a8-mxfp8"
+    )
 
 
-def run_w4a4_bias():
+def run_nvfp4_bias():
     num_experts, max_m, n, k = 2, 128, 128, 512
     x = torch.empty([num_experts * max_m, k // 2], dtype=torch.uint8)
     w = torch.empty([num_experts, n, k // 2], dtype=torch.uint8)
@@ -495,7 +644,9 @@ def run_zero_max_m_per_expert():
     sfb = torch.empty([num_experts, n, k // 32], dtype=torch.uint8)
     masked_m = torch.zeros([num_experts], dtype=torch.int32)
     out = torch.empty([0, n], dtype=torch.bfloat16)
-    group_masked_gemm(x, w, sfa, sfb, masked_m, out, None, None, max_m, -1, "w8a8")
+    group_masked_gemm(
+        x, w, sfa, sfb, masked_m, out, None, None, max_m, -1, "w8a8-mxfp8"
+    )
 
 
 def run_masked_m_int64():
@@ -506,7 +657,9 @@ def run_masked_m_int64():
     sfb = torch.empty([num_experts, n, k // 32], dtype=torch.uint8)
     masked_m = torch.full([num_experts], max_m, dtype=torch.int64)
     out = torch.empty([num_experts * max_m, n], dtype=torch.bfloat16)
-    group_masked_gemm(x, w, sfa, sfb, masked_m, out, None, None, max_m, -1, "w8a8")
+    group_masked_gemm(
+        x, w, sfa, sfb, masked_m, out, None, None, max_m, -1, "w8a8-mxfp8"
+    )
 
 
 def run_bad_rank_output():
@@ -517,19 +670,21 @@ def run_bad_rank_output():
     sfb = torch.empty([num_experts, n, k // 32], dtype=torch.uint8)
     masked_m = torch.full([num_experts], max_m, dtype=torch.int32)
     out = torch.empty([num_experts * max_m, n, 1], dtype=torch.bfloat16)
-    group_masked_gemm(x, w, sfa, sfb, masked_m, out, None, None, max_m, -1, "w8a8")
+    group_masked_gemm(
+        x, w, sfa, sfb, masked_m, out, None, None, max_m, -1, "w8a8-mxfp8"
+    )
 
 
 @pytest.mark.parametrize(
     "launch, expected",
     [
         pytest.param(
-            run_w8a8_bad_max_m,
-            "No masked w8a8 tile for M=129",
-            id="w8a8_bad_max_m",
+            run_w8a8_mxfp8_bad_max_m,
+            "No masked w8a8-mxfp8 tile for M=129",
+            id="w8a8_mxfp8_bad_max_m",
         ),
         pytest.param(
-            run_w4a4_bias, "W4A4 mode does not support bias yet", id="w4a4_bias"
+            run_nvfp4_bias, "W4A4 mode does not support bias yet", id="w4a4_bias"
         ),
         pytest.param(
             run_zero_max_m_per_expert,
@@ -556,9 +711,9 @@ def test_group_masked_unsupported_shapes(launch, expected):
 # =====================================================================
 
 
-def test_group_masked_w8a8_determinism():
+def test_group_masked_w8a8_mxfp8_determinism():
     """Determinism: identical inputs must produce bitwise-identical outputs."""
-    inp = make_w8a8_inputs(128, 4, 256, 256, full_x=True)
+    inp = make_w8a8_mxfp8_inputs(128, 4, 256, 256, full_x=True)
     out1, out2 = (
         group_masked_gemm_wrapper(
             inp.x,
@@ -572,12 +727,35 @@ def test_group_masked_w8a8_determinism():
         )
         for _ in range(2)
     )
-    assert torch.equal(out1, out2), "W8A8 group_masked_gemm output is not deterministic"
+    assert torch.equal(
+        out1, out2
+    ), "W8A8-MXFP8 group_masked_gemm output is not deterministic"
 
 
-def test_group_masked_w4a4_determinism():
+def test_group_masked_mxfp4_determinism():
     """Determinism: identical inputs must produce bitwise-identical outputs."""
-    inp = make_w4a4_inputs(128, 4, 128, 512, full_x=True)
+    inp = make_mxfp4_inputs(128, 4, 128, 512, full_x=True)
+    out1, out2 = (
+        group_masked_gemm_wrapper(
+            inp.x_packed,
+            inp.w_packed,
+            inp.sfa,
+            inp.sfb,
+            inp.masked_m,
+            inp.max_m_per_expert,
+            sm_count=inp.sm_count,
+            mode=inp.mode,
+        )
+        for _ in range(2)
+    )
+    assert torch.equal(
+        out1, out2
+    ), "MXFP4 group_masked_gemm output is not deterministic"
+
+
+def test_group_masked_nvfp4_determinism():
+    """Determinism: identical inputs must produce bitwise-identical outputs."""
+    inp = make_nvfp4_inputs(128, 4, 128, 512, full_x=True)
     out1, out2 = (
         group_masked_gemm_wrapper(
             inp.x_packed,

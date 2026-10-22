@@ -25,9 +25,9 @@ HALOps（High-performance Accelerated LLM Operators）是文心团队开发的�
 
 核心 CUDA kernel 基于 CUTLASS 实现，覆盖 Attention、MLA 与 MoE 推理路径。
 - **Attention**：变长 BF16 prefill、BF16/FP8 paged-KV decode、GQA/MTP，以及融合 RoPE、RMSNorm 与 KV cache 写入。
-- **GEMM**：W8A8 FP8 与 W4A4 FP4 的 dense、batched、MoE masked/contiguous GEMM。
+- **GEMM**：W8A8-MXFP8 FP8 与 W4A4 FP4（NVFP4 / MXFP4）的 dense、batched、MoE masked/contiguous GEMM。
 - **MLA**：MLA MegaKernel，单 kernel 融合 Q 投影（含 norm 与 RoPE）、attention 与 KV cache 写入。
-- **Quantization**：group-wise quantization、SwiGLU + quantization。
+- **Quantization**：group-wise quantization（FP8 / NVFP4 / MXFP4）、SwiGLU + quantization。
 
 ## 支持的算子
 
@@ -45,10 +45,10 @@ HALOps（High-performance Accelerated LLM Operators）是文心团队开发的�
 
 | Python API | 功能 |
 | --- | --- |
-| [`dense_gemm`](halops/gemm/dense_gemm.py) | W8A8 FP8 / W4A4 FP4 dense GEMM，BF16 输出 |
-| [`batch_gemm`](halops/gemm/batch_gemm.py) | W8A8 / W4A4 batched GEMM |
-| [`group_masked_gemm`](halops/gemm/group_masked_gemm.py) | padded MoE grouped GEMM |
-| [`group_contiguous_gemm`](halops/gemm/group_contiguous_gemm.py) | contiguous-token MoE grouped GEMM |
+| [`dense_gemm`](halops/gemm/dense_gemm.py) | W8A8-MXFP8 FP8 / W4A4 FP4（NVFP4、MXFP4）dense GEMM，BF16 输出 |
+| [`batch_gemm`](halops/gemm/batch_gemm.py) | W8A8-MXFP8 / W4A4（NVFP4、MXFP4）batched GEMM |
+| [`group_masked_gemm`](halops/gemm/group_masked_gemm.py) | padded MoE grouped GEMM，支持 W8A8-MXFP8 / W4A4（NVFP4、MXFP4） |
+| [`group_contiguous_gemm`](halops/gemm/group_contiguous_gemm.py) | contiguous-token MoE grouped GEMM，支持 W8A8-MXFP8 / W4A4（NVFP4、MXFP4） |
 | [`prefill_permute_to_masked_gemm`](halops/gemm/prefill_permute_to_masked_gemm.py) | 按 expert 重排 token 并转换 scale 布局，生成 masked GEMM 输入 |
 
 ### MLA
@@ -62,7 +62,7 @@ HALOps（High-performance Accelerated LLM Operators）是文心团队开发的�
 
 | Python API | 功能 |
 | --- | --- |
-| [`group_wise_quant`](halops/gemm/group_wise_quant.py) | BF16/FP16 到 FP8 或 packed FP4 |
+| [`group_wise_quant`](halops/gemm/group_wise_quant.py) | BF16/FP16 到 FP8（UE8M0，group=32）、NVFP4（UE4M3，group=16）或 MXFP4（UE8M0，group=32） |
 | [`fused_swiglu_quant`](halops/gemm/fused_swiglu_quant.py) | SwiGLU 与 FP8/FP4 量化融合 |
 
 ## 硬件与软件要求
@@ -88,7 +88,7 @@ python -m pip install --no-build-isolation --no-deps -v .
 
 构建目标固定为 `compute_100f/sm_100f`；wheel 构建、CUDA 路径配置和开发态编译见 [构建指南](docs/build_guide_CN.md)。
 
-安装后可通过一个 W8A8 dense GEMM 简单示例验证量化和计算链路，预期输出为 `torch.Size([128, 256]) torch.bfloat16`。
+安装后可通过一个 W8A8-MXFP8 dense GEMM 简单示例验证量化和计算链路，预期输出为 `torch.Size([128, 256]) torch.bfloat16`。
 
 ```python
 import torch
@@ -99,13 +99,15 @@ M, N, K = 128, 256, 512
 a = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
 b = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
 
-a_fp8, scale_a = group_wise_quant(a, is_fp4=False, use_swizzle=True)
-b_fp8, scale_b = group_wise_quant(b, is_fp4=False, use_swizzle=True)
+a_fp8, scale_a = group_wise_quant(a, mode="w8a8-mxfp8", use_swizzle=True)
+b_fp8, scale_b = group_wise_quant(b, mode="w8a8-mxfp8", use_swizzle=True)
 output = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
 
-dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8")
+dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8-mxfp8")
 print(output.shape, output.dtype)
 ```
+
+W4A4 的用法相同：`group_wise_quant` 与 GEMM 都传入 `mode="w4a4-mxfp4"`（FP4 E2M1 数据 + 每 32 个元素一个 UE8M0 scale）即可；NVFP4 使用 `mode="w4a4-nvfp4"`（每 16 个元素一个 UE4M3 scale），并且需要额外传入每个 expert 的全局 `alpha`。
 
 ## 如何贡献
 

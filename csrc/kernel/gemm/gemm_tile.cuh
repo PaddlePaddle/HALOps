@@ -48,23 +48,23 @@ struct GemmTile : GemmKernelConfig {
 };
 
 struct TileSpec {
-    int block_m = 0;           // KBlockM
-    int block_n = 0;           // KBlockN
-    int block_k = 0;           // KBlockK
-    int main_stages = 2;       // KPrologueStages
-    int epi_stages = 2;        // KEpilogueStages
-    int cluster_m = 1;         // KClusterM
-    int cluster_n = 1;         // KClusterN
-    int tmem_overlap = 0;      // KTmemOverlapCols
-    int epi_regs = 208;        // KNumRegsEpilogue; 160 trades regs for occ.
-    bool swap_ab = false;      // SwapAB: the activation moves to the MMA's N
-    bool skip_fence = false;   // SkipTmemFence
-    bool swizzle = false;      // UseTileSwizzle
-    bool bias = false;         // AddBias
+    int block_m = 0;          // KBlockM
+    int block_n = 0;          // KBlockN
+    int block_k = 0;          // KBlockK
+    int main_stages = 2;      // KPrologueStages
+    int epi_stages = 2;       // KEpilogueStages
+    int cluster_m = 1;        // KClusterM
+    int cluster_n = 1;        // KClusterN
+    int tmem_overlap = 0;     // KTmemOverlapCols
+    int epi_regs = 208;       // KNumRegsEpilogue; 160 trades regs for occ.
+    bool swap_ab = false;     // SwapAB: the activation moves to the MMA's N
+    bool skip_fence = false;  // SkipTmemFence
+    bool swizzle = false;     // UseTileSwizzle
+    bool bias = false;        // AddBias
 
     // Dispatch policy, not kernel parameters.
-    bool dense_only = false;   // only tuned/allowed for the dense launcher
-    bool searchable = true;    // may the cost model pick it?
+    bool dense_only = false;  // only tuned/allowed for the dense launcher
+    bool searchable = true;   // may the cost model pick it?
 
     constexpr bool pair() const { return cluster_m * cluster_n > 1; }
     // Activation-tile rows/cols; SwapAB swaps the two MMA dimensions.
@@ -93,7 +93,7 @@ struct MmaTraits<MmaKind::MXFP8> {
     static constexpr bool kFp4 = false;
     static constexpr int kSfVecSize = 16;
     static constexpr bool kHasAlpha = false;
-    static constexpr const char* kName = "w8a8";
+    static constexpr const char* kName = "w8a8-mxfp8";
 };
 
 template <>
@@ -119,90 +119,173 @@ struct MmaTraits<MmaKind::MXFP4> {
 };
 
 template <MmaKind Kind, KernelMode Mode, TileSpec S>
-using MakeTile = GemmTile<S.block_m, S.block_n, S.block_k, S.main_stages,
-                          S.epi_stages, S.cluster_m, S.cluster_n,
-                          S.tmem_overlap, S.epi_regs, S.swizzle, S.skip_fence,
-                          S.swap_ab, MmaTraits<Kind>::kFp4,
-                          MmaTraits<Kind>::kSfVecSize,
-                          MmaTraits<Kind>::kHasAlpha, S.bias, Mode>;
+using MakeTile =
+    GemmTile<S.block_m, S.block_n, S.block_k, S.main_stages, S.epi_stages,
+             S.cluster_m, S.cluster_n, S.tmem_overlap, S.epi_regs, S.swizzle,
+             S.skip_fence, S.swap_ab, MmaTraits<Kind>::kFp4,
+             MmaTraits<Kind>::kSfVecSize, MmaTraits<Kind>::kHasAlpha, S.bias,
+             Mode>;
 
 // Fp8
-constexpr TileSpec kFp8_128x256 = {
-    .block_m = 128, .block_n = 256, .block_k = 128, .main_stages = 4,
-    .tmem_overlap = 16};
-constexpr TileSpec kFp8_256x256_pair = {
-    .block_m = 256, .block_n = 256, .block_k = 128, .main_stages = 6,
-    .cluster_m = 2, .tmem_overlap = 16};
-constexpr TileSpec kFp8_256x128_pair = {
-    .block_m = 256, .block_n = 128, .block_k = 128, .main_stages = 8,
-    .cluster_m = 2, .dense_only = true};
-constexpr TileSpec kFp8_128x128 = {
-    .block_m = 128, .block_n = 128, .block_k = 128, .main_stages = 6,
-    .dense_only = true};
-constexpr TileSpec kFp8_256x192_pair_reg160 = {
-    .block_m = 256, .block_n = 192, .block_k = 128, .main_stages = 7,
-    .cluster_m = 2, .epi_regs = 160, .skip_fence = true, .dense_only = true};
-constexpr TileSpec kFp8_128x64x256_swap = {
-    .block_m = 128, .block_n = 64, .block_k = 256, .main_stages = 4,
-    .epi_stages = 7, .swap_ab = true};
-constexpr TileSpec kFp8_128x16x256_swap = {
-    .block_m = 128, .block_n = 16, .block_k = 256, .main_stages = 5,
-    .epi_stages = 7, .swap_ab = true, .dense_only = true, .searchable = false};
-constexpr TileSpec kFp8_128x64 = {
-    .block_m = 128, .block_n = 64, .block_k = 128, .main_stages = 9,
-    .dense_only = true};
-constexpr TileSpec kFp8_256x64_pair = {
-    .block_m = 256, .block_n = 64, .block_k = 128, .main_stages = 8,
-    .cluster_m = 2, .dense_only = true};
-constexpr TileSpec kFp8_128x224 = {
-    .block_m = 128, .block_n = 224, .block_k = 128, .main_stages = 4,
-    .epi_regs = 160};
-constexpr TileSpec kFp8_256x224_pair_reg160 = {
-    .block_m = 256, .block_n = 224, .block_k = 128, .main_stages = 7,
-    .cluster_m = 2, .epi_regs = 160, .skip_fence = true};
-constexpr TileSpec kFp8_256x224_pair_reg160_swizzle = {
-    .block_m = 256, .block_n = 224, .block_k = 128, .main_stages = 7,
-    .cluster_m = 2, .epi_regs = 160, .skip_fence = true, .swizzle = true,
-    .dense_only = true};
-constexpr TileSpec kFp8_256x128_bias = {
-    .block_m = 256, .block_n = 128, .block_k = 128, .main_stages = 6,
-    .epi_stages = 3, .cluster_m = 2, .bias = true, .searchable = false};
+constexpr TileSpec kFp8_128x256 = {.block_m = 128,
+                                   .block_n = 256,
+                                   .block_k = 128,
+                                   .main_stages = 4,
+                                   .tmem_overlap = 16};
+constexpr TileSpec kFp8_256x256_pair = {.block_m = 256,
+                                        .block_n = 256,
+                                        .block_k = 128,
+                                        .main_stages = 6,
+                                        .cluster_m = 2,
+                                        .tmem_overlap = 16};
+constexpr TileSpec kFp8_256x128_pair = {.block_m = 256,
+                                        .block_n = 128,
+                                        .block_k = 128,
+                                        .main_stages = 8,
+                                        .cluster_m = 2,
+                                        .dense_only = true};
+constexpr TileSpec kFp8_128x128 = {.block_m = 128,
+                                   .block_n = 128,
+                                   .block_k = 128,
+                                   .main_stages = 6,
+                                   .dense_only = true};
+constexpr TileSpec kFp8_256x192_pair_reg160 = {.block_m = 256,
+                                               .block_n = 192,
+                                               .block_k = 128,
+                                               .main_stages = 7,
+                                               .cluster_m = 2,
+                                               .epi_regs = 160,
+                                               .skip_fence = true,
+                                               .dense_only = true};
+constexpr TileSpec kFp8_128x64x256_swap = {.block_m = 128,
+                                           .block_n = 64,
+                                           .block_k = 256,
+                                           .main_stages = 4,
+                                           .epi_stages = 7,
+                                           .swap_ab = true};
+constexpr TileSpec kFp8_128x16x256_swap = {.block_m = 128,
+                                           .block_n = 16,
+                                           .block_k = 256,
+                                           .main_stages = 5,
+                                           .epi_stages = 7,
+                                           .swap_ab = true,
+                                           .dense_only = true,
+                                           .searchable = false};
+constexpr TileSpec kFp8_128x64 = {.block_m = 128,
+                                  .block_n = 64,
+                                  .block_k = 128,
+                                  .main_stages = 9,
+                                  .dense_only = true};
+constexpr TileSpec kFp8_256x64_pair = {.block_m = 256,
+                                       .block_n = 64,
+                                       .block_k = 128,
+                                       .main_stages = 8,
+                                       .cluster_m = 2,
+                                       .dense_only = true};
+constexpr TileSpec kFp8_128x224 = {.block_m = 128,
+                                   .block_n = 224,
+                                   .block_k = 128,
+                                   .main_stages = 4,
+                                   .epi_regs = 160};
+constexpr TileSpec kFp8_256x224_pair_reg160 = {.block_m = 256,
+                                               .block_n = 224,
+                                               .block_k = 128,
+                                               .main_stages = 7,
+                                               .cluster_m = 2,
+                                               .epi_regs = 160,
+                                               .skip_fence = true};
+constexpr TileSpec kFp8_256x224_pair_reg160_swizzle = {.block_m = 256,
+                                                       .block_n = 224,
+                                                       .block_k = 128,
+                                                       .main_stages = 7,
+                                                       .cluster_m = 2,
+                                                       .epi_regs = 160,
+                                                       .skip_fence = true,
+                                                       .swizzle = true,
+                                                       .dense_only = true};
+constexpr TileSpec kFp8_256x128_bias = {.block_m = 256,
+                                        .block_n = 128,
+                                        .block_k = 128,
+                                        .main_stages = 6,
+                                        .epi_stages = 3,
+                                        .cluster_m = 2,
+                                        .bias = true,
+                                        .searchable = false};
 
 // Fp4 (shared by NVFP4 and MXFP4)
-constexpr TileSpec kFp4_128x256 = {
-    .block_m = 128, .block_n = 256, .block_k = 256, .main_stages = 4,
-    .tmem_overlap = 48};
-constexpr TileSpec kFp4_128x256_reg160 = {
-    .block_m = 128, .block_n = 256, .block_k = 256, .main_stages = 4,
-    .tmem_overlap = 48, .epi_regs = 160, .skip_fence = true,
-    .dense_only = true};
-constexpr TileSpec kFp4_128x64x512_swap = {
-    .block_m = 128, .block_n = 64, .block_k = 512, .main_stages = 4,
-    .epi_stages = 7, .swap_ab = true};
-constexpr TileSpec kFp4_128x64x512_swap_reg160 = {
-    .block_m = 128, .block_n = 64, .block_k = 512, .main_stages = 4,
-    .epi_stages = 7, .epi_regs = 160, .swap_ab = true, .skip_fence = true,
-    .dense_only = true};
-constexpr TileSpec kFp4_128x32x256_swap = {
-    .block_m = 128, .block_n = 32, .block_k = 256, .main_stages = 9,
-    .epi_stages = 7, .swap_ab = true, .dense_only = true};
-constexpr TileSpec kFp4_128x16x256_swap_reg160 = {
-    .block_m = 128, .block_n = 16, .block_k = 256, .main_stages = 10,
-    .epi_stages = 7, .epi_regs = 160, .swap_ab = true, .skip_fence = true,
-    .dense_only = true};
-constexpr TileSpec kFp4_128x128x256_swap = {
-    .block_m = 128, .block_n = 128, .block_k = 256, .main_stages = 6,
-    .epi_stages = 3, .swap_ab = true, .dense_only = true};
-constexpr TileSpec kFp4_256x128_pair = {
-    .block_m = 256, .block_n = 128, .block_k = 256, .main_stages = 8,
-    .epi_stages = 3, .cluster_m = 2, .dense_only = true};
-constexpr TileSpec kFp4_256x256_pair = {
-    .block_m = 256, .block_n = 256, .block_k = 256, .main_stages = 5,
-    .cluster_m = 2, .tmem_overlap = 48};
-constexpr TileSpec kFp4_256x256_pair_reg160 = {
-    .block_m = 256, .block_n = 256, .block_k = 256, .main_stages = 5,
-    .cluster_m = 2, .tmem_overlap = 48, .epi_regs = 160, .skip_fence = true,
-    .dense_only = true};
+constexpr TileSpec kFp4_128x256 = {.block_m = 128,
+                                   .block_n = 256,
+                                   .block_k = 256,
+                                   .main_stages = 4,
+                                   .tmem_overlap = 48};
+constexpr TileSpec kFp4_128x256_reg160 = {.block_m = 128,
+                                          .block_n = 256,
+                                          .block_k = 256,
+                                          .main_stages = 4,
+                                          .tmem_overlap = 48,
+                                          .epi_regs = 160,
+                                          .skip_fence = true,
+                                          .dense_only = true};
+constexpr TileSpec kFp4_128x64x512_swap = {.block_m = 128,
+                                           .block_n = 64,
+                                           .block_k = 512,
+                                           .main_stages = 4,
+                                           .epi_stages = 7,
+                                           .swap_ab = true};
+constexpr TileSpec kFp4_128x64x512_swap_reg160 = {.block_m = 128,
+                                                  .block_n = 64,
+                                                  .block_k = 512,
+                                                  .main_stages = 4,
+                                                  .epi_stages = 7,
+                                                  .epi_regs = 160,
+                                                  .swap_ab = true,
+                                                  .skip_fence = true,
+                                                  .dense_only = true};
+constexpr TileSpec kFp4_128x32x256_swap = {.block_m = 128,
+                                           .block_n = 32,
+                                           .block_k = 256,
+                                           .main_stages = 9,
+                                           .epi_stages = 7,
+                                           .swap_ab = true,
+                                           .dense_only = true};
+constexpr TileSpec kFp4_128x16x256_swap_reg160 = {.block_m = 128,
+                                                  .block_n = 16,
+                                                  .block_k = 256,
+                                                  .main_stages = 10,
+                                                  .epi_stages = 7,
+                                                  .epi_regs = 160,
+                                                  .swap_ab = true,
+                                                  .skip_fence = true,
+                                                  .dense_only = true};
+constexpr TileSpec kFp4_128x128x256_swap = {.block_m = 128,
+                                            .block_n = 128,
+                                            .block_k = 256,
+                                            .main_stages = 6,
+                                            .epi_stages = 3,
+                                            .swap_ab = true,
+                                            .dense_only = true};
+constexpr TileSpec kFp4_256x128_pair = {.block_m = 256,
+                                        .block_n = 128,
+                                        .block_k = 256,
+                                        .main_stages = 8,
+                                        .epi_stages = 3,
+                                        .cluster_m = 2,
+                                        .dense_only = true};
+constexpr TileSpec kFp4_256x256_pair = {.block_m = 256,
+                                        .block_n = 256,
+                                        .block_k = 256,
+                                        .main_stages = 5,
+                                        .cluster_m = 2,
+                                        .tmem_overlap = 48};
+constexpr TileSpec kFp4_256x256_pair_reg160 = {.block_m = 256,
+                                               .block_n = 256,
+                                               .block_k = 256,
+                                               .main_stages = 5,
+                                               .cluster_m = 2,
+                                               .tmem_overlap = 48,
+                                               .epi_regs = 160,
+                                               .skip_fence = true,
+                                               .dense_only = true};
 
 // Candidate tiles per MmaKind.
 inline constexpr std::array<TileSpec, 13> kFp8Tiles = {
@@ -222,16 +305,11 @@ inline constexpr std::array<TileSpec, 13> kFp8Tiles = {
 };
 
 inline constexpr std::array<TileSpec, 10> kFp4Tiles = {
-    kFp4_128x256,
-    kFp4_128x256_reg160,
-    kFp4_128x64x512_swap,
-    kFp4_128x64x512_swap_reg160,
-    kFp4_128x32x256_swap,
-    kFp4_128x16x256_swap_reg160,
-    kFp4_128x128x256_swap,
-    kFp4_256x128_pair,
-    kFp4_256x256_pair,
-    kFp4_256x256_pair_reg160,
+    kFp4_128x256,          kFp4_128x256_reg160,
+    kFp4_128x64x512_swap,  kFp4_128x64x512_swap_reg160,
+    kFp4_128x32x256_swap,  kFp4_128x16x256_swap_reg160,
+    kFp4_128x128x256_swap, kFp4_256x128_pair,
+    kFp4_256x256_pair,     kFp4_256x256_pair_reg160,
 };
 
 template <MmaKind Kind>

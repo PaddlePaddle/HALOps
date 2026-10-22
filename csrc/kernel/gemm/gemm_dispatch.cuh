@@ -100,7 +100,7 @@ inline constexpr int kMFloorFp8 = 128;
 }  // namespace cost
 
 // When the shape matches, skip the cost model and use this
-// tile. 
+// tile.
 struct TileOverride {
     bool (*matches)(const GemmShape&);
     TileSpec tile;
@@ -120,15 +120,11 @@ inline constexpr TileOverride kDenseFp8Overrides[] = {
          return s.m == 8192 && s.n == 4096 && s.k == 1536;
      },
      kFp8_256x224_pair_reg160},
-    {[](const GemmShape& s) {
-         return s.m <= 16 && s.n >= 8192 && s.k >= 4096;
-     },
+    {[](const GemmShape& s) { return s.m <= 16 && s.n >= 8192 && s.k >= 4096; },
      kFp8_128x16x256_swap},
     {[](const GemmShape& s) { return s.m <= 16 && s.n >= 16384; },
      kFp8_128x16x256_swap},
-    {[](const GemmShape& s) {
-         return s.m > 16 && s.m <= 64 && s.n >= 16384;
-     },
+    {[](const GemmShape& s) { return s.m > 16 && s.m <= 64 && s.n >= 16384; },
      kFp8_128x64x256_swap},
 };
 
@@ -146,20 +142,15 @@ inline constexpr TileOverride kDenseFp4Overrides[] = {
      },
      kFp4_256x128_pair},
     // Small M: SwapAB (the activation becomes the MMA's N).
-    {[](const GemmShape& s) { return s.m <= 16; },
-     kFp4_128x16x256_swap_reg160},
+    {[](const GemmShape& s) { return s.m <= 16; }, kFp4_128x16x256_swap_reg160},
     {[](const GemmShape& s) { return s.m > 16 && s.m <= 32; },
      kFp4_128x32x256_swap},
     {[](const GemmShape& s) { return s.m > 32 && s.m <= 64; },
      kFp4_128x64x512_swap_reg160},
     // 64 < m <= 128.
-    {[](const GemmShape& s) {
-         return s.m > 64 && s.m <= 128 && s.m % 64 != 0;
-     },
+    {[](const GemmShape& s) { return s.m > 64 && s.m <= 128 && s.m % 64 != 0; },
      kFp4_128x128x256_swap},
-    {[](const GemmShape& s) {
-         return s.m > 64 && s.m <= 128 && s.n >= 8192;
-     },
+    {[](const GemmShape& s) { return s.m > 64 && s.m <= 128 && s.n >= 8192; },
      kFp4_128x64x512_swap_reg160},
     {[](const GemmShape& s) { return s.m > 64 && s.m <= 128; },
      kFp4_128x64x512_swap},
@@ -168,15 +159,12 @@ inline constexpr TileOverride kDenseFp4Overrides[] = {
          return s.m > 128 && s.m <= 2048 && s.n >= 1536 && s.n <= 4096;
      },
      kFp4_256x128_pair},
-    {[](const GemmShape& s) {
-         return s.m > 128 && s.m <= 2048 && s.n <= 8192;
-     },
+    {[](const GemmShape& s) { return s.m > 128 && s.m <= 2048 && s.n <= 8192; },
      kFp4_128x256_reg160},
     {[](const GemmShape& s) { return s.m > 128 && s.m <= 2048; },
      kFp4_256x256_pair_reg160},
     // m > 2048.
-    {[](const GemmShape& s) { return s.m > 2048; },
-     kFp4_256x256_pair_reg160},
+    {[](const GemmShape& s) { return s.m > 2048; }, kFp4_256x256_pair_reg160},
 };
 
 inline std::span<const TileOverride> Overrides(MmaKind kind, KernelMode mode) {
@@ -310,12 +298,12 @@ template <KernelMode Mode, MmaKind Kind>
 void LaunchCfg(GemmParams& params, const GemmShape& shape,
                cudaStream_t stream) {
     constexpr auto& candidates = CandidateTiles<Kind>::tiles;
-    const int pick = PickTile(candidates.data(),
-                              static_cast<int>(candidates.size()), Kind, shape,
-                              Mode);
+    const int pick =
+        PickTile(candidates.data(), static_cast<int>(candidates.size()), Kind,
+                 shape, Mode);
     TORCH_CHECK(pick >= 0, "No ", ModeName(Mode), " ", MmaTraits<Kind>::kName,
-                " tile for M=", shape.m, " (grid M=", shape.m_grid, "), N=",
-                shape.n, ", K=", shape.k,
+                " tile for M=", shape.m, " (grid M=", shape.m_grid,
+                "), N=", shape.n, ", K=", shape.k,
                 shape.has_bias ? ", with bias" : "");
     if (GemmTraceEnabled()) {
         const TileSpec& t = candidates[pick];

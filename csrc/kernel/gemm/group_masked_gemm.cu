@@ -26,11 +26,12 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
                      const std::optional<torch::Tensor>& bias,
                      const std::optional<torch::Tensor>& alpha,
                      const int max_m_per_expert, const int sm_count,
-                     const std::string& mode = "w8a8") {
+                     const std::string& mode = "w8a8-mxfp8") {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
-    TORCH_CHECK(mode == "w8a8" || mode == "w4a4-nvfp4",
-                "Unsupported mode: ", mode,
-                ". Expected 'w8a8' or 'w4a4-nvfp4'.");
+    TORCH_CHECK(
+        mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" || mode == "w4a4-mxfp4",
+        "Unsupported mode: ", mode,
+        ". Expected 'w8a8-mxfp8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
     TORCH_CHECK(input.dim() == 2,
                 "input must be a 2D tensor of shape [num_experts * "
                 "max_m_per_expert, K]");
@@ -69,7 +70,7 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.num_experts = num_experts;
     params.max_m_per_expert = max_m_per_expert;
 
-    if (mode == "w8a8") {
+    if (mode == "w8a8-mxfp8") {
         const int k = weight.size(2);
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),
@@ -102,19 +103,39 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
         params.ptr_b = weight.data_ptr();
         params.ptr_sfa = sfa.data_ptr();
         params.ptr_sfb = sfb.data_ptr();
-        TORCH_CHECK(
-            alpha.has_value(),
-            "W4A4 mode requires alpha input (per-expert scaling factor).");
-        params.ptr_alpha = alpha->data_ptr<float>();
         TORCH_CHECK(!bias.has_value(), "W4A4 mode does not support bias yet.");
-        LaunchCfg<KernelMode::Masked, MmaKind::NVFP4>(params,
-                                                      {.m = max_m_per_expert,
-                                                       .n = n,
-                                                       .k = k,
-                                                       .m_grid = m,
-                                                       .sm_count = sm,
-                                                       .has_bias = false},
-                                                      stream);
+
+        const bool mxfp4 = mode == "w4a4-mxfp4";
+        const int sf_k = k / (mxfp4 ? 32 : 16);
+        TORCH_CHECK(sfa.size(-1) == sf_k && sfb.size(-1) == sf_k,
+                    "W4A4 scale-factor shape does not match mode ",
+                    mxfp4 ? "'w4a4-mxfp4' (UE8M0 per 32)"
+                          : "'w4a4-nvfp4' (UE4M3 per 16)",
+                    " requires SF K = ", sf_k, ", got sfa K=", sfa.size(-1),
+                    " and sfb K=", sfb.size(-1), ".");
+
+        TORCH_CHECK(!mxfp4 || !alpha.has_value(),
+                    "'w4a4-mxfp4' does not take alpha; the per-expert scaling "
+                    "factor is only used by 'w4a4-nvfp4'.");
+        if (!mxfp4) {
+            TORCH_CHECK(alpha.has_value(),
+                        "W4A4-nvfp4 mode requires alpha input (per-expert "
+                        "scaling factor).");
+            params.ptr_alpha = alpha->data_ptr<float>();
+        }
+        const GemmShape shape = {.m = max_m_per_expert,
+                                 .n = n,
+                                 .k = k,
+                                 .m_grid = m,
+                                 .sm_count = sm,
+                                 .has_bias = false};
+        if (mxfp4) {
+            LaunchCfg<KernelMode::Masked, MmaKind::MXFP4>(params, shape,
+                                                          stream);
+        } else {
+            LaunchCfg<KernelMode::Masked, MmaKind::NVFP4>(params, shape,
+                                                          stream);
+        }
     }
 }
 

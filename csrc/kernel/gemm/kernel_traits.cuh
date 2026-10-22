@@ -68,7 +68,7 @@ struct GemmKernelTraits {
     static constexpr bool AddBias = KernelConfig_::AddBias;
     static constexpr bool SwapAB = KernelConfig_::SwapAB;
     static constexpr bool HasAlpha = KernelConfig_::HasAlpha;
-    static constexpr bool KDenseW8A8 =
+    static constexpr bool KDenseW8A8MXFP8 =
         KernelType == KernelMode::Dense && !AddBias && !KernelConfig_::KIsFP4;
     static constexpr bool KIsDense =
         KernelType == KernelMode::Dense && !AddBias;
@@ -83,7 +83,7 @@ struct GemmKernelTraits {
     // Narrow the A TMA box to the real M below KBlockM (the UMMA still reads
     // KBlockM rows; the epilogue drops D past M).
     static constexpr bool KNarrowA =
-        NarrowA_ && KDenseW8A8 && !SwapAB && !IsPairUmma && !KIsFP4;
+        NarrowA_ && KDenseW8A8MXFP8 && !SwapAB && !IsPairUmma && !KIsFP4;
     static constexpr int KMmaK = KIsFP4 ? 64 : 32;
     static constexpr int kItersK = KBlockK / KMmaK;
     // Epilogue warp groups split N: 1 for SwapAB (small N), 2 otherwise.
@@ -230,14 +230,12 @@ struct GemmKernelTraits {
     static constexpr bool IsCtaNSmall =
         cute::size<1>(CtaShape_MNK{}) < Blk_MN{};
     static constexpr int IsCtaN64 = cute::size<1>(CtaShape_MNK{}) == 64;
-    static constexpr bool IsSfbUnaligned = !KIsFP4 && !SwapAB &&
-                                           KBlockN > 128 &&
-                                           KBlockN % 128 != 0;
+    static constexpr bool IsSfbUnaligned =
+        !KIsFP4 && !SwapAB && KBlockN > 128 && KBlockN % 128 != 0;
     static_assert(!IsSfbUnaligned || KBlockN % 32 == 0,
                   "unaligned SFB tiles need KBlockN % 32 == 0");
     // Used when BLOCK_N=224.
-    static constexpr bool IsSfbRowShift =
-        IsSfbUnaligned && KBlockN % 64 != 0;
+    static constexpr bool IsSfbRowShift = IsSfbUnaligned && KBlockN % 64 != 0;
     static constexpr int KSfbTransposeWarpId = KLoadCWarpId;
     static constexpr int KSfbTransposeWarps = KNumWarp - KSfbTransposeWarpId;
     static_assert(!IsSfbRowShift || (!AddBias && KSfbTransposeWarps >= 1),
@@ -400,7 +398,8 @@ struct GemmKernelTraits {
         alignas(8) typename cutlass::arch::ClusterBarrier::ValueType
             overlap_cluster_bar;
 
-        static constexpr int KSfFullStages = IsSfbRowShift ? KPrologueStages : 1;
+        static constexpr int KSfFullStages =
+            IsSfbRowShift ? KPrologueStages : 1;
         alignas(8) typename cutlass::arch::ClusterTransactionBarrier::ValueType
             sf_full[KSfFullStages];
     };

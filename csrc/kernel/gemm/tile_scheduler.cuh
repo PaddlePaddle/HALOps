@@ -42,7 +42,7 @@ struct TileScheduler {
     static constexpr int kClusterNTiles = cute::size<2>(ClusterLayout_VMNK{});
     static constexpr bool SwapAB = KernelTraits::SwapAB;
     static constexpr bool UseTileSwizzle = KernelTraits::UseTileSwizzle;
-    static constexpr bool KDenseW8A8 = KernelTraits::KDenseW8A8;
+    static constexpr bool KDenseW8A8MXFP8 = KernelTraits::KDenseW8A8MXFP8;
 
     struct Params {
         int m;
@@ -394,7 +394,7 @@ struct TileScheduler {
     // Scan forward from current_tile_id_ to find the next valid tile,
     // caching its coordinates in m_idx_/n_idx_/expert_idx_/is_valid_.
     CUTLASS_DEVICE void find_next_valid_tile() {
-        if constexpr (KDenseW8A8 && !UseTileSwizzle) {
+        if constexpr (KDenseW8A8MXFP8 && !UseTileSwizzle) {
             while (current_tile_id_ < total_tiles_) {
                 int q, r;
                 divmod_blocks_.fast_divmod(q, r,

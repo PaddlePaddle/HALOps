@@ -98,7 +98,7 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const std::string& mode);
 
 std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
-                                          const bool is_fp4,
+                                          const std::string& mode,
                                           const bool use_swizzle);
 
 std::vector<torch::Tensor> PrefillPermuteToMaskedGemm(
@@ -162,7 +162,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("group_contiguous_gemm", &halops::GroupContiguousGemm);
     m.def("batch_gemm", &halops::BatchGemm);
     m.def("group_wise_quant", &halops::GroupWiseQuant, py::arg("input"),
-          py::arg("is_fp4") = false, py::arg("use_swizzle") = true);
+          py::arg("mode"), py::arg("use_swizzle") = true);
     m.def("prefill_permute_to_masked_gemm",
           &halops::PrefillPermuteToMaskedGemm);
     m.def("fused_swiglu_quant", &halops::FusedSwigluQuant);
