@@ -68,7 +68,11 @@ def make_dense_inputs(x_bf16: torch.Tensor, w_bf16: torch.Tensor, mode: str) -> 
     n = w_bf16.shape[0]
     out = torch.empty(m, n, dtype=torch.bfloat16, device=x_bf16.device)
 
-    cast = dg.per_token_cast_to_fp4 if mode.startswith("w4a4") else dg.per_token_cast_to_fp8
+    cast = (
+        dg.per_token_cast_to_fp4
+        if mode.startswith("w4a4")
+        else dg.per_token_cast_to_fp8
+    )
     a_data, a_sf = cast(x_bf16, use_ue8m0=True, gran_k=32)
     b_data, b_sf = cast(w_bf16, use_ue8m0=True, gran_k=32)
     a_sf = dg.transform_sf_into_required_layout(a_sf, m, k, (1, 32))

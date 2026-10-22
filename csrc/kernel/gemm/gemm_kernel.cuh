@@ -224,7 +224,7 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
         }
         main_loop.mma(mainloop_params, mainloop_pipeline, accumulator_pipeline,
                       shared_storage, tmem_storage, tiled_mma, scheduler);
-    // 224-column SFB rewriter, in every CTA. 
+        // 224-column SFB rewriter, in every CTA.
     } else if (KernelTraits::IsSfbRowShift &&
                warp_idx >= KernelTraits::KSfbTransposeWarpId) {
         if constexpr (KEpilogueWarpGroupCount != 1) {

@@ -230,14 +230,12 @@ struct GemmKernelTraits {
     static constexpr bool IsCtaNSmall =
         cute::size<1>(CtaShape_MNK{}) < Blk_MN{};
     static constexpr int IsCtaN64 = cute::size<1>(CtaShape_MNK{}) == 64;
-    static constexpr bool IsSfbUnaligned = !KIsFP4 && !SwapAB &&
-                                           KBlockN > 128 &&
-                                           KBlockN % 128 != 0;
+    static constexpr bool IsSfbUnaligned =
+        !KIsFP4 && !SwapAB && KBlockN > 128 && KBlockN % 128 != 0;
     static_assert(!IsSfbUnaligned || KBlockN % 32 == 0,
                   "unaligned SFB tiles need KBlockN % 32 == 0");
     // Used when BLOCK_N=224.
-    static constexpr bool IsSfbRowShift =
-        IsSfbUnaligned && KBlockN % 64 != 0;
+    static constexpr bool IsSfbRowShift = IsSfbUnaligned && KBlockN % 64 != 0;
     static constexpr int KSfbTransposeWarpId = KLoadCWarpId;
     static constexpr int KSfbTransposeWarps = KNumWarp - KSfbTransposeWarpId;
     static_assert(!IsSfbRowShift || (!AddBias && KSfbTransposeWarps >= 1),
@@ -400,7 +398,8 @@ struct GemmKernelTraits {
         alignas(8) typename cutlass::arch::ClusterBarrier::ValueType
             overlap_cluster_bar;
 
-        static constexpr int KSfFullStages = IsSfbRowShift ? KPrologueStages : 1;
+        static constexpr int KSfFullStages =
+            IsSfbRowShift ? KPrologueStages : 1;
         alignas(8) typename cutlass::arch::ClusterTransactionBarrier::ValueType
             sf_full[KSfFullStages];
     };

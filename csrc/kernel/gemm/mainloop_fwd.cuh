@@ -364,10 +364,10 @@ struct CollectiveMainloop {
                         "cuTensorMapEncodeTiled(SFB atom run) failed: ", r);
         }
 
-        return {args.layout_A,  args.layout_B,    args.layout_SFA,
-                args.layout_SFB, tma_load_A,     tma_load_B,
-                tma_load_sfa,   tma_load_sfb,   sfb_run_desc,
-                a_run_desc,     args.m,         k,
+        return {args.layout_A,   args.layout_B, args.layout_SFA,
+                args.layout_SFB, tma_load_A,    tma_load_B,
+                tma_load_sfa,    tma_load_sfb,  sfb_run_desc,
+                a_run_desc,      args.m,        k,
                 args.num_experts};
     }
 
@@ -627,8 +627,8 @@ struct CollectiveMainloop {
                                 static_cast<uint64_t>(
                                     cute::TMA::CacheHintSm90::EVICT_NORMAL),
                                 shared_storage.SFB.begin() +
-                                    prologue_stage_idx * kSfbStageElems, 0,
-                                static_cast<int32_t>(k_tile_id),
+                                    prologue_stage_idx * kSfbStageElems,
+                                0, static_cast<int32_t>(k_tile_id),
                                 static_cast<int32_t>(
                                     expert_idx *
                                         cute::ceil_div(
@@ -723,7 +723,7 @@ struct CollectiveMainloop {
     // Shift one SFB stage up by 32 rows (odd in-atom offset -> even): rotate
     // the atom's four 32-row words, the tail one coming from the next atom.
     CUTLASS_DEVICE static void sfb_shift_rows_stage(SharedStorage& storage,
-                                                   uint32_t stage_idx) {
+                                                    uint32_t stage_idx) {
         const int lane = cutlass::canonical_lane_idx();
         char* base = reinterpret_cast<char*>(storage.SFB.begin()) +
                      stage_idx * (KSfbAtoms * kSfbAtomBytes);
