@@ -117,9 +117,9 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
                     "'w4a4-mxfp4' does not take alpha; the per-expert scaling "
                     "factor is only used by 'w4a4-nvfp4'.");
         if (!mxfp4) {
-            TORCH_CHECK(
-                alpha.has_value(),
-                "W4A4-nvfp4 mode requires alpha input (per-expert scaling factor).");
+            TORCH_CHECK(alpha.has_value(),
+                        "W4A4-nvfp4 mode requires alpha input (per-expert "
+                        "scaling factor).");
             params.ptr_alpha = alpha->data_ptr<float>();
         }
         const GemmShape shape = {.m = max_m_per_expert,
