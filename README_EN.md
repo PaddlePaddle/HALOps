@@ -29,6 +29,12 @@ The core CUDA kernels are built on CUTLASS and cover the Attention, MLA and MoE 
 - **MLA**: an MLA MegaKernel that fuses the Q projection (including norm and RoPE), attention and the KV cache write into a single kernel.
 - **Quantization**: group-wise quantization (FP8 / NVFP4 / MXFP4), SwiGLU + quantization.
 
+## Performance
+- Dense Mxfp8 W8A8 GEMM performance comparison (hardware architecture: SM100)
+
+![HALOps vs DeepGEMM vs FlashInfer on dense W8A8 GEMM](docs/images/dense_w8a8_performance_halops_vs_backends.png)
+
+
 ## Supported Operators
 
 ### Attention
