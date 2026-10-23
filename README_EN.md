@@ -107,7 +107,7 @@ dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8-mxfp8")
 print(output.shape, output.dtype)
 ```
 
-W4A4 works the same way: pass `mode="w4a4-mxfp4"` to both `group_wise_quant` and the GEMM (FP4 E2M1 data with one UE8M0 scale per 32 elements), or `mode="w4a4-nvfp4"` (one UE4M3 scale per 16 elements), which additionally takes the per-expert global `alpha`.
+W4A4 works the same way: pass `mode="w4a4-mxfp4"` to both `group_wise_quant` and the GEMM (FP4 E2M1 data with one UE8M0 scale per 32 elements). `w4a4-nvfp4` (one UE4M3 scale per 16 elements) additionally takes an fp32 scaling factor `alpha` on top of the block scales, multiplied into the corresponding output group in the epilogue; its shape depends on the API: `[1]` for `dense_gemm`, `[B]` for `batch_gemm` (one per batch item), and `[num_experts]` for the MoE grouped GEMMs (one per expert). The other two modes take no `alpha`.
 
 ## Contributing
 

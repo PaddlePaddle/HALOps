@@ -38,7 +38,7 @@ Before submitting, run the unit tests directly related to your change on a GPU c
 python tests/test_dense_gemm.py
 ```
 
-Formatting and basic checks run in GitHub Actions (`.github/workflows/lint.yml`, i.e. `pre-commit run --all-files`). GPU unit tests and performance regression need an `sm_100f` machine and are run by maintainers in internal CI. When CI fails, run the corresponding check on the files changed by your PR and fix them. Bug fixes should add a regression test that reproduces the problem before the fix. If you have no GPU, list the tests you did not run in the PR description.
+Formatting and basic checks run in GitHub Actions (`.github/workflows/lint.yml`): pull requests check only the files they change, while pushes to `main` run `pre-commit run --all-files` so the baseline stays clean. GPU unit tests and performance regression need an `sm_100f` machine and are run by maintainers in internal CI. When CI fails, run the corresponding check on the files changed by your PR and fix them. Bug fixes should add a regression test that reproduces the problem before the fix. If you have no GPU, list the tests you did not run in the PR description.
 
 Unit test conventions:
 
@@ -130,7 +130,7 @@ CUDA、PyTorch、编译器和软硬件环境要求见 [构建指南](docs/build_
 python tests/test_dense_gemm.py
 ```
 
-格式和其他基础检查由 GitHub Actions（`.github/workflows/lint.yml`，即 `pre-commit run --all-files`）覆盖；GPU 单元测试和性能回归需要 `sm_100f` 机器，由维护者在内部 CI 运行。CI 报错时，根据日志对本 PR 修改的文件运行对应检查并修复；修复缺陷时应增加能在修复前复现问题的回归用例。没有 GPU 时，在变更说明中注明未运行的测试。
+格式和其他基础检查由 GitHub Actions（`.github/workflows/lint.yml`）覆盖：PR 只检查其改动的文件，合入 `main` 时执行 `pre-commit run --all-files` 以保持基线干净；GPU 单元测试和性能回归需要 `sm_100f` 机器，由维护者在内部 CI 运行。CI 报错时，根据日志对本 PR 修改的文件运行对应检查并修复；修复缺陷时应增加能在修复前复现问题的回归用例。没有 GPU 时，在变更说明中注明未运行的测试。
 
 编写单元测试时遵循以下约定：
 

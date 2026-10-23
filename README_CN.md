@@ -107,7 +107,7 @@ dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8-mxfp8")
 print(output.shape, output.dtype)
 ```
 
-W4A4 的用法相同：`group_wise_quant` 与 GEMM 都传入 `mode="w4a4-mxfp4"`（FP4 E2M1 数据 + 每 32 个元素一个 UE8M0 scale）即可；NVFP4 使用 `mode="w4a4-nvfp4"`（每 16 个元素一个 UE4M3 scale），并且需要额外传入每个 expert 的全局 `alpha`。
+W4A4 的用法相同：`group_wise_quant` 与 GEMM 都传入 `mode="w4a4-mxfp4"`（FP4 E2M1 数据 + 每 32 个元素一个 UE8M0 scale）即可。`w4a4-nvfp4`（每 16 个元素一个 UE4M3 scale）还需要在 block scale 之外额外传入一个 fp32 缩放因子 `alpha`，在 epilogue 中整体乘到对应分组的输出上；其形状由所用 API 决定：`dense_gemm` 为 `[1]`，`batch_gemm` 为 `[B]`（每个 batch item 一个），MoE grouped GEMM 为 `[num_experts]`（每个 expert 一个）。另外两种 mode 不需要 `alpha`。
 
 ## 如何贡献
 
