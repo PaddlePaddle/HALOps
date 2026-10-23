@@ -29,6 +29,12 @@ HALOps（High-performance Accelerated LLM Operators）是文心团队开发的�
 - **MLA**：MLA MegaKernel，单 kernel 融合 Q 投影（含 norm 与 RoPE）、attention 与 KV cache 写入。
 - **Quantization**：group-wise quantization（FP8 / NVFP4 / MXFP4）、SwiGLU + quantization。
 
+## 性能
+- Dense Mxfp8 W8A8 GEMM 性能对比（硬件架构: SM100）
+
+![HALOps vs DeepGEMM vs FlashInfer on dense W8A8 GEMM](docs/images/dense_w8a8_performance_halops_vs_backends.png)
+
+
 ## 支持的算子
 
 ### Attention
