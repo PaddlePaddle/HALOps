@@ -16,9 +16,11 @@
 
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/reg_reconfig.h"
+#include "cutlass/cluster_launch.hpp"
 #include "kernel/gemm/epilogue.cuh"
 #include "kernel/gemm/gemm_utils.h"
 #include "kernel/gemm/mainloop_fwd.cuh"
+#include "kernel/gemm/pdl.cuh"
 #include "kernel/gemm/tile_scheduler.cuh"
 
 namespace halops {
@@ -192,6 +194,10 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
                                 &shared_storage.tmem_base_ptr);
     }
 
+    if constexpr (KernelTraits::KUsePdl) {
+        PdlWaitForDependents();
+    }
+
     // Per-expert alpha to SMEM; visible to all warps after the sync below.
     if constexpr (KernelTraits::HasAlpha) {
         int ne = epilogue_params.num_experts;
@@ -268,6 +274,10 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
         cute::cluster_wait();
     } else {
         __syncthreads();
+    }
+
+    if constexpr (KernelTraits::KUsePdl) {
+        PdlTriggerAfterBlockWrites();
     }
 
     if (warp_idx == KernelTraits::KMmaWarpId) {
@@ -430,14 +440,39 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
     }
 }
 
+template <typename KernelTraits, typename MainloopParams,
+          typename EpilogueParams, typename SchedulerParams>
+void LaunchGemmKernel(dim3 dim_grid, dim3 dim_cluster, dim3 dim_block,
+                      int smem_size, cudaStream_t stream,
+                      const MainloopParams& mainloop_params,
+                      const EpilogueParams& epilogue_params,
+                      const SchedulerParams& scheduler_params) {
+    auto* kernel_ptr = &gemm_kernel<KernelTraits, MainloopParams,
+                                    EpilogueParams, SchedulerParams>;
+    CUTE_CHECK_ERROR(cudaFuncSetAttribute(
+        kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    void* kernel_params[] = {
+        const_cast<void*>(reinterpret_cast<void const*>(&mainloop_params)),
+        const_cast<void*>(reinterpret_cast<void const*>(&epilogue_params)),
+        const_cast<void*>(reinterpret_cast<void const*>(&scheduler_params)),
+    };
+    cutlass::Status status = cutlass::ClusterLauncher::launch(
+        dim_grid, dim_cluster, dim_block, smem_size, stream,
+        reinterpret_cast<void const*>(kernel_ptr), kernel_params,
+        KernelTraits::KUsePdl);
+    TORCH_CHECK(status == cutlass::Status::kSuccess,
+                "failed to launch the gemm kernel");
+}
+
 template <typename TypeA, typename TypeB, typename TypeC, typename TypeD,
           typename TypeSF, typename TypeAccumulate, typename KernelConfig,
-          bool NarrowA>
+          bool NarrowA, bool UsePdl>
 void gemm_impl_body(GemmParams& params, const int sm_count,
                     cudaStream_t stream) {
     using KernelTraits =
         GemmKernelTraits<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                         KernelConfig, NarrowA>;
+                         KernelConfig, NarrowA, UsePdl>;
     using MainloopParams = typename CollectiveMainloop<KernelTraits>::Params;
     using EpilogueParams = typename CollectiveEpilogue<KernelTraits>::Params;
     using Scheduler = TileScheduler<KernelTraits>;
@@ -518,15 +553,11 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
         scheduler_m, scheduler_n, params.num_experts, params.max_m_per_expert,
         params.masked_m, params.expert_ids);
 
-    auto* kernel_ptr = &gemm_kernel<KernelTraits, MainloopParams,
-                                    EpilogueParams, SchedulerParams>;
     int smem_size = sizeof(typename KernelTraits::SharedStorage);
 
     static_assert(sizeof(typename KernelTraits::SharedStorage) <=
                       cutlass::arch::sm100_smem_capacity_bytes,
                   "SMEM usage exceeded capacity");
-    CUTE_CHECK_ERROR(cudaFuncSetAttribute(
-        kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     dim3 dimBlock(KernelTraits::KThreads);
     auto cluster_shape = ClusterShape_MNK{};
@@ -536,11 +567,9 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
     int num_clusters = runtime_sm_count / KCTAsPerCluster;
     dim3 dimGrid(dimCluster.x, num_clusters * dimCluster.y);
 
-    cutlass::ClusterLaunchParams launch_params = {dimGrid, dimBlock, dimCluster,
-                                                  smem_size, stream};
-    cutlass::Status status = cutlass::launch_kernel_on_cluster(
-        launch_params, (void const*)kernel_ptr, mainloop_params,
-        epilogue_params, scheduler_params);
+    LaunchGemmKernel<KernelTraits>(dimGrid, dimCluster, dimBlock, smem_size,
+                                   stream, mainloop_params, epilogue_params,
+                                   scheduler_params);
     cudaError_t cuda_status = cudaGetLastError();
     if (cuda_status != cudaSuccess) {
         TORCH_CHECK(false, "CUDA error: ", cudaGetErrorString(cuda_status));
@@ -548,22 +577,39 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
 }
 
 template <typename TypeA, typename TypeB, typename TypeC, typename TypeD,
-          typename TypeSF, typename TypeAccumulate, typename KernelConfig>
-void gemm_impl(GemmParams& params, const int sm_count = -1,
-               cudaStream_t stream = 0) {
+          typename TypeSF, typename TypeAccumulate, typename KernelConfig,
+          bool UsePdl>
+void gemm_impl_for_pdl(GemmParams& params, const int sm_count,
+                       cudaStream_t stream) {
     using Traits = GemmKernelTraits<TypeA, TypeB, TypeC, TypeD, TypeSF,
                                     TypeAccumulate, KernelConfig,
-                                    /*NarrowA_=*/true>;
+                                    /*NarrowA_=*/true, UsePdl>;
     if constexpr (Traits::KNarrowA) {
         if (params.m < KernelConfig::KBlockM) {
             gemm_impl_body<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                           KernelConfig, /*NarrowA=*/true>(params, sm_count,
-                                                           stream);
+                           KernelConfig, /*NarrowA=*/true, UsePdl>(
+                params, sm_count, stream);
             return;
         }
     }
     gemm_impl_body<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                   KernelConfig, /*NarrowA=*/false>(params, sm_count, stream);
+                   KernelConfig, /*NarrowA=*/false, UsePdl>(params, sm_count,
+                                                            stream);
+}
+
+template <typename TypeA, typename TypeB, typename TypeC, typename TypeD,
+          typename TypeSF, typename TypeAccumulate, typename KernelConfig>
+void gemm_impl(GemmParams& params, const int sm_count = -1,
+               cudaStream_t stream = 0) {
+    if (params.use_pdl) {
+        gemm_impl_for_pdl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
+                          KernelConfig, /*UsePdl=*/true>(params, sm_count,
+                                                         stream);
+    } else {
+        gemm_impl_for_pdl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
+                          KernelConfig, /*UsePdl=*/false>(params, sm_count,
+                                                          stream);
+    }
 }
 
 }  // namespace halops

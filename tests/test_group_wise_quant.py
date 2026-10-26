@@ -593,5 +593,56 @@ def test_determinism(mode, use_swizzle):
     )
 
 
+# =====================================================================
+# Programmatic Dependent Launch (PDL)
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "mode,use_swizzle", QUANT_MODES, ids=[_mode_id(m) for m in QUANT_MODES]
+)
+def test_pdl_matches_plain_launch(mode, use_swizzle):
+    """PDL changes when the kernel may start, never what it computes."""
+    m, k = 256, 2048
+    x = torch.randn([m, k], dtype=torch.bfloat16)
+
+    plain, plain_sf = group_wise_quant(x, mode=mode, use_swizzle=use_swizzle)
+    pdl, pdl_sf = group_wise_quant(x, mode=mode, use_swizzle=use_swizzle, use_pdl=True)
+
+    assert torch.equal(
+        pdl, plain
+    ), f"PDL changed the quantized data (mode={mode}, use_swizzle={use_swizzle})"
+    assert torch.equal(
+        pdl_sf, plain_sf
+    ), f"PDL changed the scale factors (mode={mode}, use_swizzle={use_swizzle})"
+
+
+@pytest.mark.parametrize(
+    "mode,use_swizzle", QUANT_MODES, ids=[_mode_id(m) for m in QUANT_MODES]
+)
+def test_pdl_consumer_reads_producer_writes(mode, use_swizzle):
+    """A PDL launch may start while the kernel producing its input still runs.
+
+    ``x = src * 2`` is an ordinary, non-PDL producer; the quantization waits for
+    its stores before the first load, so every iteration must match the plain
+    launch that reads the same buffer.
+    """
+    m, k = 1024, 2048
+    src = torch.randn([m, k], dtype=torch.bfloat16)
+
+    for _ in range(8):
+        x = src * 2.0
+        pdl, pdl_sf = group_wise_quant(
+            x, mode=mode, use_swizzle=use_swizzle, use_pdl=True
+        )
+        plain, plain_sf = group_wise_quant(x, mode=mode, use_swizzle=use_swizzle)
+        assert torch.equal(
+            pdl, plain
+        ), f"PDL read stale input (mode={mode}, use_swizzle={use_swizzle})"
+        assert torch.equal(
+            pdl_sf, plain_sf
+        ), f"PDL read stale scale input (mode={mode}, use_swizzle={use_swizzle})"
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

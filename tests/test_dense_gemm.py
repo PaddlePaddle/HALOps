@@ -77,9 +77,11 @@ def ref_gemm_w4a4(x_fp4_float, w_fp4_float):
 # =====================================================================
 
 
-def gemm_wrapper(x, w, sfa, sfb, bias=None, alpha=None, sm_count=-1, mode="w8a8-mxfp8"):
+def gemm_wrapper(
+    x, w, sfa, sfb, bias=None, alpha=None, sm_count=-1, mode="w8a8-mxfp8", use_pdl=False
+):
     output = torch.zeros([x.shape[0], w.shape[0]], dtype=torch.bfloat16)
-    dense_gemm(x, w, sfa, sfb, output, bias, alpha, sm_count, mode)
+    dense_gemm(x, w, sfa, sfb, output, bias, alpha, sm_count, mode, use_pdl)
     return output
 
 
@@ -408,40 +410,32 @@ def test_gemm_nvfp4_determinism():
 # =====================================================================
 
 
-def run_mode_gemm(mode, m, n, k, alpha=None):
-    """Run one GEMM in ``mode`` and return ``(kernel_out, ref_out, tol)``."""
+def make_mode_inputs(mode, m, n, k):
+    """Build the kernel arguments, reference output and tolerance for ``mode``."""
     if mode == "w8a8-mxfp8":
         inp = make_w8a8_mxfp8_inputs(m, n, k)
         ref_out = ref_gemm(inp["x"], inp["w"], inp["sfa_logical"], inp["sfb_logical"])
-        output = gemm_wrapper(
-            inp["x"], inp["w"], inp["sfa"], inp["sfb"], sm_count=-1, mode=mode
-        )
-        return output, ref_out, W8A8_MXFP8_TOL
+        args = (inp["x"], inp["w"], inp["sfa"], inp["sfb"])
+        return args, {}, ref_out, W8A8_MXFP8_TOL
 
     if mode == "w4a4-nvfp4":
         inp = make_nvfp4_inputs(m, n, k)
-        output = gemm_wrapper(
-            inp["x_packed"],
-            inp["w_packed"],
-            inp["sfa"],
-            inp["sfb"],
-            alpha=inp["alpha"],
-            sm_count=-1,
-            mode=mode,
-        )
-        return output, ref_gemm_w4a4(inp["x_fp4_float"], inp["w_fp4_float"]), W4A4_TOL
+        ref_out = ref_gemm_w4a4(inp["x_fp4_float"], inp["w_fp4_float"])
+        args = (inp["x_packed"], inp["w_packed"], inp["sfa"], inp["sfb"])
+        return args, {"alpha": inp["alpha"]}, ref_out, W4A4_TOL
 
     assert mode == "w4a4-mxfp4", f"unexpected mode {mode!r}"
     inp = make_mxfp4_inputs(m, n, k)
-    output = gemm_wrapper(
-        inp["x_packed"],
-        inp["w_packed"],
-        inp["sfa"],
-        inp["sfb"],
-        sm_count=-1,
-        mode=mode,
-    )
-    return output, ref_gemm_w4a4(inp["x_fp4_float"], inp["w_fp4_float"]), W4A4_TOL
+    ref_out = ref_gemm_w4a4(inp["x_fp4_float"], inp["w_fp4_float"])
+    args = (inp["x_packed"], inp["w_packed"], inp["sfa"], inp["sfb"])
+    return args, {}, ref_out, W4A4_TOL
+
+
+def run_mode_gemm(mode, m, n, k, use_pdl=False):
+    """Run one GEMM in ``mode`` and return ``(kernel_out, ref_out, tol)``."""
+    args, kwargs, ref_out, tol = make_mode_inputs(mode, m, n, k)
+    kwargs.update(sm_count=-1, mode=mode, use_pdl=use_pdl)
+    return gemm_wrapper(*args, **kwargs), ref_out, tol
 
 
 @pytest.mark.parametrize(
@@ -517,6 +511,80 @@ def test_gemm_unaligned_m_bias_requires_multiple_of_256():
             -1,
             "w8a8-mxfp8",
         )
+
+
+# =====================================================================
+# Programmatic Dependent Launch (PDL)
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "mode, m, n, k",
+    [
+        ("w8a8-mxfp8", 1024, 2048, 2048),
+        ("w8a8-mxfp8", 128, 256, 256),
+        ("w4a4-nvfp4", 1024, 2048, 2048),
+        ("w4a4-mxfp4", 1024, 2048, 2048),
+    ],
+    ids=[
+        "w8a8-mxfp8-1024x2048x2048",
+        "w8a8-mxfp8-128x256x256",
+        "w4a4-nvfp4-1024x2048x2048",
+        "w4a4-mxfp4-1024x2048x2048",
+    ],
+)
+def test_gemm_pdl_matches_plain_launch(mode, m, n, k):
+    """PDL changes when the kernel may start, never what it computes.
+
+    The same inputs are passed to a plain and a PDL launch; both must be
+    bit-exact and match the reference.
+    """
+    args, kwargs, ref_out, tol = make_mode_inputs(mode, m, n, k)
+
+    plain_kwargs = dict(kwargs, sm_count=-1, mode=mode, use_pdl=False)
+    pdl_kwargs = dict(kwargs, sm_count=-1, mode=mode, use_pdl=True)
+    plain_out = gemm_wrapper(*args, **plain_kwargs)
+    pdl_out = gemm_wrapper(*args, **pdl_kwargs)
+
+    assert torch.equal(
+        pdl_out, plain_out
+    ), f"{mode} dense_gemm m={m}, n={n}, k={k}: PDL changed the output"
+    torch.testing.assert_close(
+        pdl_out.to(torch.float32),
+        ref_out.to(torch.float32),
+        **tol,
+        msg=lambda s: f"{mode} PDL dense_gemm m={m}, n={n}, k={k}: {s}",
+    )
+
+
+@pytest.mark.parametrize("mode", ["w8a8-mxfp8", "w4a4-mxfp4", "w4a4-nvfp4"])
+def test_gemm_pdl_after_group_wise_quant(mode):
+    """The quantize -> GEMM chain with PDL on both kernels must be exact.
+
+    Neither the quantization nor the GEMM synchronizes in between, so the GEMM
+    is allowed to start while ``group_wise_quant`` still runs; its grid
+    dependency wait is what makes the two overlap safely.
+    """
+    from halops import group_wise_quant
+
+    m, n, k = 512, 1024, 1024
+    x_bf16 = torch.randn([m, k], dtype=torch.bfloat16)
+    w_bf16 = torch.randn([n, k], dtype=torch.bfloat16)
+    alpha = torch.ones([1], dtype=torch.float32) if mode == "w4a4-nvfp4" else None
+
+    x_ref, sfa_ref = group_wise_quant(x_bf16, mode=mode)
+    w_ref, sfb_ref = group_wise_quant(w_bf16, mode=mode)
+    ref_out = torch.empty([m, n], dtype=torch.bfloat16)
+    dense_gemm(x_ref, w_ref, sfa_ref, sfb_ref, ref_out, None, alpha, -1, mode, False)
+
+    for _ in range(8):
+        x, sfa = group_wise_quant(x_bf16, mode=mode, use_pdl=True)
+        w, sfb = group_wise_quant(w_bf16, mode=mode, use_pdl=True)
+        out = torch.empty([m, n], dtype=torch.bfloat16)
+        dense_gemm(x, w, sfa, sfb, out, None, alpha, -1, mode, True)
+        assert torch.equal(
+            out, ref_out
+        ), f"{mode}: PDL quantize -> GEMM chain diverged from the plain chain"
 
 
 if __name__ == "__main__":
