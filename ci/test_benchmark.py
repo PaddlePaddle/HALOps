@@ -12,11 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-HALOps CI benchmark tests.
-
-Discovers all yaml configs under benchmark/ci_configs/, runs benchmark.py
-for each, parses CSV results, and compares against baseline JSON files.
 """
 
 import csv

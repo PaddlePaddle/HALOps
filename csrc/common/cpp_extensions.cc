@@ -110,41 +110,58 @@ std::vector<torch::Tensor> FusedSwigluQuant(
     const torch::Tensor& input, const torch::Tensor& token_nums_per_expert,
     const bool is_fp4);
 
-void MegaMla(torch::Tensor q_or_x, torch::Tensor kv_cache, int64_t page_size,
-             torch::Tensor kv_runs, int64_t topk, int64_t kv_run_step,
-             torch::Tensor topk_lengths, torch::Tensor positions,
-             torch::Tensor freqs_real, torch::Tensor wo_a_weight,
-             torch::Tensor wo_a_scale_inv, torch::Tensor wo_b_weight,
-             torch::Tensor out, double sm_scale, torch::Tensor wq_a_weight,
-             torch::Tensor q_norm_weight, torch::Tensor wq_b_weight,
-             double q_eps, bool use_phase1, torch::Tensor wkv_weight,
-             torch::Tensor kv_norm_weight, double kv_eps, bool use_kv_write,
-             torch::Tensor swa_loc, torch::Tensor attn_sink,
-             torch::Tensor wq_a_sf_g32, torch::Tensor wq_b_sf_g32,
-             torch::Tensor wkv_sf_g32, torch::Tensor wo_b_sf_g32,
-             torch::Tensor wo_a_sf_g32, torch::Tensor workspace,
-             torch::Tensor wkv_gate_weight, torch::Tensor kv_score_ring,
-             torch::Tensor kv_gate_ring_row, torch::Tensor c128_ape,
-             torch::Tensor c128_norm_weight, torch::Tensor c128_freqs_real,
-             torch::Tensor c128_out_loc, torch::Tensor c128_row_out,
-             torch::Tensor c128_pool, int64_t c128_stride_kv_block,
-             int64_t c128_page_block, torch::Tensor c128_attn_slot0,
-             torch::Tensor c128_attn_len, int64_t draft_tokens);
+void MlaAttention(const torch::Tensor& q_or_x, const torch::Tensor& kv_cache,
+                  int64_t page_size, const torch::Tensor& positions,
+                  const torch::Tensor& freqs_real, double sm_scale,
+                  const torch::Tensor& wq_a_weight,
+                  const torch::Tensor& q_norm_weight,
+                  const torch::Tensor& wq_b_weight, double q_eps,
+                  const torch::Tensor& wkv_weight,
+                  const torch::Tensor& kv_norm_weight, double kv_eps,
+                  const torch::Tensor& swa_loc,
+                  const std::optional<torch::Tensor>& attn_sink,
+                  const torch::Tensor& wq_a_sf, const torch::Tensor& wq_b_sf,
+                  const torch::Tensor& wkv_sf, const torch::Tensor& workspace,
+                  const std::optional<torch::Tensor>& wkv_gate_weight,
+                  const std::optional<torch::Tensor>& kv_score_ring,
+                  const std::optional<torch::Tensor>& kv_gate_ring_row,
+                  const std::optional<torch::Tensor>& c128_ape,
+                  const std::optional<torch::Tensor>& c128_norm_weight,
+                  const std::optional<torch::Tensor>& c128_freqs_real,
+                  const std::optional<torch::Tensor>& c128_out_loc,
+                  const std::optional<torch::Tensor>& c128_pool,
+                  int64_t c128_stride_kv_block, int64_t c128_page_block,
+                  const std::optional<torch::Tensor>& c128_page_table,
+                  const std::optional<torch::Tensor>& c128_attn_len,
+                  int64_t draft_tokens, const torch::Tensor& hidden_states,
+                  bool reset_barriers);
 
-#ifdef MEGA_MLA_TRACE
-torch::Tensor MegaMlaReadTrace();
-void MegaMlaClearTrace();
-#endif
+torch::Tensor MlaAttentionPlan(
+    const torch::Tensor& kv_indices,
+    const std::optional<torch::Tensor>& topk_lengths, int64_t page_size,
+    int64_t kv_run_step, const std::optional<torch::Tensor>& c128_attn_len,
+    const torch::Tensor& workspace);
 
-void MegaMlaPlan(torch::Tensor topk_lengths, torch::Tensor c128_attn_len,
-                 int64_t num_tokens, int64_t topk, torch::Tensor wo_a_weight,
-                 torch::Tensor workspace);
+std::vector<int64_t> MlaWorkspaceBytes(int64_t max_tokens,
+                                       const torch::Tensor& wq_a_weight,
+                                       const torch::Tensor& wkv_weight,
+                                       const torch::Tensor& wo_a_weight,
+                                       const torch::Tensor& wo_b_weight);
 
-std::vector<int64_t> MegaMlaWorkspaceBytes(int64_t num_tokens,
-                                           torch::Tensor wo_a_weight,
-                                           torch::Tensor wo_b_weight,
-                                           torch::Tensor wq_a_weight,
-                                           torch::Tensor wkv_weight);
+void CombineWithRopeQuant(const torch::Tensor& q_or_x,
+                          const torch::Tensor& positions,
+                          const torch::Tensor& freqs_real,
+                          const std::optional<torch::Tensor>& attn_sink,
+                          const std::optional<torch::Tensor>& c128_attn_len,
+                          const torch::Tensor& wo_a_weight,
+                          const torch::Tensor& wo_b_weight,
+                          const torch::Tensor& workspace);
+
+void MlaOutputProj(const torch::Tensor& wo_a_weight,
+                   const torch::Tensor& wo_a_sf,
+                   const torch::Tensor& wo_b_weight,
+                   const torch::Tensor& wo_b_sf, torch::Tensor& out,
+                   const torch::Tensor& workspace);
 
 }  // namespace halops
 
@@ -167,12 +184,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &halops::PrefillPermuteToMaskedGemm);
     m.def("fused_swiglu_quant", &halops::FusedSwigluQuant);
 
-    m.def("mega_mla_workspace_bytes", &halops::MegaMlaWorkspaceBytes);
-    m.def("mega_mla_plan", &halops::MegaMlaPlan);
-    m.def("mega_mla", &halops::MegaMla);
-#ifdef MEGA_MLA_TRACE
-    m.def("mega_mla_read_trace", &halops::MegaMlaReadTrace,
-          pybind11::call_guard<pybind11::gil_scoped_release>());
-    m.def("mega_mla_clear_trace", &halops::MegaMlaClearTrace);
-#endif
+    m.def("mla_workspace_bytes", &halops::MlaWorkspaceBytes);
+    m.def("mla_attention_plan", &halops::MlaAttentionPlan);
+    m.def("mla_attention", &halops::MlaAttention);
+    m.def("combine_with_rope_quant", &halops::CombineWithRopeQuant);
+    m.def("mla_output_proj", &halops::MlaOutputProj);
 }

@@ -1,29 +1,17 @@
+"""
 # Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-#
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
+
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
+
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Tests for group_contiguous_gemm (W8A8-MXFP8 FP8, W4A4 NVFP4 and W4A4 MXFP4).
-
-Differences from the masked version:
-- No padding: tokens of different experts are packed contiguously in the input
-- expert_ids [M] marks the expert each token belongs to
-- No masked_m or max_m_per_expert parameters
-
-Note: the contiguous kernel's tile scheduler only reads the expert_ids of the
-first row of each tile to decide which expert's weight the tile uses. Therefore:
-1. Tokens of the same expert must be laid out contiguously in the input
-2. Each expert's token count must align to a multiple of tile_m
-   (large-M config tile_m=256, mid-M config tile_m=128)
 """
 
 import re

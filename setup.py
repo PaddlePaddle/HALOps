@@ -1,16 +1,18 @@
+"""
 # Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-#
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
+
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
+
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
 
 import os
 import subprocess
@@ -66,22 +68,9 @@ gencode_flags = [
     "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage",
     "-lineinfo",
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+    "-DNDEBUG",
     "-O3",
 ]
-
-# NDEBUG is on by default. MEGA_MLA_ASSERTS=1 turns it off to enable CUTLASS
-# parameter asserts for debugging; do not take performance numbers from such a
-# build.
-if os.environ.get("MEGA_MLA_ASSERTS", "0") in ("0", "", "false", "False"):
-    gencode_flags.append("-DNDEBUG")
-else:
-    print("[setup.py] NDEBUG OFF -- CUTLASS asserts enabled (do NOT trust timings)")
-
-# Optional debug defines, e.g. MEGA_MLA_NVCC_DEFINES="-DMEGA_MLA_WATCHDOG=1".
-_extra = os.environ.get("MEGA_MLA_NVCC_DEFINES", "").split()
-if _extra:
-    print(f"[setup.py] extra nvcc defines: {' '.join(_extra)}")
-    gencode_flags += _extra
 
 setup(
     ext_modules=[
@@ -98,13 +87,14 @@ setup(
                 "csrc/kernel/gemm/group_wise_quant.cu",
                 "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
                 "csrc/kernel/gemm/fused_swiglu_quant.cu",
-                "csrc/kernel/mega_mla/mla_plan.cu",
-                "csrc/kernel/mega_mla/mega_mla.cu",
+                "csrc/kernel/mla/mla_plan.cu",
+                "csrc/kernel/mla/mla_attention.cu",
+                "csrc/kernel/mla/mla_prequant_x.cu",
+                "csrc/kernel/mla/mla_output_proj.cu",
+                "csrc/kernel/mla/combine_with_rope_quant.cu",
                 "csrc/common/cpp_extensions.cc",
             ],
-            # Debug defines also go to the C++ compiler: pybind registrations in
-            # cpp_extensions.cc are guarded by the same macros.
-            extra_compile_args={"nvcc": gencode_flags, "cxx": _extra},
+            extra_compile_args={"nvcc": gencode_flags},
             libraries=["cuda"],
         ),
     ],
