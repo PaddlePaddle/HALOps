@@ -1,27 +1,27 @@
 ---
-name: Bug report / 缺陷报告
-about: Wrong results, crashes or build failures / 算子结果错误、崩溃或构建失败
+name: 缺陷报告 / Bug report
+about: 算子结果错误、崩溃或构建失败 / Wrong results, crashes or build failures
 labels: bug
 ---
 
-## Description / 问题描述
+## 问题描述 / Description
 
-<!-- Expected vs. actual behavior. 期望行为与实际行为。 -->
+<!-- 期望行为与实际行为。 Expected vs. actual behavior. -->
 
-## Minimal reproduction / 最小复现
+## 最小复现 / Minimal reproduction
 
 ```python
-# Runnable code with input shapes, dtypes and call arguments
 # 可直接运行的最小代码，包含输入 shape、dtype 和调用参数
+# Runnable code with input shapes, dtypes and call arguments
 ```
 
-## Environment / 环境
+## 环境 / Environment
 
-- GPU and driver / GPU 型号与驱动版本:
+- GPU 型号与驱动版本 / GPU and driver:
 - CUDA Toolkit:
 - PyTorch:
 - HALOps commit:
 
-## Logs / 日志
+## 日志 / Logs
 
-<!-- Full error message or relevant logs. 完整报错信息或相关日志。 -->
+<!-- 完整报错信息或相关日志。 Full error message or relevant logs. -->

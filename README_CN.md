@@ -19,64 +19,37 @@
 
 HALOps（High-performance Accelerated LLM Operators）是文心团队开发的大模型推理高性能算子库。算子充分利用 NVIDIA GPU 硬件特性，并配合 PDL、多流 overlap、算子融合与 MegaKernel 等手段压缩 kernel 间的空泡，让计算、访存与通信尽可能满载，服务高吞吐、低时延的推理场景。
 
-[快速开始](#快速开始) | [环境要求](#硬件与软件要求) | [构建指南](docs/build_guide_CN.md) | [Benchmark 指南](benchmark/README.md) | [贡献指南](CONTRIBUTING.md)
+[核心能力](#核心能力) | [性能](#性能) | [硬件与软件要求](#硬件与软件要求) | [快速开始](#快速开始) | [构建指南](docs/build_guide_CN.md) | [Benchmark 指南](benchmark/README.md) | [贡献指南](CONTRIBUTING.md)
 
 ## 核心能力
 
-核心 CUDA kernel 基于 CUTLASS 实现，覆盖 Attention、MLA 与 MoE 推理路径。
-- **Attention**：变长 BF16 prefill、BF16/FP8 paged-KV decode、GQA/MTP，以及融合 RoPE、RMSNorm 与 KV cache 写入。
-- **GEMM**：W8A8-MXFP8 FP8 与 W4A4 FP4（NVFP4 / MXFP4）的 dense、batched、MoE masked/contiguous GEMM。
-- **MLA**：MLA MegaKernel，单 kernel 融合 Q 投影（含 norm 与 RoPE）、attention 与 KV cache 写入。
-- **Quantization**：group-wise quantization（FP8 / NVFP4 / MXFP4）、SwiGLU + quantization。
+HALOps 面向 NVIDIA Blackwell（SM100）从零设计，基于 CUTLASS / CuTe 直接使用 tcgen05、TMEM 与 TMA 等新硬件特性，覆盖大模型推理的 Attention、MoE 与 MLA 关键路径。
+
+- **GQA Attention**：支持变长 prefill 与 paged-KV decode，覆盖 BF16 / FP8 KV cache、GQA 与 MTP 等推理场景，结合 split-KV 并行、自适应规约与前后处理算子融合，在长上下文与小 batch decode 下充分释放 SM100 的算力与带宽。
+- **多精度 GEMM**：支持 FP8（MXFP8）与 FP4（NVFP4 / MXFP4）block-scaled GEMM，覆盖 dense、batched 与 MoE grouped 场景，结合超轻量开销的灵活 tile 配置与 pre-mapping tile 调度等策略，在 SM100 架构上取得了全场景业界领先的性能。
+- **巨内核稀疏 MLA**：支持 HCA 与 SWA 两类层的高性能巨内核（MegaKernel）稀疏 attention，将投影、归一化、RoPE、KV cache 写入与压缩等大量零散算子吸收进单个 kernel，消除 kernel 调度与中间结果的显存往返开销，并通过 tile 级流水编排让各阶段的计算与访存相互掩盖，进一步提升 GPU 算力利用率。
+- **端到端低精度**：量化、SwiGLU 融合量化与 expert 重排等算子直接输出 GEMM 所需的 scale 布局，低精度数据在算子之间流转无需额外的布局转换。
 
 ## 性能
-- Dense Mxfp8 W8A8 GEMM 性能对比（硬件架构: SM100）
+硬件架构：SM100。
 
-![HALOps vs DeepGEMM vs FlashInfer on dense W8A8 GEMM](docs/images/dense_w8a8_performance_halops_vs_backends.png)
-
-
-## 支持的算子
-
-### Attention
-
-| Python API | 功能 |
-| --- | --- |
-| [`encoder_attention`](halops/attention/encoder_attention.py) | 变长 BF16 prefill，支持 GQA 和可选 mask |
-| [`decoder_attention`](halops/attention/decoder_attention.py) | BF16 或 block-wise FP8 paged-KV decode，支持 GQA/MTP |
-| [`write_cache_kv_encoder`](halops/attention/write_cache_kv_encoder.py) | prefill QKV 处理与 paged cache 写入 |
-| [`write_cache_kv_decoder`](halops/attention/write_cache_kv_decoder.py) | decode Q 生成与 KV cache 追加 |
-| [`get_qk_token`](halops/attention/get_qk_token.py) | 计算 KV prefix-sum、per-sample KV 长度及 max/total token 统计 |
-
-### GEMM
-
-| Python API | 功能 |
-| --- | --- |
-| [`dense_gemm`](halops/gemm/dense_gemm.py) | W8A8-MXFP8 FP8 / W4A4 FP4（NVFP4、MXFP4）dense GEMM，BF16 输出 |
-| [`batch_gemm`](halops/gemm/batch_gemm.py) | W8A8-MXFP8 / W4A4（NVFP4、MXFP4）batched GEMM |
-| [`group_masked_gemm`](halops/gemm/group_masked_gemm.py) | padded MoE grouped GEMM，支持 W8A8-MXFP8 / W4A4（NVFP4、MXFP4） |
-| [`group_contiguous_gemm`](halops/gemm/group_contiguous_gemm.py) | contiguous-token MoE grouped GEMM，支持 W8A8-MXFP8 / W4A4（NVFP4、MXFP4） |
-| [`prefill_permute_to_masked_gemm`](halops/gemm/prefill_permute_to_masked_gemm.py) | 按 expert 重排 token 并转换 scale 布局，生成 masked GEMM 输入 |
-
-### MLA
-
-| Python API | 功能 |
-| --- | --- |
-| [`mega_mla`](halops/mla/mega_mla.py) | 融合 MLA MegaKernel，可选 Q 计算与 KV cache 写入 |
-| [`mega_mla_plan`](halops/mla/mega_mla_plan.py) | 生成 `mega_mla` 的调度计划；默认由 `mega_mla` 内部调用 |
-
-### Quantization
-
-| Python API | 功能 |
-| --- | --- |
-| [`group_wise_quant`](halops/gemm/group_wise_quant.py) | BF16/FP16 到 FP8（UE8M0，group=32）、NVFP4（UE4M3，group=16）或 MXFP4（UE8M0，group=32） |
-| [`fused_swiglu_quant`](halops/gemm/fused_swiglu_quant.py) | SwiGLU 与 FP8/FP4 量化融合 |
+<table>
+  <tr>
+    <td width="50%"><img alt="HALOps vs DeepGEMM vs FlashInfer on dense W8A8 GEMM" src="docs/images/dense_w8a8_performance_halops_vs_backends.png"></td>
+    <td width="50%"><img alt="HALOps MegaMLA vs multi-stream + PDL on the HCA attention layer" src="docs/images/megamla_hca_performance_halops_vs_baseline.png"></td>
+  </tr>
+  <tr>
+    <td align="center">图 1：Dense Mxfp8 W8A8 GEMM，HALOps 对比 DeepGEMM 与 FlashInfer</td>
+    <td align="center">图 2：HCA attention 层，小 batch decode 下 MegaMLA 以 MegaKernel 融合整层，单层时延优于多流 + PDL 串联多个 kernel 的实现</td>
+  </tr>
+</table>
 
 ## 硬件与软件要求
 
 | 组件 | 要求 |
 | --- | --- |
 | GPU | NVIDIA Blackwell SM100 GPU |
-| CUDA Toolkit | 13.0 或更高版本，编译器必须支持 `compute_100f/sm_100f` |
+| CUDA Toolkit | 13.0 或更高版本，硬件架构 `compute_100f/sm_100f` |
 | NVIDIA Driver | 与 CUDA 13.x 兼容的 R580 或更新版本 |
 | Python / PyTorch | Python 3.10+；PyTorch 2.13+ |
 
@@ -84,15 +57,30 @@ HALOps（High-performance Accelerated LLM Operators）是文心团队开发的�
 
 ## 快速开始
 
-准备虚拟环境并安装与本机 CUDA Toolkit 兼容的 CUDA 版 PyTorch，然后在仓库根目录执行：
+### 从 whl 安装
+
+准备好与本机 CUDA 兼容的 CUDA 版 PyTorch 后，直接安装 [HALOps 预编译包](https://pypi.org/project/halops/)：
+
+```bash
+python -m pip install halops
+```
+
+### 从源码构建
+
+需要自行编译或参与开发时，在仓库根目录执行：
 
 ```bash
 git submodule update --init --recursive
 python -m pip install -r requirements.txt
+# 安装到当前环境
 python -m pip install --no-build-isolation --no-deps -v .
+# 或以开发模式安装，修改 CUDA/C++ 代码后用 bash build.sh 增量编译
+python -m pip install --no-build-isolation --no-deps -e . -v
 ```
 
 构建目标固定为 `compute_100f/sm_100f`；wheel 构建、CUDA 路径配置和开发态编译见 [构建指南](docs/build_guide_CN.md)。
+
+### 验证安装
 
 安装后可通过一个 W8A8-MXFP8 dense GEMM 简单示例验证量化和计算链路，预期输出为 `torch.Size([128, 256]) torch.bfloat16`。
 
@@ -113,7 +101,7 @@ dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8-mxfp8")
 print(output.shape, output.dtype)
 ```
 
-W4A4 的用法相同：`group_wise_quant` 与 GEMM 都传入 `mode="w4a4-mxfp4"`（FP4 E2M1 数据 + 每 32 个元素一个 UE8M0 scale）即可。`w4a4-nvfp4`（每 16 个元素一个 UE4M3 scale）还需要在 block scale 之外额外传入一个 fp32 缩放因子 `alpha`，在 epilogue 中整体乘到对应分组的输出上；其形状由所用 API 决定：`dense_gemm` 为 `[1]`，`batch_gemm` 为 `[B]`（每个 batch item 一个），MoE grouped GEMM 为 `[num_experts]`（每个 expert 一个）。另外两种 mode 不需要 `alpha`。
+W4A4 的用法相同，将 `mode` 换成 `"w4a4-mxfp4"` 或 `"w4a4-nvfp4"` 即可；`w4a4-nvfp4` 还需额外传入 fp32 缩放因子 `alpha`，详见各 GEMM 接口的 docstring。
 
 ## 如何贡献
 

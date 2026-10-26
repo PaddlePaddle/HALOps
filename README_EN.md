@@ -19,64 +19,37 @@ English | [简体中文](README_CN.md)
 
 HALOps (High-performance Accelerated LLM Operators) is a high-performance operator library for large language model inference, developed by the ERNIE team. The operators are built to exploit NVIDIA GPU hardware features, and use PDL, multi-stream overlap, operator fusion and MegaKernels to remove bubbles between kernels, keeping compute, memory and communication as close to saturation as possible for high-throughput, low-latency inference.
 
-[Quick Start](#quick-start) | [Requirements](#hardware-and-software-requirements) | [Build Guide](docs/build_guide_EN.md) | [Benchmark Guide](benchmark/README.md#english-quick-reference) | [Contributing](CONTRIBUTING.md)
+[Highlights](#highlights) | [Performance](#performance) | [Hardware and Software Requirements](#hardware-and-software-requirements) | [Quick Start](#quick-start) | [Build Guide](docs/build_guide_EN.md) | [Benchmark Guide](benchmark/README.md#english-quick-reference) | [Contributing](CONTRIBUTING.md#english)
 
 ## Highlights
 
-The core CUDA kernels are built on CUTLASS and cover the Attention, MLA and MoE inference paths.
-- **Attention**: variable-length BF16 prefill, BF16/FP8 paged-KV decode, GQA/MTP, and fused RoPE, RMSNorm and KV cache writes.
-- **GEMM**: W8A8-MXFP8 FP8 and W4A4 FP4 (NVFP4 / MXFP4) dense, batched, and MoE masked/contiguous GEMM.
-- **MLA**: an MLA MegaKernel that fuses the Q projection (including norm and RoPE), attention and the KV cache write into a single kernel.
-- **Quantization**: group-wise quantization (FP8 / NVFP4 / MXFP4), SwiGLU + quantization.
+HALOps is designed from the ground up for NVIDIA Blackwell (SM100). Built on CUTLASS / CuTe, it uses tcgen05, TMEM and TMA directly and covers the Attention, MoE and MLA hot paths of LLM inference.
+
+- **GQA attention**: variable-length prefill and paged-KV decode across BF16 / FP8 KV cache, GQA and MTP; split-KV parallelism, adaptive reduction and fused pre/post-processing make full use of SM100 compute and bandwidth in long-context and small-batch decode.
+- **Multi-precision GEMM**: FP8 (MXFP8) and FP4 (NVFP4 / MXFP4) block-scaled GEMM for dense, batched and MoE grouped workloads; with ultra-lightweight flexible tile configurations and pre-mapped tile scheduling, it delivers industry-leading performance across all scenarios on SM100.
+- **MegaKernel sparse MLA**: high-performance MegaKernel sparse attention for both HCA and SWA layers. It absorbs the many small surrounding ops (projections, normalization, RoPE, KV cache write and compression) into a single kernel, removing kernel scheduling and intermediate memory round trips, and orchestrates tile-level pipelines so the compute and memory traffic of different stages overlap, pushing GPU utilization further.
+- **Low precision end to end**: quantization, fused SwiGLU + quantization and expert permutation write the scale layout the GEMMs read, so low-precision data flows between operators without layout conversion.
 
 ## Performance
-- Dense Mxfp8 W8A8 GEMM performance comparison (hardware architecture: SM100)
+Hardware architecture: SM100.
 
-![HALOps vs DeepGEMM vs FlashInfer on dense W8A8 GEMM](docs/images/dense_w8a8_performance_halops_vs_backends.png)
-
-
-## Supported Operators
-
-### Attention
-
-| Python API | Description |
-| --- | --- |
-| [`encoder_attention`](halops/attention/encoder_attention.py) | Variable-length BF16 prefill with GQA and an optional mask |
-| [`decoder_attention`](halops/attention/decoder_attention.py) | BF16 or block-wise FP8 paged-KV decode with GQA/MTP |
-| [`write_cache_kv_encoder`](halops/attention/write_cache_kv_encoder.py) | Prefill QKV processing and paged cache write |
-| [`write_cache_kv_decoder`](halops/attention/write_cache_kv_decoder.py) | Decode Q generation and KV cache append |
-| [`get_qk_token`](halops/attention/get_qk_token.py) | KV prefix sums, per-sample KV lengths, and max/total token counts |
-
-### GEMM
-
-| Python API | Description |
-| --- | --- |
-| [`dense_gemm`](halops/gemm/dense_gemm.py) | W8A8-MXFP8 FP8 / W4A4 FP4 (NVFP4, MXFP4) dense GEMM with BF16 output |
-| [`batch_gemm`](halops/gemm/batch_gemm.py) | W8A8-MXFP8 / W4A4 (NVFP4, MXFP4) batched GEMM |
-| [`group_masked_gemm`](halops/gemm/group_masked_gemm.py) | Padded MoE grouped GEMM, W8A8-MXFP8 / W4A4 (NVFP4, MXFP4) |
-| [`group_contiguous_gemm`](halops/gemm/group_contiguous_gemm.py) | Contiguous-token MoE grouped GEMM, W8A8-MXFP8 / W4A4 (NVFP4, MXFP4) |
-| [`prefill_permute_to_masked_gemm`](halops/gemm/prefill_permute_to_masked_gemm.py) | Permute tokens by expert and convert the scale layout to build masked GEMM inputs |
-
-### MLA
-
-| Python API | Description |
-| --- | --- |
-| [`mega_mla`](halops/mla/mega_mla.py) | Fused MLA MegaKernel with optional Q computation and KV cache write |
-| [`mega_mla_plan`](halops/mla/mega_mla_plan.py) | Builds the schedule for `mega_mla`; called internally by `mega_mla` by default |
-
-### Quantization
-
-| Python API | Description |
-| --- | --- |
-| [`group_wise_quant`](halops/gemm/group_wise_quant.py) | BF16/FP16 to FP8 (UE8M0, group=32), NVFP4 (UE4M3, group=16) or MXFP4 (UE8M0, group=32) |
-| [`fused_swiglu_quant`](halops/gemm/fused_swiglu_quant.py) | SwiGLU fused with FP8/FP4 quantization |
+<table>
+  <tr>
+    <td width="50%"><img alt="HALOps vs DeepGEMM vs FlashInfer on dense W8A8 GEMM" src="docs/images/dense_w8a8_performance_halops_vs_backends.png"></td>
+    <td width="50%"><img alt="HALOps MegaMLA vs multi-stream + PDL on the HCA attention layer" src="docs/images/megamla_hca_performance_halops_vs_baseline.png"></td>
+  </tr>
+  <tr>
+    <td align="center">Figure 1: dense Mxfp8 W8A8 GEMM, HALOps against DeepGEMM and FlashInfer</td>
+    <td align="center">Figure 2: HCA attention layer; for small-batch decode, MegaMLA fuses the whole layer into a MegaKernel and beats the multi-kernel implementation chained with multi-stream overlap and PDL</td>
+  </tr>
+</table>
 
 ## Hardware and Software Requirements
 
 | Component | Requirement |
 | --- | --- |
 | GPU | NVIDIA Blackwell SM100 data center GPU |
-| CUDA Toolkit | 13.0 or later; the compiler must support `compute_100f/sm_100f` |
+| CUDA Toolkit | 13.0 or later, hardware architecture `compute_100f/sm_100f` |
 | NVIDIA Driver | R580 or later, compatible with CUDA 13.x |
 | Python / PyTorch | Python 3.10+; PyTorch 2.13+ |
 
@@ -84,15 +57,30 @@ See the [NVIDIA CUDA compatibility matrix](https://docs.nvidia.com/deploy/cuda-c
 
 ## Quick Start
 
-Set up a virtual environment with a CUDA build of PyTorch that matches your local CUDA Toolkit, then run from the repository root:
+### Install from whl
+
+With a CUDA build of PyTorch that matches your local CUDA, install the [prebuilt HALOps package](https://pypi.org/project/halops/):
+
+```bash
+python -m pip install halops
+```
+
+### Build from Source
+
+To build it yourself or develop HALOps, run from the repository root:
 
 ```bash
 git submodule update --init --recursive
 python -m pip install -r requirements.txt
+# install into the current environment
 python -m pip install --no-build-isolation --no-deps -v .
+# or install in development mode; after changing CUDA/C++ code, rebuild incrementally with bash build.sh
+python -m pip install --no-build-isolation --no-deps -e . -v
 ```
 
 The build target is fixed to `compute_100f/sm_100f`. See the [Build Guide](docs/build_guide_EN.md) for wheel builds, CUDA path configuration and development builds.
+
+### Verify the Installation
 
 After installation, the W8A8-MXFP8 dense GEMM example below checks the quantization and GEMM path. It should print `torch.Size([128, 256]) torch.bfloat16`.
 
@@ -113,11 +101,11 @@ dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8-mxfp8")
 print(output.shape, output.dtype)
 ```
 
-W4A4 works the same way: pass `mode="w4a4-mxfp4"` to both `group_wise_quant` and the GEMM (FP4 E2M1 data with one UE8M0 scale per 32 elements). `w4a4-nvfp4` (one UE4M3 scale per 16 elements) additionally takes an fp32 scaling factor `alpha` on top of the block scales, multiplied into the corresponding output group in the epilogue; its shape depends on the API: `[1]` for `dense_gemm`, `[B]` for `batch_gemm` (one per batch item), and `[num_experts]` for the MoE grouped GEMMs (one per expert). The other two modes take no `alpha`.
+W4A4 works the same way with `mode="w4a4-mxfp4"` or `mode="w4a4-nvfp4"`; `w4a4-nvfp4` also takes an fp32 scaling factor `alpha`, see the GEMM docstrings.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, code quality and testing requirements, and the pull request checklist.
+See [CONTRIBUTING.md](CONTRIBUTING.md#english) for the development setup, code quality and testing requirements, and the pull request checklist.
 
 ## Acknowledgement
 

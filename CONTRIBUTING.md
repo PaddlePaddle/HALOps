@@ -1,98 +1,6 @@
-# Contributing to HALOps / 贡献指南
+# 贡献指南 / Contributing to HALOps
 
-[English](#english) | [简体中文](#简体中文)
-
-## English
-
-Thank you for contributing to HALOps. This guide describes the minimum requirements from setting up the environment to code review. Implementation, documentation, correctness tests and performance claims should share the same interfaces and hardware constraints.
-
-### Before You Start
-
-Before submitting a large feature, interface or architecture change, open or link an issue describing the use case, design, compatibility impact and acceptance criteria, so the direction is agreed on before implementation. Bug fixes should include a minimal reproduction; performance issues should include the workload, environment and measurement method.
-
-Set up the development environment:
-
-```bash
-git submodule update --init --recursive
-python -m pip install -r requirements.txt
-python -m pip install pre-commit
-pre-commit install
-```
-
-See the [Build Guide](docs/build_guide_EN.md) for CUDA, PyTorch, compiler and hardware requirements. Python rules live in [`pyproject.toml`](pyproject.toml), CUDA/C++ formatting in [`.clang-format`](.clang-format), and all checks run through [`.pre-commit-config.yaml`](.pre-commit-config.yaml).
-
-### Development Conventions
-
-- Each change addresses one clear problem; do not mix in unrelated refactoring, mechanical reformatting or generated files.
-- Reuse the existing directory layout, interfaces and dispatch patterns. A new abstraction should remove real complexity or duplication.
-- The Python wrapper, the PyBind declaration and the CUDA/C++ implementation must agree on argument order, defaults and semantics.
-- A new public API needs type hints, a docstring, a top-level export and an entry in the README operator table.
-- A new kernel needs tests for regular shapes, boundary shapes, invalid inputs and every supported precision mode; error messages should identify the violated constraint.
-- Do not commit `.so` files, wheels, profiling captures, logs or benchmark output directories, except reviewed results used in project documentation.
-
-### Code Quality and Tests
-
-Before submitting, run the unit tests directly related to your change on a GPU compatible with `sm_100f`, for example:
-
-```bash
-python tests/test_dense_gemm.py
-```
-
-Formatting and basic checks run in GitHub Actions (`.github/workflows/lint.yml`): pull requests check only the files they change, while pushes to `main` run `pre-commit run --all-files` so the baseline stays clean. GPU unit tests and performance regression need an `sm_100f` machine and are run by maintainers in internal CI. When CI fails, run the corresponding check on the files changed by your PR and fix them. Bug fixes should add a regression test that reproduces the problem before the fix. If you have no GPU, list the tests you did not run in the PR description.
-
-Unit test conventions:
-
-- Name files `tests/test_<api>.py`; put shared reference implementations and input builders in `tests/utils/`.
-- Use module-level `test_*` functions. Expand shapes, configs and invalid inputs with `@pytest.mark.parametrize` instead of looping inside one test.
-- Seeding, the default CUDA device and skipping on machines without an `sm_100f` GPU are handled by `tests/conftest.py`; do not set them in test files. Do not allocate CUDA tensors at import time; use fixtures.
-- Compare values with `torch.testing.assert_close` and bit-exact results with `torch.equal`. Define tolerances as named constants; GEMM tests use `W8A8_MXFP8_TOL` / `W4A4_TOL` from `tests/utils/gemm_utils.py`.
-- Assert exceptions with `pytest.raises(<type>, match=...)`. Do not use `print` in tests.
-
-### Performance Changes
-
-A performance change must first pass correctness checks, then be measured with the shared tooling described in the [Benchmark Guide](benchmark/README.md#english-quick-reference). Use the same GPU, software environment, YAML and measurement options before and after the change, and include the command, config and results in the pull request.
-
-```bash
-cd benchmark
-python benchmark.py --config=gemm/dense_w8a8.yaml --gpu=0
-```
-
-### Commits and Review
-
-A commit message states what changed in the title and why in the body. Use this title format:
-
-```text
-<type>[(<scope>)]: <short description>
-```
-
-- `type`: required; one of `feat`, `fix`, `perf`, `docs`, `test`, `refactor`, `build`, etc.
-- `scope`: optional; an operator or module name. Omit it, together with the parentheses, when the change is not specific to one module.
-
-For example:
-
-```text
-perf(dense_gemm): reduce epilogue smem traffic
-docs: update build guide
-```
-
-When opening a pull request:
-
-1. Link the issue or task and describe the problem, solution, scope of impact and compatibility.
-2. List the checks and tests you actually ran, and explain any you did not run.
-3. Fill in the accuracy and performance impact sections of the PR template; performance changes include the benchmark command, config and results.
-4. Keep the branch reviewable; push follow-up commits in response to review and clean up history before merging.
-
-Review focuses on interface compatibility, correctness, edge cases, performance regressions, maintainability and documentation. Authors should respond to every open comment; significant design changes should be reflected in the issue and documentation.
-
-### Pull Request Checklist
-
-- [ ] The change is linked to an issue or task and is focused in scope.
-- [ ] The Python, PyBind and CUDA/C++ interfaces are consistent.
-- [ ] Unit tests directly related to the change were run, or the skipped ones are listed.
-- [ ] CI failures were investigated and fixed.
-- [ ] Performance changes include benchmark command, config and results.
-- [ ] New or changed public behavior is reflected in the README and docs.
-- [ ] No generated artifacts, secrets or unrelated profiling files are included.
+[简体中文](#简体中文) | [English](#english)
 
 ## 简体中文
 
@@ -114,6 +22,8 @@ pre-commit install
 CUDA、PyTorch、编译器和软硬件环境要求见 [构建指南](docs/build_guide_CN.md)。Python 规则位于 [`pyproject.toml`](pyproject.toml)，CUDA/C++ 格式位于 [`.clang-format`](.clang-format)，统一检查入口位于 [`.pre-commit-config.yaml`](.pre-commit-config.yaml)。
 
 ### 开发约定
+
+CUDA/C++ 编码规范见 [代码规范](docs/code_standards.md)。
 
 - 每个变更只解决一个明确问题；不要混入无关重构、机械格式化或生成文件。
 - 优先复用现有目录结构、接口和调度模式。新增抽象应能消除实际复杂度或重复。
@@ -185,3 +95,97 @@ docs: update build guide
 - [ ] 性能变更已完成 Benchmark 自测，并附命令、配置和结果。
 - [ ] 新增或变更的公开行为已更新 README 和对应文档。
 - [ ] 未包含生成产物、敏感信息或无关 profiling 文件。
+
+## English
+
+Thank you for contributing to HALOps. This guide describes the minimum requirements from setting up the environment to code review. Implementation, documentation, correctness tests and performance claims should share the same interfaces and hardware constraints.
+
+### Before You Start
+
+Before submitting a large feature, interface or architecture change, open or link an issue describing the use case, design, compatibility impact and acceptance criteria, so the direction is agreed on before implementation. Bug fixes should include a minimal reproduction; performance issues should include the workload, environment and measurement method.
+
+Set up the development environment:
+
+```bash
+git submodule update --init --recursive
+python -m pip install -r requirements.txt
+python -m pip install pre-commit
+pre-commit install
+```
+
+See the [Build Guide](docs/build_guide_EN.md) for CUDA, PyTorch, compiler and hardware requirements. Python rules live in [`pyproject.toml`](pyproject.toml), CUDA/C++ formatting in [`.clang-format`](.clang-format), and all checks run through [`.pre-commit-config.yaml`](.pre-commit-config.yaml).
+
+### Development Conventions
+
+CUDA/C++ coding rules are listed in the [code standards](docs/code_standards.md) (in Chinese).
+
+- Each change addresses one clear problem; do not mix in unrelated refactoring, mechanical reformatting or generated files.
+- Reuse the existing directory layout, interfaces and dispatch patterns. A new abstraction should remove real complexity or duplication.
+- The Python wrapper, the PyBind declaration and the CUDA/C++ implementation must agree on argument order, defaults and semantics.
+- A new public API needs type hints, a docstring, a top-level export and an entry in the README operator table.
+- A new kernel needs tests for regular shapes, boundary shapes, invalid inputs and every supported precision mode; error messages should identify the violated constraint.
+- Do not commit `.so` files, wheels, profiling captures, logs or benchmark output directories, except reviewed results used in project documentation.
+
+### Code Quality and Tests
+
+Before submitting, run the unit tests directly related to your change on a GPU compatible with `sm_100f`, for example:
+
+```bash
+python tests/test_dense_gemm.py
+```
+
+Formatting and basic checks run in GitHub Actions (`.github/workflows/lint.yml`): pull requests check only the files they change, while pushes to `main` run `pre-commit run --all-files` so the baseline stays clean. GPU unit tests and performance regression need an `sm_100f` machine and are run by maintainers in internal CI. When CI fails, run the corresponding check on the files changed by your PR and fix them. Bug fixes should add a regression test that reproduces the problem before the fix. If you have no GPU, list the tests you did not run in the PR description.
+
+Unit test conventions:
+
+- Name files `tests/test_<api>.py`; put shared reference implementations and input builders in `tests/utils/`.
+- Use module-level `test_*` functions. Expand shapes, configs and invalid inputs with `@pytest.mark.parametrize` instead of looping inside one test.
+- Seeding, the default CUDA device and skipping on machines without an `sm_100f` GPU are handled by `tests/conftest.py`; do not set them in test files. Do not allocate CUDA tensors at import time; use fixtures.
+- Compare values with `torch.testing.assert_close` and bit-exact results with `torch.equal`. Define tolerances as named constants; GEMM tests use `W8A8_MXFP8_TOL` / `W4A4_TOL` from `tests/utils/gemm_utils.py`.
+- Assert exceptions with `pytest.raises(<type>, match=...)`. Do not use `print` in tests.
+
+### Performance Changes
+
+A performance change must first pass correctness checks, then be measured with the shared tooling described in the [Benchmark Guide](benchmark/README.md#english-quick-reference). Use the same GPU, software environment, YAML and measurement options before and after the change, and include the command, config and results in the pull request.
+
+```bash
+cd benchmark
+python benchmark.py --config=gemm/dense_w8a8.yaml --gpu=0
+```
+
+### Commits and Review
+
+A commit message states what changed in the title and why in the body. Use this title format:
+
+```text
+<type>[(<scope>)]: <short description>
+```
+
+- `type`: required; one of `feat`, `fix`, `perf`, `docs`, `test`, `refactor`, `build`, etc.
+- `scope`: optional; an operator or module name. Omit it, together with the parentheses, when the change is not specific to one module.
+
+For example:
+
+```text
+perf(dense_gemm): reduce epilogue smem traffic
+docs: update build guide
+```
+
+When opening a pull request:
+
+1. Link the issue or task and describe the problem, solution, scope of impact and compatibility.
+2. List the checks and tests you actually ran, and explain any you did not run.
+3. Fill in the accuracy and performance impact sections of the PR template; performance changes include the benchmark command, config and results.
+4. Keep the branch reviewable; push follow-up commits in response to review and clean up history before merging.
+
+Review focuses on interface compatibility, correctness, edge cases, performance regressions, maintainability and documentation. Authors should respond to every open comment; significant design changes should be reflected in the issue and documentation.
+
+### Pull Request Checklist
+
+- [ ] The change is linked to an issue or task and is focused in scope.
+- [ ] The Python, PyBind and CUDA/C++ interfaces are consistent.
+- [ ] Unit tests directly related to the change were run, or the skipped ones are listed.
+- [ ] CI failures were investigated and fixed.
+- [ ] Performance changes include benchmark command, config and results.
+- [ ] New or changed public behavior is reflected in the README and docs.
+- [ ] No generated artifacts, secrets or unrelated profiling files are included.
