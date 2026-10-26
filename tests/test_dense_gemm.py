@@ -401,5 +401,121 @@ def test_gemm_nvfp4_determinism():
     assert torch.equal(out1, out2), "W4A4 dense_gemm output is not deterministic"
 
 
+# =====================================================================
+# Unaligned M (activation and output are not padded)
+# =====================================================================
+
+
+def run_mode_gemm(mode, m, n, k, alpha=None):
+    """Run one GEMM in ``mode`` and return ``(kernel_out, ref_out, tol)``."""
+    if mode == "w8a8-mxfp8":
+        inp = make_w8a8_mxfp8_inputs(m, n, k)
+        ref_out = ref_gemm(inp["x"], inp["w"], inp["sfa_logical"], inp["sfb_logical"])
+        output = gemm_wrapper(
+            inp["x"], inp["w"], inp["sfa"], inp["sfb"], sm_count=-1, mode=mode
+        )
+        return output, ref_out, W8A8_MXFP8_TOL
+
+    if mode == "w4a4-nvfp4":
+        inp = make_nvfp4_inputs(m, n, k)
+        output = gemm_wrapper(
+            inp["x_packed"],
+            inp["w_packed"],
+            inp["sfa"],
+            inp["sfb"],
+            alpha=inp["alpha"],
+            sm_count=-1,
+            mode=mode,
+        )
+        return output, ref_gemm_w4a4(inp["x_fp4_float"], inp["w_fp4_float"]), W4A4_TOL
+
+    assert mode == "w4a4-mxfp4", f"unexpected mode {mode!r}"
+    inp = make_mxfp4_inputs(m, n, k)
+    output = gemm_wrapper(
+        inp["x_packed"],
+        inp["w_packed"],
+        inp["sfa"],
+        inp["sfb"],
+        sm_count=-1,
+        mode=mode,
+    )
+    return output, ref_gemm_w4a4(inp["x_fp4_float"], inp["w_fp4_float"]), W4A4_TOL
+
+
+@pytest.mark.parametrize(
+    "mode, m, n, k",
+    [
+        ("w8a8-mxfp8", 129, 1024, 1024),
+        ("w8a8-mxfp8", 200, 1024, 1024),
+        ("w8a8-mxfp8", 300, 1024, 1024),
+        ("w8a8-mxfp8", 449, 1024, 1024),
+        ("w8a8-mxfp8", 200, 8192, 4096),
+        ("w8a8-mxfp8", 1000, 8192, 4096),
+        ("w4a4-nvfp4", 129, 1024, 1024),
+        ("w4a4-nvfp4", 200, 1024, 1024),
+        ("w4a4-nvfp4", 300, 1024, 1024),
+        ("w4a4-mxfp4", 129, 1024, 1024),
+        ("w4a4-mxfp4", 200, 1024, 1024),
+        ("w4a4-mxfp4", 300, 1024, 1024),
+    ],
+    ids=lambda v: str(v) if not isinstance(v, str) else v,
+)
+def test_gemm_unaligned_m(mode, m, n, k):
+    """M does not have to be padded to 128: the activation, the output and the
+    reference all stay at the true M.  Only the scale factors cover whole
+    128-row SfAtoms, which is what ``reorder_sf_to_cutlass`` already produces."""
+    output, ref_out, tol = run_mode_gemm(mode, m, n, k)
+    torch.testing.assert_close(
+        output.to(torch.float32),
+        ref_out.to(torch.float32),
+        **tol,
+        msg=lambda s: f"{mode} unaligned M dense_gemm m={m}, n={n}, k={k}: {s}",
+    )
+
+
+def test_gemm_unaligned_m_end_to_end():
+    """The user flow with no manual pad/slice: quantize, call, read [m, n]."""
+    from halops import group_wise_quant
+
+    m, n, k = 300, 1024, 2048
+    x_bf16 = torch.randn([m, k], dtype=torch.bfloat16)
+    w_bf16 = torch.randn([n, k], dtype=torch.bfloat16)
+
+    x, sfa = group_wise_quant(x_bf16, mode="w8a8-mxfp8")
+    w, sfb = group_wise_quant(w_bf16, mode="w8a8-mxfp8")
+    assert list(x.shape) == [m, k], "quantized data must keep its row count"
+    assert list(sfa.shape) == [(m + 127) // 128 * 128, k // FP8_BLOCK_SIZE]
+
+    out = torch.empty([m, n], dtype=torch.bfloat16)
+    dense_gemm(x, w, sfa, sfb, out, None, None, -1, "w8a8-mxfp8")
+
+    x_ref, sfa_logical = per_token_cast_to_fp8(x_bf16, FP8_BLOCK_SIZE)
+    w_ref, sfb_logical = per_block_cast_to_fp8(w_bf16, FP8_BLOCK_SIZE)
+    torch.testing.assert_close(
+        out, ref_gemm(x_ref, w_ref, sfa_logical, sfb_logical), **W8A8_MXFP8_TOL
+    )
+
+
+def test_gemm_unaligned_m_bias_requires_multiple_of_256():
+    """The bias epilogue cannot stop before M, so an unaligned M is rejected
+    instead of writing past the caller's rows."""
+    m, n, k = 200, 1024, 1024
+    inp = make_w8a8_mxfp8_inputs(m, n, k)
+    bias = torch.rand([n], dtype=torch.bfloat16)
+    out = torch.empty([m, n], dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match=re.escape("multiple of 256")):
+        dense_gemm(
+            inp["x"],
+            inp["w"],
+            inp["sfa"],
+            inp["sfb"],
+            out,
+            bias,
+            None,
+            -1,
+            "w8a8-mxfp8",
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

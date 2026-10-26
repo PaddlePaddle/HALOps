@@ -498,6 +498,46 @@ def test_small_m_swizzle_shapes(m):
     ], f"m={m}: scale must cover one whole 128-row atom, got {list(sf.shape)}"
 
 
+@pytest.mark.parametrize("m", [129, 200, 300, 1000], ids=lambda m: f"m{m}")
+def test_unaligned_m_swizzle_shapes(m):
+    """m above one atom is not padded either: the quantized data keeps m rows
+    while the scale tensor covers ceil(m/128) whole atoms, whose padding rows
+    are zero.  dense_gemm consumes exactly this pair."""
+    k = 1024
+    kb_dim = k // 32
+    m_sf = (m + 127) // 128 * 128
+    x = torch.randn([m, k], dtype=torch.bfloat16)
+    data, sf = group_wise_quant(x, mode="w8a8-mxfp8")
+
+    assert list(data.shape) == [
+        m,
+        k,
+    ], f"m={m}: data should keep its row count, got {list(data.shape)}"
+    assert list(sf.shape) == [
+        m_sf,
+        kb_dim,
+    ], f"m={m}: scale must cover ceil(m/128)*128={m_sf} rows, got {list(sf.shape)}"
+
+    ref_fp8, ref_sf_logical = ref_per_token_cast_to_fp8(x, 32)
+    torch.testing.assert_close(
+        data.to(torch.float32),
+        ref_fp8.to(torch.float32),
+        **FP8_EXACT_TOL,
+        msg=lambda m_: f"m={m}: quantized data differs from the reference: {m_}",
+    )
+
+    ref_sf_padded = torch.zeros([m_sf, kb_dim], dtype=torch.uint8)
+    ref_sf_padded[:m] = ref_sf_logical.cpu()
+    # Bit-exactness against a reference whose rows past m are zero also proves
+    # the padding rows of the last partial SfAtom are zero: the swizzle scatters
+    # an atom's bytes over the flat buffer, so they cannot be checked with a
+    # plain ``sf[m:]`` slice.
+    ref_sf_cutlass = ref_reorder_sf_to_cutlass(ref_sf_padded, m_sf, kb_dim)
+    assert torch.equal(
+        sf, ref_sf_cutlass.to(sf.device)
+    ), f"m={m}: swizzled scale differs from the reference"
+
+
 def test_unsupported_swizzle_shapes():
     """Test that unsupported SfAtom shapes under use_swizzle=True raise clearly."""
     x_bad_k = torch.randn([128, 96], dtype=torch.bfloat16)
