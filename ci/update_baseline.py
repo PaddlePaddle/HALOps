@@ -13,13 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-Update baseline JSON files from benchmark CSV results.
-
-Usage:
-    python update_baseline.py \\
-        --results-dir <benchmark_output>/results/ \\
-        --baseline-dir ci/baselines/
 """
 
 import argparse

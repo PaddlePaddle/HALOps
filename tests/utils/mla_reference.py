@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-Inputs and a torch reference for the `mega_mla` fused MLA megakernel.
 """
 
 from __future__ import annotations
@@ -21,13 +19,29 @@ from __future__ import annotations
 import math
 from typing import NamedTuple
 
+import pytest
 import torch
 
-from halops.mla.mega_mla import build_kv_runs
+from halops.gemm.dense_gemm import dense_gemm
+from halops.gemm.group_wise_quant import group_wise_quant
+from halops.mla.mla_attention import mla_attention
+from halops.mla.mla_attention_plan import mla_attention_plan
+from halops.mla.mla_output_proj import mla_output_proj
+from halops.mla.mla_workspace import mla_workspace
+
+# Max abs error relative to max |reference|.  Both sides quantize to fp8 with
+# group-32 / per-64 ue8m0 scales but at different rounding points.
+# the projection alone, both sides fed the kernel's O
+OUTPUT_PROJ_REL_TOL = 0.01
+# the whole layer: the ~1% O difference flips the e4m3 rounding of O and o_lora
+# elements near a rounding tie, which the projection amplifies to ~4%
+LAYER_REL_TOL = 0.05
+# the fixtures' SWA windows hold ascending slots
+KV_RUN_STEP = 1
 
 
 class Dims(NamedTuple):
-    """Model and pool geometry; mirrors Dsv4Dims in csrc/kernel/mega_mla/mla_traits.cuh."""
+    """Model and pool geometry; mirrors ModelDims in csrc/kernel/mla/mla_traits.cuh."""
 
     b_h: int = 64
     d_q: int = 512
@@ -82,21 +96,20 @@ def _e4m3(x: torch.Tensor, d: Dims) -> torch.Tensor:
 def _pack_kv_rows(latent: torch.Tensor, d: Dims) -> tuple[torch.Tensor, torch.Tensor]:
     """bf16 [n, 512] latent (already normed AND roped) -> (rows [n, 576], scales [n, 8])."""
     n = latent.shape[0]
-    dev = latent.device
     nope = (
         latent[:, : d.d_nope]
         .float()
         .reshape(n, d.d_nope // d.kv_quant_block, d.kv_quant_block)
     )
     amax = nope.abs().amax(dim=-1).clamp_min(1e-4)
-    exp = torch.clamp(torch.round(torch.log2(amax / d.fp8_max)) + 127, 0, 255)
+    exp = torch.clamp(torch.ceil(torch.log2(amax / d.fp8_max)) + 127, 0, 255)
     q = _e4m3(nope * torch.pow(2.0, 127.0 - exp)[..., None], d)
-    rows = torch.zeros((n, d.kv_row), dtype=torch.uint8, device=dev)
+    rows = torch.zeros((n, d.kv_row), dtype=torch.uint8)
     rows[:, : d.d_nope] = q.reshape(n, d.d_nope).view(torch.uint8)
     rows[:, d.d_nope :] = (
         latent[:, d.d_nope :].contiguous().view(torch.uint8).reshape(n, -1)
     )
-    scales = torch.zeros((n, d.kv_sc), dtype=torch.uint8, device=dev)
+    scales = torch.zeros((n, d.kv_sc), dtype=torch.uint8)
     scales[:, : d.d_nope // d.kv_quant_block] = exp.to(torch.uint8)
     return rows, scales
 
@@ -158,25 +171,19 @@ class Weight(NamedTuple):
     sf: torch.Tensor
 
 
-def _make_weight(n: int, k: int, gen: torch.Generator, dev: str) -> Weight:
+def _make_weight(n: int, k: int) -> Weight:
     """Random bf16 weight, quantized by the package's own quantizer."""
-    from halops.gemm.group_wise_quant import group_wise_quant
-
-    w = torch.randn((n, k), generator=gen, device=dev, dtype=torch.bfloat16) * 0.02
+    w = torch.randn((n, k), dtype=torch.bfloat16) * 0.02
     q, sf = group_wise_quant(w, mode="w8a8-mxfp8", use_swizzle=True)
     return Weight(q=q, sf=sf)
 
 
-def _freqs_real(
-    max_pos: int, dev: str, d: Dims, theta: float = 10000.0
-) -> torch.Tensor:
+def _freqs_real(max_pos: int, d: Dims, theta: float = 10000.0) -> torch.Tensor:
     """fp32 [max_pos, 64] = 32 interleaved (cos, sin) pairs, the layout `freqs_real` is."""
-    p = torch.arange(max_pos, device=dev, dtype=torch.float32)[:, None]
-    inv = theta ** (
-        -torch.arange(0, d.d_rope, 2, device=dev, dtype=torch.float32) / d.d_rope
-    )
+    p = torch.arange(max_pos, dtype=torch.float32)[:, None]
+    inv = theta ** (-torch.arange(0, d.d_rope, 2, dtype=torch.float32) / d.d_rope)
     ang = p * inv[None, :]
-    out = torch.empty((max_pos, d.d_rope), device=dev, dtype=torch.float32)
+    out = torch.empty((max_pos, d.d_rope), dtype=torch.float32)
     out[:, 0::2], out[:, 1::2] = torch.cos(ang), torch.sin(ang)
     return out
 
@@ -186,6 +193,7 @@ class Aux(NamedTuple):
 
     x: torch.Tensor
     swa_slots: torch.Tensor
+    topk_lengths: torch.Tensor
     c128_slots: torch.Tensor
     weights: dict
     swa_len: int
@@ -200,155 +208,134 @@ def build_inputs(
     swa_len: int = 128,
     c128_len: int = 0,
     fire_compressor: bool = False,
-    seed: int = 0,
-    device: str = "cuda",
+    attn_sink: bool = True,
     dims: Dims = Dims(),
 ):
-    """Build the whole `mega_mla` argument dict from scratch, plus the reference's `Aux`."""
+    """Build the whole `mla_attention` argument dict (all but the workspace) on
+    the default device and global RNG, plus the reference's `Aux`.  attn_sink:
+    random per-head sink, else None."""
     assert swa_len > 0, "a token must have at least one KV row"
     d = dims
     d.validate()
-    dev = device
-    gen = torch.Generator(device=dev).manual_seed(seed)
     T = bs * draft_tokens
 
     w = {
-        "wq_a": _make_weight(d.qlora_rank, d.hidden, gen, dev),
-        "wq_b": _make_weight(d.b_h * d.d_q, d.qlora_rank, gen, dev),
-        "wkv": _make_weight(d.kvlora_rank, d.hidden, gen, dev),
-        "wo_b": _make_weight(d.hidden, d.o_groups * d.o_lora_rank, gen, dev),
+        "wq_a": _make_weight(d.qlora_rank, d.hidden),
+        "wq_b": _make_weight(d.b_h * d.d_q, d.qlora_rank),
+        "wkv": _make_weight(d.kvlora_rank, d.hidden),
+        "wo_b": _make_weight(d.hidden, d.o_groups * d.o_lora_rank),
+        "wo_a": _make_weight(d.o_groups * d.o_lora_rank, d.b_h * d.d_q // d.o_groups),
     }
 
-    w["wo_a"] = _make_weight(
-        d.o_groups * d.o_lora_rank, d.b_h * d.d_q // d.o_groups, gen, dev
-    )
-
-    base = torch.arange(bs, device=dev, dtype=torch.int64) * 128 * 8 + 128 * 64
+    base = torch.arange(bs, dtype=torch.int64) * 128 * 8 + 128 * 64
     if fire_compressor:
         base = base - 1
-    positions = (
-        base[:, None] + torch.arange(draft_tokens, device=dev, dtype=torch.int64)
-    ).reshape(-1)
-    freqs = _freqs_real(int(positions.max()) + 1, dev, d)
+    positions = (base[:, None] + torch.arange(draft_tokens, dtype=torch.int64)).reshape(
+        -1
+    )
+    freqs = _freqs_real(int(positions.max()) + 1, d)
 
     swa_slots = (
-        torch.arange(T, device=dev, dtype=torch.int64)[:, None] * swa_len
-        + torch.arange(swa_len, device=dev, dtype=torch.int64)[None, :]
+        torch.arange(T, dtype=torch.int64)[:, None] * swa_len
+        + torch.arange(swa_len, dtype=torch.int64)[None, :]
     )
     n_pages = -(-int(swa_slots.max() + 1) // d.page_size)
-    kv_cache = torch.zeros((n_pages, d.kv_page_stride), dtype=torch.uint8, device=dev)
+    kv_cache = torch.zeros((n_pages, d.kv_page_stride), dtype=torch.uint8)
 
     hist = swa_slots[:, :-1].reshape(-1)
-    lat = torch.randn(
-        (hist.numel(), d.d_q), generator=gen, device=dev, dtype=torch.bfloat16
-    )
+    lat = torch.randn((hist.numel(), d.d_q), dtype=torch.bfloat16)
     _scatter_rows(
         kv_cache, hist, d.page_size, d.kv_page_stride, *_pack_kv_rows(lat, d), d
     )
     swa_loc = swa_slots[:, -1].to(torch.int32).contiguous()
-    topk_lengths = torch.full((T,), swa_len, dtype=torch.int32, device=dev)
-    kv_runs, kv_run_step = build_kv_runs(
-        swa_slots.to(torch.int32), topk_lengths, d.page_size
-    )
+    topk_lengths = torch.full((T,), swa_len, dtype=torch.int32)
 
     c128 = {}
-    c128_slots = torch.zeros((T, 0), dtype=torch.int64, device=dev)
+    c128_slots = torch.zeros((T, 0), dtype=torch.int64)
     if c128_len:
-        pb = max(d.b_topk, 1 << (c128_len - 1).bit_length())
+        # 2 compressed rows per pool page (page_size / c128_ratio), addressed
+        # through a page table.  A token's pages are consecutive here, so its
+        # slots come out ascending; the page-table path is still the one used.
+        pb = 2
         stride = -(-(pb * (d.kv_row + d.kv_sc)) // d.kv_row) * d.kv_row
-        pool = torch.zeros((2 * T, stride), dtype=torch.uint8, device=dev)
+        ppt = -(-c128_len // pb)  # pages one token's window spans
+        pool = torch.zeros((T * ppt + T, stride), dtype=torch.uint8)
+        page_table = (
+            torch.arange(T, dtype=torch.int32)[:, None] * ppt
+            + torch.arange(ppt, dtype=torch.int32)[None, :]
+        ).contiguous()
         c128_slots = (
-            torch.arange(T, device=dev, dtype=torch.int64)[:, None] * pb
-            + torch.arange(c128_len, device=dev, dtype=torch.int64)[None, :]
+            torch.arange(T, dtype=torch.int64)[:, None] * (ppt * pb)
+            + torch.arange(c128_len, dtype=torch.int64)[None, :]
         )
         flat = c128_slots.reshape(-1)
-        lat = torch.randn(
-            (flat.numel(), d.d_q), generator=gen, device=dev, dtype=torch.bfloat16
-        )
+        lat = torch.randn((flat.numel(), d.d_q), dtype=torch.bfloat16)
         _scatter_rows(pool, flat, pb, stride, *_pack_kv_rows(lat, d), d)
         c128 = dict(
             c128_pool=pool,
             c128_stride_kv_block=stride,
             c128_page_block=pb,
-            c128_attn_slot0=c128_slots[:, 0].to(torch.int32).contiguous(),
-            c128_attn_len=torch.full((T,), c128_len, dtype=torch.int32, device=dev),
+            c128_page_table=page_table,
+            c128_attn_len=torch.full((T,), c128_len, dtype=torch.int32),
             wkv_gate_weight=torch.randn(
                 (2 * d.kvlora_rank, d.hidden),
-                generator=gen,
-                device=dev,
                 dtype=torch.bfloat16,
             )
             * 0.02,
             kv_score_ring=torch.randn(
                 (bs * d.c128_ratio, 2 * d.kvlora_rank),
-                generator=gen,
-                device=dev,
                 dtype=torch.float32,
             )
             * 0.1,
             kv_gate_ring_row=(
-                (torch.arange(T, device=dev, dtype=torch.int64) // draft_tokens)
-                * d.c128_ratio
+                (torch.arange(T, dtype=torch.int64) // draft_tokens) * d.c128_ratio
                 + (positions % d.c128_ratio)
             ).to(torch.int32),
             c128_ape=torch.randn(
                 (d.c128_ratio, d.kvlora_rank),
-                generator=gen,
-                device=dev,
                 dtype=torch.float32,
             )
             * 0.02,
-            c128_norm_weight=torch.ones(
-                d.kvlora_rank, dtype=torch.bfloat16, device=dev
-            ),
+            c128_norm_weight=torch.ones(d.kvlora_rank, dtype=torch.bfloat16),
             c128_freqs_real=freqs,
-            c128_out_loc=((T + torch.arange(T, device=dev, dtype=torch.int64)) * pb).to(
+            c128_out_loc=((T * ppt + torch.arange(T, dtype=torch.int64)) * pb).to(
                 torch.int32
             ),
         )
 
-    x = torch.randn((T, d.hidden), generator=gen, device=dev, dtype=torch.bfloat16)
+    x = torch.randn((T, d.hidden), dtype=torch.bfloat16)
 
-    q_or_x = torch.zeros((T, d.b_h * d.d_q), dtype=torch.bfloat16, device=dev)
-    q_or_x[:, : d.hidden] = x
+    q_or_x = torch.zeros((T, d.b_h * d.d_q), dtype=torch.bfloat16)
 
     args = dict(
         q_or_x=q_or_x,
+        hidden_states=x.clone(),
         kv_cache=kv_cache,
         page_size=d.page_size,
-        kv_runs=kv_runs,
-        topk=swa_len,
-        kv_run_step=kv_run_step,
-        topk_lengths=topk_lengths,
         positions=positions.to(torch.int32),
         freqs_real=freqs,
-        wo_a_weight=w["wo_a"].q,
-        wo_a_scale_inv=w["wo_a"].sf,
-        wo_b_weight=w["wo_b"].q,
-        wo_b_scale_inv=w["wo_b"].sf,
-        out=torch.zeros((T, d.hidden), dtype=torch.bfloat16, device=dev),
         sm_scale=1.0 / math.sqrt(d.d_q),
         wq_a_weight=w["wq_a"].q,
-        wq_a_scale_inv=w["wq_a"].sf,
-        q_norm_weight=torch.ones(d.qlora_rank, dtype=torch.bfloat16, device=dev),
+        wq_a_sf=w["wq_a"].sf,
+        q_norm_weight=torch.ones(d.qlora_rank, dtype=torch.bfloat16),
         wq_b_weight=w["wq_b"].q,
-        wq_b_scale_inv=w["wq_b"].sf,
+        wq_b_sf=w["wq_b"].sf,
         q_eps=1e-6,
-        use_phase1=True,
         wkv_weight=w["wkv"].q,
-        wkv_scale_inv=w["wkv"].sf,
-        kv_norm_weight=torch.ones(d.kvlora_rank, dtype=torch.bfloat16, device=dev),
+        wkv_sf=w["wkv"].sf,
+        kv_norm_weight=torch.ones(d.kvlora_rank, dtype=torch.bfloat16),
         kv_eps=1e-6,
-        use_kv_write=True,
         swa_loc=swa_loc,
-        attn_sink=torch.randn(d.b_h, generator=gen, device=dev, dtype=torch.float32)
-        * 0.1,
+        attn_sink=(
+            torch.randn(d.b_h, dtype=torch.float32) * 0.1 if attn_sink else None
+        ),
         draft_tokens=draft_tokens,
         **c128,
     )
     aux = Aux(
         x=x.clone(),
         swa_slots=swa_slots,
+        topk_lengths=topk_lengths,
         c128_slots=c128_slots,
         weights=w,
         swa_len=swa_len,
@@ -388,9 +375,6 @@ def _gather_latents(pool, slots, page_block, stride, d) -> torch.Tensor:
 
 def _gemm(a: torch.Tensor, w: Weight) -> torch.Tensor:
     """bf16 [T, K] @ fp8 [N, K]^T -> bf16 [T, N], through this package's own GEMM."""
-    from halops.gemm.dense_gemm import dense_gemm
-    from halops.gemm.group_wise_quant import group_wise_quant
-
     t, k = a.shape
     tp = -(-t // 128) * 128
     a_pad = a
@@ -405,8 +389,52 @@ def _gemm(a: torch.Tensor, w: Weight) -> torch.Tensor:
     return out[:t]
 
 
-def reference_forward(args: dict, aux: Aux) -> torch.Tensor:
-    """The whole fused layer in torch: bf16 [T, d.hidden], to compare against `args["out"]`."""
+def _run_breaks(idx: torch.Tensor, lengths: torch.Tensor, page_size: int, step: int):
+    """[T, topk - 1] bool: window column c + 1 starts a new run (its slot is not
+    the previous one + step, or lies on another page)."""
+    shift = page_size.bit_length() - 1
+    prev, cur = idx[:, :-1], idx[:, 1:]
+    brk = (cur != prev + step) | ((cur >> shift) != (prev >> shift))
+    col = torch.arange(1, idx.shape[1], device=idx.device)
+    return brk & (col[None, :] < lengths[:, None])
+
+
+def _ascending_runs(first0, len0, first1, rows, step: int) -> torch.Tensor:
+    """Runs scanned with `step` -> ascending (slot0, len0, slot1, rows)."""
+    if step > 0:
+        return torch.stack([first0, len0, first1, rows], dim=1)
+    len1 = rows - len0
+    two = len1 > 0
+    slot0 = torch.where(two, first1 - (len1 - 1), first0 - (rows - 1))
+    slot1 = torch.where(two, first0 - (len0 - 1), slot0)
+    return torch.stack([slot0, torch.where(two, len1, rows), slot1, rows], dim=1)
+
+
+def reference_kv_runs(
+    kv_indices: torch.Tensor,
+    topk_lengths: torch.Tensor | None,
+    page_size: int,
+    step: int,
+) -> torch.Tensor:
+    """`mla_attention_plan`'s per-token KV runs in torch, int32 [T, 4]: a
+    window of more than two runs is cut to its first row, then its first run
+    ends at the first break."""
+    idx = kv_indices.to(torch.int64)
+    T, topk = idx.shape
+    lengths = torch.full((T,), topk, device=idx.device)
+    if topk_lengths is not None:
+        lengths = topk_lengths.to(torch.int64)
+    cut = _run_breaks(idx, lengths, page_size, step).sum(1) > 1
+    lengths = torch.where(cut, torch.ones_like(lengths), lengths)
+    brk = _run_breaks(idx, lengths, page_size, step)
+    len0 = torch.where(brk.any(1), brk.int().argmax(1) + 1, lengths)
+    first1 = idx.gather(1, len0.clamp(max=topk - 1)[:, None])[:, 0]
+    return _ascending_runs(idx[:, 0], len0, first1, lengths, step).to(torch.int32)
+
+
+def reference_attention(args: dict, aux: Aux) -> torch.Tensor:
+    """`mla_attention` in torch: attention O before the inverse RoPE, fp32
+    [T, 64, 512]."""
     d = aux.dims
     w, x = aux.weights, aux.x
     T = x.shape[0]
@@ -446,8 +474,18 @@ def reference_forward(args: dict, aux: Aux) -> torch.Tensor:
     m = s.amax(dim=-1, keepdim=True)
     p = torch.exp(s - m)
 
-    den = p.sum(dim=-1, keepdim=True) + torch.exp(args["attn_sink"][None, :, None] - m)
-    o = torch.einsum("thl,tld->thd", p / den, kv_seg)
+    den = p.sum(dim=-1, keepdim=True)
+    if args["attn_sink"] is not None:
+        den = den + torch.exp(args["attn_sink"][None, :, None] - m)
+    return torch.einsum("thl,tld->thd", p / den, kv_seg)
+
+
+def reference_output_proj(o: torch.Tensor, args: dict, aux: Aux) -> torch.Tensor:
+    """`mla_output_proj` in torch: fp32 attention O [T, 64, 512] -> inverse
+    RoPE -> grouped wo_a -> wo_b, bf16 [T, hidden]."""
+    d, w = aux.dims, aux.weights
+    T = o.shape[0]
+    fr = args["freqs_real"][args["positions"].to(torch.int64)]
     o = _rope(o, fr[:, None, :], d, inverse=True).to(torch.bfloat16)
 
     R = d.o_lora_rank
@@ -467,3 +505,128 @@ def reference_forward(args: dict, aux: Aux) -> torch.Tensor:
         dim=1,
     )
     return _gemm(o_lora.to(torch.bfloat16), w["wo_b"])
+
+
+def assert_rel_close(out: torch.Tensor, ref: torch.Tensor, rel_tol: float) -> None:
+    """Max abs error within rel_tol of max |ref|, all values finite."""
+    out, ref = out.float(), ref.float()
+    assert torch.isfinite(out).all(), "non-finite output"
+    atol = rel_tol * max(float(ref.abs().max()), 1e-6)
+    torch.testing.assert_close(out, ref, rtol=0, atol=atol)
+
+
+class Mode(NamedTuple):
+    """One attention scenario: c128_len compressed rows per token (0: SWA
+    layer), fire: the compressor writes a row this launch, swa_len SWA rows."""
+
+    name: str
+    c128_len: int
+    fire: bool
+    swa_len: int = 128
+
+
+class Case(NamedTuple):
+    """One (bs, draft_tokens) shape, T = bs * draft_tokens."""
+
+    bs: int
+    draft_tokens: int
+    exercises: str
+    quick: bool
+
+
+# T ladder of the attention prelude: select_tile_t in mla_workspace.cuh picks the
+# HCA token tile from T (SWA always uses 128); exercises names what each adds
+CASES = [
+    Case(1, 5, "token tile 16, distributed q norm", quick=True),
+    Case(8, 5, "token tile 32", quick=False),
+    Case(12, 5, "token tile 128 from T = 45 on", quick=False),
+    Case(13, 5, "token tile 128, one group", quick=True),
+    Case(24, 5, "token tile 128, one group nearly full", quick=False),
+    Case(26, 5, "HCA token tile 64 (3 groups), SWA 2 groups", quick=True),
+    Case(40, 5, "2 token groups of 128", quick=True),
+]
+
+
+def params(modes: list[Mode]):
+    """The (mode, case) product for one suite; `quick` rides along as a marker."""
+    return [
+        pytest.param(
+            mode,
+            case,
+            marks=[pytest.mark.quick] if case.quick else [],
+            id=f"{mode.name}-T{case.bs * case.draft_tokens}",
+        )
+        for mode in modes
+        for case in CASES
+    ]
+
+
+def layer_workspace(args: dict, aux: Aux, max_tokens: int) -> torch.Tensor:
+    """`mla_workspace` for the weight shapes of one layer."""
+    w = aux.weights
+    return mla_workspace(
+        max_tokens, args["wq_a_weight"], args["wkv_weight"], w["wo_a"].q, w["wo_b"].q
+    )
+
+
+def plan_layer(args: dict, aux: Aux, workspace: torch.Tensor) -> torch.Tensor:
+    """`mla_attention_plan` of one layer's kind into `workspace`."""
+    return mla_attention_plan(
+        aux.swa_slots.to(torch.int32),
+        aux.topk_lengths,
+        args["page_size"],
+        KV_RUN_STEP,
+        args.get("c128_attn_len"),
+        workspace,
+    )
+
+
+def run_layer(args: dict, aux: Aux, workspace: torch.Tensor | None = None):
+    """A closure running `mla_attention` + `mla_output_proj` for one layer; it
+    restores q_or_x first and returns the layer output.  Without `workspace`
+    the layer gets its own, planned here; with one, the caller runs the layer
+    kind's `mla_attention_plan` first."""
+    w = aux.weights
+    T = args["q_or_x"].shape[0]
+    q0 = args["q_or_x"].clone()
+    ws = workspace
+    if ws is None:
+        ws = layer_workspace(args, aux, T)
+        plan_layer(args, aux, ws)
+
+    def run() -> torch.Tensor:
+        out = torch.empty((T, w["wo_b"].q.shape[0]), dtype=torch.bfloat16)
+        args["q_or_x"].copy_(q0)
+        mla_attention(**args, workspace=ws, reset_barriers=False)
+        mla_output_proj(
+            args["q_or_x"],
+            args["positions"],
+            args["freqs_real"],
+            w["wo_a"].q,
+            w["wo_a"].sf,
+            w["wo_b"].q,
+            w["wo_b"].sf,
+            out,
+            ws,
+            attn_sink=args["attn_sink"],
+            c128_attn_len=args.get("c128_attn_len"),
+        )
+        return out
+
+    return run
+
+
+def check_attention(mode: Mode, case: Case, *, attn_sink: bool = True) -> None:
+    """Run the layer on one fixture and compare its output with the torch
+    layer."""
+    args, aux = build_inputs(
+        bs=case.bs,
+        draft_tokens=case.draft_tokens,
+        swa_len=mode.swa_len,
+        c128_len=mode.c128_len,
+        fire_compressor=mode.fire,
+        attn_sink=attn_sink,
+    )
+    out = run_layer(args, aux)()
+    ref = reference_output_proj(reference_attention(args, aux), args, aux)
+    assert_rel_close(out, ref, LAYER_REL_TOL)

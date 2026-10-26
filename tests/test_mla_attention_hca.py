@@ -12,17 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-Accuracy gate for `mega_mla` on the HCA path (compress_ratio 128).
 """
 
 from __future__ import annotations
 
 import pytest
 
-from tests.mega_mla_gate import Case, Mode, check, params, skip_reason
-
-pytestmark = pytest.mark.skipif(skip_reason() is not None, reason=skip_reason() or "")
+from tests.utils.mla_reference import Case, Mode, check_attention, params
 
 MODES = [
     Mode(name="hca", c128_len=128, fire=True),
@@ -32,7 +28,8 @@ MODES = [
 ]
 
 
+@pytest.mark.parametrize("attn_sink", [True, False], ids=["sink", "no_sink"])
 @pytest.mark.parametrize("mode,case", params(MODES))
-def test_accuracy(mode: Mode, case: Case):
-    """Tolerance gate: every (scenario, shape) stays inside the fp8 noise band."""
-    check(mode, case)
+def test_accuracy(mode: Mode, case: Case, attn_sink: bool):
+    """Every (scenario, shape) stays inside the fp8 noise band."""
+    check_attention(mode, case, attn_sink=attn_sink)

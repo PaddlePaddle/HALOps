@@ -1,25 +1,17 @@
+"""
 # Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-#
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
+
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
+
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Shared test helpers for GEMM quantization tests (FP8 / NVFP4 / MXFP4).
-
-These reference implementations and CUTLASS SfAtom reorder helpers are shared
-across the dense / grouped / batched GEMM test files. Note that
-test_group_wise_quant.py intentionally keeps its own ``ref_*`` variants because
-those are bit-accurate to the CUDA kernel (RNE UE4M3 cast, reciprocal-multiply,
-side='right' tie-break) and are not interchangeable with the generic references
-below.
 """
 
 import numpy as np
