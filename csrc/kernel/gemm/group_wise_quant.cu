@@ -307,27 +307,21 @@ std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
                     kb_dim);
     }
 
-    const int m_tile = (!use_swizzle || m < 128) ? m : (m + 127) / 128 * 128;
-    const int m_sf = use_swizzle ? (m_tile + 127) / 128 * 128 : m;
+    const int m_sf = use_swizzle ? AlignSfM(m) : m;
 
-    // output_quant: (m_tile, k) fp8, or (m_tile, k/2) packed FP4.
-    // output_sf: (m_sf, kb_dim) uint8 holding UE8M0 / UE4M3 bits.
+    // output_quant: (m, k) fp8, or (m, k/2) packed FP4.
+    // output_sf: (m_sf, kb_dim) uint8 holding UE8M0 / UE4M3 bits;
     torch::Tensor output_quant;
     if (IsFp4(quant_mode)) {
         output_quant =
-            torch::empty({m_tile, k / 2}, input.options().dtype(torch::kByte));
+            torch::empty({m, k / 2}, input.options().dtype(torch::kByte));
     } else {
-        output_quant = torch::empty(
-            {m_tile, k}, input.options().dtype(torch::kFloat8_e4m3fn));
+        output_quant =
+            torch::empty({m, k}, input.options().dtype(torch::kFloat8_e4m3fn));
     }
 
     auto output_sf =
-        m_sf == m
-            ? torch::empty({m_sf, kb_dim}, input.options().dtype(torch::kByte))
-            : torch::zeros({m_sf, kb_dim}, input.options().dtype(torch::kByte));
-    if (m_tile != m) {
-        output_quant.narrow(0, m, m_tile - m).zero_();
-    }
+        torch::zeros({m_sf, kb_dim}, input.options().dtype(torch::kByte));
 
     const int total_groups = m * kb_dim;
     const int block_dim = 128;

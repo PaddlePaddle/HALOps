@@ -44,6 +44,11 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
     const int sm = sm_count_arg > 0 ? sm_count_arg : GetSmCount();
     const cudaStream_t stream = GetCurrentCUDAStream(input);
 
+    const int m_sf = AlignSfM(m);
+    // still need to pass a rounded-up M to the kernel when using the bias path.
+    const bool bias_path = bias.has_value();
+    const int m_shape = (m < kSfAtomM || bias_path) ? m : m_sf;
+
     GemmParams params;
     params.ptr_d = output.data_ptr();
     params.m = m;
@@ -69,15 +74,23 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
         if (bias.has_value()) {
             params.ptr_c = bias->data_ptr();
         }
-        LaunchCfg<KernelMode::Dense, MmaKind::MXFP8>(
-            params,
-            {.m = m,
-             .n = n,
-             .k = k,
-             .m_grid = m,
-             .sm_count = sm,
-             .has_bias = bias.has_value()},
-            stream);
+        TORCH_CHECK(
+            sfa.is_contiguous() && sfa.numel() >= int64_t(m_sf) * (k / 32),
+            "sfa must hold whole 128-row SfAtoms: expected at least ",
+            int64_t(m_sf) * (k / 32), " elements (", m_sf, " x ", k / 32,
+            ") for M=", m, ", got ", sfa.numel());
+        TORCH_CHECK(
+            !bias_path || m % 256 == 0,
+            "the bias epilogue has no per-row store predicate yet, so M "
+            "must be a multiple of 256 when bias is given, got ",
+            m);
+        const GemmShape shape = {.m = m_shape,
+                                 .n = n,
+                                 .k = k,
+                                 .m_grid = m_shape,
+                                 .sm_count = sm,
+                                 .has_bias = bias_path};
+        LaunchCfg<KernelMode::Dense, MmaKind::MXFP8>(params, shape, stream);
     } else {
         const int k = weight.size(1) * 2;  // 2 FP4 per packed byte
         TORCH_CHECK(
@@ -104,6 +117,10 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                           : "'w4a4-nvfp4' (UE4M3 per 16)",
                     " requires SF K = ", sf_k, ", got sfa K=", sfa.size(-1),
                     " and sfb K=", sfb.size(-1), ".");
+        TORCH_CHECK(sfa.is_contiguous() && sfa.numel() >= int64_t(m_sf) * sf_k,
+                    "sfa must hold whole 128-row SfAtoms: expected at least ",
+                    int64_t(m_sf) * sf_k, " elements (", m_sf, " x ", sf_k,
+                    ") for M=", m, ", got ", sfa.numel());
         TORCH_CHECK(!mxfp4 || !alpha.has_value(),
                     "'w4a4-mxfp4' does not take alpha; the per-batch scaling "
                     "factor is only used by 'w4a4-nvfp4'.");
@@ -113,10 +130,10 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                 "W4A4-nvfp4 mode requires alpha input (per-batch scaling).");
             params.ptr_alpha = alpha->data_ptr<float>();
         }
-        const GemmShape shape = {.m = m,
+        const GemmShape shape = {.m = m_shape,
                                  .n = n,
                                  .k = k,
-                                 .m_grid = m,
+                                 .m_grid = m_shape,
                                  .sm_count = sm,
                                  .has_bias = false};
         if (mxfp4) {

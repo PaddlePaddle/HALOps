@@ -387,19 +387,22 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
             }
         }
     } else {
+        // use aligned M for selecting tiles.
+        const int m_for_tiles =
+            KernelTraits::KIsDense ? AlignSfM(params.m) : params.m;
         if constexpr (KernelTraits::SwapAB) {
             TORCH_CHECK(
                 params.n % KernelTraits::KBlockM == 0,
                 "SwapAB gemm_impl requires N to be divisible by KBlockM=",
                 KernelTraits::KBlockM, ", got ", params.n);
             TORCH_CHECK(
-                params.m % KernelTraits::KBlockN == 0 ||
+                m_for_tiles % KernelTraits::KBlockN == 0 ||
                     (KernelTraits::KIsDense &&
                      params.m <= KernelTraits::KBlockN),
                 "SwapAB gemm_impl requires M to be divisible by KBlockN=",
                 KernelTraits::KBlockN, ", got ", params.m);
         } else {
-            TORCH_CHECK(params.m % KernelTraits::KBlockM == 0 ||
+            TORCH_CHECK(m_for_tiles % KernelTraits::KBlockM == 0 ||
                             (KernelTraits::KDenseW8A8MXFP8 &&
                              params.m <= KernelTraits::KBlockM),
                         "gemm_impl requires M to be divisible by KBlockM=",
@@ -477,9 +480,8 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
     cute::Layout layout_C = cute::make_layout(
         cute::make_shape(M, N), cute::make_stride(N, cute::Int<1>{}));
 
-    // Scale tensors cover whole 128-row SF atoms even when M is smaller.
-    const int M_sf = (M + KernelTraits::KBlockM - 1) / KernelTraits::KBlockM *
-                     KernelTraits::KBlockM;
+    // meet the cutlass's 128 row SfAtoms layout.
+    const int M_sf = AlignSfM(M);
     typename KernelTraits::LayoutSFA layout_SFA =
         SwapAB ? KernelTraits::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
                      cute::make_shape(MMA_M, M_sf, K, num_experts))

@@ -40,4 +40,10 @@ inline int GetSmCount() {
     return cached;
 }
 
+inline constexpr int kSfAtomM = 128;
+
+constexpr int AlignSfM(int m) {
+    return (m + kSfAtomM - 1) / kSfAtomM * kSfAtomM;
+}
+
 }  // namespace halops
