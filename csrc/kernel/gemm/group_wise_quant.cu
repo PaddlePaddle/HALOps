@@ -24,6 +24,7 @@
 #include <string>
 
 #include "kernel/gemm/gemm_utils.h"
+#include "kernel/gemm/pdl.cuh"
 
 namespace halops {
 
@@ -125,7 +126,7 @@ struct TypeTraits<__half> {
     static constexpr int elem_per_float4 = 8;
 };
 
-template <typename T, QuantMode MODE, bool USE_SWIZZLE>
+template <typename T, QuantMode MODE, bool USE_SWIZZLE, bool USE_PDL>
 __global__ void group_wise_quant_kernel(
     const T* __restrict__ input,
     void* __restrict__ output_quant,  // FP8 e4m3 or packed FP4 bytes
@@ -139,6 +140,13 @@ __global__ void group_wise_quant_kernel(
 
     const int num_k_tiles = kb_dim / 4;
     const int total_groups = m * kb_dim;
+
+    // The loop below holds the first global access, so a PDL launch resolves
+    // the grid dependency here: the index math above overlaps with the tail of
+    // the producing kernel.
+    if constexpr (USE_PDL) {
+        PdlWaitForDependents();
+    }
 
     for (int group_idx = blockIdx.x * blockDim.x + threadIdx.x;
          group_idx < total_groups; group_idx += gridDim.x * blockDim.x) {
@@ -243,20 +251,52 @@ __global__ void group_wise_quant_kernel(
         }
         reinterpret_cast<uint8_t*>(output_sf)[sf_offset] = scale_byte;
     }
+
+    // Every store of this block is out: publish it and let a PDL-dependent
+    // grid (typically the GEMM consuming these buffers) start.
+    if constexpr (USE_PDL) {
+        PdlTriggerAfterBlockWrites();
+    }
+}
+
+template <typename T, QuantMode MODE, bool USE_SWIZZLE, bool USE_PDL>
+void LaunchQuantKernel(const T* input, void* output_quant, void* output_sf,
+                       int m, int k, int kb_dim, int grid_dim, int block_dim,
+                       cudaStream_t stream) {
+    LaunchKernelWithPdl(group_wise_quant_kernel<T, MODE, USE_SWIZZLE, USE_PDL>,
+                        grid_dim, block_dim, 0, stream, USE_PDL, input,
+                        output_quant, output_sf, m, k, kb_dim);
+}
+
+template <typename T, QuantMode MODE, bool USE_SWIZZLE>
+void LaunchGroupWiseQuantForSwizzle(const T* input, void* output_quant,
+                                    void* output_sf, int m, int k, int kb_dim,
+                                    int grid_dim, int block_dim,
+                                    cudaStream_t stream, bool use_pdl) {
+    if (use_pdl) {
+        LaunchQuantKernel<T, MODE, USE_SWIZZLE, true>(
+            input, output_quant, output_sf, m, k, kb_dim, grid_dim, block_dim,
+            stream);
+    } else {
+        LaunchQuantKernel<T, MODE, USE_SWIZZLE, false>(
+            input, output_quant, output_sf, m, k, kb_dim, grid_dim, block_dim,
+            stream);
+    }
 }
 
 template <typename T, QuantMode MODE>
 void LaunchGroupWiseQuant(const T* input, void* output_quant, void* output_sf,
                           int m, int k, int kb_dim, bool use_swizzle,
-                          int grid_dim, int block_dim, cudaStream_t stream) {
+                          int grid_dim, int block_dim, cudaStream_t stream,
+                          bool use_pdl) {
     if (use_swizzle) {
-        group_wise_quant_kernel<T, MODE, true>
-            <<<grid_dim, block_dim, 0, stream>>>(input, output_quant, output_sf,
-                                                 m, k, kb_dim);
+        LaunchGroupWiseQuantForSwizzle<T, MODE, true>(
+            input, output_quant, output_sf, m, k, kb_dim, grid_dim, block_dim,
+            stream, use_pdl);
     } else {
-        group_wise_quant_kernel<T, MODE, false>
-            <<<grid_dim, block_dim, 0, stream>>>(input, output_quant, output_sf,
-                                                 m, k, kb_dim);
+        LaunchGroupWiseQuantForSwizzle<T, MODE, false>(
+            input, output_quant, output_sf, m, k, kb_dim, grid_dim, block_dim,
+            stream, use_pdl);
     }
 }
 
@@ -264,25 +304,27 @@ template <typename T>
 void LaunchGroupWiseQuantForMode(const T* input, void* output_quant,
                                  void* output_sf, int m, int k, int kb_dim,
                                  QuantMode mode, bool use_swizzle, int grid_dim,
-                                 int block_dim, cudaStream_t stream) {
+                                 int block_dim, cudaStream_t stream,
+                                 bool use_pdl) {
     if (mode == QuantMode::W8A8MXFP8) {
         LaunchGroupWiseQuant<T, QuantMode::W8A8MXFP8>(
             input, output_quant, output_sf, m, k, kb_dim, use_swizzle, grid_dim,
-            block_dim, stream);
+            block_dim, stream, use_pdl);
     } else if (mode == QuantMode::W4A4MXFP4) {
         LaunchGroupWiseQuant<T, QuantMode::W4A4MXFP4>(
             input, output_quant, output_sf, m, k, kb_dim, use_swizzle, grid_dim,
-            block_dim, stream);
+            block_dim, stream, use_pdl);
     } else {
         LaunchGroupWiseQuant<T, QuantMode::W4A4NVFP4>(
             input, output_quant, output_sf, m, k, kb_dim, use_swizzle, grid_dim,
-            block_dim, stream);
+            block_dim, stream, use_pdl);
     }
 }
 
 std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
                                           const std::string& mode,
-                                          const bool use_swizzle) {
+                                          const bool use_swizzle,
+                                          const bool use_pdl) {
     const at::cuda::OptionalCUDAGuard device_guard(input.device());
     TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor of shape [m, k]");
     TORCH_CHECK(input.scalar_type() == torch::kBFloat16 ||
@@ -341,13 +383,13 @@ std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
             input.mutable_data_ptr<c10::BFloat16>());
         LaunchGroupWiseQuantForMode<__nv_bfloat16>(
             input_ptr, quant_data, sf_data, m, k, kb_dim, quant_mode,
-            use_swizzle, grid_dim, block_dim, stream);
+            use_swizzle, grid_dim, block_dim, stream, use_pdl);
     } else {
         const auto* input_ptr = reinterpret_cast<const __half*>(
             input.mutable_data_ptr<c10::Half>());
-        LaunchGroupWiseQuantForMode<__half>(input_ptr, quant_data, sf_data, m,
-                                            k, kb_dim, quant_mode, use_swizzle,
-                                            grid_dim, block_dim, stream);
+        LaunchGroupWiseQuantForMode<__half>(
+            input_ptr, quant_data, sf_data, m, k, kb_dim, quant_mode,
+            use_swizzle, grid_dim, block_dim, stream, use_pdl);
     }
 
     cudaError_t cuda_status = cudaGetLastError();

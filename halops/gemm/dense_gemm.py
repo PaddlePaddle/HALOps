@@ -33,6 +33,7 @@ def dense_gemm(
     alpha: Optional[torch.Tensor] = None,
     sm_count: int = -1,
     mode: str = "w8a8-mxfp8",
+    use_pdl: bool = True,
 ) -> None:
     """Dense GEMM on Blackwell SM100 tensor cores.
 
@@ -62,6 +63,7 @@ def dense_gemm(
         sm_count: Number of SMs to use (-1 for all available).
         mode: Quantization mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or
             ``"w4a4-nvfp4"``.
+        use_pdl: Enable Programmatic Dependent Launch (on by default).
 
     Returns:
         None. The result is written in-place to output.
@@ -87,4 +89,5 @@ def dense_gemm(
         alpha,
         sm_count,
         mode,
+        use_pdl,
     )

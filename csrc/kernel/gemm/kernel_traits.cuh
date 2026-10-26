@@ -33,6 +33,7 @@ struct GemmParams {
     int max_m_per_expert = 0;
     int *__restrict__ masked_m = nullptr;
     int *__restrict__ expert_ids = nullptr;
+    bool use_pdl = false;
 };
 
 template <class AccTensor, class SfaTensor, class SfbTensor>
@@ -48,7 +49,8 @@ template <typename TypeA_ = cutlass::float_e4m3_t,
           typename TypeD_ = cutlass::bfloat16_t,
           typename TypeSF_ = cutlass::float_ue4m3_t,
           typename TypeAccumulate_ = float,
-          typename KernelConfig_ = GemmKernelConfig, bool NarrowA_ = false>
+          typename KernelConfig_ = GemmKernelConfig, bool NarrowA_ = false,
+          bool UsePdl_ = false>
 struct GemmKernelTraits {
     using TypeA = TypeA_;
     using TypeB = TypeB_;
@@ -84,6 +86,7 @@ struct GemmKernelTraits {
     // KBlockM rows; the epilogue drops D past M).
     static constexpr bool KNarrowA =
         NarrowA_ && KDenseW8A8MXFP8 && !SwapAB && !IsPairUmma && !KIsFP4;
+    static constexpr bool KUsePdl = UsePdl_;
     static constexpr int KMmaK = KIsFP4 ? 64 : 32;
     static constexpr int kItersK = KBlockK / KMmaK;
     // Epilogue warp groups split N: 1 for SwapAB (small N), 2 otherwise.

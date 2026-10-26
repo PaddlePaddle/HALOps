@@ -73,7 +73,7 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const torch::Tensor& sfa, const torch::Tensor& sfb,
                torch::Tensor& output, const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha, const int sm_count,
-               const std::string& mode);
+               const std::string& mode, const bool use_pdl);
 
 void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
                      const torch::Tensor& sfa, const torch::Tensor& sfb,
@@ -99,7 +99,8 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
 
 std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
                                           const std::string& mode,
-                                          const bool use_swizzle);
+                                          const bool use_swizzle,
+                                          const bool use_pdl);
 
 std::vector<torch::Tensor> PrefillPermuteToMaskedGemm(
     const torch::Tensor& x, const torch::Tensor& scale,
@@ -174,12 +175,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("dense_gemm", &halops::DenseGemm, py::arg("input"), py::arg("weight"),
           py::arg("sfa"), py::arg("sfb"), py::arg("output"), py::arg("bias"),
-          py::arg("alpha"), py::arg("sm_count"), py::arg("mode"));
+          py::arg("alpha"), py::arg("sm_count"), py::arg("mode"),
+          py::arg("use_pdl") = true);
     m.def("group_masked_gemm", &halops::GroupMaskedGemm);
     m.def("group_contiguous_gemm", &halops::GroupContiguousGemm);
     m.def("batch_gemm", &halops::BatchGemm);
     m.def("group_wise_quant", &halops::GroupWiseQuant, py::arg("input"),
-          py::arg("mode"), py::arg("use_swizzle") = true);
+          py::arg("mode"), py::arg("use_swizzle") = true,
+          py::arg("use_pdl") = true);
     m.def("prefill_permute_to_masked_gemm",
           &halops::PrefillPermuteToMaskedGemm);
     m.def("fused_swiglu_quant", &halops::FusedSwigluQuant);
