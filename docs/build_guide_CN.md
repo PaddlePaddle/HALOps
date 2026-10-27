@@ -2,21 +2,9 @@
 
 # HALOps 构建指南
 
-HALOps 当前仅提供源码构建。本文说明环境准备、wheel/开发态构建、安装验证和常见问题；项目通过 [`setup.py`](../setup.py) 和 PyTorch `CUDAExtension` 编译 CUDA/C++ 扩展。
+直接使用 HALOps 时安装预编译包即可，见 [README 快速开始](../README.md#快速开始)。本文面向源码构建，说明环境准备、wheel/开发态构建与安装验证；项目通过 [`setup.py`](../setup.py) 和 PyTorch `CUDAExtension` 编译 CUDA/C++ 扩展。
 
-[返回 README](../README_CN.md) | [Benchmark 指南](../benchmark/README.md)
-
-## 快速安装
-
-先准备与 CUDA 13.0+ 兼容的 PyTorch 2.13.0+ CUDA 环境，再从仓库根目录执行：
-
-```bash
-git submodule update --init --recursive
-python -m pip install -r requirements.txt
-python -m pip install --no-build-isolation --no-deps -v .
-```
-
-HALOps 暂无 PyPI 或预编译 wheel；命令参数说明见“从源码安装”。
+[返回 README](../README.md) | [Benchmark 指南](../benchmark/README.md)
 
 ## 1. 环境要求
 
@@ -25,6 +13,7 @@ HALOps 暂无 PyPI 或预编译 wheel；命令参数说明见“从源码安装�
 | Python | 3.10 或更高版本 |
 | CUDA Toolkit | 13.0 或更高版本；`nvcc` 必须支持 `compute_100f/sm_100f` |
 | NVIDIA GPU | 计算能力与 `sm_100f` 兼容的 Blackwell GPU |
+| NVIDIA Driver | 与 CUDA 13.x 兼容的 R580 或更新版本 |
 | PyTorch | 2.13.0 或更高版本 |
 | C++ 编译器 | 支持 C++20 |
 

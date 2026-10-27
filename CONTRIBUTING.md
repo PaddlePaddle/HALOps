@@ -8,7 +8,7 @@
 
 ### 开始之前
 
-提交较大的功能、接口或架构变更前，请先创建或关联议题，说明使用场景、设计方案、兼容性影响和验收方式，避免在实现完成后才讨论方向。缺陷修复应给出最小复现；性能问题应同时给出 workload、环境和测量方法。
+提交较大的功能、接口或架构变更前，请先创建或关联issue，说明使用场景、设计方案、兼容性影响和验收方式。缺陷修复应给出最小复现；性能问题应同时给出 workload、环境和测量方法。
 
 开发环境准备：
 
@@ -39,8 +39,6 @@ CUDA/C++ 编码规范见 [代码规范](docs/code_standards.md)。
 ```bash
 python tests/test_dense_gemm.py
 ```
-
-格式和其他基础检查由 GitHub Actions（`.github/workflows/lint.yml`）覆盖：PR 只检查其改动的文件，合入 `main` 时执行 `pre-commit run --all-files` 以保持基线干净；GPU 单元测试和性能回归需要 `sm_100f` 机器，由维护者在内部 CI 运行。CI 报错时，根据日志对本 PR 修改的文件运行对应检查并修复；修复缺陷时应增加能在修复前复现问题的回归用例。没有 GPU 时，在变更说明中注明未运行的测试。
 
 编写单元测试时遵循以下约定：
 
@@ -79,19 +77,18 @@ docs: update build guide
 
 创建 Pull Request 时请：
 
-1. 关联对应议题或任务，并描述问题、方案、影响范围和兼容性。
+1. 关联对应issue或任务，并描述问题、方案、影响范围和兼容性。
 2. 列出实际执行的检查与测试；未运行的项目需说明原因。
 3. 填写 PR 模板中的精度影响与性能影响；性能变更附 Benchmark 命令、配置和自测结果。
 4. 保持分支可评审；根据反馈追加提交，合入前再整理历史。
 
-评审重点包括接口兼容性、正确性、边界条件、性能回退、可维护性和文档完整性。作者应回应所有未解决意见；重大设计变化应同步更新议题和文档。
+评审重点包括接口兼容性、正确性、边界条件、性能回退、可维护性和文档完整性。作者应回应所有未解决意见；重大设计变化应同步更新issue和文档。
 
 ### Pull Request 检查项
 
-- [ ] 变更已关联议题或任务，且范围聚焦。
+- [ ] 变更已关联issue或任务，且范围聚焦。
 - [ ] Python、PyBind 与 CUDA/C++ 接口保持一致。
 - [ ] 已运行与改动直接相关的单元测试，或明确说明未运行项。
-- [ ] CI 报错时已根据日志完成检查和修复。
 - [ ] 性能变更已完成 Benchmark 自测，并附命令、配置和结果。
 - [ ] 新增或变更的公开行为已更新 README 和对应文档。
 - [ ] 未包含生成产物、敏感信息或无关 profiling 文件。
@@ -102,7 +99,7 @@ Thank you for contributing to HALOps. This guide describes the minimum requireme
 
 ### Before You Start
 
-Before submitting a large feature, interface or architecture change, open or link an issue describing the use case, design, compatibility impact and acceptance criteria, so the direction is agreed on before implementation. Bug fixes should include a minimal reproduction; performance issues should include the workload, environment and measurement method.
+Before submitting a large feature, interface or architecture change, open or link an issue describing the use case, design, compatibility impact and acceptance criteria. Bug fixes should include a minimal reproduction; performance issues should include the workload, environment and measurement method.
 
 Set up the development environment:
 
@@ -133,8 +130,6 @@ Before submitting, run the unit tests directly related to your change on a GPU c
 ```bash
 python tests/test_dense_gemm.py
 ```
-
-Formatting and basic checks run in GitHub Actions (`.github/workflows/lint.yml`): pull requests check only the files they change, while pushes to `main` run `pre-commit run --all-files` so the baseline stays clean. GPU unit tests and performance regression need an `sm_100f` machine and are run by maintainers in internal CI. When CI fails, run the corresponding check on the files changed by your PR and fix them. Bug fixes should add a regression test that reproduces the problem before the fix. If you have no GPU, list the tests you did not run in the PR description.
 
 Unit test conventions:
 
@@ -185,7 +180,6 @@ Review focuses on interface compatibility, correctness, edge cases, performance 
 - [ ] The change is linked to an issue or task and is focused in scope.
 - [ ] The Python, PyBind and CUDA/C++ interfaces are consistent.
 - [ ] Unit tests directly related to the change were run, or the skipped ones are listed.
-- [ ] CI failures were investigated and fixed.
 - [ ] Performance changes include benchmark command, config and results.
 - [ ] New or changed public behavior is reflected in the README and docs.
 - [ ] No generated artifacts, secrets or unrelated profiling files are included.
