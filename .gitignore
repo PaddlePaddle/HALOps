@@ -1,10 +1,8 @@
 build
-.github
 halops.egg-info
 *.ncu-rep
 *.so
 dist/
-cutlass/
 __pycache__/
 .pytest_cache/
 .ruff_cache/

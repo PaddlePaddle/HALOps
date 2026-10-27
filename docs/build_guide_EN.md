@@ -133,5 +133,5 @@ Operator tests require an NVIDIA Blackwell GPU compatible with `sm_100f`; the bu
 A minimal operator test:
 
 ```bash
-python tests/test_dense_gemm.py
+python -m pytest tests/test_dense_gemm.py
 ```

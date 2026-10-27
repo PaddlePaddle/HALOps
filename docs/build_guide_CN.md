@@ -133,5 +133,5 @@ PY
 最小算子测试命令为：
 
 ```bash
-python tests/test_dense_gemm.py
+python -m pytest tests/test_dense_gemm.py
 ```
