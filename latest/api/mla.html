@@ -1,0 +1,680 @@
+<!doctype html>
+<html class="no-js" lang="en" data-content_root="../">
+  <head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="light dark"><meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="index" title="Index" href="../genindex.html"><link rel="search" title="Search" href="../search.html"><link rel="next" title="Benchmark" href="../pages/benchmark.html"><link rel="prev" title="GEMM" href="gemm.html">
+        <link rel="prefetch" href="../_static/halops-logo-light.svg" as="image">
+
+    <!-- Generated with Sphinx 8.2.3 and Furo 2025.09.25 -->
+        <title>MLA - HALOps latest</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=d75fae25" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/furo.css?v=580074bf" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/furo-extensions.css?v=8dab3a3b" />
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.2.8/index.min.css" />
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/@fontsource-variable/jetbrains-mono@5.2.8/index.min.css" />
+    <link rel="stylesheet" type="text/css" href="../_static/halops.css" />
+    
+    
+
+
+<style>
+  body {
+    --color-code-background: #f0f0f0;
+  --color-code-foreground: black;
+  --font-stack: "Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", Helvetica, Arial, sans-serif;
+  --font-stack--monospace: "JetBrains Mono Variable", "SFMono-Regular", Menlo, Consolas, monospace;
+  --color-brand-primary: #2563EB;
+  --color-brand-content: #2563EB;
+  
+  }
+  @media not print {
+    body[data-theme="dark"] {
+      --color-code-background: #202020;
+  --color-code-foreground: #d0d0d0;
+  
+    }
+    @media (prefers-color-scheme: dark) {
+      body:not([data-theme="light"]) {
+        --color-code-background: #202020;
+  --color-code-foreground: #d0d0d0;
+  
+      }
+    }
+  }
+</style></head>
+  <body>
+    
+    <script>
+      document.body.dataset.theme = localStorage.getItem("theme") || "auto";
+    </script>
+    
+
+<svg xmlns="http://www.w3.org/2000/svg" style="display: none;">
+  <symbol id="svg-toc" viewBox="0 0 24 24">
+    <title>Contents</title>
+    <svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 1024 1024">
+      <path d="M408 442h480c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8H408c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8zm-8 204c0 4.4 3.6 8 8 8h480c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8H408c-4.4 0-8 3.6-8 8v56zm504-486H120c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8h784c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8zm0 632H120c-4.4 0-8 3.6-8 8v56c0 4.4 3.6 8 8 8h784c4.4 0 8-3.6 8-8v-56c0-4.4-3.6-8-8-8zM115.4 518.9L271.7 642c5.8 4.6 14.4.5 14.4-6.9V388.9c0-7.4-8.5-11.5-14.4-6.9L115.4 505.1a8.74 8.74 0 0 0 0 13.8z"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-menu" viewBox="0 0 24 24">
+    <title>Menu</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather-menu">
+      <line x1="3" y1="12" x2="21" y2="12"></line>
+      <line x1="3" y1="6" x2="21" y2="6"></line>
+      <line x1="3" y1="18" x2="21" y2="18"></line>
+    </svg>
+  </symbol>
+  <symbol id="svg-arrow-right" viewBox="0 0 24 24">
+    <title>Expand</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather-chevron-right">
+      <polyline points="9 18 15 12 9 6"></polyline>
+    </svg>
+  </symbol>
+  <symbol id="svg-sun" viewBox="0 0 24 24">
+    <title>Light mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="feather-sun">
+      <circle cx="12" cy="12" r="5"></circle>
+      <line x1="12" y1="1" x2="12" y2="3"></line>
+      <line x1="12" y1="21" x2="12" y2="23"></line>
+      <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+      <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+      <line x1="1" y1="12" x2="3" y2="12"></line>
+      <line x1="21" y1="12" x2="23" y2="12"></line>
+      <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+      <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+    </svg>
+  </symbol>
+  <symbol id="svg-moon" viewBox="0 0 24 24">
+    <title>Dark mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-moon">
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z" />
+    </svg>
+  </symbol>
+  <symbol id="svg-sun-with-moon" viewBox="0 0 24 24">
+    <title>Auto light/dark, in light mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+      class="icon-custom-derived-from-feather-sun-and-tabler-moon">
+      <path style="opacity: 50%" d="M 5.411 14.504 C 5.471 14.504 5.532 14.504 5.591 14.504 C 3.639 16.319 4.383 19.569 6.931 20.352 C 7.693 20.586 8.512 20.551 9.25 20.252 C 8.023 23.207 4.056 23.725 2.11 21.184 C 0.166 18.642 1.702 14.949 4.874 14.536 C 5.051 14.512 5.231 14.5 5.411 14.5 L 5.411 14.504 Z"/>
+      <line x1="14.5" y1="3.25" x2="14.5" y2="1.25"/>
+      <line x1="14.5" y1="15.85" x2="14.5" y2="17.85"/>
+      <line x1="10.044" y1="5.094" x2="8.63" y2="3.68"/>
+      <line x1="19" y1="14.05" x2="20.414" y2="15.464"/>
+      <line x1="8.2" y1="9.55" x2="6.2" y2="9.55"/>
+      <line x1="20.8" y1="9.55" x2="22.8" y2="9.55"/>
+      <line x1="10.044" y1="14.006" x2="8.63" y2="15.42"/>
+      <line x1="19" y1="5.05" x2="20.414" y2="3.636"/>
+      <circle cx="14.5" cy="9.55" r="3.6"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-moon-with-sun" viewBox="0 0 24 24">
+    <title>Auto light/dark, in dark mode</title>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+      class="icon-custom-derived-from-feather-sun-and-tabler-moon">
+      <path d="M 8.282 7.007 C 8.385 7.007 8.494 7.007 8.595 7.007 C 5.18 10.184 6.481 15.869 10.942 17.24 C 12.275 17.648 13.706 17.589 15 17.066 C 12.851 22.236 5.91 23.143 2.505 18.696 C -0.897 14.249 1.791 7.786 7.342 7.063 C 7.652 7.021 7.965 7 8.282 7 L 8.282 7.007 Z"/>
+      <line style="opacity: 50%" x1="18" y1="3.705" x2="18" y2="2.5"/>
+      <line style="opacity: 50%" x1="18" y1="11.295" x2="18" y2="12.5"/>
+      <line style="opacity: 50%" x1="15.316" y1="4.816" x2="14.464" y2="3.964"/>
+      <line style="opacity: 50%" x1="20.711" y1="10.212" x2="21.563" y2="11.063"/>
+      <line style="opacity: 50%" x1="14.205" y1="7.5" x2="13.001" y2="7.5"/>
+      <line style="opacity: 50%" x1="21.795" y1="7.5" x2="23" y2="7.5"/>
+      <line style="opacity: 50%" x1="15.316" y1="10.184" x2="14.464" y2="11.036"/>
+      <line style="opacity: 50%" x1="20.711" y1="4.789" x2="21.563" y2="3.937"/>
+      <circle style="opacity: 50%" cx="18" cy="7.5" r="2.169"/>
+    </svg>
+  </symbol>
+  <symbol id="svg-pencil" viewBox="0 0 24 24">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-pencil-code">
+      <path d="M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4" />
+      <path d="M13.5 6.5l4 4" />
+      <path d="M20 21l2 -2l-2 -2" />
+      <path d="M17 17l-2 2l2 2" />
+    </svg>
+  </symbol>
+  <symbol id="svg-eye" viewBox="0 0 24 24">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="icon-tabler-eye-code">
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M10 12a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" />
+      <path
+        d="M11.11 17.958c-3.209 -.307 -5.91 -2.293 -8.11 -5.958c2.4 -4 5.4 -6 9 -6c3.6 0 6.6 2 9 6c-.21 .352 -.427 .688 -.647 1.008" />
+      <path d="M20 21l2 -2l-2 -2" />
+      <path d="M17 17l-2 2l2 2" />
+    </svg>
+  </symbol>
+</svg>
+
+<input type="checkbox" class="sidebar-toggle" name="__navigation" id="__navigation" aria-label="Toggle site navigation sidebar">
+<input type="checkbox" class="sidebar-toggle" name="__toc" id="__toc" aria-label="Toggle table of contents sidebar">
+<label class="overlay sidebar-overlay" for="__navigation"></label>
+<label class="overlay toc-overlay" for="__toc"></label>
+
+<a class="skip-to-content muted-link" href="#furo-main-content">Skip to content</a>
+
+
+
+<div class="page">
+  <header class="mobile-header">
+    <div class="header-left">
+      <label class="nav-overlay-icon" for="__navigation">
+        <span class="icon"><svg><use href="#svg-menu"></use></svg></span>
+      </label>
+    </div>
+    <div class="header-center">
+      <a href="../index.html"><div class="brand">HALOps latest</div></a>
+    </div>
+    <div class="header-right">
+      <div class="theme-toggle-container theme-toggle-header">
+        <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
+          <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
+          <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
+          <svg class="theme-icon-when-dark"><use href="#svg-moon"></use></svg>
+          <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
+        </button>
+      </div>
+      <label class="toc-overlay-icon toc-header-icon" for="__toc">
+        <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
+      </label>
+    </div>
+  </header>
+  <aside class="sidebar-drawer">
+    <div class="sidebar-container">
+      
+      <div class="sidebar-sticky"><a class="sidebar-brand" href="../index.html">
+  <div class="sidebar-logo-container">
+    <img class="sidebar-logo" src="../_static/halops-logo-light.svg" alt="Logo"/>
+  </div>
+  
+  
+</a><form class="sidebar-search-container" method="get" action="../search.html" role="search">
+  <input class="sidebar-search" placeholder="Search" name="q" aria-label="Search">
+  <input type="hidden" name="check_keywords" value="yes">
+  <input type="hidden" name="area" value="default">
+</form>
+<div id="searchbox"></div><div class="sidebar-scroll"><div class="sidebar-tree">
+  <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../pages/installation.html">Installation and Quick Start</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../build_guide.html">HALOps Build Guide</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="attention.html">Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gemm.html">GEMM</a></li>
+<li class="toctree-l1 current current-page"><a class="current reference internal" href="#">MLA</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Development</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../pages/benchmark.html">Benchmark</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pages/contributing.html">Contributing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pages/changelog.html">Changelog</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../pages/acknowledgement.html">Acknowledgement</a></li>
+</ul>
+
+</div>
+</div>
+
+      </div>
+      
+    </div>
+  </aside>
+  <div class="main">
+    <div class="content">
+      <div class="article-container">
+        <a href="#" class="back-to-top muted-link">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+            <path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8v12z"></path>
+          </svg>
+          <span>Back to top</span>
+        </a>
+        <div class="content-icon-container">
+          <div class="view-this-page">
+  <a class="muted-link" href="../_sources/api/mla.md.txt" title="View this page">
+    <svg><use href="#svg-eye"></use></svg>
+    <span class="visually-hidden">View this page</span>
+  </a>
+</div>
+<div class="theme-toggle-container theme-toggle-content">
+            <button class="theme-toggle" aria-label="Toggle Light / Dark / Auto color theme">
+              <svg class="theme-icon-when-auto-light"><use href="#svg-sun-with-moon"></use></svg>
+              <svg class="theme-icon-when-auto-dark"><use href="#svg-moon-with-sun"></use></svg>
+              <svg class="theme-icon-when-dark"><use href="#svg-moon"></use></svg>
+              <svg class="theme-icon-when-light"><use href="#svg-sun"></use></svg>
+            </button>
+          </div>
+          <label class="toc-overlay-icon toc-content-icon" for="__toc">
+            <span class="icon"><svg><use href="#svg-toc"></use></svg></span>
+          </label>
+        </div>
+        <article role="main" id="furo-main-content">
+          <section id="mla">
+<h1>MLA<a class="headerlink" href="#mla" title="Link to this heading">¶</a></h1>
+<div class="table-wrapper autosummary longtable docutils container">
+<table class="autosummary longtable docutils align-default">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.mla_attention" title="halops.mla_attention"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mla_attention</span></code></a></p></td>
+<td><p>DSV4 MLA decode/verify megakernel up to the sparse attention, on SM100.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.mla_attention_plan" title="halops.mla_attention_plan"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mla_attention_plan</span></code></a></p></td>
+<td><p>Fill the plan slot of one layer kind in <code class="docutils literal notranslate"><span class="pre">workspace</span></code> and zero its barriers.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.mla_output_proj" title="halops.mla_output_proj"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mla_output_proj</span></code></a></p></td>
+<td><p>MLA output projection after an <code class="docutils literal notranslate"><span class="pre">mla_attention</span></code> launch, on SM100.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.mla_workspace" title="halops.mla_workspace"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mla_workspace</span></code></a></p></td>
+<td><p>Allocate the gmem workspace of <code class="docutils literal notranslate"><span class="pre">mla_attention_plan</span></code>, <code class="docutils literal notranslate"><span class="pre">mla_attention</span></code> and <code class="docutils literal notranslate"><span class="pre">mla_output_proj</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<section class="api-entry" id="mla-attention">
+<h2>mla_attention<a class="headerlink" href="#mla-attention" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.mla_attention">
+<span class="sig-name descname"><span class="pre">mla_attention</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">q_or_x</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">hidden_states</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_cache</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">positions</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">freqs_real</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">sm_scale</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wq_a_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wq_a_sf</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">q_norm_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wq_b_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wq_b_sf</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wkv_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wkv_sf</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_norm_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">swa_loc</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">attn_sink</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">workspace</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">q_eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-06</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-06</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wkv_gate_weight</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_score_ring</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_gate_ring_row</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_ape</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_norm_weight</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_freqs_real</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_out_loc</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_pool</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_stride_kv_block</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_page_block</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_page_table</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_attn_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">draft_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">reset_barriers</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.mla_attention" title="Link to this definition">¶</a></dt>
+<dd><p>DSV4 MLA decode/verify megakernel up to the sparse attention, on SM100.</p>
+<p>One persistent launch (one CTA per SM) runs x -&gt; wq_a / wkv GEMMs -&gt;
+q / kv RMSNorm + RoPE + KV cache write -&gt; wq_b GEMM, the kv_gate GEMM and
+c128 compressor of HCA layers, and the sparse attention over the SWA window
+(plus the compressed c128 segment on HCA layers).  <code class="docutils literal notranslate"><span class="pre">mla_output_proj</span></code>
+finishes the layer.</p>
+<p>Only the DSV4 attention config is supported: 64 heads of head dim 512
+(448 NoPE + 64 RoPE), q_lora rank 1024, kv_lora rank 512, value dim 512,
+c128 compress ratio 128, fp8 KV rows with one ue8m0 scale per 64 NoPE
+elements.  The hidden size H is free but must be a multiple of 32.</p>
+<p>Each token’s SWA window (its KV runs and length) comes from the plan slot
+of this layer kind in <code class="docutils literal notranslate"><span class="pre">workspace</span></code>: call <code class="docutils literal notranslate"><span class="pre">mla_attention_plan</span></code> for the
+kind first, once per forward, on the same stream with the same T.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>q_or_x</strong> (<em>torch.Tensor</em>) – [T, 64 * 512] bfloat16, contiguous, T &gt; 0.  q staging buffer;
+on return it holds the normalized attention output O (before the
+inverse RoPE) of every token whose KV was not split.  The other
+tokens’ partials stay in <code class="docutils literal notranslate"><span class="pre">workspace</span></code>; pass both to
+<code class="docutils literal notranslate"><span class="pre">mla_output_proj</span></code>.</p></li>
+<li><p><strong>hidden_states</strong> (<em>torch.Tensor</em>) – [T, H] bfloat16 layer input, unit column stride, 16-byte
+aligned rows (may be a column slice of a wider buffer).</p></li>
+<li><p><strong>kv_cache</strong> (<em>torch.Tensor</em>) – [num_pages, page_bytes] uint8 paged SWA KV cache.  A page holds
+<code class="docutils literal notranslate"><span class="pre">page_size</span></code> rows of 576 bytes (448 float8_e4m3fn NoPE + 64
+bfloat16 RoPE), then <code class="docutils literal notranslate"><span class="pre">page_size</span></code> 8-byte ue8m0 scale slots;
+<code class="docutils literal notranslate"><span class="pre">page_bytes</span></code> is a multiple of 576.  Each token’s new row is
+written in place.</p></li>
+<li><p><strong>page_size</strong> (<em>int</em>) – Rows per <code class="docutils literal notranslate"><span class="pre">kv_cache</span></code> page, a power of two, as passed to
+<code class="docutils literal notranslate"><span class="pre">mla_attention_plan</span></code>.</p></li>
+<li><p><strong>positions</strong> (<em>torch.Tensor</em>) – [T] int32 position of each token.</p></li>
+<li><p><strong>freqs_real</strong> (<em>torch.Tensor</em>) – [max_pos, 64] float32 RoPE table, contiguous, 32 interleaved
+(cos, sin) pairs per position.</p></li>
+<li><p><strong>sm_scale</strong> (<em>float</em>) – Softmax scale of the QK scores.</p></li>
+<li><p><strong>wq_a_weight</strong> (<em>torch.Tensor</em>) – [1024, H] float8_e4m3fn wq_a weight.</p></li>
+<li><p><strong>wq_a_sf</strong> (<em>torch.Tensor</em>) – [1024, H / 32] uint8 SfAtom ue8m0 scale of <code class="docutils literal notranslate"><span class="pre">wq_a_weight</span></code>.</p></li>
+<li><p><strong>q_norm_weight</strong> (<em>torch.Tensor</em>) – [1024] bfloat16 RMSNorm gain of q_lora.</p></li>
+<li><p><strong>wq_b_weight</strong> (<em>torch.Tensor</em>) – [64 * 512, 1024] float8_e4m3fn wq_b weight.</p></li>
+<li><p><strong>wq_b_sf</strong> (<em>torch.Tensor</em>) – [64 * 512, 1024 / 32] uint8 SfAtom ue8m0 scale of
+<code class="docutils literal notranslate"><span class="pre">wq_b_weight</span></code>.</p></li>
+<li><p><strong>wkv_weight</strong> (<em>torch.Tensor</em>) – [512, H] float8_e4m3fn wkv weight.</p></li>
+<li><p><strong>wkv_sf</strong> (<em>torch.Tensor</em>) – [512, H / 32] uint8 SfAtom ue8m0 scale of <code class="docutils literal notranslate"><span class="pre">wkv_weight</span></code>.</p></li>
+<li><p><strong>kv_norm_weight</strong> (<em>torch.Tensor</em>) – [512] bfloat16 RMSNorm gain of the new KV row.</p></li>
+<li><p><strong>swa_loc</strong> (<em>torch.Tensor</em>) – [T] int32 <code class="docutils literal notranslate"><span class="pre">kv_cache</span></code> slot of each token’s new KV row.</p></li>
+<li><p><strong>attn_sink</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [64] float32 per-head sink logit added to the softmax
+denominator, or None for no sink.</p></li>
+<li><p><strong>workspace</strong> (<em>torch.Tensor</em>) – uint8 workspace from <code class="docutils literal notranslate"><span class="pre">mla_workspace</span></code>, planned for this
+layer kind by <code class="docutils literal notranslate"><span class="pre">mla_attention_plan</span></code>.</p></li>
+<li><p><strong>q_eps</strong> (<em>float</em>) – RMSNorm epsilon of q.</p></li>
+<li><p><strong>kv_eps</strong> (<em>float</em>) – RMSNorm epsilon of the KV rows (new and compressed).</p></li>
+<li><p><strong>wkv_gate_weight</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [2 * 512, H] bfloat16 kv_gate weight (compressor kv and
+score halves).  This and the <code class="docutils literal notranslate"><span class="pre">kv_*</span></code> / <code class="docutils literal notranslate"><span class="pre">c128_*</span></code> arguments below
+are given on HCA layers and left None on SWA layers;
+<code class="docutils literal notranslate"><span class="pre">wkv_gate_weight</span></code> and <code class="docutils literal notranslate"><span class="pre">c128_attn_len</span></code> must be given together.</p></li>
+<li><p><strong>kv_score_ring</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [num_requests * 128, 2 * 512] float32 ring of each
+request’s last 128 kv_gate outputs ([kv | score]); updated in place.</p></li>
+<li><p><strong>kv_gate_ring_row</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [T] int32 <code class="docutils literal notranslate"><span class="pre">kv_score_ring</span></code> row of each token
+(request * 128 + position % 128).</p></li>
+<li><p><strong>c128_ape</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [128, 512] float32 absolute position bias added to the ring
+scores.</p></li>
+<li><p><strong>c128_norm_weight</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [512] bfloat16 RMSNorm gain of a compressed row.</p></li>
+<li><p><strong>c128_freqs_real</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [max_pos, 64] float32 RoPE table of compressed rows;
+a row fired at position p is roped at p - 127 (its window start).</p></li>
+<li><p><strong>c128_out_loc</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [T] int32 <code class="docutils literal notranslate"><span class="pre">c128_pool</span></code> slot written by a token whose
+position % 128 == 127 (the compressor fires there).</p></li>
+<li><p><strong>c128_pool</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – uint8 paged compressed KV pool, same row and scale layout as
+<code class="docutils literal notranslate"><span class="pre">kv_cache</span></code> with <code class="docutils literal notranslate"><span class="pre">c128_page_block</span></code> rows per page.</p></li>
+<li><p><strong>c128_stride_kv_block</strong> (<em>int</em>) – Bytes per <code class="docutils literal notranslate"><span class="pre">c128_pool</span></code> page, a multiple of 576.</p></li>
+<li><p><strong>c128_page_block</strong> (<em>int</em>) – Rows per <code class="docutils literal notranslate"><span class="pre">c128_pool</span></code> page, a power of two.</p></li>
+<li><p><strong>c128_page_table</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [T, max_pages] int32 <code class="docutils literal notranslate"><span class="pre">c128_pool</span></code> pages of each
+token’s compressed segment.</p></li>
+<li><p><strong>c128_attn_len</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [T] int32 compressed rows each token attends over; None
+on SWA layers.</p></li>
+<li><p><strong>draft_tokens</strong> (<em>int</em>) – Tokens per request in verify, laid out consecutively at
+consecutive positions; 0 if unknown.</p></li>
+<li><p><strong>reset_barriers</strong> (<em>bool</em>) – True to zero the barrier banks at exit; pass False only
+if the next op on the stream (<code class="docutils literal notranslate"><span class="pre">mla_output_proj</span></code>) does it.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>None. Results are written in place.</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section class="api-entry" id="mla-attention-plan">
+<h2>mla_attention_plan<a class="headerlink" href="#mla-attention-plan" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.mla_attention_plan">
+<span class="sig-name descname"><span class="pre">mla_attention_plan</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_indices</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">topk_lengths</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">page_size</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_run_step</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_attn_len</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">workspace</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.mla_attention_plan" title="Link to this definition">¶</a></dt>
+<dd><p>Fill the plan slot of one layer kind in <code class="docutils literal notranslate"><span class="pre">workspace</span></code> and zero its
+barriers.</p>
+<p><code class="docutils literal notranslate"><span class="pre">workspace</span></code> keeps one plan per layer kind: SWA (<code class="docutils literal notranslate"><span class="pre">c128_attn_len</span></code> is
+None) and HCA.  Run it once per forward per kind, before that kind’s
+<code class="docutils literal notranslate"><span class="pre">mla_attention</span></code> launches on the same stream with the same T; layers of
+one kind share the plan as long as every launch’s barriers are zeroed after
+it (by <code class="docutils literal notranslate"><span class="pre">mla_attention</span></code> itself, or by <code class="docutils literal notranslate"><span class="pre">mla_output_proj</span></code>).</p>
+<p>The plan compresses each token’s SWA window into at most two runs of
+consecutive slots (a run ends where the next slot is not the previous one
+plus <code class="docutils literal notranslate"><span class="pre">kv_run_step</span></code> or lies on another page).  A window of more than two
+runs (a padding or not yet written window) is cut to its first row, as
+sglang pads such rows to length 1.  The block counts and the attention use
+these effective lengths.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>kv_indices</strong> (<em>torch.Tensor</em>) – [T, topk] int32 SWA <code class="docutils literal notranslate"><span class="pre">kv_cache</span></code> slots of each token’s
+window, unit column stride, T &gt; 0; columns past a token’s length
+are ignored (e.g. -1 padding).</p></li>
+<li><p><strong>topk_lengths</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [T] int32 contiguous SWA rows each token attends over,
+including its own new row, or None if every token attends over
+<code class="docutils literal notranslate"><span class="pre">topk</span></code> rows.</p></li>
+<li><p><strong>page_size</strong> (<em>int</em>) – Rows per <code class="docutils literal notranslate"><span class="pre">kv_cache</span></code> page, a power of two.</p></li>
+<li><p><strong>kv_run_step</strong> (<em>int</em>) – Slot step between consecutive window rows, 1 or -1 (a
+property of the slot table’s producer).</p></li>
+<li><p><strong>c128_attn_len</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [T] int32 compressed rows each token attends over, or
+None on SWA layers; selects the plan slot.</p></li>
+<li><p><strong>workspace</strong> (<em>torch.Tensor</em>) – uint8 workspace from <code class="docutils literal notranslate"><span class="pre">mla_workspace</span></code>.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>[T, 4] int32 view of the plan’s per-token KV runs in <code class="docutils literal notranslate"><span class="pre">workspace</span></code> – (slot0, len0, slot1, rows), row g &lt; len0 of the window on slot
+<code class="docutils literal notranslate"><span class="pre">slot0</span> <span class="pre">+</span> <span class="pre">g</span></code>, the others on <code class="docutils literal notranslate"><span class="pre">slot1</span> <span class="pre">+</span> <span class="pre">g</span> <span class="pre">-</span> <span class="pre">len0</span></code>, rows the effective
+length.  Valid until the next plan of this kind.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>torch.Tensor</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section class="api-entry" id="mla-output-proj">
+<h2>mla_output_proj<a class="headerlink" href="#mla-output-proj" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.mla_output_proj">
+<span class="sig-name descname"><span class="pre">mla_output_proj</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">q_or_x</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">positions</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">freqs_real</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wo_a_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wo_a_sf</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wo_b_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wo_b_sf</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">out</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">workspace</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">attn_sink</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_attn_len</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.mla_output_proj" title="Link to this definition">¶</a></dt>
+<dd><p>MLA output projection after an <code class="docutils literal notranslate"><span class="pre">mla_attention</span></code> launch, on SM100.</p>
+<p>Computes <code class="docutils literal notranslate"><span class="pre">out</span> <span class="pre">=</span> <span class="pre">wo_b(quant(wo_a(quant(rope^-1(combine(O))))))</span></code>: the
+split-KV LSE combine and inverse RoPE of O, group-32 e4m3 / ue8m0
+quantization, the grouped wo_a GEMM, group-32 quantization and the wo_b
+GEMM, as two PDL-chained kernels.  It also zeroes the attention’s barrier
+banks, so the preceding <code class="docutils literal notranslate"><span class="pre">mla_attention</span></code> may pass <code class="docutils literal notranslate"><span class="pre">reset_barriers=False</span></code>.</p>
+<p>The wo_a weight stacks G output groups: group g maps O columns
+[g * K, (g + 1) * K) of the flat [T, 64 * 512] O to its 2 * H / G rows of
+o_lora, with K = 64 * 512 / G.  o_lora is twice the hidden size H.  The
+fixed work split needs H a multiple of 512 and at most 4096, K a multiple
+of 512 and 2 * H / G a multiple of 256.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>q_or_x</strong> (<em>torch.Tensor</em>) – [T, 64 * 512] bfloat16, contiguous, 1 &lt;= T &lt;= 640.  The
+<code class="docutils literal notranslate"><span class="pre">q_or_x</span></code> of the attention launch, which holds O on return of
+<code class="docutils literal notranslate"><span class="pre">mla_attention</span></code>; read only.</p></li>
+<li><p><strong>positions</strong> (<em>torch.Tensor</em>) – [T] int32 token positions of the attention launch.</p></li>
+<li><p><strong>freqs_real</strong> (<em>torch.Tensor</em>) – [max_pos, 64] float32 RoPE table of the attention launch.</p></li>
+<li><p><strong>wo_a_weight</strong> (<em>torch.Tensor</em>) – [2 * H, 64 * 512 / G] float8_e4m3fn wo_a weight.</p></li>
+<li><p><strong>wo_a_sf</strong> (<em>torch.Tensor</em>) – [2 * H, 64 * 512 / G / 32] uint8 SfAtom ue8m0 scale of
+<code class="docutils literal notranslate"><span class="pre">wo_a_weight</span></code>.</p></li>
+<li><p><strong>wo_b_weight</strong> (<em>torch.Tensor</em>) – [H, 2 * H] float8_e4m3fn wo_b weight.</p></li>
+<li><p><strong>wo_b_sf</strong> (<em>torch.Tensor</em>) – [H, 2 * H / 32] uint8 SfAtom ue8m0 scale of <code class="docutils literal notranslate"><span class="pre">wo_b_weight</span></code>.</p></li>
+<li><p><strong>out</strong> (<em>torch.Tensor</em>) – [T, H] bfloat16, contiguous; written in place.</p></li>
+<li><p><strong>workspace</strong> (<em>torch.Tensor</em>) – uint8 workspace of the attention launch.</p></li>
+<li><p><strong>attn_sink</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [64] float32 attention sink of the attention launch, or None
+if it had none.</p></li>
+<li><p><strong>c128_attn_len</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – <code class="docutils literal notranslate"><span class="pre">c128_attn_len</span></code> of the attention launch (None on SWA
+layers).  Only whether it is None is used: it selects the SWA or
+HCA plan slot of <code class="docutils literal notranslate"><span class="pre">workspace</span></code>, so it must match the attention
+launch.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>None. The result is written in place to <code class="docutils literal notranslate"><span class="pre">out</span></code>.</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section class="api-entry" id="mla-workspace">
+<h2>mla_workspace<a class="headerlink" href="#mla-workspace" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.mla_workspace">
+<span class="sig-name descname"><span class="pre">mla_workspace</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_tokens</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wq_a_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wkv_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wo_a_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wo_b_weight</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.mla_workspace" title="Link to this definition">¶</a></dt>
+<dd><p>Allocate the gmem workspace of <code class="docutils literal notranslate"><span class="pre">mla_attention_plan</span></code>,
+<code class="docutils literal notranslate"><span class="pre">mla_attention</span></code> and <code class="docutils literal notranslate"><span class="pre">mla_output_proj</span></code>.</p>
+<p>One workspace serves every layer of the model (SWA and HCA alike, same
+weight shapes), every CUDA graph and any T up to <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code>.  It holds
+the barriers, one plan per layer kind, the attention partials and
+activations, and the output projection’s buffers.  Its barrier prefix is
+zeroed here, once; the kernels keep it zeroed.</p>
+<p>Call order: <code class="docutils literal notranslate"><span class="pre">mla_workspace</span></code> once (before any CUDA-graph capture); per
+forward one <code class="docutils literal notranslate"><span class="pre">mla_attention_plan</span></code> per layer kind (required: the attention
+reads its KV runs and work list); per layer <code class="docutils literal notranslate"><span class="pre">mla_attention</span></code> then
+<code class="docutils literal notranslate"><span class="pre">mla_output_proj</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>max_tokens</strong> (<em>int</em>) – Largest T the workspace serves, in [1, 640].</p></li>
+<li><p><strong>wq_a_weight</strong> (<em>torch.Tensor</em>) – [1024, H] float8_e4m3fn wq_a weight; sets H.</p></li>
+<li><p><strong>wkv_weight</strong> (<em>torch.Tensor</em>) – [512, H] float8_e4m3fn wkv weight.</p></li>
+<li><p><strong>wo_a_weight</strong> (<em>torch.Tensor</em>) – [2 * H, 64 * 512 / G] float8_e4m3fn wo_a weight.</p></li>
+<li><p><strong>wo_b_weight</strong> (<em>torch.Tensor</em>) – [H, 2 * H] float8_e4m3fn wo_b weight.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>1-D uint8 workspace tensor on the device of <code class="docutils literal notranslate"><span class="pre">wq_a_weight</span></code>.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>torch.Tensor</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+</section>
+
+        </article>
+      </div>
+      <footer>
+        
+        <div class="related-pages">
+          <a class="next-page" href="../pages/benchmark.html">
+              <div class="page-info">
+                <div class="context">
+                  <span>Next</span>
+                </div>
+                <div class="title">Benchmark</div>
+              </div>
+              <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
+            </a>
+          <a class="prev-page" href="gemm.html">
+              <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
+              <div class="page-info">
+                <div class="context">
+                  <span>Previous</span>
+                </div>
+                
+                <div class="title">GEMM</div>
+                
+              </div>
+            </a>
+        </div>
+        <div class="bottom-of-page">
+          <div class="left-details">
+            <div class="copyright">
+                Copyright &#169; 2026, PaddlePaddle Authors
+            </div>
+            Made with <a href="https://www.sphinx-doc.org/">Sphinx</a> and <a class="muted-link" href="https://pradyunsg.me">@pradyunsg</a>'s
+            
+            <a href="https://github.com/pradyunsg/furo">Furo</a>
+            
+          </div>
+          <div class="right-details">
+            
+          </div>
+        </div>
+        
+      </footer>
+    </div>
+    <aside class="toc-drawer">
+      
+      
+      <div class="toc-sticky toc-scroll">
+        <div class="toc-title-container">
+          <span class="toc-title">
+            On this page
+          </span>
+        </div>
+        <div class="toc-tree-container">
+          <div class="toc-tree">
+            <ul>
+<li><a class="reference internal" href="#">MLA</a><ul>
+<li><a class="reference internal" href="#mla-attention">mla_attention</a></li>
+<li><a class="reference internal" href="#mla-attention-plan">mla_attention_plan</a></li>
+<li><a class="reference internal" href="#mla-output-proj">mla_output_proj</a></li>
+<li><a class="reference internal" href="#mla-workspace">mla_workspace</a></li>
+</ul>
+</li>
+</ul>
+
+          </div>
+        </div>
+      </div>
+      
+      
+    </aside>
+  </div>
+</div><script src="../_static/documentation_options.js?v=01f34227"></script>
+    <script src="../_static/doctools.js?v=9bcbadda"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/scripts/furo.js?v=46bd48cc"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=6dbb43f8"></script>
+    <script>localStorage.setItem("theme", "light");</script>
+    <script>
+document.addEventListener("DOMContentLoaded", () => {
+  const brand = document.querySelector(".sidebar-brand");
+  if (!brand) return;
+  const box = document.createElement("div");
+  box.className = "halops-version";
+  box.textContent = "Version";
+  const select = document.createElement("select");
+  select.innerHTML = `<option>${"latest"}</option>`;
+  box.appendChild(select);
+  brand.after(box);
+  const root = new URL(document.documentElement.dataset.content_root, location.href);
+  const page = location.href.slice(root.href.length);
+  fetch(new URL("../versions.json", root))
+    .then((r) => r.json())
+    .then((versions) => {
+      select.innerHTML = versions
+        .map((v) => `<option value="${v.version}"${v.version === "latest" ? " selected" : ""}>${v.title}</option>`)
+        .join("");
+      select.onchange = () => { location.href = new URL(`../${select.value}/${page}`, root).href; };
+    })
+    .catch(() => {});
+});
+</script>
+    </body>
+</html>
