@@ -157,10 +157,10 @@ def _speedup_summary(df: pd.DataFrame, sorted_keys: list[str]) -> list[str]:
     columns = [
         "config",
         *sorted_keys,
-        "IR median(us)",
-        "IR TFLOPS",
-        "IR BW%",
-        "IR host(us)",
+        "halops median(us)",
+        "halops TFLOPS",
+        "halops BW%",
+        "halops host(us)",
         *other_backends,
     ]
     header = "|" + " | ".join(columns) + " |"

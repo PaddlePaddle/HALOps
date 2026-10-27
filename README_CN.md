@@ -25,8 +25,8 @@ HALOps（High-performance Accelerated LLM Operators）是文心团队开发的�
 
 HALOps 面向 NVIDIA Blackwell（SM100）从零设计，基于 CUTLASS / CuTe 直接使用 tcgen05、TMEM 与 TMA 等新硬件特性，覆盖大模型推理的 Attention、MoE 与 MLA 关键路径。
 
-- **GQA Attention**：支持变长 prefill 与 paged-KV decode，覆盖 BF16 / FP8 KV cache、GQA 与 投机解码 等推理场景，结合 split-KV 并行、自适应规约与前后处理算子融合，在长上下文与小 batch decode 下充分释放 SM100 的算力与带宽。
-- **多精度 GEMM**：支持 FP8（MXFP8）与 FP4（NVFP4 / MXFP4）block-scaled GEMM，覆盖 dense、batched 与 MoE grouped 场景，结合超轻量开销的灵活 tile 配置与 pre-mapping tile 调度等策略，在 SM100 架构上取得了全场景业界领先的性能。
+- **GQA Attention**：支持变长 prefill 与 paged-KV decode，覆盖 BF16 / FP8 KV cache、GQA 与投机解码等推理场景，结合 split-KV 并行、自适应规约与前后处理算子融合，在长上下文与小 batch decode 下充分释放 SM100 的算力与带宽。
+- **多精度 GEMM**：支持 FP8（MXFP8）与 FP4（NVFP4 / MXFP4）block-scaled GEMM，覆盖 dense、batched 与 MoE grouped 场景，结合超轻量开销的灵活 tile 配置与 pre-mapping tile 调度等策略，在 SM100 架构上在多数场景下取得了业界领先的性能。
 - **巨内核稀疏 MLA**：支持 HCA 与 SWA 的高性能巨内核（MegaKernel）稀疏 attention，消除 kernel 调度与中间结果的显存往返开销，并通过 tile 级流水编排掩盖计算与访存开销，进一步提升 GPU 算力利用率。
 
 ## 性能
@@ -56,13 +56,15 @@ HALOps 面向 NVIDIA Blackwell（SM100）从零设计，基于 CUTLASS / CuTe �
 
 ## 快速开始
 
-### 从 whl 安装
+### 从 wheel 安装
 
-准备好与本机 CUDA 兼容的 CUDA 版 PyTorch 后，直接安装 [HALOps 预编译包](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/)：
+预编译包支持 Python 3.12 + CUDA 13.2，平台为 Linux x86_64 与 aarch64。安装 CUDA 13.2 版 PyTorch 后，可直接安装 [HALOps 预编译包](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/)：
 
 ```bash
 python -m pip install halops==0.1.0 -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
 ```
+
+其他 Python 或 CUDA 版本请[从源码构建](#从源码构建)。
 
 ### 从源码构建
 

@@ -10,7 +10,7 @@ attention 和 GEMM 使用相同的指标字段：
 |---|---|---|
 | `median_us` | 多次测量的 kernel 耗时中位数，性能主指标 | μs |
 | `std_us` | 多次测量耗时的标准差，反映稳定性 | μs |
-| `speedup` | 当前实现相对 halops 的耗时倍数，>1 表示halops更快 | 倍 |
+| `speedup` | 当前实现相对 halops 的耗时倍数，>1 表示 halops 更快 | 倍 |
 | `tflops` | 计算吞吐 | TFLOPS |
 | `tb_per_sec` | 访存吞吐 | TB/s |
 | `bw_pct` | 访存带宽占 GPU 峰值带宽的比例 | % |
@@ -28,7 +28,7 @@ attention 和 GEMM 使用相同的指标字段：
 
 ### Attention
 
-`scenario`、`backend`、`batch_size`、`s_q`、`s_kv`、`num_q_heads`、`num_kv_heads`、`head_dim`、`dtype`、`causal`、通用指标、`case_tag`（测试用例标签，值为cfg文件名）、`use_cuda_graph`、`status`。
+`scenario`、`backend`、`batch_size`、`s_q`、`s_kv`、`num_q_heads`、`num_kv_heads`、`head_dim`、`dtype`、`causal`、通用指标、`case_tag`（测试用例标签，值为 cfg 文件名）、`use_cuda_graph`、`status`。
 
 ### GEMM
 
@@ -54,7 +54,7 @@ attention 和 GEMM 使用相同的指标字段：
 GPU        : <GPU 名>
 Backend versions:
   torch         : ...
-  halops    : commit ...
+  halops        : commit ...
 ============================================================
 ```
 
@@ -64,13 +64,13 @@ arithmetic intensity: 2730.667 FLOPs/byte  roofline: 4500.00 TFLOPS
 backend         median(us)  std(us)  Speedup  TFLOPS   TB/s   BW%  roof_util%  host(us)  disp(us)  mismatch%  status
 --------------------------------------------------------------------------------------------------------------------
 halops          53.632    7.514    1.00x  2562.63  0.939 12.2%      57.0%    56.592     0.000      0.0%      OK
-fi                 61.200    8.100    1.14x  2245.10  0.822 10.7%      49.9%    64.100     0.000      0.0%      OK
+fi              61.200    8.100    1.14x  2245.10  0.822 10.7%      49.9%    64.100     0.000      0.0%      OK
 ```
 
 ## Speedup Summary
-| config | m | n | k | IR median(us) | IR TFLOPS | IR BW% | fi |
-|---|---|---|---|---|---|---|---|
-| mode=w8a8-mxfp8 | 4096 | 4096 | 4096 | 53.632 | 2562.63 | 12.2% | 1.14x |
+| config | m | n | k | halops median(us) | halops TFLOPS | halops BW% | halops host(us) | fi |
+|---|---|---|---|---|---|---|---|---|
+| mode=w8a8-mxfp8 | 4096 | 4096 | 4096 | 53.632 | 2562.63 | 12.2% | 56.592 | 1.14x |
 
 ## Summary
 | backend | total | valid | mean | P25/P50/P75/P90 | distribution | issues |

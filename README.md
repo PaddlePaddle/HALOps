@@ -26,7 +26,7 @@ HALOps (High-performance Accelerated LLM Operators) is a high-performance operat
 HALOps is designed from the ground up for NVIDIA Blackwell (SM100). Built on CUTLASS / CuTe, it uses tcgen05, TMEM and TMA directly and covers the Attention, MoE and MLA hot paths of LLM inference.
 
 - **GQA attention**: variable-length prefill and paged-KV decode across BF16 / FP8 KV cache, GQA and speculative decoding; split-KV parallelism, adaptive reduction and fused pre/post-processing make full use of SM100 compute and bandwidth in long-context and small-batch decode.
-- **Multi-precision GEMM**: FP8 (MXFP8) and FP4 (NVFP4 / MXFP4) block-scaled GEMM for dense, batched and MoE grouped workloads; with ultra-lightweight flexible tile configurations and pre-mapped tile scheduling, it delivers industry-leading performance across all scenarios on SM100.
+- **Multi-precision GEMM**: FP8 (MXFP8) and FP4 (NVFP4 / MXFP4) block-scaled GEMM for dense, batched and MoE grouped workloads; with ultra-lightweight flexible tile configurations and pre-mapped tile scheduling, it delivers industry-leading performance in most scenarios on SM100.
 - **MegaKernel sparse MLA**: high-performance MegaKernel sparse attention for HCA and SWA, removing kernel scheduling and intermediate memory round trips, with tile-level pipelining that hides compute and memory latency to push GPU utilization further.
 
 ## Performance
@@ -47,7 +47,7 @@ All results are measured on SM100: MXFP8 dense GEMM outperforms DeepGEMM and Fla
 
 | Component | Requirement |
 | --- | --- |
-| GPU | NVIDIA Blackwell SM100 data center GPU |
+| GPU | NVIDIA Blackwell SM100 GPU |
 | CUDA Toolkit | 13.0 or later, hardware architecture `compute_100f/sm_100f` |
 | NVIDIA Driver | R580 or later, compatible with CUDA 13.x |
 | Python / PyTorch | Python 3.10+; PyTorch 2.13+ |
@@ -56,13 +56,15 @@ See the [NVIDIA CUDA compatibility matrix](https://docs.nvidia.com/deploy/cuda-c
 
 ## Quick Start
 
-### Install from whl
+### Install from Wheel
 
-With a CUDA build of PyTorch that matches your local CUDA, install the [prebuilt HALOps package](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/):
+Prebuilt wheels are available for Python 3.12 with CUDA 13.2 on Linux x86_64 and aarch64. With a CUDA 13.2 build of PyTorch installed, install the [prebuilt HALOps package](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/) directly:
 
 ```bash
 python -m pip install halops==0.1.0 -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
 ```
+
+For other Python or CUDA versions, [build from source](#build-from-source).
 
 ### Build from Source
 
