@@ -45,14 +45,18 @@ def batch_gemm(
 
     Args:
         input: [B, M, K] CUDA tensor.
-            w8a8-mxfp8: dtype float8_e4m3fn.
-            w4a4-*: dtype uint8 (packed FP4, logical K is size(2)*2).
+
+            - ``w8a8-mxfp8``: dtype float8_e4m3fn.
+            - ``w4a4-*``: dtype uint8 (packed FP4, logical K is size(2)*2).
+
         weight: [B, N, K] CUDA tensor. Same dtype/packing rules as input.
         sfa: Scale factor for A, dtype uint8, CUTLASS SfAtom 128x4 swizzled
             layout. Shape: ``[ceil(B * M / 128) * 128, sf_k]``, where
             ``sf_k = K // 32`` (w8a8-mxfp8, w4a4-mxfp4) or ``K // 16`` (w4a4-nvfp4).
-            w8a8-mxfp8, w4a4-mxfp4: UE8M0 encoding.
-            w4a4-nvfp4: UE4M3 encoding.
+
+            - ``w8a8-mxfp8``, ``w4a4-mxfp4``: UE8M0 encoding.
+            - ``w4a4-nvfp4``: UE4M3 encoding.
+
         sfb: [B, N, sf_k] scale factor for B, dtype uint8, same SfAtom layout as sfa.
         output: [B, M, N] pre-allocated output tensor, dtype bfloat16. Written in-place.
         bias: Optional [B, N] bfloat16 bias vector. Only supported in w8a8-mxfp8 mode.

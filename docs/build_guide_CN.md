@@ -1,10 +1,10 @@
-[English](build_guide_EN.md) | 简体中文
+[English](build_guide.md) | 简体中文
 
 # HALOps 构建指南
 
-直接使用 HALOps 时安装预编译包即可，见 [README 快速开始](../README.md#快速开始)。本文面向源码构建，说明环境准备、wheel/开发态构建与安装验证；项目通过 [`setup.py`](../setup.py) 和 PyTorch `CUDAExtension` 编译 CUDA/C++ 扩展。
+直接使用 HALOps 时安装预编译包即可，见 [README 快速开始](../README_CN.md#快速开始)。本文面向源码构建，说明环境准备、wheel/开发态构建与安装验证；项目通过 [`setup.py`](../setup.py) 和 PyTorch `CUDAExtension` 编译 CUDA/C++ 扩展。
 
-[返回 README](../README.md) | [Benchmark 指南](../benchmark/README.md)
+[返回 README](../README_CN.md) | [Benchmark 指南](../benchmark/README.md#简体中文)
 
 ## 1. 环境要求
 

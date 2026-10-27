@@ -43,16 +43,20 @@ def dense_gemm(
 
     Args:
         input: [M, K] CUDA tensor.
-            w8a8-mxfp8: dtype float8_e4m3fn.
-            w4a4-*: dtype uint8 (packed FP4, physical shape [M, K // 2]).
+
+            - ``w8a8-mxfp8``: dtype float8_e4m3fn.
+            - ``w4a4-*``: dtype uint8 (packed FP4, physical shape [M, K // 2]).
+
         weight: [N, K] CUDA tensor. Same dtype and packing rules as input.
         sfa: Scale factor for A, dtype uint8, CUTLASS SfAtom 128x4 swizzled
             layout.  The layout covers whole 128-row atoms, so the shape is
             ``[ceil(M / 128) * 128, K // 32]`` (w8a8-mxfp8, w4a4-mxfp4) or
             ``[ceil(M / 128) * 128, K // 16]`` (w4a4-nvfp4) -- exactly what
             ``group_wise_quant`` returns.
-            w8a8-mxfp8, w4a4-mxfp4: UE8M0 encoding.
-            w4a4-nvfp4: UE4M3 encoding.
+
+            - ``w8a8-mxfp8``, ``w4a4-mxfp4``: UE8M0 encoding.
+            - ``w4a4-nvfp4``: UE4M3 encoding.
+
         sfb: Scale factor for B, dtype uint8, in the same ordinary SfAtom
             layout as sfa. Shape [N, K // 32] (w8a8-mxfp8, w4a4-mxfp4) or
             [N, K // 16] (w4a4-nvfp4).

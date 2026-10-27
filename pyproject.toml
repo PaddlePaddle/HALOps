@@ -2,7 +2,7 @@
 name = "halops"
 version = "0.1.0"
 description = "High-performance Accelerated LLM Operators: Attention, MLA, GEMM and quantization CUDA kernels for LLM inference"
-readme = "README_EN.md"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

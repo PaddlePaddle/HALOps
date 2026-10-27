@@ -43,12 +43,16 @@ def fused_swiglu_quant(
 
     Returns:
         A tuple ``(out_quant, out_scale)`` where:
+
         - ``out_quant``:
-            FP4: [E*M, hidden_size/2] uint8 (packed nibbles)
-            FP8: [E*M, hidden_size] float8_e4m3fn
+
+          - FP4: [E*M, hidden_size/2] uint8 (packed nibbles)
+          - FP8: [E*M, hidden_size] float8_e4m3fn
+
         - ``out_scale``: [E*M, kb_dim] uint8, CUTLASS SfAtom 128x4 interleaved layout.
-            FP8 kb_dim = ceil(hidden_size/128/4) * 16
-            FP4 kb_dim = hidden_size / 16
+
+          - FP8: ``kb_dim = ceil(hidden_size / 128 / 4) * 16``
+          - FP4: ``kb_dim = hidden_size / 16``
 
     Example:
         >>> from halops import fused_swiglu_quant

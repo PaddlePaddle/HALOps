@@ -2,9 +2,9 @@ English | [简体中文](build_guide_CN.md)
 
 # HALOps Build Guide
 
-To use HALOps, install the prebuilt package; see [Quick Start](../README_EN.md#quick-start). This guide is for building from source: environment setup, wheel and development builds, and installation checks. The CUDA/C++ extension is built by [`setup.py`](../setup.py) through PyTorch `CUDAExtension`.
+To use HALOps, install the prebuilt package; see [Quick Start](../README.md#quick-start). This guide is for building from source: environment setup, wheel and development builds, and installation checks. The CUDA/C++ extension is built by [`setup.py`](../setup.py) through PyTorch `CUDAExtension`.
 
-[Back to README](../README_EN.md) | [Benchmark Guide](../benchmark/README.md#english-quick-reference)
+[Back to README](../README.md) | [Benchmark Guide](../benchmark/README.md#english-quick-reference)
 
 ## 1. Requirements
 

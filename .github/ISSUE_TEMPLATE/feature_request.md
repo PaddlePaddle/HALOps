@@ -1,13 +1,13 @@
 ---
-name: 功能需求 / Feature request
-about: 新算子、新精度或接口改进 / New operators, precisions or API improvements
+name: Feature request / 功能需求
+about: New operators, precisions or API improvements / 新算子、新精度或接口改进
 labels: enhancement
 ---
 
-## 使用场景 / Use case
+## Use case / 使用场景
 
-<!-- 模型、shape 范围、精度要求。 Model, shape range, precision requirements. -->
+<!-- Model, shape range, precision requirements. 模型、shape 范围、精度要求。 -->
 
-## 期望的接口或行为 / Proposed interface or behavior
+## Proposed interface or behavior / 期望的接口或行为
 
-## 备选方案 / Alternatives
+## Alternatives / 备选方案

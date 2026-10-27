@@ -1,4 +1,4 @@
-[English](README_EN.md) | 简体中文
+English | [简体中文](README_CN.md)
 
 <div align="center">
 
@@ -11,26 +11,26 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg?logo=python&logoColor=white)](pyproject.toml)
-[![CUDA](https://img.shields.io/badge/CUDA-13.0%2B-76B900.svg?logo=nvidia&logoColor=white)](docs/build_guide_CN.md)
-[![GPU](https://img.shields.io/badge/GPU-NVIDIA%20Blackwell%20SM100-76B900.svg)](docs/build_guide_CN.md)
+[![CUDA](https://img.shields.io/badge/CUDA-13.0%2B-76B900.svg?logo=nvidia&logoColor=white)](docs/build_guide.md)
+[![GPU](https://img.shields.io/badge/GPU-NVIDIA%20Blackwell%20SM100-76B900.svg)](docs/build_guide.md)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.13%2B-EE4C2C.svg?logo=pytorch&logoColor=white)](pyproject.toml)
 
 </div>
 
-HALOps（High-performance Accelerated LLM Operators）是文心团队开发的大模型推理高性能算子库。算子充分利用 NVIDIA GPU 硬件特性，并配合 PDL、多流 overlap、算子融合与 MegaKernel 等手段压缩 kernel 间的空泡，让计算、访存与通信尽可能满载，服务高吞吐、低时延的推理场景。
+HALOps (High-performance Accelerated LLM Operators) is a high-performance operator library for large language model inference, developed by the ERNIE team. The operators are built to exploit NVIDIA GPU hardware features, and use PDL, multi-stream overlap, operator fusion and MegaKernels to remove bubbles between kernels, keeping compute, memory and communication as close to saturation as possible for high-throughput, low-latency inference.
 
-[核心能力](#核心能力) | [性能](#性能) | [硬件与软件要求](#硬件与软件要求) | [快速开始](#快速开始) | [构建指南](docs/build_guide_CN.md) | [Benchmark 指南](benchmark/README.md) | [贡献指南](CONTRIBUTING.md)
+[Highlights](#highlights) | [Performance](#performance) | [Hardware and Software Requirements](#hardware-and-software-requirements) | [Quick Start](#quick-start) | [Documentation](https://paddlepaddle.github.io/HALOps/) | [Build Guide](docs/build_guide.md) | [Benchmark Guide](benchmark/README.md#english-quick-reference) | [Contributing](CONTRIBUTING.md#english)
 
-## 核心能力
+## Highlights
 
-HALOps 面向 NVIDIA Blackwell（SM100）从零设计，基于 CUTLASS / CuTe 直接使用 tcgen05、TMEM 与 TMA 等新硬件特性，覆盖大模型推理的 Attention、MoE 与 MLA 关键路径。
+HALOps is designed from the ground up for NVIDIA Blackwell (SM100). Built on CUTLASS / CuTe, it uses tcgen05, TMEM and TMA directly and covers the Attention, MoE and MLA hot paths of LLM inference.
 
-- **GQA Attention**：支持变长 prefill 与 paged-KV decode，覆盖 BF16 / FP8 KV cache、GQA 与 投机解码 等推理场景，结合 split-KV 并行、自适应规约与前后处理算子融合，在长上下文与小 batch decode 下充分释放 SM100 的算力与带宽。
-- **多精度 GEMM**：支持 FP8（MXFP8）与 FP4（NVFP4 / MXFP4）block-scaled GEMM，覆盖 dense、batched 与 MoE grouped 场景，结合超轻量开销的灵活 tile 配置与 pre-mapping tile 调度等策略，在 SM100 架构上取得了全场景业界领先的性能。
-- **巨内核稀疏 MLA**：支持 HCA 与 SWA 的高性能巨内核（MegaKernel）稀疏 attention，消除 kernel 调度与中间结果的显存往返开销，并通过 tile 级流水编排掩盖计算与访存开销，进一步提升 GPU 算力利用率。
+- **GQA attention**: variable-length prefill and paged-KV decode across BF16 / FP8 KV cache, GQA and speculative decoding; split-KV parallelism, adaptive reduction and fused pre/post-processing make full use of SM100 compute and bandwidth in long-context and small-batch decode.
+- **Multi-precision GEMM**: FP8 (MXFP8) and FP4 (NVFP4 / MXFP4) block-scaled GEMM for dense, batched and MoE grouped workloads; with ultra-lightweight flexible tile configurations and pre-mapped tile scheduling, it delivers industry-leading performance across all scenarios on SM100.
+- **MegaKernel sparse MLA**: high-performance MegaKernel sparse attention for HCA and SWA, removing kernel scheduling and intermediate memory round trips, with tile-level pipelining that hides compute and memory latency to push GPU utilization further.
 
-## 性能
-硬件架构：SM100。
+## Performance
+All results are measured on SM100: MXFP8 dense GEMM outperforms DeepGEMM and FlashInfer in some cases, and MegaMLA consistently outperforms the multi-stream + PDL implementation at small concurrency.
 
 <table>
   <tr>
@@ -38,35 +38,35 @@ HALOps 面向 NVIDIA Blackwell（SM100）从零设计，基于 CUTLASS / CuTe �
     <td width="50%"><img alt="HALOps MegaMLA vs multi-stream + PDL on the HCA attention layer" src="docs/images/megamla_hca_performance_halops_vs_baseline.png"></td>
   </tr>
   <tr>
-    <td align="center"><sub>图 1：Dense Mxfp8 W8A8 GEMM 性能对比</sub></td>
-    <td align="center"><sub>图 2：HCA attention 层性能对比</sub></td>
+    <td align="center"><sub>Figure 1: Dense Mxfp8 W8A8 GEMM performance comparison</sub></td>
+    <td align="center"><sub>Figure 2: HCA attention layer performance comparison</sub></td>
   </tr>
 </table>
 
-## 硬件与软件要求
+## Hardware and Software Requirements
 
-| 组件 | 要求 |
+| Component | Requirement |
 | --- | --- |
-| GPU | NVIDIA Blackwell SM100 GPU |
-| CUDA Toolkit | 13.0 或更高版本，硬件架构 `compute_100f/sm_100f` |
-| NVIDIA Driver | 与 CUDA 13.x 兼容的 R580 或更新版本 |
-| Python / PyTorch | Python 3.10+；PyTorch 2.13+ |
+| GPU | NVIDIA Blackwell SM100 data center GPU |
+| CUDA Toolkit | 13.0 or later, hardware architecture `compute_100f/sm_100f` |
+| NVIDIA Driver | R580 or later, compatible with CUDA 13.x |
+| Python / PyTorch | Python 3.10+; PyTorch 2.13+ |
 
-驱动要求以 [NVIDIA CUDA compatibility matrix](https://docs.nvidia.com/deploy/cuda-compatibility/) 为准；源码构建的完整环境要求见 [构建指南](docs/build_guide_CN.md)。
+See the [NVIDIA CUDA compatibility matrix](https://docs.nvidia.com/deploy/cuda-compatibility/) for driver requirements, and the [Build Guide](docs/build_guide.md) for the full source-build requirements.
 
-## 快速开始
+## Quick Start
 
-### 从 whl 安装
+### Install from whl
 
-准备好与本机 CUDA 兼容的 CUDA 版 PyTorch 后，直接安装 [HALOps 预编译包](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/)：
+With a CUDA build of PyTorch that matches your local CUDA, install the [prebuilt HALOps package](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/):
 
 ```bash
 python -m pip install halops==0.1.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu132/
 ```
 
-### 从源码构建
+### Build from Source
 
-需要自行编译时，在仓库根目录执行：
+To build it yourself, run from the repository root:
 
 ```bash
 git submodule update --init --recursive
@@ -74,11 +74,11 @@ python -m pip install -r requirements.txt
 python -m pip install --no-build-isolation --no-deps -v .
 ```
 
-开发态安装、wheel 构建、CUDA 路径配置与编译并发控制见 [构建指南](docs/build_guide_CN.md)。
+See the [Build Guide](docs/build_guide.md) for development installs, wheel builds, CUDA path configuration and build parallelism.
 
-### 验证安装
+### Verify the Installation
 
-安装后可通过一个 W8A8-MXFP8 dense GEMM 简单示例验证量化和计算链路，预期输出为 `torch.Size([128, 256]) torch.bfloat16`。
+After installation, the W8A8-MXFP8 dense GEMM example below checks the quantization and GEMM path. It should print `torch.Size([128, 256]) torch.bfloat16`.
 
 ```python
 import torch
@@ -97,14 +97,20 @@ dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8-mxfp8")
 print(output.shape, output.dtype)
 ```
 
-## 如何贡献
+## Roadmap
 
-开发环境、代码质量、测试要求和提交检查项见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+- **Complete GEMM coverage**: add W4A8, BF16 and other GEMM types to build a full quantization-type support matrix, so users can pick the trade-off between inference speed and accuracy they need.
+- **Higher-performance MegaKernels**: cover more compute-communication fusion scenarios and further overlap compute with memory traffic.
+- **High-performance kernels for small workloads**: kernels tuned for small problem sizes that deliver the lowest latency at low concurrency.
 
-## 致谢
+## Contributing
 
-HALOps 基于 [CUTLASS](https://github.com/NVIDIA/cutlass) 与 [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute) 构建，感谢 CUTLASS 开发者的工作。
+See [CONTRIBUTING.md](CONTRIBUTING.md#english) for the development setup, code quality and testing requirements, and the pull request checklist.
 
-## 许可证
+## Acknowledgement
 
-HALOps 使用 [Apache License 2.0](LICENSE)。
+HALOps is built on [CUTLASS](https://github.com/NVIDIA/cutlass) and [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute); we thank the CUTLASS developers for their work. We are also grateful to [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [FlashMLA](https://github.com/deepseek-ai/FlashMLA) and [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM), whose prior work on LLM inference kernels inspired many of our designs and served as valuable references for validating them.
+
+## License
+
+HALOps is released under the [Apache License 2.0](LICENSE).
