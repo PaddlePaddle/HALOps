@@ -2,9 +2,7 @@
 
 [GitHub](https://github.com/PaddlePaddle/HALOps) | [Installation](pages/installation.md)
 
-```{include} ../README.md
-:start-after: </div>
-:end-before: "## Hardware and Software Requirements"
+```{include} pages/_overview.md
 ```
 
 ```{toctree}

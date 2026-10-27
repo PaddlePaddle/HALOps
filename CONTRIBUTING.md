@@ -23,12 +23,9 @@ See the [Build Guide](docs/build_guide.md) for CUDA, PyTorch, compiler and hardw
 
 ### Development Conventions
 
-CUDA/C++ coding rules are listed in the [code standards](docs/code_standards.md) (in Chinese).
-
 - Each change addresses one clear problem; do not mix in unrelated refactoring, mechanical reformatting or generated files.
 - Reuse the existing directory layout, interfaces and dispatch patterns. A new abstraction should remove real complexity or duplication.
 - The Python wrapper, the PyBind declaration and the CUDA/C++ implementation must agree on argument order, defaults and semantics.
-- A new public API needs type hints, a docstring, a top-level export and an entry in the README operator table.
 - A new kernel needs tests for regular shapes, boundary shapes, invalid inputs and every supported precision mode; error messages should identify the violated constraint.
 - Do not commit `.so` files, wheels, profiling captures, logs or benchmark output directories, except reviewed results used in project documentation.
 
@@ -37,7 +34,7 @@ CUDA/C++ coding rules are listed in the [code standards](docs/code_standards.md)
 Before submitting, run the unit tests directly related to your change on a GPU compatible with `sm_100f`, for example:
 
 ```bash
-python tests/test_dense_gemm.py
+python -m pytest tests/test_dense_gemm.py
 ```
 
 Unit test conventions:
@@ -99,7 +96,7 @@ Review focuses on interface compatibility, correctness, edge cases, performance 
 
 ### 开始之前
 
-提交较大的功能、接口或架构变更前，请先创建或关联issue，说明使用场景、设计方案、兼容性影响和验收方式。缺陷修复应给出最小复现；性能问题应同时给出 workload、环境和测量方法。
+提交较大的功能、接口或架构变更前，请先创建或关联 issue，说明使用场景、设计方案、兼容性影响和验收方式。缺陷修复应给出最小复现；性能问题应同时给出 workload、环境和测量方法。
 
 开发环境准备：
 
@@ -114,18 +111,15 @@ CUDA、PyTorch、编译器和软硬件环境要求见 [构建指南](docs/build_
 
 ### 开发约定
 
-CUDA/C++ 编码规范见 [代码规范](docs/code_standards.md)。
-
 - 每个变更只解决一个明确问题；不要混入无关重构、机械格式化或生成文件。
 - 优先复用现有目录结构、接口和调度模式。新增抽象应能消除实际复杂度或重复。
 - Python wrapper、PyBind 声明与 CUDA/C++ 实现的参数顺序、默认值和语义必须一致。
-- 新增公开 API 时，补充类型标注、docstring、顶层导出、README 算子表。
 - 新增 kernel 时，覆盖正常 shape、边界 shape、非法输入及其支持的精度模式；错误信息应能定位违反的约束。
 - 不提交 `.so`、wheel、profiling capture、日志或 Benchmark 自动输出目录。经过复核且用于项目文档的精选结果除外。
 
 ### 代码质量与测试
 
-提交前只需在兼容 `sm_100f` 的 GPU 上运行与本次改动直接相关的单元测试，例如：
+提交前请在兼容 `sm_100f` 的 GPU 上运行与本次改动直接相关的单元测试，例如：
 
 ```bash
 python -m pytest tests/test_dense_gemm.py
@@ -168,16 +162,16 @@ docs: update build guide
 
 创建 Pull Request 时请：
 
-1. 关联对应issue或任务，并描述问题、方案、影响范围和兼容性。
+1. 关联对应 issue 或任务，并描述问题、方案、影响范围和兼容性。
 2. 列出实际执行的检查与测试；未运行的项目需说明原因。
 3. 填写 PR 模板中的精度影响与性能影响；性能变更附 Benchmark 命令、配置和自测结果。
 4. 保持分支可评审；根据反馈追加提交，合入前再整理历史。
 
-评审重点包括接口兼容性、正确性、边界条件、性能回退、可维护性和文档完整性。作者应回应所有未解决意见；重大设计变化应同步更新issue和文档。
+评审重点包括接口兼容性、正确性、边界条件、性能回退、可维护性和文档完整性。作者应回应所有未解决意见；重大设计变化应同步更新 issue 和文档。
 
 ### Pull Request 检查项
 
-- [ ] 变更已关联issue或任务，且范围聚焦。
+- [ ] 变更已关联 issue 或任务，且范围聚焦。
 - [ ] Python、PyBind 与 CUDA/C++ 接口保持一致。
 - [ ] 已运行与改动直接相关的单元测试，或明确说明未运行项。
 - [ ] 性能变更已完成 Benchmark 自测，并附命令、配置和结果。

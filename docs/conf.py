@@ -20,13 +20,24 @@ import sys
 import tomllib
 from pathlib import Path
 
+from sphinx.util import logging
+
+_LOGGER = logging.getLogger("halops.docs")
+
 DOCS = Path(__file__).resolve().parent
 ROOT = DOCS.parent
 sys.path.insert(0, str(ROOT))
 
+_PYPROJECT = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))["project"]
+
 project = "HALOps"
 author = "PaddlePaddle Authors"
 copyright = "2026, PaddlePaddle Authors"
+release = version = _PYPROJECT["version"]
+# Set by the docs workflow: the site directory this build is published to
+# ("latest" for main, "0.1" for release/0.1) and the git ref links point at.
+DOCS_VERSION = os.environ.get("DOCS_VERSION", release)
+DOCS_GIT_REF = os.environ.get("DOCS_GIT_REF", "main")
 
 extensions = [
     "sphinx.ext.autodoc",
@@ -51,12 +62,12 @@ napoleon_use_rtype = False
 
 copybutton_exclude = ".linenos, .gp, .go"
 
-exclude_patterns = ["_build", "*_CN.md", "code_standards.md"]
-# included repository files keep their own heading levels
-suppress_warnings = ["myst.xref_missing", "myst.header"]
+exclude_patterns = ["_build", "*_CN.md", "pages/_*"]
+myst_heading_anchors = 3
+suppress_warnings = ["myst.xref_missing"]
 
 html_theme = "furo"
-html_title = "HALOps"
+html_title = f"HALOps {DOCS_VERSION}"
 _FONTS = {
     "font-stack": '"Inter Variable", -apple-system, BlinkMacSystemFont, "Segoe UI", '
     '"PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", Helvetica, Arial, sans-serif',
@@ -125,6 +136,13 @@ dl.field-list > dd > ul > li > p > em,
 dl.field-list > dd > ul > li > em { color: #64748B; }
 dl.field-list > dd ul ul { margin-top: 0.3rem; font-size: 0.93em; color: #475569; }
 
+/* version switcher under the sidebar logo */
+.halops-version { margin: -0.4rem var(--sidebar-item-spacing-horizontal) 0.8rem;
+  font-size: 0.8rem; color: var(--color-foreground-secondary); }
+.halops-version select { margin-left: 0.3rem; padding: 0.1rem 0.3rem; font: inherit;
+  color: var(--color-brand-primary); border: 1px solid var(--color-background-border);
+  border-radius: 4px; background: #fff; }
+
 /* summary table at the top of each API page */
 table.autosummary { width: 100%; border: 1px solid var(--color-background-border);
   border-radius: 8px; border-collapse: separate; border-spacing: 0; box-shadow: none; }
@@ -184,40 +202,60 @@ def _write_api_pages() -> None:
         (out / f"{pkg.name}.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-# Pages that show part of a repository file, generated into docs/pages/:
-# (page, title, source file, start-after, end-before).
-_INCLUDE_PAGES = [
-    (
-        "installation",
+# Pages built from sections of repository files, generated into docs/pages/.
+# Each entry: page -> (title, source file, "## " headings to take). "" takes the
+# text before the first heading (minus the title, logo and badges); None takes
+# the whole file. A heading missing from the source is reported as a warning
+# naming this table, which fails the -W build in CI.
+_SECTION_PAGES = {
+    "_overview": (None, "README.md", ["", "Highlights", "Performance"]),
+    "installation": (
         "Installation and Quick Start",
         "README.md",
-        "</table>",
-        "## Roadmap",
+        ["Hardware and Software Requirements", "Quick Start"],
     ),
-    (
-        "benchmark",
-        "Benchmark",
-        "benchmark/README.md",
-        "## English Quick Reference",
-        "The Chinese sections",
-    ),
-    ("contributing", "Contributing", "CONTRIBUTING.md", "## English", "## 简体中文"),
-    ("changelog", None, "CHANGELOG.md", None, None),
-    (
-        "acknowledgement",
-        "Acknowledgement",
-        "README.md",
-        "## Acknowledgement",
-        "## License",
-    ),
-]
-# links to these files from included text point at their page instead
-_INCLUDED_PAGES = {src: f"pages/{page}.md" for page, _, src, _, _ in _INCLUDE_PAGES}
-_REPO_URL = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))["project"][
-    "urls"
-]["Repository"]
+    "benchmark": ("Benchmark", "benchmark/README.md", ["English Quick Reference"]),
+    "contributing": ("Contributing", "CONTRIBUTING.md", ["English"]),
+    "changelog": (None, "CHANGELOG.md", None),
+    "acknowledgement": ("Acknowledgement", "README.md", ["Acknowledgement"]),
+}
+_REPO_URL = _PYPROJECT["urls"]["Repository"]
 _LINK = re.compile(r"(\]\(|src=\"|href=\")([^)\"\s]+)")
+# Chinese lines of bilingual files (e.g. the changelog); the site is English only.
+_CJK_LINE = re.compile(r"^[^\n]*[一-鿿][^\n]*\n?", re.M)
 _NAV_BAR = re.compile(r"^\[[^\]]+\]\([^)]+\)( \| \[[^\]]+\]\([^)]+\))+$", re.M)
+_LANG_NOTE = re.compile(r"^The Chinese sections .*\n?", re.M)
+
+
+def _slug(heading: str) -> str:
+    return re.sub(r"[^\w\- ]", "", heading.strip().lower()).replace(" ", "-")
+
+
+def _split_sections(text: str) -> tuple[str, dict[str, str]]:
+    """Text before the first "## " heading, and each "## " section's body."""
+    pre, sections, name, buf, fence = [], {}, None, [], False
+    for line in text.splitlines(keepends=True):
+        if line.startswith("```"):
+            fence = not fence
+        if not fence and line.startswith("## "):
+            if name is not None:
+                sections[name] = "".join(buf)
+            name, buf = line[3:].strip(), []
+        elif name is None:
+            pre.append(line)
+        else:
+            buf.append(line)
+    if name is not None:
+        sections[name] = "".join(buf)
+    return "".join(pre), sections
+
+
+# (source file, anchor) -> page holding that section, for links between pages
+_ANCHOR_PAGES: dict[tuple[str, str], str] = {}
+for _page, (_, _src, _heads) in _SECTION_PAGES.items():
+    _target = "index" if _page == "_overview" else f"pages/{_page}"
+    for _h in [""] + (_heads or []):
+        _ANCHOR_PAGES.setdefault((_src, _slug(_h)), _target)
 
 
 def _rewrite_link(link: str, src_dir: Path, to_root: str) -> str:
@@ -225,41 +263,80 @@ def _rewrite_link(link: str, src_dir: Path, to_root: str) -> str:
         return link
     path, _, frag = link.partition("#")
     rel = Path(os.path.relpath((src_dir / path).resolve(), ROOT)).as_posix()
+    anchor = f"#{frag}" if frag else ""
     if rel.startswith("docs/images/"):
         return to_root + "_static/" + rel.removeprefix("docs/images/")
-    if rel in _INCLUDED_PAGES:
-        return to_root + _INCLUDED_PAGES[rel]
+    page = _ANCHOR_PAGES.get((rel, frag)) or _ANCHOR_PAGES.get((rel, ""))
+    if page:
+        return to_root + page + ".md" + (anchor if (rel, frag) in _ANCHOR_PAGES else "")
     if rel.startswith("docs/") and rel.endswith(".md") and (ROOT / rel).exists():
-        page = rel.removeprefix("docs/")
-        if not any(Path(page).match(p) for p in exclude_patterns):
-            return to_root + page + (f"#{frag}" if frag else "")
-    return f"{_REPO_URL}/blob/main/{rel}" + (f"#{frag}" if frag else "")
+        doc = rel.removeprefix("docs/")
+        if not any(Path(doc).match(p) for p in exclude_patterns):
+            return to_root + doc + anchor
+    return f"{_REPO_URL}/blob/{DOCS_GIT_REF}/{rel}" + anchor
 
 
-def _fix_included_links(app, relative_path, parent_docname, content):
-    """Make links in repository files included into docs pages resolve on the
-    docs site, and drop their in-page navigation bars."""
-    src_dir = (DOCS / relative_path).resolve().parent
-    to_root = "../" * app.env.docname.count("/")
-    text = _NAV_BAR.sub("", content[0])
-    content[0] = _LINK.sub(
+def _clean(text: str, src_dir: Path, to_root: str, nav: bool = False) -> str:
+    """Drop Chinese lines (and, for repository files, their navigation bars)
+    and point links at docs pages or the repository."""
+    text = _LANG_NOTE.sub(
+        "", _CJK_LINE.sub("", text if nav else _NAV_BAR.sub("", text))
+    )
+    return _LINK.sub(
         lambda m: m.group(1) + _rewrite_link(m.group(2), src_dir, to_root), text
     )
 
 
-def _write_include_pages() -> None:
+def _promote(text: str) -> str:
+    """Shift headings so the highest one in ``text`` becomes "##"."""
+    levels = [len(m) for m in re.findall(r"^(#+) ", text, re.M)]
+    shift = min(levels) - 2 if levels else 0
+    if shift <= 0:
+        return text
+    return re.sub(r"^#{%d}" % (shift + 1), "#", text, flags=re.M)
+
+
+def _intro(pre: str) -> str:
+    """Prose of the text before the first section: no title, HTML or badges."""
+    skip = ("<", "[![", "# ")
+    lines = pre.splitlines(keepends=True)
+    return "".join(line for line in lines if not line.lstrip().startswith(skip))
+
+
+def _write_section_pages(app) -> None:
     out = DOCS / "pages"
     shutil.rmtree(out, ignore_errors=True)
     out.mkdir()
-    for page, title, src, start, end in _INCLUDE_PAGES:
-        lines = [f"# {title}", ""] if title else []
-        lines.append(f"```{{include}} ../../{src}")
-        if start:
-            lines.append(f':start-after: "{start}"')
-        if end:
-            lines.append(f':end-before: "{end}"')
-        lines += ["```", ""]
-        (out / f"{page}.md").write_text("\n".join(lines), encoding="utf-8")
+    for page, (title, src, heads) in _SECTION_PAGES.items():
+        text = (ROOT / src).read_text("utf-8")
+        if heads is not None:
+            pre, sections = _split_sections(text)
+            parts = []
+            for head in heads:
+                if head == "":
+                    parts.append(_intro(pre))
+                elif head not in sections:
+                    _LOGGER.warning(
+                        f'section "## {head}" not found in {src}; update '
+                        "_SECTION_PAGES in docs/conf.py"
+                    )
+                elif len(heads) == 1:
+                    parts.append(_promote(sections[head]))
+                else:
+                    parts.append(f"## {head}\n" + sections[head])
+            text = "\n".join(parts)
+        to_root = "" if page.startswith("_") else "../"
+        body = _clean(text, (ROOT / src).parent, to_root).strip() + "\n"
+        head = f"# {title}\n\n" if title else ""
+        (out / f"{page}.md").write_text(head + body, encoding="utf-8")
+
+
+def _clean_source(app, docname, source):
+    """Drop the language switcher and fix repository links of hand-written
+    docs pages (generated pages are already clean)."""
+    if not docname.startswith(("pages/", "api/")):
+        to_root = "../" * docname.count("/")
+        source[0] = _clean(source[0], DOCS, to_root, nav=docname == "index")
 
 
 def _doctest_to_code_block(app, what, name, obj, options, lines):
@@ -289,7 +366,34 @@ def _drop_none_return(app, what, name, obj, options, signature, return_annotatio
 
 
 _write_api_pages()
-_write_include_pages()
+
+
+# Version switcher: lists the versions in versions.json at the site root, which
+# the docs workflow keeps up to date; a local build shows its version only.
+_VERSION_JS = """
+document.addEventListener("DOMContentLoaded", () => {
+  const brand = document.querySelector(".sidebar-brand");
+  if (!brand) return;
+  const box = document.createElement("div");
+  box.className = "halops-version";
+  box.textContent = "Version";
+  const select = document.createElement("select");
+  select.innerHTML = `<option>${CURRENT}</option>`;
+  box.appendChild(select);
+  brand.after(box);
+  const root = new URL(document.documentElement.dataset.content_root, location.href);
+  const page = location.href.slice(root.href.length);
+  fetch(new URL("../versions.json", root))
+    .then((r) => r.json())
+    .then((versions) => {
+      select.innerHTML = versions
+        .map((v) => `<option value="${v.version}"${v.version === CURRENT ? " selected" : ""}>${v.title}</option>`)
+        .join("");
+      select.onchange = () => { location.href = new URL(`../${select.value}/${page}`, root).href; };
+    })
+    .catch(() => {});
+});
+"""
 
 
 def _write_css(app, exception):
@@ -298,8 +402,10 @@ def _write_css(app, exception):
 
 
 def setup(app):
+    app.connect("builder-inited", _write_section_pages)
     app.add_js_file(None, body='localStorage.setItem("theme", "light");')
+    app.add_js_file(None, body=_VERSION_JS.replace("CURRENT", f'"{DOCS_VERSION}"'))
     app.connect("build-finished", _write_css)
     app.connect("autodoc-process-docstring", _doctest_to_code_block)
     app.connect("autodoc-process-signature", _drop_none_return)
-    app.connect("include-read", _fix_included_links)
+    app.connect("source-read", _clean_source)

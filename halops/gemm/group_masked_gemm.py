@@ -66,6 +66,28 @@ def group_masked_gemm(
         max_m_per_expert: Maximum tokens per expert (padding bound), must be > 0.
         sm_count: Number of SMs to use (-1 for all available).
         mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``.
+
+    Returns:
+        None. The result is written in-place to output.
+
+    Example:
+        >>> from halops import group_masked_gemm, group_wise_quant
+        >>>
+        >>> num_experts, max_m_per_expert, n, k = 4, 128, 256, 256
+        >>> m = num_experts * max_m_per_expert
+        >>> x_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+        >>> w_bf16 = torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda")
+        >>> x, sfa = group_wise_quant(x_bf16, mode="w8a8-mxfp8")
+        >>> w, sfb = group_wise_quant(w_bf16.view(num_experts * n, k), mode="w8a8-mxfp8")
+        >>> w = w.view(num_experts, n, k)
+        >>> sfb = sfb.view(num_experts, n, -1)
+        >>> # valid rows of each expert's 128-row slot
+        >>> masked_m = torch.tensor([128, 64, 0, 32], dtype=torch.int32, device="cuda")
+        >>> out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+        >>> group_masked_gemm(
+        ...     x, w, sfa, sfb, masked_m, out,
+        ...     max_m_per_expert=max_m_per_expert, mode="w8a8-mxfp8",
+        ... )
     """
     halops_kernel.group_masked_gemm(
         input,

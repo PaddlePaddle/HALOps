@@ -27,7 +27,7 @@ ci/
 Run directly from the HALOps project root:
 
 ```bash
-cd /workspace/HALOps
+cd HALOps  # repository root
 pytest ci/test_benchmark.py -v
 ```
 

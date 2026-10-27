@@ -1,21 +1,25 @@
 name: docs
 
+# One site per version on the gh-pages branch:
+#   main         -> latest/
+#   release/X.Y.Z -> X.Y.Z/ (the newest release is also copied to stable/)
+# The site root redirects to stable/ (latest/ before the first release) and
+# versions.json feeds the version switcher of every page.
+
 on:
   push:
-    branches: [main]
+    branches: [main, "release/*"]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: docs-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,14 +28,27 @@ jobs:
           cache: pip
           cache-dependency-path: docs/requirements.txt
 
+      - id: version
+        run: |
+          ref="${GITHUB_REF_NAME}"
+          case "$ref" in
+            release/*) version="${ref#release/}"; version="${version#v}" ;;
+            *) version=latest ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       # Docstrings are read with torch and the CUDA extension mocked, so the
       # build needs neither a GPU nor a compiled HALOps.
       - run: python -m pip install -r docs/requirements.txt
       - run: sphinx-build -b html -W --keep-going docs docs/_build/html
+        env:
+          DOCS_VERSION: ${{ steps.version.outputs.version }}
+          DOCS_GIT_REF: ${{ github.event_name == 'pull_request' && 'main' || github.ref_name }}
 
       - if: github.event_name != 'pull_request'
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
+          name: site
           path: docs/_build/html
 
   deploy:
@@ -39,11 +56,61 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      contents: write
+    # pushes to different branches must not race on gh-pages
+    concurrency:
+      group: docs-deploy
+      cancel-in-progress: false
     steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: ${{ runner.temp }}/site
+
+      - name: Publish to gh-pages
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SITE: ${{ runner.temp }}/site
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git worktree add pages origin/gh-pages
+            git -C pages checkout -B gh-pages
+          else
+            git worktree add --orphan -b gh-pages pages
+          fi
+          cd pages
+          rm -rf "$VERSION" && cp -r "$SITE" "$VERSION"
+          touch .nojekyll
+          python3 - <<'EOF'
+          import json, re, shutil
+          from pathlib import Path
+
+          root = Path(".")
+          releases = sorted(
+              (d.name for d in root.iterdir() if d.is_dir() and re.fullmatch(r"\d+(\.\d+)*", d.name)),
+              key=lambda v: [int(x) for x in v.split(".")],
+              reverse=True,
+          )
+          if releases:
+              shutil.rmtree("stable", ignore_errors=True)
+              shutil.copytree(releases[0], "stable")
+          versions = [{"version": "latest", "title": "latest (main)"}] if Path("latest").is_dir() else []
+          versions += [
+              {"version": v, "title": f"{v} (stable)" if i == 0 else v}
+              for i, v in enumerate(releases)
+          ]
+          Path("versions.json").write_text(json.dumps(versions, indent=2) + "\n")
+          target = "stable/" if releases else "latest/"
+          Path("index.html").write_text(
+              f'<!doctype html><meta http-equiv="refresh" content="0; url={target}">'
+              f'<link rel="canonical" href="{target}"><a href="{target}">{target}</a>\n'
+          )
+          EOF
+          git add -A
+          git commit -m "docs: publish ${VERSION} from ${GITHUB_SHA::7}" || exit 0
+          git push origin gh-pages
