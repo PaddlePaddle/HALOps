@@ -1,4 +1,4 @@
-English | [简体中文](README_CN.md)
+English | [简体中文](README.md)
 
 <div align="center">
 
@@ -25,10 +25,9 @@ HALOps (High-performance Accelerated LLM Operators) is a high-performance operat
 
 HALOps is designed from the ground up for NVIDIA Blackwell (SM100). Built on CUTLASS / CuTe, it uses tcgen05, TMEM and TMA directly and covers the Attention, MoE and MLA hot paths of LLM inference.
 
-- **GQA attention**: variable-length prefill and paged-KV decode across BF16 / FP8 KV cache, GQA and MTP; split-KV parallelism, adaptive reduction and fused pre/post-processing make full use of SM100 compute and bandwidth in long-context and small-batch decode.
+- **GQA attention**: variable-length prefill and paged-KV decode across BF16 / FP8 KV cache, GQA and speculative decoding; split-KV parallelism, adaptive reduction and fused pre/post-processing make full use of SM100 compute and bandwidth in long-context and small-batch decode.
 - **Multi-precision GEMM**: FP8 (MXFP8) and FP4 (NVFP4 / MXFP4) block-scaled GEMM for dense, batched and MoE grouped workloads; with ultra-lightweight flexible tile configurations and pre-mapped tile scheduling, it delivers industry-leading performance across all scenarios on SM100.
-- **MegaKernel sparse MLA**: high-performance MegaKernel sparse attention for both HCA and SWA layers. It absorbs the many small surrounding ops (projections, normalization, RoPE, KV cache write and compression) into a single kernel, removing kernel scheduling and intermediate memory round trips, and orchestrates tile-level pipelines so the compute and memory traffic of different stages overlap, pushing GPU utilization further.
-- **Low precision end to end**: quantization, fused SwiGLU + quantization and expert permutation write the scale layout the GEMMs read, so low-precision data flows between operators without layout conversion.
+- **MegaKernel sparse MLA**: high-performance MegaKernel sparse attention for HCA and SWA, removing kernel scheduling and intermediate memory round trips, with tile-level pipelining that hides compute and memory latency to push GPU utilization further.
 
 ## Performance
 Hardware architecture: SM100.
@@ -39,8 +38,8 @@ Hardware architecture: SM100.
     <td width="50%"><img alt="HALOps MegaMLA vs multi-stream + PDL on the HCA attention layer" src="docs/images/megamla_hca_performance_halops_vs_baseline.png"></td>
   </tr>
   <tr>
-    <td align="center">Figure 1: dense Mxfp8 W8A8 GEMM, HALOps against DeepGEMM and FlashInfer</td>
-    <td align="center">Figure 2: HCA attention layer; for small-batch decode, MegaMLA fuses the whole layer into a MegaKernel and beats the multi-kernel implementation chained with multi-stream overlap and PDL</td>
+    <td align="center"><sub>Figure 1: Dense Mxfp8 W8A8 GEMM performance comparison</sub></td>
+    <td align="center"><sub>Figure 2: HCA attention layer performance comparison</sub></td>
   </tr>
 </table>
 
@@ -53,32 +52,29 @@ Hardware architecture: SM100.
 | NVIDIA Driver | R580 or later, compatible with CUDA 13.x |
 | Python / PyTorch | Python 3.10+; PyTorch 2.13+ |
 
-See the [NVIDIA CUDA compatibility matrix](https://docs.nvidia.com/deploy/cuda-compatibility/) for driver requirements, and the [Build Guide](docs/build_guide_EN.md) for environment checks, building and troubleshooting.
+See the [NVIDIA CUDA compatibility matrix](https://docs.nvidia.com/deploy/cuda-compatibility/) for driver requirements, and the [Build Guide](docs/build_guide_EN.md) for the full source-build requirements.
 
 ## Quick Start
 
 ### Install from whl
 
-With a CUDA build of PyTorch that matches your local CUDA, install the [prebuilt HALOps package](https://pypi.org/project/halops/):
+With a CUDA build of PyTorch that matches your local CUDA, install the [prebuilt HALOps package](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/):
 
 ```bash
-python -m pip install halops
+python -m pip install halops==0.1.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu132/
 ```
 
 ### Build from Source
 
-To build it yourself or develop HALOps, run from the repository root:
+To build it yourself, run from the repository root:
 
 ```bash
 git submodule update --init --recursive
 python -m pip install -r requirements.txt
-# install into the current environment
 python -m pip install --no-build-isolation --no-deps -v .
-# or install in development mode; after changing CUDA/C++ code, rebuild incrementally with bash build.sh
-python -m pip install --no-build-isolation --no-deps -e . -v
 ```
 
-The build target is fixed to `compute_100f/sm_100f`. See the [Build Guide](docs/build_guide_EN.md) for wheel builds, CUDA path configuration and development builds.
+See the [Build Guide](docs/build_guide_EN.md) for development installs, wheel builds, CUDA path configuration and build parallelism.
 
 ### Verify the Installation
 
@@ -100,8 +96,6 @@ output = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
 dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8-mxfp8")
 print(output.shape, output.dtype)
 ```
-
-W4A4 works the same way with `mode="w4a4-mxfp4"` or `mode="w4a4-nvfp4"`; `w4a4-nvfp4` also takes an fp32 scaling factor `alpha`, see the GEMM docstrings.
 
 ## Contributing
 

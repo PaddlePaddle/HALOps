@@ -2,21 +2,9 @@ English | [简体中文](build_guide_CN.md)
 
 # HALOps Build Guide
 
-HALOps is currently distributed as source only. This guide covers environment setup, wheel and development builds, installation checks and common options. The CUDA/C++ extension is built by [`setup.py`](../setup.py) through PyTorch `CUDAExtension`.
+To use HALOps, install the prebuilt package; see [Quick Start](../README_EN.md#quick-start). This guide is for building from source: environment setup, wheel and development builds, and installation checks. The CUDA/C++ extension is built by [`setup.py`](../setup.py) through PyTorch `CUDAExtension`.
 
 [Back to README](../README_EN.md) | [Benchmark Guide](../benchmark/README.md#english-quick-reference)
-
-## Quick Install
-
-Prepare a CUDA build of PyTorch 2.13.0+ compatible with CUDA 13.0+, then run from the repository root:
-
-```bash
-git submodule update --init --recursive
-python -m pip install -r requirements.txt
-python -m pip install --no-build-isolation --no-deps -v .
-```
-
-HALOps has no PyPI package or prebuilt wheel yet; see "Install from source" for what the options do.
 
 ## 1. Requirements
 
@@ -25,6 +13,7 @@ HALOps has no PyPI package or prebuilt wheel yet; see "Install from source" for 
 | Python | 3.10 or later |
 | CUDA Toolkit | 13.0 or later; `nvcc` must support `compute_100f/sm_100f` |
 | NVIDIA GPU | Blackwell GPU with compute capability compatible with `sm_100f` |
+| NVIDIA Driver | R580 or later, compatible with CUDA 13.x |
 | PyTorch | 2.13.0 or later |
 | C++ compiler | C++20 support |
 
