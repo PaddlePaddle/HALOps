@@ -61,7 +61,7 @@ See the [NVIDIA CUDA compatibility matrix](https://docs.nvidia.com/deploy/cuda-c
 With a CUDA build of PyTorch that matches your local CUDA, install the [prebuilt HALOps package](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/):
 
 ```bash
-python -m pip install halops==0.1.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu132/
+python -m pip install halops==0.1.0 -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
 ```
 
 ### Build from Source

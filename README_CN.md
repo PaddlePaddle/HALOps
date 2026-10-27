@@ -61,7 +61,7 @@ HALOps 面向 NVIDIA Blackwell（SM100）从零设计，基于 CUTLASS / CuTe �
 准备好与本机 CUDA 兼容的 CUDA 版 PyTorch 后，直接安装 [HALOps 预编译包](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/)：
 
 ```bash
-python -m pip install halops==0.1.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu132/
+python -m pip install halops==0.1.0 -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
 ```
 
 ### 从源码构建
