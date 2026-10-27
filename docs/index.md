@@ -30,4 +30,5 @@ api/*
 pages/benchmark
 pages/contributing
 pages/changelog
+pages/acknowledgement
 ```

@@ -63,18 +63,13 @@ _FONTS = {
     "font-stack--monospace": '"JetBrains Mono Variable", "SFMono-Regular", Menlo, '
     "Consolas, monospace",
 }
+html_logo = "images/halops-logo-light.svg"
 html_theme_options = {
-    "light_logo": "halops-logo-light.svg",
-    "dark_logo": "halops-logo-dark.svg",
     "sidebar_hide_name": True,
     "light_css_variables": {
         **_FONTS,
         "color-brand-primary": "#2563EB",
         "color-brand-content": "#2563EB",
-    },
-    "dark_css_variables": {
-        "color-brand-primary": "#38BDF8",
-        "color-brand-content": "#38BDF8",
     },
 }
 html_static_path = ["images"]
@@ -85,22 +80,52 @@ html_css_files = [
     "halops.css",
 ]
 pygments_style = "friendly"
-pygments_dark_style = "github-dark"
+toc_object_entries = False
 
 # Written into the build output by setup(), so the repository needs no CSS file.
+# The site is light only: the theme toggle is hidden and the theme pinned.
 _CSS = """
-body { line-height: 1.65; }
-h1, h2, h3 { font-weight: 700; letter-spacing: -0.015em; }
+.theme-toggle-container { display: none !important; }
+body { line-height: 1.65; color: #1F2937; }
+h1, h2, h3 { font-weight: 700; letter-spacing: -0.015em; color: #0F172A; }
 code.literal, p code.literal { border: none; border-radius: 4px; font-size: 0.86em; }
 pre, div.highlight { border-radius: 8px; }
-dl.py.function { margin: 2.2rem 0; padding-bottom: 1.2rem;
-  border-bottom: 1px solid var(--color-background-border); }
-dl.py.function > dt.sig { margin: 0; padding: 0.6rem 1rem 0.6rem 3em; line-height: 1.7;
+
+/* one section per API: deep-blue heading over its signature card */
+section.api-entry { margin-top: 3rem; padding-top: 0.5rem;
+  border-top: 1px solid var(--color-background-border); }
+section.api-entry > h2 { font-family: var(--font-stack--monospace); font-size: 1.35rem;
+  font-weight: 700; color: #1E3A8A; margin-bottom: 0.8rem; }
+dl.py.function { margin: 0 0 1rem; }
+dl.py.function > dt.sig { margin: 0 0 1rem; padding: 0.6rem 1rem 0.6rem 3em;
+  line-height: 1.7; font-size: 0.86rem; background: #F1F5F9;
   border-left: 3px solid var(--color-brand-primary); border-radius: 0 6px 6px 0; }
 dl.py.function > dt.sig .sig-name { color: var(--color-brand-primary); }
-dl.py.function > dt.sig .sig-param { font-weight: 400; }
-dl.field-list > dt, p.rubric { font-size: 0.78rem; font-weight: 650; letter-spacing: 0.06em;
-  text-transform: uppercase; color: var(--color-foreground-secondary); }
+dl.py.function > dt.sig .sig-param { font-weight: 400; color: #334155; }
+dl.py.function > dt.sig .default_value { color: #9333EA; }
+dl.py.function > dd { margin-left: 0; }
+
+/* the one-line summary reads as a lead paragraph */
+dl.py.function > dd > p:first-child { font-size: 1.05rem; font-weight: 500; color: #0F172A; }
+
+/* "Parameters" / "Returns" / "Example" section labels */
+dl.field-list > dt, dl.py.function p.rubric { display: block; margin: 1.4rem 0 0.6rem;
+  padding: 0.15rem 0 0.15rem 0.6rem; font-size: 0.95rem; font-weight: 700;
+  letter-spacing: 0.02em; text-transform: none; color: #1E40AF;
+  border-left: 3px solid #93C5FD; background: none; }
+dl.field-list { display: block; }
+dl.field-list > dd { margin-left: 0.9rem; }
+dl.field-list .colon { display: none; }
+
+/* parameter name / type / description */
+dl.field-list > dd > ul > li { margin-bottom: 0.55rem; }
+dl.field-list > dd strong { font-family: var(--font-stack--monospace); font-size: 0.9em;
+  color: #B45309; }
+dl.field-list > dd > ul > li > p > em,
+dl.field-list > dd > ul > li > em { color: #64748B; }
+dl.field-list > dd ul ul { margin-top: 0.3rem; font-size: 0.93em; color: #475569; }
+
+/* summary table at the top of each API page */
 table.autosummary { width: 100%; border: 1px solid var(--color-background-border);
   border-radius: 8px; border-collapse: separate; border-spacing: 0; box-shadow: none; }
 table.autosummary td { padding: 0.45rem 0.9rem;
@@ -151,8 +176,11 @@ def _write_api_pages() -> None:
         lines = [f"# {_page_title(pkg)}", "", "```{eval-rst}"]
         lines += [".. currentmodule:: halops", ""]
         lines += [".. autosummary::", "   :nosignatures:", ""]
-        lines += [f"   {name}" for name in names] + [""]
-        lines += [f".. autofunction:: {name}" for name in names] + ["```", ""]
+        lines += [f"   {name}" for name in names] + ["```", ""]
+        for name in names:
+            lines += ["```{rst-class} api-entry", "```", ""]
+            lines += [f"## {name}", "", "```{eval-rst}", ".. currentmodule:: halops"]
+            lines += ["", f".. autofunction:: {name}", "```", ""]
         (out / f"{pkg.name}.md").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -175,6 +203,13 @@ _INCLUDE_PAGES = [
     ),
     ("contributing", "Contributing", "CONTRIBUTING.md", "## English", "## 简体中文"),
     ("changelog", None, "CHANGELOG.md", None, None),
+    (
+        "acknowledgement",
+        "Acknowledgement",
+        "README.md",
+        "## Acknowledgement",
+        "## License",
+    ),
 ]
 # links to these files from included text point at their page instead
 _INCLUDED_PAGES = {src: f"pages/{page}.md" for page, _, src, _, _ in _INCLUDE_PAGES}
@@ -263,6 +298,7 @@ def _write_css(app, exception):
 
 
 def setup(app):
+    app.add_js_file(None, body='localStorage.setItem("theme", "light");')
     app.connect("build-finished", _write_css)
     app.connect("autodoc-process-docstring", _doctest_to_code_block)
     app.connect("autodoc-process-signature", _drop_none_return)
