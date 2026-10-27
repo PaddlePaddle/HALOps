@@ -1,0 +1,58 @@
+# Installation and Quick Start
+
+## Hardware and Software Requirements
+
+| Component | Requirement |
+| --- | --- |
+| GPU | NVIDIA Blackwell SM100 GPU |
+| CUDA Toolkit | 13.0 or later, hardware architecture `compute_100f/sm_100f` |
+| NVIDIA Driver | R580 or later, compatible with CUDA 13.x |
+| Python / PyTorch | Python 3.10+; PyTorch 2.13+ |
+
+See the [NVIDIA CUDA compatibility matrix](https://docs.nvidia.com/deploy/cuda-compatibility/) for driver requirements, and the [Build Guide](../build_guide.md) for the full source-build requirements.
+
+
+## Quick Start
+
+### Install from Wheel
+
+Prebuilt wheels are available for Python 3.12 with CUDA 13.2 on Linux x86_64 and aarch64. With a CUDA 13.2 build of PyTorch installed, install the [prebuilt HALOps package](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/) directly:
+
+```bash
+python -m pip install halops==0.1.0 -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
+```
+
+For other Python or CUDA versions, [build from source](#build-from-source).
+
+### Build from Source
+
+To build it yourself, run from the repository root:
+
+```bash
+git submodule update --init --recursive
+python -m pip install -r requirements.txt
+python -m pip install --no-build-isolation --no-deps -v .
+```
+
+See the [Build Guide](../build_guide.md) for development installs, wheel builds, CUDA path configuration and build parallelism.
+
+### Verify the Installation
+
+After installation, the W8A8-MXFP8 dense GEMM example below checks the quantization and GEMM path. It should print `torch.Size([128, 256]) torch.bfloat16`.
+
+```python
+import torch
+
+from halops import dense_gemm, group_wise_quant
+
+M, N, K = 128, 256, 512
+a = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
+b = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
+
+a_fp8, scale_a = group_wise_quant(a, mode="w8a8-mxfp8", use_swizzle=True)
+b_fp8, scale_b = group_wise_quant(b, mode="w8a8-mxfp8", use_swizzle=True)
+output = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+
+dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8-mxfp8")
+print(output.shape, output.dtype)
+```
