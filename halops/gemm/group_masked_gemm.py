@@ -48,8 +48,8 @@ def group_masked_gemm(
             K is size(1)*2).
         weight: [num_experts, N, K] 3D CUDA tensor. Per-expert weights.
         sfa: Scale factor for A, dtype uint8, CUTLASS SfAtom 128x4 swizzled
-            layout. sf_k = K // 32 (w8a8-mxfp8, w4a4-mxfp4) or K // 16
-            (w4a4-nvfp4).
+            layout. Shape: ``[num_experts * max_m_per_expert, sf_k]``, where
+            ``sf_k = K // 32`` (w8a8-mxfp8, w4a4-mxfp4) or ``K // 16`` (w4a4-nvfp4).
             w8a8-mxfp8, w4a4-mxfp4: UE8M0 encoding.
             w4a4-nvfp4: UE4M3 encoding.
         sfb: Scale factor for B, dtype uint8, same SfAtom layout as sfa,
