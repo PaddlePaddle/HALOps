@@ -87,6 +87,7 @@ setup(
                 "csrc/kernel/gemm/group_wise_quant.cu",
                 "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
                 "csrc/kernel/gemm/fused_swiglu_quant.cu",
+                "csrc/kernel/gemm/low_latency_mma_gemm.cu",
                 "csrc/kernel/mla/mla_plan.cu",
                 "csrc/kernel/mla/mla_attention.cu",
                 "csrc/kernel/mla/mla_prequant_x.cu",

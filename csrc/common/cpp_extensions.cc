@@ -96,6 +96,17 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const std::optional<torch::Tensor>& alpha, const int sm_count,
                const std::string& mode);
 
+void LowLatencyMmaGemm(const torch::Tensor& input, const torch::Tensor& weight,
+                       const torch::Tensor& sfa, const torch::Tensor& sfb,
+                       torch::Tensor& output, const int block_n,
+                       const int warps_k, const int stage_smem,
+                       const int persist, const int sm_count,
+                       const std::optional<torch::Tensor>& output2,
+                       const int n_split,
+                       const std::optional<torch::Tensor>& input2,
+                       const std::optional<torch::Tensor>& sfa2,
+                       const bool use_pdl);
+
 std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
                                           const std::string& mode,
                                           const bool use_swizzle,
@@ -179,6 +190,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("group_masked_gemm", &halops::GroupMaskedGemm);
     m.def("group_contiguous_gemm", &halops::GroupContiguousGemm);
     m.def("batch_gemm", &halops::BatchGemm);
+    m.def("low_latency_mma_gemm", &halops::LowLatencyMmaGemm, py::arg("input"),
+          py::arg("weight"), py::arg("sfa"), py::arg("sfb"), py::arg("output"),
+          py::arg("block_n") = -1, py::arg("warps_k") = -1,
+          py::arg("stage_smem") = -1, py::arg("persist") = -1,
+          py::arg("sm_count") = -1,
+          py::arg("output2") = std::optional<torch::Tensor>(),
+          py::arg("n_split") = 0,
+          py::arg("input2") = std::optional<torch::Tensor>(),
+          py::arg("sfa2") = std::optional<torch::Tensor>(),
+          py::arg("use_pdl") = true);
     m.def("group_wise_quant", &halops::GroupWiseQuant, py::arg("input"),
           py::arg("mode"), py::arg("use_swizzle") = true,
           py::arg("use_pdl") = true);
