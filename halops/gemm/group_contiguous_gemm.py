@@ -43,14 +43,18 @@ def group_contiguous_gemm(
 
     Args:
         input: [M, K] CUDA tensor. All tokens packed contiguously.
-            w8a8-mxfp8: dtype float8_e4m3fn. w4a4-*: dtype uint8 (packed FP4, logical
-            K is size(1)*2).
+
+            - ``w8a8-mxfp8``: dtype float8_e4m3fn.
+            - ``w4a4-*``: dtype uint8 (packed FP4, logical K is size(1)*2).
+
         weight: [num_experts, N, K] 3D CUDA tensor. Per-expert weights.
         sfa: Scale factor for A, dtype uint8, CUTLASS SfAtom 128x4 swizzled
             layout. Shape: ``[ceil(M / 128) * 128, sf_k]``, where
             ``sf_k = K // 32`` (w8a8-mxfp8, w4a4-mxfp4) or ``K // 16`` (w4a4-nvfp4).
-            w8a8-mxfp8, w4a4-mxfp4: UE8M0 encoding.
-            w4a4-nvfp4: UE4M3 encoding.
+
+            - ``w8a8-mxfp8``, ``w4a4-mxfp4``: UE8M0 encoding.
+            - ``w4a4-nvfp4``: UE4M3 encoding.
+
         sfb: Scale factor for B, dtype uint8, same SfAtom layout as sfa.
             shape: [num_experts, N, K // 32] (w8a8-mxfp8, w4a4-mxfp4) or
             [num_experts, N, K // 16] (w4a4-nvfp4).

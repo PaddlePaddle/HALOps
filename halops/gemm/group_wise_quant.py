@@ -50,12 +50,16 @@ def group_wise_quant(
 
     Returns:
         A tuple ``(output_quant, output_sf)`` where:
+
         - ``output_quant``:
-            FP8: [m, k] float8_e4m3fn
-            FP4: [m, k/2] uint8 (packed nibbles, even index = low nibble)
+
+          - FP8: [m, k] float8_e4m3fn
+          - FP4: [m, k/2] uint8 (packed nibbles, even index = low nibble)
+
         - ``output_sf``: [ceil(m/128)*128, k / group_size] uint8
-            w8a8-mxfp8, w4a4-mxfp4: UE8M0 encoding (power-of-2 biased exponent)
-            w4a4-nvfp4: UE4M3 encoding (fp8_e4m3fn bit pattern as unsigned byte)
+
+          - ``w8a8-mxfp8``, ``w4a4-mxfp4``: UE8M0 encoding (power-of-2 biased exponent)
+          - ``w4a4-nvfp4``: UE4M3 encoding (fp8_e4m3fn bit pattern as unsigned byte)
 
     Example:
         >>> from halops import group_wise_quant
