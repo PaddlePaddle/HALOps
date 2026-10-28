@@ -14,6 +14,8 @@
 # limitations under the License.
 """
 
+import random
+
 import pytest
 import torch
 
@@ -25,55 +27,72 @@ SCALE_GROUP = 32
 # that misreads the scale layout the same way the kernel does.
 BF16_REL_TOL = 0.08
 
-# Decode-sized projections, M = 8.
-DECODE_SHAPES = [
-    (512, 4096),
-    (1024, 4096),
-    (1024, 8192),
-    (2048, 4096),
-    (4096, 2048),
-    (4096, 8192),
-    (8192, 4096),
-    (32768, 1024),
+# Shapes are drawn from a fixed-seed RNG so the parametrization is stable
+# across runs while not pinning the tests to a handful of hand-picked sizes.
+SHAPE_SEED = 2026
+_rng = random.Random(SHAPE_SEED)
+
+# Supported (block_n, warps_k) pairs: block_n * warps_k <= 128, warps_k <= 16.
+TILE_CONFIGS = [
+    (bn, wk) for bn in (8, 16, 32, 64) for wk in (1, 2, 4, 8, 16) if bn * wk <= 128
 ]
 
-# (n, k, block_n, warps_k): explicit tile configs used by decode callers.
-GATE_SHAPES = [
-    (1600, 4096, 16, 8),
-    (1536, 4096, 16, 4),
-    (4096, 8192, 32, 4),
-    (8192, 1024, 16, 4),
-    (7168, 4096, 16, 8),
-    (2048, 4096, 16, 8),
-    (4096, 2048, 16, 8),
-    (4096, 4096, 32, 4),
-    (2048, 1024, 16, 4),
-]
 
-# K / 128 not a power of two: the auto chooser must still find a warps_k with
-# 2 * warps_k dividing K / 128. K = 3584 also has 112-byte scale rows, which
-# are not 16-byte granular and go through the host repack.
-ODD_GROUP_SHAPES = [(640, 7168), (1536, 7168), (4096, 3584), (2048, 2560)]
+def rand_n(step, lo=512, hi=16384):
+    return _rng.randrange(-(-lo // step) * step, hi + 1, step)
+
+
+def rand_k(warps_k, lo=1024, hi=8192):
+    """K a multiple of 128 with K / 128 divisible by 2 * warps_k; hi bounds
+    the 16-row resident A in shared memory."""
+    step = 256 * max(warps_k, 1)
+    return _rng.randrange(-(-lo // step) * step, hi + 1, step)
+
+
+def rand_tiled_shape(lo_k=1024, hi_k=8192):
+    block_n, warps_k = _rng.choice(TILE_CONFIGS)
+    return rand_n(block_n), rand_k(warps_k, lo_k, hi_k), block_n, warps_k
+
+
+def rand_odd_group_k():
+    """K / 128 even but not a power of two, so the auto chooser has to halve
+    warps_k; K / 32 not a multiple of 16 also forces the scale repack."""
+    while True:
+        j = _rng.randrange(3, 33)
+        if j & (j - 1):
+            return 256 * j
+
+
+# Auto-configured decode projections, M = 8.
+DECODE_SHAPES = [(rand_n(64), rand_k(1)) for _ in range(8)]
+
+# (n, k, block_n, warps_k): explicit tile configs.
+GATE_SHAPES = [rand_tiled_shape() for _ in range(9)]
+
+ODD_GROUP_SHAPES = [(rand_n(64), rand_odd_group_k()) for _ in range(4)]
+
+
+def rand_dual_output_shape():
+    n, k, block_n, warps_k = rand_tiled_shape(hi_k=4096)
+    n_split = _rng.randrange(block_n, n, block_n)
+    return n, k, n_split, block_n, warps_k
+
 
 # (n, k, n_split, block_n, warps_k) for the segmented dual output.
-DUAL_OUTPUT_SHAPES = [
-    (10240, 1024, 8192, 16, 4),
-    (10240, 1024, 8192, 32, 2),
-    (10240, 1024, 8192, 8, 4),
-    (1536, 4096, 1024, 16, 4),
-    (6144, 4096, 2048, 16, 8),
-]
+DUAL_OUTPUT_SHAPES = [rand_dual_output_shape() for _ in range(5)]
 
-# (n, k1, k2, block_n, warps_k) for the dual-A concat-K path: K1 != K2,
-# K1 % 512 != 0 (host merge of sfa and sfa2), and K2 = 1280 (40-byte sfa2
-# rows, repacked on the two-slab path).
-DUAL_A_SHAPES = [
-    (4096, 2048, 2048, 32, 4),
-    (4096, 2048, 2048, -1, -1),
-    (4096, 1024, 3072, 16, 8),
-    (2048, 1920, 2176, 16, 4),
-    (2048, 2048, 1280, 16, 1),
-]
+
+def rand_dual_a_shape(auto):
+    block_n, warps_k = (-1, -1) if auto else _rng.choice(TILE_CONFIGS)
+    n = rand_n(64 if auto else block_n)
+    k = rand_k(warps_k, lo=2048, hi=6144)
+    k1 = _rng.randrange(128, k, 128)
+    return n, k1, k - k1, block_n, warps_k
+
+
+# (n, k1, k2, block_n, warps_k) for the dual-A concat-K path; random K1 often
+# has K1 % 512 != 0 (host merge of sfa and sfa2) and non-16B scale rows.
+DUAL_A_SHAPES = [rand_dual_a_shape(auto=i == 0) for i in range(5)]
 
 # A CTA that walks several tiles, each many B phases deep: 4096 / 8 = 512
 # tiles over the SMs, and warps_k = 1 gives 16 phases per tile, so ring wraps
@@ -158,10 +177,7 @@ def test_gate_configs(m, n, k, block_n, warps_k):
     check_gemm(m, n, k, block_n=block_n, warps_k=warps_k)
 
 
-@pytest.mark.parametrize(
-    "block_n,warps_k",
-    [(8, 1), (8, 8), (8, 16), (16, 2), (16, 8), (32, 1), (32, 4), (64, 2)],
-)
+@pytest.mark.parametrize("block_n,warps_k", TILE_CONFIGS)
 def test_tile_configs(block_n, warps_k):
     check_gemm(8, 1024, 4096, block_n=block_n, warps_k=warps_k)
 

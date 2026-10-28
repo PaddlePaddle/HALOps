@@ -26,7 +26,6 @@ struct TileConfig {
     int warps_k;
 };
 
-// Fitted on the GB200 decode shapes (M <= 16).
 TileConfig SelectTileConfig(int n, int k) {
     int block_n = (n == 4096 && k >= 4096) ? 32 : 16;
     if (n % block_n != 0) {
