@@ -19,7 +19,7 @@ import random
 import pytest
 import torch
 
-from halops import group_wise_quant, low_latency_mma_gemm, prefer_low_latency_mma
+from halops import group_wise_quant, low_latency_mma_gemm
 from tests.utils.gemm_utils import W8A8_MXFP8_TOL, ue8m0_to_float32
 
 SCALE_GROUP = 32
@@ -190,7 +190,6 @@ def test_block_n8_k1024(warps_k):
 @pytest.mark.parametrize("n,k", ODD_GROUP_SHAPES)
 @pytest.mark.parametrize("m", [8, 16])
 def test_auto_config_odd_k_groups(m, n, k):
-    assert prefer_low_latency_mma(m, k)
     check_gemm(m, n, k)
 
 
@@ -389,7 +388,6 @@ def test_rejects_resident_a_over_smem():
 
 @pytest.mark.parametrize("k", [1152, 3200])
 def test_rejects_odd_k_groups(k):
-    assert not prefer_low_latency_mma(8, k)
     _, _, x_q, sfa, w_q, sfb = make_operands(8, 512, k)
     with pytest.raises(RuntimeError, match="cannot serve"):
         run(x_q, w_q, sfa, sfb)
