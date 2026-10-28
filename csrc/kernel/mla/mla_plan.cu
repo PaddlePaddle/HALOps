@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <c10/cuda/CUDAGuard.h>
-
 #include "kernel/mla/mla_output_proj_plan.cuh"
 #include "kernel/mla/mla_params.cuh"
 
@@ -300,7 +298,7 @@ torch::Tensor MlaAttentionPlan(
     const std::optional<torch::Tensor>& topk_lengths, int64_t page_size,
     int64_t kv_run_step, const std::optional<torch::Tensor>& c128_attn_len,
     const torch::Tensor& workspace) {
-    const at::cuda::OptionalCUDAGuard device_guard(workspace.device());
+    const CudaDeviceGuard device_guard(workspace.device());
     check_plan_inputs(kv_indices, topk_lengths, page_size, kv_run_step,
                       c128_attn_len);
     const int token_count = (int)kv_indices.size(0);
@@ -351,7 +349,7 @@ std::vector<int64_t> MlaWorkspaceBytes(int64_t max_tokens,
                                        const torch::Tensor& wkv_weight,
                                        const torch::Tensor& wo_a_weight,
                                        const torch::Tensor& wo_b_weight) {
-    const at::cuda::OptionalCUDAGuard device_guard(wq_a_weight.device());
+    const CudaDeviceGuard device_guard(wq_a_weight.device());
     const OutputProjShape shape = check_workspace_weights(
         wq_a_weight, wkv_weight, wo_a_weight, wo_b_weight);
     const OutputProjPlan plan((int)max_tokens, shape, "mla_workspace");

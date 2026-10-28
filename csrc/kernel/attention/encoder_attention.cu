@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
+#include "common/cuda_utils.h"
 #include "kernel/attention/attention_kernel.cuh"
 #include "kernel/attention/kernel_traits.cuh"
 
@@ -36,7 +34,7 @@ void EncoderAttention(const torch::Tensor& q_input,
                       const torch::Tensor& cu_seq_k,
                       const torch::Tensor& attn_out,
                       const std::optional<torch::Tensor>& mask) {
-    const at::cuda::OptionalCUDAGuard device_guard(q_input.device());
+    const CudaDeviceGuard device_guard(q_input.device());
     using T = c10::BFloat16;
     AttentionParams params;
     memset(&params, 0, sizeof(AttentionParams));
@@ -66,8 +64,7 @@ void EncoderAttention(const torch::Tensor& q_input,
     params.scale_softmax_log2 = 1.0f / std::sqrt((float)head_dim) * kLog2e;
     params.o_ptr = const_cast<T*>(attn_out.data_ptr<T>());
 
-    auto stream =
-        at::cuda::getCurrentCUDAStream(q_input.device().index()).stream();
+    auto stream = GetCurrentCUDAStream(q_input);
     if (mask.has_value()) {
         params.mask = const_cast<int*>(mask.value().data_ptr<int>());
         LaunchEncoderAttention<true, cutlass::bfloat16_t>(params, stream);
