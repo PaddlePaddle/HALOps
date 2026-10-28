@@ -26,7 +26,7 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const std::optional<torch::Tensor>& alpha,
                const int sm_count_arg, const std::string& mode,
                const bool use_pdl) {
-    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+    const CudaDeviceGuard device_guard(input.device());
     TORCH_CHECK(
         mode == "w8a8-mxfp8" || mode == "w4a4-mxfp4" || mode == "w4a4-nvfp4",
         "Unsupported mode: ", mode,
