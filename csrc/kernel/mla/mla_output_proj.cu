@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <c10/cuda/CUDAGuard.h>
-
 #include "kernel/mla/mla_output_proj_plan.cuh"
 #include "kernel/mla/mla_params.cuh"
 
@@ -58,7 +56,7 @@ void MlaOutputProj(const torch::Tensor& wo_a_weight,
                    const torch::Tensor& wo_b_weight,
                    const torch::Tensor& wo_b_sf, torch::Tensor& out,
                    const torch::Tensor& workspace) {
-    const at::cuda::OptionalCUDAGuard device_guard(out.device());
+    const CudaDeviceGuard device_guard(out.device());
     const OutputProjShape shape =
         output_proj_shape(wo_a_weight, wo_b_weight, "mla_output_proj");
     const OutputProjPlan plan((int)out.size(0), shape, "mla_output_proj");

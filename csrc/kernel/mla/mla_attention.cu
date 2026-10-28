@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <c10/cuda/CUDAGuard.h>
-
+#include "common/cuda_utils.h"
 #include "kernel/mla/mla_attention_kernel.cuh"
 
 namespace halops {
@@ -117,7 +116,7 @@ void MlaAttention(const torch::Tensor& q_or_x, const torch::Tensor& kv_cache,
                   const std::optional<torch::Tensor>& c128_attn_len,
                   int64_t draft_tokens, const torch::Tensor& hidden_states,
                   bool reset_barriers) {
-    const at::cuda::OptionalCUDAGuard device_guard(q_or_x.device());
+    const CudaDeviceGuard device_guard(q_or_x.device());
     const MlaAttentionArguments args{
         .q_or_x = q_or_x,
         .kv_cache = kv_cache,

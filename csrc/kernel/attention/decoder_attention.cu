@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
 #include <algorithm>
 #include <optional>
 
+#include "common/cuda_utils.h"
 #include "kernel/attention/attention_kernel.cuh"
 #include "kernel/attention/kernel_traits.cuh"
 #include "kernel/attention/reduce_kernel.cuh"
@@ -60,7 +58,7 @@ void DecoderAttention(
     const std::optional<torch::Tensor>& kv_dequant_scale, const int head_num,
     const int kv_head_num, const int head_dim, const int max_seq_k,
     const int mtp_steps, const std::string& cache_quant_type_str) {
-    const at::cuda::OptionalCUDAGuard device_guard(q_input.device());
+    const CudaDeviceGuard device_guard(q_input.device());
     using T = c10::BFloat16;
     using fp8 = c10::Float8_e4m3fn;
 
@@ -102,8 +100,7 @@ void DecoderAttention(
     params.scale_softmax_log2 = 1.0f / std::sqrt((float)head_dim) * kLog2e;
     params.o_ptr = const_cast<T*>(attn_out.data_ptr<T>());
 
-    auto stream =
-        at::cuda::getCurrentCUDAStream(q_input.device().index()).stream();
+    auto stream = GetCurrentCUDAStream(q_input);
     auto device = q_input.device();
 
     if (cache_quant_type_str == "block_wise_fp8") {
@@ -164,8 +161,7 @@ void DecoderAttention(
 
     // Skip split-KV when one CTA per (batch, kv head) already fills most SMs;
     // the partition_o round trip and reduce kernel would be pure overhead.
-    const int sm_count =
-        at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    const int sm_count = CurrentDeviceSmCount();
     const bool enough_ctas_without_split =
         batch_size * kv_head_num * 5 >= sm_count * 4;  // >= 80% of the SMs
 

@@ -14,8 +14,6 @@
 
 #pragma once
 
-#include <c10/cuda/CUDAException.h>
-#include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
@@ -92,17 +90,17 @@ inline int setup_kernel_once(const void* kernel, const LaunchDims& dims,
     static std::mutex mutex;
     static std::map<std::pair<const void*, int>, int> max_clusters;
     int device = 0;
-    C10_CUDA_CHECK(cudaGetDevice(&device));
+    HALOPS_CUDA_CHECK(cudaGetDevice(&device));
     const std::lock_guard<std::mutex> lock(mutex);
     const auto key = std::make_pair(kernel, device);
     const auto it = max_clusters.find(key);
     if (it != max_clusters.end()) return it->second;
     if (dims.smem > 0)
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
+        HALOPS_CUDA_CHECK(cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dims.smem));
     int clusters = 0;
     if (dims.cluster > 1)
-        C10_CUDA_CHECK(
+        HALOPS_CUDA_CHECK(
             cudaOccupancyMaxActiveClusters(&clusters, kernel, &cluster_query));
     max_clusters.emplace(key, clusters);
     return clusters;
@@ -114,7 +112,7 @@ void launch_pdl(Kernel* kernel, const LaunchDims& dims, Args... args) {
     cfg.gridDim = dim3(dims.grid, 1, 1);
     cfg.blockDim = dim3(dims.block, 1, 1);
     cfg.dynamicSmemBytes = dims.smem;
-    cfg.stream = c10::cuda::getCurrentCUDAStream();
+    cfg.stream = GetCurrentCUDAStream();
     cudaLaunchAttribute attr[2] = {};
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[0].val.programmaticStreamSerializationAllowed = 1;
@@ -132,6 +130,6 @@ void launch_pdl(Kernel* kernel, const LaunchDims& dims, Args... args) {
     TORCH_CHECK(dims.cluster == 1 || max_clusters >= dims.grid / dims.cluster,
                 "mla: only ", max_clusters, " of ", dims.grid / dims.cluster,
                 " clusters co-resident");
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, args...));
+    HALOPS_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, args...));
 }
 }  // namespace halops::mla

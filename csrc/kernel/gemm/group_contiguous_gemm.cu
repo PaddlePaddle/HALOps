@@ -28,7 +28,7 @@ void GroupContiguousGemm(const torch::Tensor& input,
                          const std::optional<torch::Tensor>& alpha,
                          const int sm_count,
                          const std::string& mode = "w8a8-mxfp8") {
-    const at::cuda::OptionalCUDAGuard device_guard(input.device());
+    const CudaDeviceGuard device_guard(input.device());
     TORCH_CHECK(
         mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" || mode == "w4a4-mxfp4",
         "Unsupported mode: ", mode,

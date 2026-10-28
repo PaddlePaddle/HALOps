@@ -14,20 +14,15 @@
 
 #pragma once
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <c10/util/BFloat16.h>
 #include <c10/util/Float8_e4m3fn.h>
 #include <c10/util/Half.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-namespace halops {
+#include "common/cuda_utils.h"
 
-inline cudaStream_t GetCurrentCUDAStream(const torch::Tensor& tensor) {
-    return at::cuda::getCurrentCUDAStream(tensor.device().index()).stream();
-}
+namespace halops {
 
 // SM count of the current device, cached for the host-side launch heuristics.
 inline int GetSmCount() {

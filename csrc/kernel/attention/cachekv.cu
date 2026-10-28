@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
+#include "common/cuda_utils.h"
 #include "kernel/attention/utils.cuh"
 
 namespace halops {
@@ -827,7 +825,7 @@ void WriteCacheKVEncoder(
     const int kv_head_num, const int head_dim, const int max_seq_len_q,
     const int max_seq_len_k, const int max_input_len,
     const std::string& cache_quant_type_str) {
-    const at::cuda::OptionalCUDAGuard device_guard(qkv_input.device());
+    const CudaDeviceGuard device_guard(qkv_input.device());
     constexpr int kThreads = 128;
     constexpr int kHeadDim = 128;
     constexpr int kBlockSize = 128;
@@ -860,9 +858,7 @@ void WriteCacheKVEncoder(
         grid_dims.y = head_num + 2 * kv_head_num;
         grid_dims.z = batch_size;
         write_cachekv_encoder_c8<T, kHeadDim, kBlockSize>
-            <<<grid_dims, kThreads, 0,
-               at::cuda::getCurrentCUDAStream(qkv_input.device().index())
-                   .stream()>>>(
+            <<<grid_dims, kThreads, 0, GetCurrentCUDAStream(qkv_input)>>>(
                 const_cast<T*>(qkv_input.data_ptr<T>()),
                 const_cast<T*>(q_input.data_ptr<T>()),
                 const_cast<T*>(k_input.data_ptr<T>()),
@@ -885,9 +881,7 @@ void WriteCacheKVEncoder(
             grid_dims.y = kv_head_num * 2;
             grid_dims.z = batch_size;
             read_fp8_cachekv_encoder<T, kBlockSize, kThreads, kHeadDim>
-                <<<grid_dims, kThreads, 0,
-                   at::cuda::getCurrentCUDAStream(qkv_input.device().index())
-                       .stream()>>>(
+                <<<grid_dims, kThreads, 0, GetCurrentCUDAStream(qkv_input)>>>(
                     const_cast<T*>(k_input.data_ptr<T>()),
                     const_cast<T*>(v_input.data_ptr<T>()),
                     cu_seq_k.data_ptr<int>(), seq_len_encoder.data_ptr<int>(),
@@ -907,9 +901,7 @@ void WriteCacheKVEncoder(
         grid_dims.y = kv_head_num * 2;
         grid_dims.z = batch_size;
         read_cachekv_encoder<T, kBlockSize, kThreads, kHeadDim>
-            <<<grid_dims, kThreads, 0,
-               at::cuda::getCurrentCUDAStream(qkv_input.device().index())
-                   .stream()>>>(
+            <<<grid_dims, kThreads, 0, GetCurrentCUDAStream(qkv_input)>>>(
                 const_cast<T*>(k_input.data_ptr<T>()),
                 const_cast<T*>(v_input.data_ptr<T>()), cu_seq_k.data_ptr<int>(),
                 seq_len_encoder.data_ptr<int>(),
@@ -923,20 +915,19 @@ void WriteCacheKVEncoder(
     grid_dims.y = head_num + kv_head_num * 2;
     grid_dims.z = batch_size;
 
-    write_cachekv_encoder<T, kBlockSize, kThreads, kHeadDim><<<
-        grid_dims, kThreads, 0,
-        at::cuda::getCurrentCUDAStream(qkv_input.device().index()).stream()>>>(
-        const_cast<T*>(qkv_input.data_ptr<T>()),
-        const_cast<T*>(q_input.data_ptr<T>()),
-        const_cast<T*>(k_input.data_ptr<T>()),
-        const_cast<T*>(v_input.data_ptr<T>()), cu_seq_q.data_ptr<int>(),
-        cu_seq_k.data_ptr<int>(), rotary_embs.data_ptr<float>(),
-        seq_len_encoder.data_ptr<int>(), seq_len_decoder.data_ptr<int>(),
-        head_num, kv_head_num, max_blocks_per_seq, max_input_len,
-        gqa_group_size, const_cast<T*>(cache_k.data_ptr<T>()),
-        const_cast<T*>(cache_v.data_ptr<T>()), block_tables.data_ptr<int>(),
-        q_norm_gamma ? q_norm_gamma.value().data_ptr<float>() : nullptr,
-        k_norm_gamma ? k_norm_gamma.value().data_ptr<float>() : nullptr);
+    write_cachekv_encoder<T, kBlockSize, kThreads, kHeadDim>
+        <<<grid_dims, kThreads, 0, GetCurrentCUDAStream(qkv_input)>>>(
+            const_cast<T*>(qkv_input.data_ptr<T>()),
+            const_cast<T*>(q_input.data_ptr<T>()),
+            const_cast<T*>(k_input.data_ptr<T>()),
+            const_cast<T*>(v_input.data_ptr<T>()), cu_seq_q.data_ptr<int>(),
+            cu_seq_k.data_ptr<int>(), rotary_embs.data_ptr<float>(),
+            seq_len_encoder.data_ptr<int>(), seq_len_decoder.data_ptr<int>(),
+            head_num, kv_head_num, max_blocks_per_seq, max_input_len,
+            gqa_group_size, const_cast<T*>(cache_k.data_ptr<T>()),
+            const_cast<T*>(cache_v.data_ptr<T>()), block_tables.data_ptr<int>(),
+            q_norm_gamma ? q_norm_gamma.value().data_ptr<float>() : nullptr,
+            k_norm_gamma ? k_norm_gamma.value().data_ptr<float>() : nullptr);
 }
 
 // Scale layout: [phys_blk, kv_head, kDequantScalePackSize]; slot 0 = K, 1 = V.
@@ -1345,7 +1336,7 @@ std::vector<torch::Tensor> WriteCacheKVDecoder(
     const std::optional<torch::Tensor>& k_norm_gamma, const int head_num,
     const int kv_head_num, const int head_dim, const int max_input_len,
     const std::string& cache_quant_type_str) {
-    const at::cuda::OptionalCUDAGuard device_guard(qkv_input.device());
+    const CudaDeviceGuard device_guard(qkv_input.device());
     constexpr int kThreads = 128;
     constexpr int kHeadDim = 128;
     constexpr int kBlockSize = 128;
@@ -1388,9 +1379,7 @@ std::vector<torch::Tensor> WriteCacheKVDecoder(
         grid_dims.y = batch_size;
 
         write_cachekv_decoder_c8<T, kHeadDim, kBlockSize>
-            <<<grid_dims, 256, 0,
-               at::cuda::getCurrentCUDAStream(qkv_input.device().index())
-                   .stream()>>>(
+            <<<grid_dims, 256, 0, GetCurrentCUDAStream(qkv_input)>>>(
                 const_cast<T*>(qkv_input.data_ptr<T>()),
                 reinterpret_cast<cutlass::float_e4m3_t*>(
                     q_output.data_ptr<fp8>()),
@@ -1420,17 +1409,16 @@ std::vector<torch::Tensor> WriteCacheKVDecoder(
                          .dtype(qkv_input.scalar_type())
                          .device(qkv_input.device()));
 
-    write_cachekv_decoder<T, kBlockSize, kThreads, kHeadDim><<<
-        grid_dims, kThreads, 0,
-        at::cuda::getCurrentCUDAStream(qkv_input.device().index()).stream()>>>(
-        const_cast<T*>(qkv_input.data_ptr<T>()), q_output.data_ptr<T>(),
-        cu_seq_q.data_ptr<int>(), seq_len_encoder.data_ptr<int>(),
-        seq_len_decoder.data_ptr<int>(), rotary_embs.data_ptr<float>(),
-        max_input_len, const_cast<T*>(cache_k.data_ptr<T>()),
-        const_cast<T*>(cache_v.data_ptr<T>()), block_tables.data_ptr<int>(),
-        head_num, kv_head_num, max_blocks_per_seq, gqa_group_size,
-        q_norm_gamma ? q_norm_gamma.value().data_ptr<float>() : nullptr,
-        k_norm_gamma ? k_norm_gamma.value().data_ptr<float>() : nullptr);
+    write_cachekv_decoder<T, kBlockSize, kThreads, kHeadDim>
+        <<<grid_dims, kThreads, 0, GetCurrentCUDAStream(qkv_input)>>>(
+            const_cast<T*>(qkv_input.data_ptr<T>()), q_output.data_ptr<T>(),
+            cu_seq_q.data_ptr<int>(), seq_len_encoder.data_ptr<int>(),
+            seq_len_decoder.data_ptr<int>(), rotary_embs.data_ptr<float>(),
+            max_input_len, const_cast<T*>(cache_k.data_ptr<T>()),
+            const_cast<T*>(cache_v.data_ptr<T>()), block_tables.data_ptr<int>(),
+            head_num, kv_head_num, max_blocks_per_seq, gqa_group_size,
+            q_norm_gamma ? q_norm_gamma.value().data_ptr<float>() : nullptr,
+            k_norm_gamma ? k_norm_gamma.value().data_ptr<float>() : nullptr);
 
     return {q_output, q_dequant_scale_output};
 }
@@ -1506,7 +1494,7 @@ std::vector<torch::Tensor> GetQKToken(const torch::Tensor& seq_lens_encoder,
                                       const torch::Tensor& actual_cu_seq_k,
                                       const torch::Tensor& seq_lens_kv,
                                       const int kv_head_num) {
-    const at::cuda::OptionalCUDAGuard device_guard(seq_lens_encoder.device());
+    const CudaDeviceGuard device_guard(seq_lens_encoder.device());
     const int batch_size = cu_seq_q.size(0) - 1;
     const int max_batch_size = seq_lens_kv.size(0);
     torch::Tensor max_token_num =
@@ -1515,15 +1503,13 @@ std::vector<torch::Tensor> GetQKToken(const torch::Tensor& seq_lens_encoder,
                               .device(cu_seq_q.device()));
     constexpr int kNThreads = 128;
     get_qk_token_kernel<kNThreads>
-        <<<1, kNThreads, 0,
-           at::cuda::getCurrentCUDAStream(seq_lens_encoder.device().index())
-               .stream()>>>(seq_lens_encoder.data_ptr<int>(),
-                            seq_lens_decoder.data_ptr<int>(),
-                            cu_seq_q.data_ptr<int>(), cu_seq_k.data_ptr<int>(),
-                            const_cast<int*>(actual_cu_seq_k.data_ptr<int>()),
-                            const_cast<int*>(seq_lens_kv.data_ptr<int>()),
-                            max_token_num.data_ptr<int>(), batch_size,
-                            kv_head_num, max_batch_size);
+        <<<1, kNThreads, 0, GetCurrentCUDAStream(seq_lens_encoder)>>>(
+            seq_lens_encoder.data_ptr<int>(), seq_lens_decoder.data_ptr<int>(),
+            cu_seq_q.data_ptr<int>(), cu_seq_k.data_ptr<int>(),
+            const_cast<int*>(actual_cu_seq_k.data_ptr<int>()),
+            const_cast<int*>(seq_lens_kv.data_ptr<int>()),
+            max_token_num.data_ptr<int>(), batch_size, kv_head_num,
+            max_batch_size);
     auto max_token_num_cpu = max_token_num.cpu();
     return {max_token_num_cpu};
 }
