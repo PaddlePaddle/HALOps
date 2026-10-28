@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <c10/cuda/CUDAGuard.h>
-
+#include "common/cuda_utils.h"
 #include "kernel/mla/combine_with_rope_quant.cuh"
 #include "kernel/mla/mla_output_proj_plan.cuh"
 
@@ -43,7 +42,7 @@ void CombineWithRopeQuant(const torch::Tensor& q_or_x,
                           const torch::Tensor& wo_a_weight,
                           const torch::Tensor& wo_b_weight,
                           const torch::Tensor& workspace) {
-    const at::cuda::OptionalCUDAGuard device_guard(q_or_x.device());
+    const CudaDeviceGuard device_guard(q_or_x.device());
     const int num_tokens = (int)q_or_x.size(0);
     const OutputProjShape shape =
         output_proj_shape(wo_a_weight, wo_b_weight, "combine_with_rope_quant");

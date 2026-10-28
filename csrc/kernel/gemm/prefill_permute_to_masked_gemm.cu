@@ -165,12 +165,12 @@ std::vector<torch::Tensor> PrefillPermuteToMaskedGemmDispatch(
         torch::empty({num_local_experts, 1}, x.options().dtype(torch::kInt));
 
     // 0xFF fill makes unused permuted_indice_map entries -1.
-    C10_CUDA_CHECK(cudaMemsetAsync(token_nums_per_expert.data_ptr<int32_t>(), 0,
-                                   num_local_experts * sizeof(int32_t),
-                                   stream));
-    C10_CUDA_CHECK(cudaMemsetAsync(permuted_indice_map.data_ptr<int32_t>(),
-                                   0xFF, num_tokens * topk * sizeof(int32_t),
-                                   stream));
+    HALOPS_CUDA_CHECK(cudaMemsetAsync(token_nums_per_expert.data_ptr<int32_t>(),
+                                      0, num_local_experts * sizeof(int32_t),
+                                      stream));
+    HALOPS_CUDA_CHECK(cudaMemsetAsync(permuted_indice_map.data_ptr<int32_t>(),
+                                      0xFF, num_tokens * topk * sizeof(int32_t),
+                                      stream));
 
     TORCH_CHECK(
         IsFusedAlignedTo(output_scale.data_ptr<uint8_t>(), kFusedAlignment),
@@ -210,7 +210,7 @@ std::vector<torch::Tensor> PrefillPermuteToMaskedGemm(
     const torch::Tensor& x, const torch::Tensor& scale,
     const torch::Tensor& topk_ids, const int num_local_experts,
     const int max_token_num) {
-    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    const CudaDeviceGuard device_guard(x.device());
     const bool broadcast_scale = (scale.scalar_type() != torch::kByte);
     TORCH_CHECK(scale.scalar_type() == torch::kInt ||
                     scale.scalar_type() == torch::kByte,
