@@ -89,11 +89,17 @@ def run_dense_golden(inp: dict) -> torch.Tensor:
     the golden is a neutral baseline that excludes quantization noise and shares
     the kernels' compute and output dtype.
 
-    inp keys: x_bf16 [M, K], w_bf16 [N, K], mode ("w8a8-mxfp8" | "w4a4-nvfp4").
+    inp keys: x_bf16 [M, K], w_bf16 [N, K], mode ("w8a8-mxfp8" | "w4a4-nvfp4" |
+    "bf16").
     """
     mode = inp.get("mode", "w8a8-mxfp8")
-    x = _dequant_to_bf16(inp["x_bf16"], mode)
-    w = _dequant_to_bf16(inp["w_bf16"], mode)
+    if mode == "bf16":
+        # Native BF16: the kernel consumes bf16 directly, no quantization noise.
+        x = inp["x_bf16"]
+        w = inp["w_bf16"]
+    else:
+        x = _dequant_to_bf16(inp["x_bf16"], mode)
+        w = _dequant_to_bf16(inp["w_bf16"], mode)
     return torch.matmul(x, w.t())
 
 
@@ -110,18 +116,26 @@ def run_grouped_golden(inp: dict) -> torch.Tensor:
             x_bf16   [M, K]      unquantized activation source (bfloat16)
             w_bf16   [E, N, K]   unquantized per-expert weight source (bfloat16)
             m_indptr [E+1]       per-group row offsets (prefix sum)
-            mode     str         "w8a8-mxfp8" (fp8) or "w4a4-nvfp4" (fp4)
+            mode     str         "w8a8-mxfp8" (fp8), "w4a4-nvfp4" (fp4), or
+                                 "bf16"
 
     Returns:
         torch.Tensor [M, N] bfloat16 reference output.
     """
     mode = inp.get("mode", "w8a8-mxfp8")
-    x = _dequant_to_bf16(inp["x_bf16"], mode)  # [M, K]
-    w_src = inp["w_bf16"]  # [E, N, K]
+    if mode == "bf16":
+        # Native BF16: the kernel consumes bf16 directly, no quantization noise.
+        x = inp["x_bf16"]  # [M, K]
+        w_src = inp["w_bf16"]
+        w = w_src
+    else:
+        x = _dequant_to_bf16(inp["x_bf16"], mode)  # [M, K]
+        w_src = inp["w_bf16"]  # [E, N, K]
+        num_groups, n, k = w_src.shape
+        w = _dequant_to_bf16(w_src.reshape(num_groups * n, k), mode).reshape(
+            num_groups, n, k
+        )
     num_groups, n, k = w_src.shape
-    w = _dequant_to_bf16(w_src.reshape(num_groups * n, k), mode).reshape(
-        num_groups, n, k
-    )
     # Materialize offsets on CPU once to avoid per-group GPU->CPU syncs.
     offsets = inp["m_indptr"].tolist()
     out = torch.empty(x.shape[0], n, dtype=torch.bfloat16, device=x.device)
