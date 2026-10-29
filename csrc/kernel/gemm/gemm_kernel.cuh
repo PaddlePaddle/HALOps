@@ -21,12 +21,14 @@
 #include "kernel/gemm/gemm_utils.h"
 #include "kernel/gemm/mainloop_fwd.cuh"
 #include "kernel/gemm/pdl.cuh"
+#include "kernel/gemm/stream_k_reduce.cuh"
 #include "kernel/gemm/tile_scheduler.cuh"
 
 namespace halops {
 
 template <typename KernelTraits, typename MainloopParams,
-          typename EpilogueParams, typename SchedulerParams>
+          typename EpilogueParams, typename SchedulerParams,
+          bool KStreamK = false>
 __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
     gemm_kernel(CUTE_GRID_CONSTANT const MainloopParams mainloop_params,
                 CUTE_GRID_CONSTANT const EpilogueParams epilogue_params,
@@ -83,18 +85,22 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
 
     bool is_load_ab_warp = (warp_idx == KernelTraits::KLoadABWarpId);
 
+    // Prefetch TMA descriptors: AB warp handles A, B (+ SFA, SFB for
+    // block-scaled modes). BF16 has no scale-factor descriptors.
     if (is_load_ab_warp && lane_predicate) {
         cute::prefetch_tma_descriptor(
             mainloop_params.tma_load_A.get_tma_descriptor());
         cute::prefetch_tma_descriptor(
             mainloop_params.tma_load_B.get_tma_descriptor());
-        cute::prefetch_tma_descriptor(
-            mainloop_params.tma_load_SFA.get_tma_descriptor());
-        if constexpr (KernelTraits::IsSfbUnaligned) {
-            cute::prefetch_tma_descriptor(&mainloop_params.sfb_run_desc);
-        } else {
+        if constexpr (!KernelTraits::KIsBF16) {
             cute::prefetch_tma_descriptor(
-                mainloop_params.tma_load_SFB.get_tma_descriptor());
+                mainloop_params.tma_load_SFA.get_tma_descriptor());
+            if constexpr (KernelTraits::IsSfbUnaligned) {
+                cute::prefetch_tma_descriptor(&mainloop_params.sfb_run_desc);
+            } else {
+                cute::prefetch_tma_descriptor(
+                    mainloop_params.tma_load_SFB.get_tma_descriptor());
+            }
         }
     }
     if constexpr (KernelTraits::AddBias) {
@@ -188,9 +194,13 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
     BiasPipeline bias_pipeline(shared_storage.bias_pipeline,
                                bias_pipeline_params);
 
+    // TMEM allocation, issued right before the barrier that waits on it
+    // (hoisting it earlier hides nothing).
     TmemAllocator tmem_allocator{};
     if (warp_idx == KernelTraits::KMmaWarpId) {
-        tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns,
+        // Right-sized (KTmemColumns, see kernel_traits.cuh), not the full 512
+        // columns; shrinks the TMEM footprint, MMA geometry unchanged.
+        tmem_allocator.allocate(KernelTraits::KTmemColumns,
                                 &shared_storage.tmem_base_ptr);
     }
 
@@ -215,34 +225,47 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
     }
     TmemStorage tmem_storage = main_loop.init_tmem_tensors();
 
-    main_loop.set_tmem_offsets(tmem_storage, shared_storage.tmem_base_ptr);
+    // The load warp never touches TMEM, so it skips set_tmem_offsets and with
+    // it the first tmem_base_ptr read (where tcgen05.alloc latency surfaces),
+    // reaching its first TMA issue earlier.
+    if (!is_load_ab_warp) {
+        main_loop.set_tmem_offsets(tmem_storage, shared_storage.tmem_base_ptr);
+    }
 
     if (is_load_ab_warp) {
-        // Non-epilogue warps hand registers to the epilogue warps.
-        if constexpr (KEpilogueWarpGroupCount != 1) {
+        // Prologue warps need few registers — release to pool for epilogue
+        // warps.
+        if constexpr (KernelTraits::KRedistributeRegs) {
             cutlass::arch::warpgroup_reg_dealloc<KernelTraits::KNumRegsOther>();
         }
         main_loop.tma_loadAB(mainloop_params, mainloop_pipeline, shared_storage,
                              tiled_mma, scheduler);
-    } else if (warp_idx == KernelTraits::KMmaWarpId && is_mma_leader_cta) {
-        if constexpr (KEpilogueWarpGroupCount != 1) {
+    } else if (warp_idx == KernelTraits::KMmaWarpId &&
+               is_mma_leader_cta) {  // mma
+        // MMA warp uses TMEM for accumulators, needs few GP registers.
+        if constexpr (KernelTraits::KRedistributeRegs) {
             cutlass::arch::warpgroup_reg_dealloc<KernelTraits::KNumRegsOther>();
         }
-        main_loop.mma(mainloop_params, mainloop_pipeline, accumulator_pipeline,
-                      shared_storage, tmem_storage, tiled_mma, scheduler);
+        main_loop.template mma<decltype(tmem_storage), KStreamK>(
+            mainloop_params, mainloop_pipeline, accumulator_pipeline,
+            shared_storage, tmem_storage, tiled_mma, scheduler);
         // 224-column SFB rewriter, in every CTA.
     } else if (KernelTraits::IsSfbRowShift &&
                warp_idx >= KernelTraits::KSfbTransposeWarpId) {
-        if constexpr (KEpilogueWarpGroupCount != 1) {
+        if constexpr (KernelTraits::KRedistributeRegs) {
             cutlass::arch::warpgroup_reg_dealloc<KernelTraits::KNumRegsOther>();
         }
+        // Guarded so the rewriter (which static_asserts IsSfbRowShift) is not
+        // instantiated by every other config.
         if constexpr (KernelTraits::IsSfbRowShift) {
             main_loop.sfb_shift_rows(
                 mainloop_params, shared_storage, scheduler,
                 warp_idx - KernelTraits::KSfbTransposeWarpId);
         }
     } else if (warp_idx <= KernelTraits::KEpilogueWarpEndId) {
-        if constexpr (KEpilogueWarpGroupCount != 1) {
+        // Epilogue warps need the most registers for TMEM->reg->smem
+        // conversion.
+        if constexpr (KernelTraits::KRedistributeRegs) {
             cutlass::arch::warpgroup_reg_alloc<
                 KernelTraits::KNumRegsEpilogue>();
         }
@@ -251,19 +274,20 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
                 epilogue_params, accumulator_pipeline, bias_pipeline,
                 shared_storage, tmem_storage, warp_idx, scheduler);
         } else {
-            epilogue_loop.epilogue(epilogue_params, accumulator_pipeline,
-                                   shared_storage, tmem_storage, warp_idx,
-                                   scheduler);
+            epilogue_loop.template epilogue<KStreamK>(
+                epilogue_params, accumulator_pipeline, shared_storage,
+                tmem_storage, warp_idx, scheduler);
         }
     } else if (KernelTraits::AddBias &&
                warp_idx == KernelTraits::KLoadCWarpId) {
-        if constexpr (KEpilogueWarpGroupCount != 1) {
+        if constexpr (KernelTraits::KRedistributeRegs) {
             cutlass::arch::warpgroup_reg_dealloc<KernelTraits::KNumRegsOther>();
         }
         epilogue_loop.load_c(epilogue_params, bias_pipeline, shared_storage,
                              scheduler);
     } else {
-        if constexpr (KEpilogueWarpGroupCount != 1) {
+        // Any non-participant warp releases registers.
+        if constexpr (KernelTraits::KRedistributeRegs) {
             cutlass::arch::warpgroup_reg_dealloc<KernelTraits::KNumRegsOther>();
         }
     }
@@ -275,15 +299,15 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
     } else {
         __syncthreads();
     }
-
     if constexpr (KernelTraits::KUsePdl) {
         PdlTriggerAfterBlockWrites();
     }
 
+    // Then deallocate TMEM (must match the allocated column count).
     if (warp_idx == KernelTraits::KMmaWarpId) {
         tmem_allocator.release_allocation_lock();
         tmem_allocator.free(shared_storage.tmem_base_ptr,
-                            TmemAllocator::Sm100TmemCapacityColumns);
+                            KernelTraits::KTmemColumns);
     }
 }
 
@@ -306,10 +330,12 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
                 "gemm_impl requires ptr_b to be non-null");
     TORCH_CHECK(params.ptr_d != nullptr,
                 "gemm_impl requires ptr_d to be non-null");
-    TORCH_CHECK(params.ptr_sfa != nullptr,
-                "gemm_impl requires ptr_sfa to be non-null");
-    TORCH_CHECK(params.ptr_sfb != nullptr,
-                "gemm_impl requires ptr_sfb to be non-null");
+    if constexpr (!KernelTraits::KIsBF16) {
+        TORCH_CHECK(params.ptr_sfa != nullptr,
+                    "gemm_impl requires ptr_sfa to be non-null");
+        TORCH_CHECK(params.ptr_sfb != nullptr,
+                    "gemm_impl requires ptr_sfb to be non-null");
+    }
     if constexpr (KernelTraits::AddBias) {
         TORCH_CHECK(
             params.ptr_c != nullptr,
@@ -418,10 +444,21 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
                         "gemm_impl requires M to be divisible by KBlockM=",
                         KernelTraits::KBlockM, ", got ", params.m);
             if constexpr (KernelTraits::IsSfbUnaligned) {
+                // Unpacked 224-pair tiles load a run of whole 128-row SF
+                // atoms, which requires n to tile cleanly at 128.
                 TORCH_CHECK(params.n % 128 == 0 && params.n >= 384,
                             "gemm_impl requires N to be a multiple of 128 and "
                             ">= 384 for KBlockN=",
                             KernelTraits::KBlockN, ", got ", params.n);
+            } else if constexpr (KernelTraits::KEpiNeedsNPredicate) {
+                // Non-power-of-2 KBlockN (96/112/224) need not divide n; the
+                // epilogue predicates the overhang per KSubTileN sub-tile.
+                TORCH_CHECK(params.n % KernelTraits::KSubTileN == 0,
+                            "gemm_impl with KBlockN=", KernelTraits::KBlockN,
+                            " predicates the N overhang per ",
+                            KernelTraits::KSubTileN,
+                            "-wide sub-tile, so N must be divisible by ",
+                            KernelTraits::KSubTileN, ", got ", params.n);
             } else {
                 TORCH_CHECK(params.n % KernelTraits::KBlockN == 0,
                             "gemm_impl requires N to be divisible by KBlockN=",
@@ -440,15 +477,15 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
     }
 }
 
+// Kernel pointer in, not a traits type: the caller picks between the
+// data-parallel and the stream-K instantiation of gemm_kernel.
 template <typename KernelTraits, typename MainloopParams,
           typename EpilogueParams, typename SchedulerParams>
-void LaunchGemmKernel(dim3 dim_grid, dim3 dim_cluster, dim3 dim_block,
-                      int smem_size, cudaStream_t stream,
+void LaunchGemmKernel(void const* kernel_ptr, dim3 dim_grid, dim3 dim_cluster,
+                      dim3 dim_block, int smem_size, cudaStream_t stream,
                       const MainloopParams& mainloop_params,
                       const EpilogueParams& epilogue_params,
                       const SchedulerParams& scheduler_params) {
-    auto* kernel_ptr = &gemm_kernel<KernelTraits, MainloopParams,
-                                    EpilogueParams, SchedulerParams>;
     CUTE_CHECK_ERROR(cudaFuncSetAttribute(
         kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -458,9 +495,8 @@ void LaunchGemmKernel(dim3 dim_grid, dim3 dim_cluster, dim3 dim_block,
         const_cast<void*>(reinterpret_cast<void const*>(&scheduler_params)),
     };
     cutlass::Status status = cutlass::ClusterLauncher::launch(
-        dim_grid, dim_cluster, dim_block, smem_size, stream,
-        reinterpret_cast<void const*>(kernel_ptr), kernel_params,
-        KernelTraits::KUsePdl);
+        dim_grid, dim_cluster, dim_block, smem_size, stream, kernel_ptr,
+        kernel_params, KernelTraits::KUsePdl);
     TORCH_CHECK(status == cutlass::Status::kSuccess,
                 "failed to launch the gemm kernel");
 }
@@ -480,8 +516,10 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
 
     using ClusterShape_MNK = typename KernelTraits::ClusterShape_MNK;
     static constexpr int KCTAsPerCluster = cute::size(ClusterShape_MNK{});
-    const int raw_sm_count = sm_count > 0 ? sm_count : GetSmCount();
-    // Only launch full clusters.
+    // Same SM-count resolution as the dispatch-site tile heuristics.
+    const int raw_sm_count = ResolveSmCount(sm_count);
+    // Round down to a multiple of KCTAsPerCluster so every cluster is fully
+    // occupied.
     const int runtime_sm_count =
         (raw_sm_count / KCTAsPerCluster) * KCTAsPerCluster;
     int M = params.m;
@@ -515,7 +553,9 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
     cute::Layout layout_C = cute::make_layout(
         cute::make_shape(M, N), cute::make_stride(N, cute::Int<1>{}));
 
-    // meet the cutlass's 128 row SfAtoms layout.
+    // The scale tensors always cover whole 128-row SfAtom atoms even when the
+    // activation is only M rows. (BF16 passes null SF pointers; these layouts
+    // are then unused bookkeeping.)
     const int M_sf = AlignSfM(M);
     typename KernelTraits::LayoutSFA layout_SFA =
         SwapAB ? KernelTraits::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
@@ -541,23 +581,59 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
              layout_A, layout_B, layout_SFA, layout_SFB, params.k, params.m,
              num_experts});
 
-    EpilogueParams epilogue_params =
-        CollectiveEpilogue<KernelTraits>::to_underlying_arguments(
-            {static_cast<TypeC const*>(params.ptr_c),
-             static_cast<TypeD*>(params.ptr_d), params.m, params.n,
-             params.num_experts, params.ptr_alpha});
-
     int scheduler_m = SwapAB ? N : M;
     int scheduler_n = SwapAB ? M : N;
+    // The scheduler sizes the stream-K tail against the persistent grid.
+    const int num_clusters_planned = runtime_sm_count / KCTAsPerCluster;
+    const int k_tiles_planned =
+        cutlass::ceil_div(K, cute::size<2>(typename KernelTraits::TileShape{}));
     SchedulerParams scheduler_params = Scheduler::to_underlying_arguments(
         scheduler_m, scheduler_n, params.num_experts, params.max_m_per_expert,
-        params.masked_m, params.expert_ids);
-
-    int smem_size = sizeof(typename KernelTraits::SharedStorage);
+        params.masked_m, params.expert_ids, num_clusters_planned,
+        k_tiles_planned);
 
     static_assert(sizeof(typename KernelTraits::SharedStorage) <=
                       cutlass::arch::sm100_smem_capacity_bytes,
                   "SMEM usage exceeded capacity");
+
+    // Tail-only stream-K fp32 workspace, allocated only if the scheduler split
+    // a tail: rem * splits * KNumCTA per-CTA slots of CtaShape_M x KBlockN.
+    static constexpr int KPartM = KernelTraits::KBlockM / KernelTraits::KNumCTA;
+    static constexpr int KPartN = KernelTraits::KBlockN;
+    at::Tensor streamk_ws;
+    const bool streamk_active = scheduler_params.streamk_rem > 0;
+    if (streamk_active) {
+        const int64_t slots =
+            static_cast<int64_t>(scheduler_params.streamk_rem) *
+            scheduler_params.streamk_splits * KernelTraits::KNumCTA;
+        streamk_ws = at::empty(
+            {slots, static_cast<int64_t>(KPartM), static_cast<int64_t>(KPartN)},
+            at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
+    }
+
+    EpilogueParams epilogue_params =
+        CollectiveEpilogue<KernelTraits>::to_underlying_arguments(
+            {static_cast<TypeC const*>(params.ptr_c),
+             static_cast<TypeD*>(params.ptr_d), params.m, params.n,
+             params.num_experts, params.ptr_alpha,
+             streamk_active ? streamk_ws.data_ptr<float>() : nullptr});
+
+    // Two instantiations, picked by pointer: data-parallel (unchanged codegen,
+    // used whenever nothing is split) and fused stream-K. The `if constexpr`
+    // keeps traits without KSupportsStreamK (all but BF16 dense no-bias
+    // no-alpha) from instantiating a dead stream-K copy.
+    auto* kernel_ptr_dp = &gemm_kernel<KernelTraits, MainloopParams,
+                                       EpilogueParams, SchedulerParams, false>;
+    void const* kernel_ptr = (void const*)kernel_ptr_dp;
+    if constexpr (KernelTraits::KSupportsStreamK) {
+        if (streamk_active) {
+            kernel_ptr = (void const*)&gemm_kernel<KernelTraits, MainloopParams,
+                                                   EpilogueParams,
+                                                   SchedulerParams, true>;
+        }
+    }
+    int smem_size = sizeof(typename KernelTraits::SharedStorage);
+    assert(smem_size < 228 * 1024);
 
     dim3 dimBlock(KernelTraits::KThreads);
     auto cluster_shape = ClusterShape_MNK{};
@@ -567,12 +643,28 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
     int num_clusters = runtime_sm_count / KCTAsPerCluster;
     dim3 dimGrid(dimCluster.x, num_clusters * dimCluster.y);
 
-    LaunchGemmKernel<KernelTraits>(dimGrid, dimCluster, dimBlock, smem_size,
-                                   stream, mainloop_params, epilogue_params,
-                                   scheduler_params);
+    LaunchGemmKernel<KernelTraits>(kernel_ptr, dimGrid, dimCluster, dimBlock,
+                                   smem_size, stream, mainloop_params,
+                                   epilogue_params, scheduler_params);
     cudaError_t cuda_status = cudaGetLastError();
     if (cuda_status != cudaSuccess) {
         TORCH_CHECK(false, "CUDA error: ", cudaGetErrorString(cuda_status));
+    }
+
+    if (streamk_active) {
+        // Reduce tail fp32 partials into D (whole tiles were already stored
+        // to D by the main launch).
+        launch_stream_k_reduce<TypeD, KPartM, KPartN, KernelTraits::KNumCTA>(
+            static_cast<TypeD*>(params.ptr_d), streamk_ws.data_ptr<float>(),
+            scheduler_params.streamk_tail_base, scheduler_params.streamk_rem,
+            scheduler_params.streamk_splits, scheduler_params.expert_ctm,
+            scheduler_params.expert_ctn, scheduler_params.traverse_m_fast,
+            scheduler_n, stream);
+        cuda_status = cudaGetLastError();
+        if (cuda_status != cudaSuccess) {
+            TORCH_CHECK(false, "CUDA error (stream-K reduce): ",
+                        cudaGetErrorString(cuda_status));
+        }
     }
 }
 

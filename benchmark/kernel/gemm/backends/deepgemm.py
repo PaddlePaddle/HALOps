@@ -68,6 +68,16 @@ def make_dense_inputs(x_bf16: torch.Tensor, w_bf16: torch.Tensor, mode: str) -> 
     n = w_bf16.shape[0]
     out = torch.empty(m, n, dtype=torch.bfloat16, device=x_bf16.device)
 
+    if mode == "bf16":
+        # Native BF16: no quantization / scale factors. bf16_gemm_nt computes
+        # a @ b.T, so pass w_bf16 [N, K] directly as b.
+        return {
+            "a": x_bf16,
+            "b": w_bf16,
+            "out": out,
+            "mode": mode,
+        }
+
     cast = (
         dg.per_token_cast_to_fp4
         if mode.startswith("w4a4")
@@ -111,6 +121,19 @@ def make_grouped_masked_inputs(
     dev = x_bf16.device
     a_bf16 = x_bf16.reshape(num_groups, max_m, k)
     masked_m = masked_m.to(device=dev, dtype=torch.int32)
+
+    if mode == "bf16":
+        # Native BF16: 3D masked layout, no quantization / scale factors.
+        # m_grouped_bf16_gemm_nt_masked computes a @ b.T per group.
+        out = torch.empty(num_groups, max_m, n, dtype=torch.bfloat16, device=dev)
+        return {
+            "a": a_bf16,
+            "b": w_bf16,
+            "out": out,
+            "masked_m": masked_m,
+            "max_m": max_m,
+            "mode": mode,
+        }
 
     if mode.startswith("w4a4"):
         # A: FP4 per-token (gran_k=32), pre-pack SF to UE8M0 INT
@@ -194,6 +217,19 @@ def make_grouped_contiguous_inputs(
     dev = x_bf16.device
     m_indices = m_indices.to(device=dev, dtype=torch.int32)
 
+    if mode == "bf16":
+        # Native BF16: 2D contiguous layout, no quantization / scale factors.
+        # m_grouped_bf16_gemm_nt_contiguous computes a @ b.T with per-row expert
+        # routing given by m_indices.
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
+        return {
+            "a": x_bf16,
+            "b": w_bf16,
+            "out": out,
+            "m_indices": m_indices,
+            "mode": mode,
+        }
+
     if mode.startswith("w4a4"):
         a_fp4, a_sf = dg.per_token_cast_to_fp4(x_bf16, use_ue8m0=True, gran_k=32)
         a_sf_packed = dg.get_mn_major_tma_aligned_packed_ue8m0_tensor(a_sf)
@@ -247,6 +283,8 @@ def run_dense_gemm(inp: dict):
         dg.fp8_fp4_gemm_nt(
             inp["a"], inp["b"], inp["out"], recipe_a=(1, 32), recipe_b=(1, 32)
         )
+    elif inp.get("mode") == "bf16":
+        dg.bf16_gemm_nt(inp["a"], inp["b"], inp["out"])
     else:
         dg.fp8_gemm_nt(
             inp["a"], inp["b"], inp["out"], recipe_a=(1, 32), recipe_b=(1, 32)
@@ -269,6 +307,10 @@ def run_group_masked_gemm(inp: dict):
             recipe_a=(1, 32),
             recipe_b=(1, 32),
         )
+    elif inp.get("mode") == "bf16":
+        dg.m_grouped_bf16_gemm_nt_masked(
+            inp["a"], inp["b"], inp["out"], inp["masked_m"], inp["max_m"]
+        )
     else:
         dg.m_grouped_fp8_gemm_nt_masked(
             inp["a"], inp["b"], inp["out"], inp["masked_m"], inp["max_m"]
@@ -289,6 +331,10 @@ def run_group_contiguous_gemm(inp: dict):
             inp["m_indices"],
             recipe_a=(1, 32),
             recipe_b=(1, 32),
+        )
+    elif inp.get("mode") == "bf16":
+        dg.m_grouped_bf16_gemm_nt_contiguous(
+            inp["a"], inp["b"], inp["out"], inp["m_indices"]
         )
     else:
         dg.m_grouped_fp8_gemm_nt_contiguous(

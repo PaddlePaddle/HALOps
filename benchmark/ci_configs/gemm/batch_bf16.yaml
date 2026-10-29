@@ -1,0 +1,23 @@
+scenario: batch_gemm
+mode: bf16
+
+# CI regression subset for native BF16 batch GEMM, mirroring the shapes in
+# benchmark/configs/gemm/batch_bf16.yaml. halops-only + refcheck off, per the
+# ci_configs convention (baseline comparison is halops-vs-baseline).
+# [B, M, N, K].
+shapes:
+  - [8, 8192, 1024, 4096]
+  - [8192, 64, 128, 4096]
+  - [8192, 64, 512, 576]
+  - [8192, 64, 512, 64]
+  - [8192, 64, 256, 64]
+  - [8, 1024, 4096, 4096]
+  - [8, 128, 4096, 4096]
+  - [4, 256, 7168, 4096]
+  - [1, 8192, 4096, 4096]
+sm_count: -1
+
+backends: [halops]
+cold_l2_cache: true
+refcheck: false
+refcheck_reference: golden
