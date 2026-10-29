@@ -21,16 +21,20 @@ from halops import group_contiguous_gemm
 
 
 def run_dense_gemm(inp: dict):
-    """Run halops dense GEMM (W8A8-MXFP8/FP8 or W4A4/FP4).
+    """Run halops dense GEMM (W8A8-MXFP8/FP8, W4A4/FP4, or native BF16).
 
     inp keys:
       x        [M, K]  (w8a8-mxfp8) float8_e4m3fn  /  [M, K//2] (w4a4-nvfp4) uint8 packed
+                       (bf16) bfloat16
       w        [N, K]  (w8a8-mxfp8) float8_e4m3fn  /  [N, K//2] (w4a4-nvfp4) uint8 packed
-      sfa      [M, K//32] (w8a8-mxfp8) / [M, K//16] (w4a4-nvfp4)  uint8 (CUTLASS layout)
-      sfb      [N, K//32] (w8a8-mxfp8) / [N, K//16] (w4a4-nvfp4)  uint8
+                       (bf16) bfloat16
+      sfa      [M, K//32] (w8a8-mxfp8) / [M, K//16] (w4a4-nvfp4)  uint8 (None for
+               bf16)
+      sfb      [N, K//32] (w8a8-mxfp8) / [N, K//16] (w4a4-nvfp4)  uint8 (None for
+               bf16)
       out      [M, N]  bfloat16, pre-allocated output
-      alpha    [1] float32 (w4a4-nvfp4) / None (w8a8-mxfp8)
-      mode     "w8a8-mxfp8" | "w4a4-nvfp4"
+      alpha    [1] float32 (w4a4-nvfp4) / None (w8a8-mxfp8, bf16)
+      mode     "w8a8-mxfp8" | "w4a4-nvfp4" | "bf16"
       sm_count int
     """
     dense_gemm(
@@ -48,7 +52,7 @@ def run_dense_gemm(inp: dict):
 
 
 def run_group_masked_gemm(inp: dict):
-    """Run halops grouped masked GEMM (W8A8-MXFP8/FP8 or W4A4/FP4).
+    """Run halops grouped masked GEMM (W8A8-MXFP8/FP8, W4A4/FP4, or BF16).
 
     inp keys:
       x        [E*max_m, K] (w8a8-mxfp8) float8_e4m3fn / [E*max_m, K//2] (w4a4-nvfp4) uint8
@@ -79,7 +83,7 @@ def run_group_masked_gemm(inp: dict):
 
 
 def run_group_contiguous_gemm(inp: dict):
-    """Run halops grouped contiguous GEMM (W8A8-MXFP8/FP8 or W4A4/FP4).
+    """Run halops grouped contiguous GEMM (W8A8-MXFP8/FP8, W4A4/FP4, or BF16).
 
     inp keys:
       x          [M, K]        (w8a8-mxfp8) float8_e4m3fn / [M, K//2]    (w4a4-nvfp4) uint8

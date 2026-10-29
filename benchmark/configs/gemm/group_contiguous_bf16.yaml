@@ -1,0 +1,24 @@
+# configs/gemm/group_contiguous_bf16.yaml
+# Grouped contiguous native BF16 GEMM (mode="bf16") on the self-developed
+# CollectiveMainloop. No quantization / scale factors; the golden
+# torch.matmul (bf16, no dequant) is the refcheck reference.
+scenario: group_contiguous
+mode: bf16
+
+# [num_experts, max_m, N, K] shapes (total m = num_experts * max_m, aligned to
+# tile_m boundaries). N a multiple of 256, K a multiple of 64.
+shapes:
+  - [4, 128, 256, 512]
+  - [4, 256, 1024, 1024]
+  - [8, 512, 7168, 3584]
+  - [10, 4096, 7168, 3584]
+  - [4, 128, 4096, 4096]
+  - [8, 512, 4096, 4096]
+  - [8, 1024, 4096, 4096]
+  - [10, 4096, 4096, 4096]
+sm_count: -1
+
+backends: [halops, fi, deepgemm]
+cold_l2_cache: true
+refcheck: true
+refcheck_reference: golden

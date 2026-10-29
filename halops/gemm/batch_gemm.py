@@ -27,8 +27,8 @@ __all__ = ["batch_gemm"]
 def batch_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
-    sfa: torch.Tensor,
-    sfb: torch.Tensor,
+    sfa: Optional[torch.Tensor],
+    sfb: Optional[torch.Tensor],
     output: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     alpha: Optional[torch.Tensor] = None,
@@ -71,7 +71,9 @@ def batch_gemm(
             value per batch item. Required for ``w4a4-nvfp4``; not accepted for
             ``w4a4-mxfp4``.
         sm_count: Number of SMs to use (-1 for all available).
-        mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``.
+        mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"`` for
+            quantized GEMM, or ``"bf16"`` for native BF16 GEMM (no
+            quantization; pass ``sfa=None, sfb=None``).
         epilogue: ``EpilogueOp.Identity``, ``EpilogueOp.Quant``,
             ``EpilogueOp.GateMulQuant`` or ``EpilogueOp.SigmoidGateMulQuant``
             (``w8a8-mxfp8``: float8_e4m3fn output, the result (times ``gate``,
@@ -100,6 +102,11 @@ def batch_gemm(
         >>> out = torch.empty(m, b * n, dtype=torch.bfloat16, device="cuda")
         >>> batch_gemm(x, w, sfa, sfb, out, mode="w8a8-mxfp8")
     """
+    if sfa is None:
+        sfa = torch.empty(0, dtype=torch.uint8, device=input.device)
+    if sfb is None:
+        sfb = torch.empty(0, dtype=torch.uint8, device=input.device)
+
     halops_kernel.batch_gemm(
         input,
         weight,

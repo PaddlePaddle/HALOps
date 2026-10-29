@@ -52,7 +52,7 @@ FP8_SF_BLOCK = 32
 NVFP4_SF_BLOCK = 16
 # The grouped kernels also support w4a4-mxfp4; this benchmark only generates
 # the FP8 and NVFP4 recipes.
-GROUPED_MODES = ("w8a8-mxfp8", "w4a4-nvfp4")
+GROUPED_MODES = ("w8a8-mxfp8", "w4a4-nvfp4", "bf16")
 
 
 @dataclass
@@ -98,6 +98,17 @@ def _make_grouped_tensors(num_experts: int, max_m: int, n: int, k: int, mode: st
             f"Expected one of {GROUPED_MODES}."
         )
     is_nvfp4 = mode == "w4a4-nvfp4"
+
+    if mode == "bf16":
+        # Native BF16: no quantization, no scale factors, no alpha. x/w double
+        # as the golden source (returned as x_bf16 / w_bf16).
+        assert k % 64 == 0, f"k={k} must be divisible by 64 for bf16"
+        x_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device=dev)
+        w_bf16_stacked = torch.randn(
+            num_experts, n, k, dtype=torch.bfloat16, device=dev
+        )
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
+        return x_bf16, w_bf16_stacked, None, None, out, None, x_bf16, w_bf16_stacked
 
     if is_nvfp4:
         assert k % (2 * NVFP4_SF_BLOCK) == 0, f"k={k} must be divisible by 32"
@@ -253,6 +264,7 @@ def adapt_fi(inp: GroupGemmInput, scenario: str = "masked") -> dict:
         "sfa": inp.sfa,
         "sfb": inp.sfb,
         "m_indptr": m_indptr,
+        "out": inp.out,
         "mode": inp.mode,
     }
 
@@ -394,8 +406,15 @@ def run_group_masked(cfg: dict) -> None:
     refcheck_rtol = cfg.get("refcheck_rtol", 1e-2)
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    dtype_bytes = 0.5 if mode == "w4a4-nvfp4" else 1
-    dtype_str = "fp4_e2m1" if mode == "w4a4-nvfp4" else "fp8_e4m3"
+    if mode == "bf16":
+        dtype_bytes = 2
+        dtype_str = "bf16"
+    elif mode == "w4a4-nvfp4":
+        dtype_bytes = 0.5
+        dtype_str = "fp4_e2m1"
+    else:
+        dtype_bytes = 1
+        dtype_str = "fp8_e4m3"
 
     for num_experts, max_m, n, k in cfg["shapes"]:
         active_m = num_experts * max_m
@@ -498,8 +517,15 @@ def run_group_contiguous(cfg: dict) -> None:
     refcheck_rtol = cfg.get("refcheck_rtol", 1e-2)
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    dtype_bytes = 0.5 if mode == "w4a4-nvfp4" else 1
-    dtype_str = "fp4_e2m1" if mode == "w4a4-nvfp4" else "fp8_e4m3"
+    if mode == "bf16":
+        dtype_bytes = 2
+        dtype_str = "bf16"
+    elif mode == "w4a4-nvfp4":
+        dtype_bytes = 0.5
+        dtype_str = "fp4_e2m1"
+    else:
+        dtype_bytes = 1
+        dtype_str = "fp8_e4m3"
 
     for requested_experts, max_m, n, k in cfg["shapes"]:
         m = requested_experts * max_m

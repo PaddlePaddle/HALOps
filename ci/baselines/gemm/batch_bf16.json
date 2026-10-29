@@ -1,0 +1,133 @@
+{
+  "config": "batch_bf16",
+  "op": "gemm",
+  "threshold": 0.05,
+  "entries": [
+    {
+      "key": {
+        "scenario": "batch_gemm",
+        "backend": "halops",
+        "num_experts": 8,
+        "max_m": "",
+        "m": 8192,
+        "n": 1024,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "batch_bf16"
+      },
+      "median_us": 348.236
+    },
+    {
+      "key": {
+        "scenario": "batch_gemm",
+        "backend": "halops",
+        "num_experts": 8192,
+        "max_m": "",
+        "m": 64,
+        "n": 128,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "batch_bf16"
+      },
+      "median_us": 1888.814
+    },
+    {
+      "key": {
+        "scenario": "batch_gemm",
+        "backend": "halops",
+        "num_experts": 8192,
+        "max_m": "",
+        "m": 64,
+        "n": 512,
+        "k": 576,
+        "mode": "bf16",
+        "case_tag": "batch_bf16"
+      },
+      "median_us": 912.394
+    },
+    {
+      "key": {
+        "scenario": "batch_gemm",
+        "backend": "halops",
+        "num_experts": 8192,
+        "max_m": "",
+        "m": 64,
+        "n": 512,
+        "k": 64,
+        "mode": "bf16",
+        "case_tag": "batch_bf16"
+      },
+      "median_us": 192.414
+    },
+    {
+      "key": {
+        "scenario": "batch_gemm",
+        "backend": "halops",
+        "num_experts": 8192,
+        "max_m": "",
+        "m": 64,
+        "n": 256,
+        "k": 64,
+        "mode": "bf16",
+        "case_tag": "batch_bf16"
+      },
+      "median_us": 100.035
+    },
+    {
+      "key": {
+        "scenario": "batch_gemm",
+        "backend": "halops",
+        "num_experts": 8,
+        "max_m": "",
+        "m": 1024,
+        "n": 4096,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "batch_bf16"
+      },
+      "median_us": 184.657
+    },
+    {
+      "key": {
+        "scenario": "batch_gemm",
+        "backend": "halops",
+        "num_experts": 8,
+        "max_m": "",
+        "m": 128,
+        "n": 4096,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "batch_bf16"
+      },
+      "median_us": 64.24
+    },
+    {
+      "key": {
+        "scenario": "batch_gemm",
+        "backend": "halops",
+        "num_experts": 4,
+        "max_m": "",
+        "m": 256,
+        "n": 7168,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "batch_bf16"
+      },
+      "median_us": 62.082
+    },
+    {
+      "key": {
+        "scenario": "batch_gemm",
+        "backend": "halops",
+        "num_experts": 1,
+        "max_m": "",
+        "m": 8192,
+        "n": 4096,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "batch_bf16"
+      },
+      "median_us": 170.864
+    }
+  ]
+}
