@@ -41,4 +41,28 @@ constexpr int AlignSfM(int m) {
     return (m + kSfAtomM - 1) / kSfAtomM * kSfAtomM;
 }
 
+inline void CheckDivisible(int64_t value, int64_t divisor, const char* name) {
+    TORCH_CHECK(value % divisor == 0, name, " must be divisible by ", divisor,
+                ", got ", value);
+}
+
+// SM count for the tile-selection heuristics. `sm_count <= 0` falls back to
+// the cached device count, so dispatch sees the same SM count gemm_impl
+// launches onto (a hard-coded value would mis-pick tiles in the
+// `tiles(...) < target_sm` ladders).
+inline int ResolveSmCount(int sm_count) {
+    return sm_count > 0 ? sm_count : GetSmCount();
+}
+
+inline void CheckGemmTileShape(int64_t m, int64_t n, int64_t k, int64_t tile_m,
+                               int64_t tile_n, int64_t tile_k,
+                               const char* kernel_name) {
+    TORCH_CHECK(m % tile_m == 0, kernel_name, " requires M to be divisible by ",
+                tile_m, ", got ", m);
+    TORCH_CHECK(n % tile_n == 0, kernel_name, " requires N to be divisible by ",
+                tile_n, ", got ", n);
+    TORCH_CHECK(k % tile_k == 0, kernel_name, " requires K to be divisible by ",
+                tile_k, ", got ", k);
+}
+
 }  // namespace halops

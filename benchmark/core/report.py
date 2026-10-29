@@ -32,7 +32,12 @@ MISMATCH_THRESHOLD_PCT = 10.0
 
 
 def _is_gemm_scenario(scenario):
-    _GEMM_SCENARIOS = ("dense_gemm", "group_masked", "group_contiguous")
+    _GEMM_SCENARIOS = (
+        "dense_gemm",
+        "group_masked",
+        "group_contiguous",
+        "batch_gemm",
+    )
     return True if scenario in _GEMM_SCENARIOS else False
 
 

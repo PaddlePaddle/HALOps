@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 
+#include "kernel/gemm/bf16_cfgs.h"
 #include "kernel/gemm/gemm_dispatch.cuh"
 #include "kernel/gemm/gemm_utils.h"
 
@@ -28,9 +29,10 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const bool use_pdl) {
     const CudaDeviceGuard device_guard(input.device());
     TORCH_CHECK(
-        mode == "w8a8-mxfp8" || mode == "w4a4-mxfp4" || mode == "w4a4-nvfp4",
+        mode == "bf16" || mode == "w8a8-mxfp8" || mode == "w4a4-mxfp4" ||
+            mode == "w4a4-nvfp4",
         "Unsupported mode: ", mode,
-        ". Expected 'w8a8-mxfp8', 'w4a4-mxfp4' or 'w4a4-nvfp4'.");
+        ". Expected 'bf16', 'w8a8-mxfp8', 'w4a4-mxfp4' or 'w4a4-nvfp4'.");
     TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor of shape [M, K]");
     TORCH_CHECK(weight.dim() == 2,
                 "weight must be a 2D tensor of shape [N, K]");
@@ -58,7 +60,209 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.max_m_per_expert = m;
     params.use_pdl = use_pdl;
 
-    if (mode == "w8a8-mxfp8") {
+    if (mode == "bf16") {
+        // Native BF16: sfa/sfb/bias/alpha are ignored.
+        using TypeA = cutlass::bfloat16_t;
+        using TypeB = cutlass::bfloat16_t;
+        using TypeC = cutlass::bfloat16_t;
+        using TypeD = cutlass::bfloat16_t;
+        // Placeholder, never dereferenced.
+        using TypeSF = cutlass::float_ue8m0_t;
+        using TypeAccumulate = float;
+
+        TORCH_CHECK(input.dtype() == torch::kBFloat16,
+                    "bf16 dense GEMM: input must be bfloat16");
+        TORCH_CHECK(weight.dtype() == torch::kBFloat16,
+                    "bf16 dense GEMM: weight must be bfloat16");
+        TORCH_CHECK(output.dtype() == torch::kBFloat16,
+                    "bf16 dense GEMM: output must be bfloat16");
+
+        const int k = weight.size(1);
+        TORCH_CHECK(input.size(1) == k,
+                    "input K must match weight K, got input K=", input.size(1),
+                    ", weight K=", k);
+        params.k = k;
+        params.ptr_a = input.data_ptr();
+        params.ptr_b = weight.data_ptr();
+        params.ptr_sfa = nullptr;
+        params.ptr_sfb = nullptr;
+        params.ptr_c = nullptr;
+        params.ptr_alpha = nullptr;
+
+        // Debug only: HALOPS_FORCE_CFG=256x128x64_2CTA (any name in kKnown,
+        // i.e. GemmKernelConfigBF16NaiveNoBias<name>) skips the dispatch below
+        // and runs that config on every shape it supports; other shapes are
+        // dispatched normally.
+        static const std::string forced_cfg = [] {
+            const char* e = std::getenv("HALOPS_FORCE_CFG");
+            std::string name(e == nullptr ? "" : e);
+            static const char* kKnown[] = {
+                "",
+                "256x256x64_2CTA",
+                "256x256x64_2CTA_P7",
+                "256x128x64_2CTA",
+                "256x128x64_2CTA_Ntail",
+                "256x128x64_2CTA_P9",
+                "256x128x64_2CTA_P9_Ntail",
+                "256x192x64_2CTA",
+                "256x64x64_2CTA",
+                "128x256x64_1CTA",
+                "128x128x64_1CTA",
+                "128x64x64_1CTA",
+                "128x32x64_1CTA",
+                "128x64x64_2CTA_P18",
+                "64x224x64_1CTA_P6",
+                "64x128x64_1CTA",
+                "64x96x64_1CTA_P11",
+                "64x64x64_1CTA",
+                "64x64x64_1WG_1CTA",
+                "64x64x64_P12_1CTA",
+                "64x64x64_P14_1CTA",
+                "64x32x64_1WG_P14_1CTA",
+                "64x32x64_1WG_P18_1CTA",
+                "64x64x64_1WG_P14_1CTA",
+            };
+            bool known = false;
+            for (const char* k : kKnown) {
+                known = known || name == k;
+            }
+            TORCH_CHECK(known, "HALOPS_FORCE_CFG=", name,
+                        " is not a config name this hatch knows; see the "
+                        "kKnown list in dense_gemm.cu.");
+            return name;
+        }();
+        if (!forced_cfg.empty()) {
+            // Required n alignment: 32 for non-power-of-2 KBlockN, 64 for
+            // _Ntail configs, KBlockN otherwise.
+#define HALOPS_FORCE_TRY(NAME, CFG, EXTRA)                                    \
+    if (forced_cfg == NAME) {                                                 \
+        using KernelConfig = CFG;                                             \
+        constexpr int kNMod =                                                 \
+            KernelConfig::KForceEpiNPredicate                                 \
+                ? 64                                                          \
+                : ((KernelConfig::KBlockN & (KernelConfig::KBlockN - 1)) != 0 \
+                       ? 32                                                   \
+                       : KernelConfig::KBlockN);                              \
+        constexpr int kNModCluster = kNMod * KernelConfig::KClusterN;         \
+        if (m % KernelConfig::KBlockM == 0 && n % kNModCluster == 0 &&        \
+            k % KernelConfig::KBlockK == 0 && (EXTRA)) {                      \
+            gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,     \
+                      KernelConfig>(params, sm, stream);                      \
+            return;                                                           \
+        }                                                                     \
+    }
+            HALOPS_FORCE_TRY("256x256x64_2CTA",
+                             GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA,
+                             true)
+            HALOPS_FORCE_TRY("256x256x64_2CTA_P7",
+                             GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA_P7,
+                             true)
+            HALOPS_FORCE_TRY("256x128x64_2CTA",
+                             GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA,
+                             true)
+            HALOPS_FORCE_TRY(
+                "256x128x64_2CTA_Ntail",
+                GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_Ntail, true)
+            HALOPS_FORCE_TRY("256x128x64_2CTA_P9",
+                             GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_P9,
+                             true)
+            HALOPS_FORCE_TRY(
+                "256x128x64_2CTA_P9_Ntail",
+                GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_P9_Ntail, true)
+            HALOPS_FORCE_TRY("256x192x64_2CTA",
+                             GemmKernelConfigBF16NaiveNoBias256x192x64_2CTA,
+                             true)
+            HALOPS_FORCE_TRY("256x64x64_2CTA",
+                             GemmKernelConfigBF16NaiveNoBias256x64x64_2CTA,
+                             true)
+            HALOPS_FORCE_TRY("128x256x64_1CTA",
+                             GemmKernelConfigBF16NaiveNoBias128x256x64_1CTA,
+                             true)
+            HALOPS_FORCE_TRY("128x128x64_1CTA",
+                             GemmKernelConfigBF16NaiveNoBias128x128x64_1CTA,
+                             true)
+            HALOPS_FORCE_TRY("128x64x64_1CTA",
+                             GemmKernelConfigBF16NaiveNoBias128x64x64_1CTA,
+                             true)
+            HALOPS_FORCE_TRY("128x32x64_1CTA",
+                             GemmKernelConfigBF16NaiveNoBias128x32x64_1CTA,
+                             true)
+            // Only within the correct CTA band.
+            HALOPS_FORCE_TRY("128x64x64_2CTA_P18",
+                             GemmKernelConfigBF16NaiveNoBias128x64x64_2CTA_P18,
+                             bf16_dispatch::PairDeepCtaCount(m, n) >=
+                                     bf16_dispatch::kPairDeepMinCtas &&
+                                 bf16_dispatch::PairDeepCtaCount(m, n) <=
+                                     bf16_dispatch::kPairDeepMaxCtas)
+            HALOPS_FORCE_TRY("64x224x64_1CTA_P6",
+                             GemmKernelConfigBF16NaiveNoBias64x224x64_1CTA_P6,
+                             true)
+            HALOPS_FORCE_TRY("64x128x64_1CTA",
+                             GemmKernelConfigBF16NaiveNoBias64x128x64_1CTA,
+                             true)
+            HALOPS_FORCE_TRY("64x96x64_1CTA_P11",
+                             GemmKernelConfigBF16NaiveNoBias64x96x64_1CTA_P11,
+                             true)
+            HALOPS_FORCE_TRY("64x64x64_1CTA",
+                             GemmKernelConfigBF16NaiveNoBias64x64x64_1CTA, true)
+            HALOPS_FORCE_TRY("64x64x64_1WG_1CTA",
+                             GemmKernelConfigBF16NaiveNoBias64x64x64_1WG_1CTA,
+                             true)
+            HALOPS_FORCE_TRY("64x64x64_P12_1CTA",
+                             GemmKernelConfigBF16NaiveNoBias64x64x64_P12_1CTA,
+                             true)
+            HALOPS_FORCE_TRY("64x64x64_P14_1CTA",
+                             GemmKernelConfigBF16NaiveNoBias64x64x64_P14_1CTA,
+                             true)
+            HALOPS_FORCE_TRY(
+                "64x32x64_1WG_P14_1CTA",
+                GemmKernelConfigBF16NaiveNoBias64x32x64_1WG_P14_1CTA, true)
+            HALOPS_FORCE_TRY(
+                "64x32x64_1WG_P18_1CTA",
+                GemmKernelConfigBF16NaiveNoBias64x32x64_1WG_P18_1CTA, true)
+            HALOPS_FORCE_TRY(
+                "64x64x64_1WG_P14_1CTA",
+                GemmKernelConfigBF16NaiveNoBias64x64x64_1WG_P14_1CTA, true)
+#undef HALOPS_FORCE_TRY
+        }
+
+        // Entry guards per tier (same messages the per-rung checks used).
+        if (m >= 128 && m < 4096) {
+            CheckDivisible(m, 128, "BF16 GEMM mid M M");
+            CheckDivisible(n, 32, "BF16 GEMM mid M N");
+            CheckDivisible(k, 64, "BF16 GEMM mid M K");
+        } else if (m < 128 && !bf16_dispatch::ThinMNoSwapOk(m, n, k, sm)) {
+            CheckDivisible(n, 128, "BF16 GEMM SwapAB N");
+            CheckDivisible(m, 64, "BF16 GEMM SwapAB M");
+            CheckDivisible(k, 64, "BF16 GEMM SwapAB K");
+        }
+        const int cfg = bf16_dispatch::dense::SelectBF16Cfg(m, n, k, sm);
+        TORCH_CHECK(cfg >= 0, "No BF16 dense GEMM tile supports M=", m,
+                    ", N=", n, ", K=", k);
+        const auto& desc = bf16_dispatch::kBF16Cfgs[cfg];
+        // Same divisibility contract the per-rung checks enforced: the
+        // output M/N tile multiples (N may relax to %32 for non-power-of-2
+        // widths or %64 for predicated-tail tiles), K a KBlockK multiple.
+        // SwapAB swaps the roles: KBlockM tiles the weight (output N) and
+        // KBlockN the activation (output M).
+        const int n_mod =
+            desc.ntail ? 64 : (((desc.bn & (desc.bn - 1)) != 0) ? 32 : desc.bn);
+        const int m_div = desc.swap ? desc.bn : desc.bm;
+        const int n_div = desc.swap ? desc.bm : n_mod;
+        TORCH_CHECK(m % m_div == 0,
+                    "BF16 dense GEMM requires M to be divisible by ", m_div,
+                    ", got ", m);
+        TORCH_CHECK(n % n_div == 0,
+                    "BF16 dense GEMM requires N to be divisible by ", n_div,
+                    ", got ", n);
+        TORCH_CHECK(k % desc.bk == 0,
+                    "BF16 dense GEMM requires K to be divisible by ", desc.bk,
+                    ", got ", k);
+        bf16_dispatch::DispatchBF16Cfg(cfg, [&]<class KernelConfig>() {
+            gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
+                      KernelConfig>(params, sm, stream);
+        });
+    } else if (mode == "w8a8-mxfp8") {
         const int k = weight.size(1);
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),

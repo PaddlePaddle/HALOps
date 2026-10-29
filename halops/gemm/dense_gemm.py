@@ -26,8 +26,8 @@ __all__ = ["dense_gemm"]
 def dense_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
-    sfa: torch.Tensor,
-    sfb: torch.Tensor,
+    sfa: Optional[torch.Tensor],
+    sfb: Optional[torch.Tensor],
     output: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     alpha: Optional[torch.Tensor] = None,
@@ -65,8 +65,9 @@ def dense_gemm(
         alpha: Optional float32 scaling factor with shape [1]. Required for
             ``w4a4-nvfp4``; not accepted for ``w4a4-mxfp4``.
         sm_count: Number of SMs to use (-1 for all available).
-        mode: Quantization mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or
-            ``"w4a4-nvfp4"``.
+        mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"`` for
+            quantized GEMM, or ``"bf16"`` for native BF16 GEMM (no
+            quantization; pass ``sfa=None, sfb=None``).
         use_pdl: Enable Programmatic Dependent Launch (on by default).
 
     Returns:
@@ -83,6 +84,11 @@ def dense_gemm(
         >>> out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
         >>> dense_gemm(x, w, sfa, sfb, out, mode="w8a8-mxfp8")
     """
+    if sfa is None:
+        sfa = torch.empty(0, dtype=torch.uint8, device=input.device)
+    if sfb is None:
+        sfb = torch.empty(0, dtype=torch.uint8, device=input.device)
+
     halops_kernel.dense_gemm(
         input,
         weight,

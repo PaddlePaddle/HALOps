@@ -21,11 +21,34 @@
 
 namespace halops {
 
+// ---------------------------------------------------------------------------
+// Dense GEMM tile parameters; this is the only tile definition in the tree.
+//
+//   BM, BN, BK    KBlockM/N/K; for SwapAB, BM is the weight's M and BN the
+//                 activation extent.
+//   PST, EST      prologue (mainloop) / epilogue pipeline depth.
+//   CM, CN        cluster shape; IsPairUmma = CM*CN > 1.
+//   OVLP          KTmemOverlapCols.
+//   REG           KNumRegsEpilogue; 160 is the Reg160 occupancy variant.
+//   SWZ           UseTileSwizzle.
+//   FENCE         SkipTmemFence.
+//   SWAP, FP4     SwapAB, KIsFP4.
+//   SFVS          KSfVecSize: 16 = NVFP4, 32 = MXFP4.
+//   ALPHA, BIAS   HasAlpha, AddBias.
+//   MODE          KernelType.
+//   EWGO          KEpilogueWarpGroupsOverride; 0 = auto (SwapAB ? 1 : 2).
+//   NTAIL         KForceEpiNPredicate (predicated store on power-of-2 N).
+//   BF16          KIsBF16 (native BF16 GEMM, no scale factors).
+//   ATOM          CTAs per MMA atom: 0 = auto (CM*CN > 1 ? 2 : 1), 1 = 1SM,
+//                 2 = 2x1SM. Decoupled from the cluster shape so a 1SM atom
+//                 can still sit in a multi-CTA cluster and share loads.
+// ---------------------------------------------------------------------------
 template <int BM, int BN, int BK, int PST, int EST, int CM = 1, int CN = 1,
           int OVLP = 0, int REG = 208, bool SWZ = false, bool FENCE = false,
           bool SWAP = false, bool FP4 = false, int SFVS = 16,
           bool ALPHA = false, bool BIAS = false,
-          KernelMode MODE = KernelMode::Dense>
+          KernelMode MODE = KernelMode::Dense, int EWGO = 0, bool NTAIL = false,
+          bool BF16 = false, int ATOM = 0>
 struct GemmTile : GemmKernelConfig {
     static constexpr int KBlockM = BM;
     static constexpr int KBlockN = BN;
@@ -44,7 +67,12 @@ struct GemmTile : GemmKernelConfig {
     static constexpr bool HasAlpha = ALPHA;
     static constexpr bool AddBias = BIAS;
     static constexpr KernelMode KernelType = MODE;
-    static constexpr bool IsPairUmma = (CM * CN) > 1;
+    // CTAs per MMA atom (0 = legacy: any cluster > 1 implies pair-UMMA).
+    static constexpr int KAtomCtas = ATOM == 0 ? ((CM * CN) > 1 ? 2 : 1) : ATOM;
+    static constexpr bool IsPairUmma = KAtomCtas == 2;
+    static constexpr int KEpilogueWarpGroupsOverride = EWGO;
+    static constexpr bool KForceEpiNPredicate = NTAIL;
+    static constexpr bool KIsBF16 = BF16;
 };
 
 struct TileSpec {
@@ -326,5 +354,216 @@ template <>
 struct CandidateTiles<MmaKind::MXFP4> {
     static constexpr const auto& tiles = kFp4Tiles;
 };
+
+// ===========================================================================
+// BF16 (kind::f16) configs — no block-scale, no alpha. KBlockK=64 gives the
+// same per-stage A/B smem as FP8@KBlockK=128 and there is no SFA/SFB smem, so
+// stage counts can mirror the FP8 configs (< 228 KB). The tail three template
+// parameters are BF16-relevant: EWGO (KEpilogueWarpGroupsOverride, 1 for the
+// 2SM "2x2" TMEM layout and narrow tiles), NTAIL (KForceEpiNPredicate, the
+// predicated store for N % KBlockN != 0), BF16 (KIsBF16).
+// ---------------------------------------------------------------------------
+// Dense (Naive)
+using GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA =
+    GemmTile<256, 256, 64, 6, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x256x64_1CTA =
+    GemmTile<128, 256, 64, 4, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x128x64_1CTA =
+    GemmTile<128, 128, 64, 4, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x32x64_1CTA =
+    GemmTile<128, 32, 64, 10, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x64x64_2x2CTA =
+    GemmTile<128, 64, 64, 8, 2, 2, 2, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 1, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x64x64_2x2CTA_P16 =
+    GemmTile<128, 64, 64, 16, 2, 2, 2, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 1, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x64x64_2x2CTA_P18 =
+    GemmTile<128, 64, 64, 18, 2, 2, 2, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 1, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x64x64_2CTA_P18 =
+    GemmTile<128, 64, 64, 18, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 1, false, true>;
+using GemmKernelConfigBF16NaiveNoBias64x96x64_1CTA_P11 =
+    GemmTile<64, 96, 64, 11, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 1, false, true>;
+using GemmKernelConfigBF16NaiveNoBias64x224x64_1CTA_P6 =
+    GemmTile<64, 224, 64, 6, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 1, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x64x64_2x1CTA =
+    GemmTile<128, 64, 64, 8, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 1, false, true>;
+using GemmKernelConfigBF16NaiveNoBias64x64x64_1CTA =
+    GemmTile<64, 64, 64, 10, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias64x128x64_1CTA =
+    GemmTile<64, 128, 64, 8, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias64x32x64_1WG_P14_1CTA =
+    GemmTile<64, 32, 64, 14, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 1, false, true>;
+using GemmKernelConfigBF16NaiveNoBias64x32x64_1WG_P18_1CTA =
+    GemmTile<64, 32, 64, 18, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 1, false, true>;
+using GemmKernelConfigBF16NaiveNoBias64x32x64_1WG_1CTA =
+    GemmTile<64, 32, 64, 10, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 1, false, true>;
+using GemmKernelConfigBF16NaiveNoBias64x64x64_1WG_1CTA =
+    GemmTile<64, 64, 64, 10, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 1, false, true>;
+using GemmKernelConfigBF16NaiveNoBias64x64x64_P12_1CTA =
+    GemmTile<64, 64, 64, 12, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias64x64x64_P14_1CTA =
+    GemmTile<64, 64, 64, 14, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias64x64x64_1WG_P14_1CTA =
+    GemmTile<64, 64, 64, 14, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 1, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x32x64_P4_1CTA =
+    GemmTile<128, 32, 64, 4, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x32x64_P6_1CTA =
+    GemmTile<128, 32, 64, 6, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x32x32_1CTA =
+    GemmTile<128, 32, 32, 16, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x64x64_1CTA =
+    GemmTile<128, 64, 64, 8, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA =
+    GemmTile<256, 128, 64, 8, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_Ntail =
+    GemmTile<256, 128, 64, 8, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, true, true>;
+using GemmKernelConfigBF16NaiveNoBias256x64x64_2CTA =
+    GemmTile<256, 64, 64, 10, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA_P7 =
+    GemmTile<256, 256, 64, 7, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_P9 =
+    GemmTile<256, 128, 64, 9, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_P9_Ntail =
+    GemmTile<256, 128, 64, 9, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, true, true>;
+using GemmKernelConfigBF16NaiveNoBias256x192x64_2CTA =
+    GemmTile<256, 192, 64, 8, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x64x64_SwapAB_1CTA =
+    GemmTile<128, 64, 64, 8, 2, 1, 1, 0, 208, false, false, true, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x32x64_SwapAB_1CTA =
+    GemmTile<128, 32, 64, 8, 2, 1, 1, 0, 208, false, false, true, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias256x64x64_SwapAB_2CTA =
+    GemmTile<256, 64, 64, 9, 2, 2, 1, 0, 208, false, false, true, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+using GemmKernelConfigBF16NaiveNoBias128x64x128_SwapAB_1CTA =
+    GemmTile<128, 64, 128, 4, 2, 1, 1, 0, 208, false, false, true, false, 16,
+             false, false, KernelMode::Dense, 0, false, true>;
+
+// Batch
+using GemmKernelConfigBF16BatchNoBias256x256x64_2CTA =
+    GemmTile<256, 256, 64, 6, 2, 2, 1, 16, 208, false, false, false, false, 16,
+             false, false, KernelMode::Batch, 0, false, true>;
+
+using GemmKernelConfigBF16BatchNoBias128x256x64_1CTA =
+    GemmTile<128, 256, 64, 4, 2, 1, 1, 16, 208, false, false, false, false, 16,
+             false, false, KernelMode::Batch, 0, false, true>;
+
+using GemmKernelConfigBF16BatchNoBias128x64x64_SwapAB_1CTA =
+    GemmTile<128, 64, 64, 8, 2, 1, 1, 0, 208, false, false, true, false, 16,
+             false, false, KernelMode::Batch, 0, false, true>;
+
+// Group contiguous
+using GemmKernelConfigBF16ContiguousNoBias256x256x64_2CTA =
+    GemmTile<256, 256, 64, 7, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Contiguous, 0, false, true>;
+
+using GemmKernelConfigBF16ContiguousNoBias256x128x64_2CTA =
+    GemmTile<256, 128, 64, 9, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Contiguous, 0, false, true>;
+
+using GemmKernelConfigBF16ContiguousNoBias128x256x64_1CTA =
+    GemmTile<128, 256, 64, 4, 2, 1, 1, 16, 208, false, false, false, false, 16,
+             false, false, KernelMode::Contiguous, 0, false, true>;
+
+using GemmKernelConfigBF16ContiguousNoBias128x128x64_1CTA =
+    GemmTile<128, 128, 64, 6, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Contiguous, 0, false, true>;
+
+using GemmKernelConfigBF16ContiguousNoBias128x64x64_1CTA =
+    GemmTile<128, 64, 64, 8, 2, 1, 1, 16, 208, false, false, false, false, 16,
+             false, false, KernelMode::Contiguous, 0, false, true>;
+
+using GemmKernelConfigBF16ContiguousNoBias128x64x64_SwapAB_1CTA =
+    GemmTile<128, 64, 64, 8, 2, 1, 1, 0, 208, false, false, true, false, 16,
+             false, false, KernelMode::Contiguous, 0, false, true>;
+
+// Group masked
+using GemmKernelConfigBF16MaskedNoBias128x256x64_1CTA =
+    GemmTile<128, 256, 64, 4, 2, 1, 1, 16, 208, false, false, false, false, 16,
+             false, false, KernelMode::Masked, 0, false, true>;
+
+using GemmKernelConfigBF16MaskedNoBias128x64x64_SwapAB_1CTA =
+    GemmTile<128, 64, 64, 8, 2, 1, 1, 0, 208, false, false, true, false, 16,
+             false, false, KernelMode::Masked, 0, false, true>;
+
+using GemmKernelConfigBF16MaskedNoBias128x128x64_1CTA =
+    GemmTile<128, 128, 64, 6, 2, 1, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Masked, 0, false, true>;
+
+using GemmKernelConfigBF16MaskedNoBias128x64x64_1CTA =
+    GemmTile<128, 64, 64, 8, 2, 1, 1, 16, 208, false, false, false, false, 16,
+             false, false, KernelMode::Masked, 0, false, true>;
+
+using GemmKernelConfigBF16MaskedNoBias256x256x64_2CTA =
+    GemmTile<256, 256, 64, 7, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Masked, 0, false, true>;
+
+using GemmKernelConfigBF16MaskedNoBias256x128x64_2CTA =
+    GemmTile<256, 128, 64, 9, 2, 2, 1, 0, 208, false, false, false, false, 16,
+             false, false, KernelMode::Masked, 0, false, true>;
+
+// Field-lock asserts: guard against positional-argument drift in the
+// 21-parameter alias lists above (migration from hand-written structs).
+static_assert(GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA::KBlockM == 256 &&
+              GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA::KBlockN == 256 &&
+              GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA::KBlockK == 64 &&
+              GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA::KPrologueStages ==
+                  6 &&
+              GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA::IsPairUmma &&
+              GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA::KIsBF16);
+static_assert(
+    GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_Ntail::KForceEpiNPredicate &&
+    GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_Ntail::KPrologueStages ==
+        8 &&
+    GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_P9_Ntail::KPrologueStages ==
+        9 &&
+    GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_P9_Ntail::
+        KForceEpiNPredicate);
+static_assert(
+    GemmKernelConfigBF16NaiveNoBias128x64x64_2x2CTA_P18::
+            KEpilogueWarpGroupsOverride == 1 &&
+    GemmKernelConfigBF16NaiveNoBias128x64x64_2x2CTA_P18::KPrologueStages ==
+        18 &&
+    GemmKernelConfigBF16NaiveNoBias128x64x64_2x2CTA_P18::KClusterN == 2);
+static_assert(GemmKernelConfigBF16NaiveNoBias128x32x32_1CTA::KBlockK == 32 &&
+              GemmKernelConfigBF16NaiveNoBias128x64x128_SwapAB_1CTA::KBlockK ==
+                  128 &&
+              GemmKernelConfigBF16NaiveNoBias128x64x128_SwapAB_1CTA::SwapAB);
+static_assert(
+    GemmKernelConfigBF16ContiguousNoBias128x256x64_1CTA::KTmemOverlapCols ==
+        16 &&
+    GemmKernelConfigBF16MaskedNoBias256x128x64_2CTA::KPrologueStages == 9 &&
+    GemmKernelConfigBF16BatchNoBias128x64x64_SwapAB_1CTA::SwapAB);
 
 }  // namespace halops

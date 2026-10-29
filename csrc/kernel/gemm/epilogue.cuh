@@ -96,6 +96,10 @@ class CollectiveEpilogue {
         int n;
         int num_experts;
         float const* ptr_alpha = nullptr;
+        // Tail-only stream-K: fp32 partial workspace, laid out as
+        //   [slot][CtaShape_M][KBlockN]  (slot = scheduler.partial_slot())
+        // nullptr when stream-K is off.
+        TypeAccumulate* ptr_partial = nullptr;
     };
 
     struct Params {
@@ -105,6 +109,7 @@ class CollectiveEpilogue {
         int num_experts;
         TypeD* ptr_d;
         float const* ptr_alpha = nullptr;
+        TypeAccumulate* ptr_partial = nullptr;
     };
 
     static Params to_underlying_arguments(Arguments const& args) {
@@ -123,7 +128,8 @@ class CollectiveEpilogue {
             cute::make_tma_atom(CopyOpG2S_Bias{}, tensor_c, SmemLayoutStageC{},
                                 EpilogueTile{}, cute::_1{});
 
-        return {tma_load_c, m, n, num_experts, args.ptr_d, args.ptr_alpha};
+        return {tma_load_c,      m, n, num_experts, args.ptr_d, args.ptr_alpha,
+                args.ptr_partial};
     }
 
     // Producer warp: TMA-loads one bias C stage per scheduled tile.
@@ -196,7 +202,10 @@ class CollectiveEpilogue {
     }
 
     // No-bias path: TMEM -> registers -> cast -> GMEM.
-    template <class TmemStorage>
+    // KStreamK: tail-only stream-K instantiation. Compile-time so the
+    // data-parallel store path keeps its register allocation (a runtime branch
+    // here causes heavy spills).
+    template <bool KStreamK = false, class TmemStorage>
     CUTLASS_DEVICE void epilogue(Params const& epilogue_params,
                                  AccumulatorPipeline& acc_pipeline,
                                  SharedStorage& shared_storage,
@@ -298,6 +307,42 @@ class CollectiveEpilogue {
             return thr_r2g_sub.partition_D(gD_sub_tile_coords);
         }();
 
+        // Tail-only stream-K: partials address a compact per-CTA
+        // [CtaShape_M][KBlockN] fp32 slot instead of the global D grid.
+        static constexpr int KPartialM =
+            cute::size<0>(cute::take<0, 2>(CtaShape_MNK{}));
+        static constexpr int KPartialN =
+            cute::size<1>(cute::take<0, 2>(CtaShape_MNK{}));
+
+        // Loop-invariant partial-store partition, built once against the
+        // workspace base rather than in r2g_sub (inlined per sub-tile; doing it
+        // there causes spills). Per work item only a pointer offset changes.
+        // Same thread layout as the D store -> vectorized fp32 stores. Empty
+        // tuple when !KStreamK so data-parallel codegen is untouched.
+        auto partial_store = [&]() {
+            if constexpr (KStreamK) {
+                auto tiled_p = cute::make_tiled_copy_D(
+                    cute::Copy_Atom<
+                        cute::AutoVectorizingCopyWithAssumedAlignment<128>,
+                        TypeAccumulate>{},
+                    tiled_t2r_sub);
+                auto thr_p = tiled_p.get_slice(tx);
+                return cute::make_tuple(
+                    tiled_p, thr_p.retile_S(thr_racc_dst_sub),
+                    thr_p.partition_D(cute::flat_divide(
+                        cute::make_tensor(
+                            cute::make_gmem_ptr(epilogue_params.ptr_partial),
+                            cute::make_layout(
+                                cute::make_shape(cute::Int<KPartialM>{},
+                                                 cute::Int<KPartialN>{}),
+                                cute::make_stride(cute::Int<KPartialN>{},
+                                                  cute::_1{}))),
+                        OverlapComputeTile{})));
+            } else {
+                return cute::make_tuple();
+            }
+        }();
+
         AccumulatorPipelineState acc_pipe_consumer_state;
 
         uint32_t epilogue_stage_idx = 0;
@@ -305,6 +350,16 @@ class CollectiveEpilogue {
         while (scheduler.is_valid()) {
             uint32_t m_idx = scheduler.m_idx();
             uint32_t n_idx = scheduler.n_idx();
+            // Resolved once per work item: < 0 means it owns the whole K range
+            // and stores the final bf16 result.
+            int partial_slot = -1;
+            int64_t partial_off = 0;
+            if constexpr (KStreamK) {
+                partial_slot = scheduler.partial_slot();
+                partial_off =
+                    (static_cast<int64_t>(partial_slot) * KNumCTA + cta_v) *
+                    KPartialM * KPartialN;
+            }
             float alpha_val = 1.0f;
             if constexpr (HasAlpha) {
                 alpha_val = shared_storage.alpha[scheduler.expert_idx()];
@@ -324,6 +379,36 @@ class CollectiveEpilogue {
             };
 
             auto r2g_sub = [&](uint32_t epi_m_idx, uint32_t sub_n_idx) {
+                // N-overhang predicate: a KBlockN that does not divide n
+                // overhangs on the last tile. D is stored register -> GMEM
+                // (SM100_STORE_256bit, not TMA; CopyOpS2G is unused), so
+                // nothing clips OOB writes. The host enforces n % KSubTileN ==
+                // 0, so each sub-tile is entirely in or out of bounds: one
+                // scalar compare, vector store intact.
+                if constexpr (KernelTraits::KEpiNeedsNPredicate) {
+                    const uint32_t sub_n_begin =
+                        n_idx * static_cast<uint32_t>(KernelTraits::KBlockN) +
+                        sub_n_idx *
+                            static_cast<uint32_t>(KernelTraits::KSubTileN);
+                    if (sub_n_begin >= static_cast<uint32_t>(out_n)) {
+                        return;
+                    }
+                }
+                // Stream-K tail chunk (K-slice only): store the raw fp32
+                // accumulator to its workspace slot; the reduce kernel sums and
+                // casts. No alpha: stream-K is gated to no-alpha BF16 dense.
+                if constexpr (KStreamK) {
+                    if (partial_slot >= 0) {
+                        auto dst_p = cute::get<2>(partial_store);
+                        dst_p.data() = dst_p.data() + partial_off;
+                        copy(cute::get<0>(partial_store),
+                             cute::get<1>(partial_store),
+                             dst_p((cute::_, cute::_), cute::_, cute::_,
+                                   cute::Int<0>{}, sub_n_idx));
+                        return;
+                    }
+                }
+
                 const uint32_t block_m_idx = m_idx * KNumCTA + cta_v;
                 auto dst_cur =
                     dst_sub((cute::_, cute::_), cute::_, cute::_,
