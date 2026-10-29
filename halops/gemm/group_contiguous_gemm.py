@@ -26,8 +26,8 @@ __all__ = ["group_contiguous_gemm"]
 def group_contiguous_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
-    sfa: torch.Tensor,
-    sfb: torch.Tensor,
+    sfa: Optional[torch.Tensor],
+    sfb: Optional[torch.Tensor],
     expert_ids: torch.Tensor,
     output: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
@@ -71,8 +71,9 @@ def group_contiguous_gemm(
             ``w4a8-mxfp4``.
         sm_count: Number of SMs to use (-1 for all available).
         mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"``, ``"w4a4-nvfp4"`` or
-            ``"w4a8-mxfp4"`` (FP8 activation x MXFP4 weight). For
-            ``w4a8-mxfp4`` the per-expert M ``M // num_experts`` must be 64
+            ``"w4a8-mxfp4"`` (FP8 activation x MXFP4 weight), or ``"bf16"`` for
+            native BF16 GEMM (no quantization; pass ``sfa=None, sfb=None``).
+            For ``w4a8-mxfp4`` the per-expert M ``M // num_experts`` must be 64
             or a multiple of 128; N must be a multiple of 128 when that M is
             at most 128, else a multiple of 256, and K a multiple of 256.
 
@@ -95,6 +96,11 @@ def group_contiguous_gemm(
         >>> out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
         >>> group_contiguous_gemm(x, w, sfa, sfb, expert_ids, out, mode="w8a8-mxfp8")
     """
+    if sfa is None:
+        sfa = torch.empty(0, dtype=torch.uint8, device=input.device)
+    if sfb is None:
+        sfb = torch.empty(0, dtype=torch.uint8, device=input.device)
+
     halops_kernel.group_contiguous_gemm(
         input,
         weight,

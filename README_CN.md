@@ -99,9 +99,17 @@ dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8-mxfp8")
 print(output.shape, output.dtype)
 ```
 
+原生 BF16 不需要量化，scale factor 传 `None` 即可：
+
+```python
+output = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+dense_gemm(a, b, None, None, output, mode="bf16")
+print(output.shape, output.dtype)
+```
+
 ## 路线图
 
-- **全面的 GEMM 支持矩阵**：覆盖 W4A8、BF16 等类型的 GEMM，打造全量化类型的 GEMM 支持矩阵，满足不同推理性能与效果需求下的选择。
+- **全面的 GEMM 支持矩阵**：覆盖 W4A8 等类型的 GEMM，打造全量化类型的 GEMM 支持矩阵，满足不同推理性能与效果需求下的选择。
 - **更高性能的巨内核方案**：覆盖更多场景的通算融合，以及计算与访存 overlap 的优化方案。
 - **小计算规模下的高性能 kernel**：面向小数据规模的推理方案，为小并发下的极限推理速度提供 kernel 底座支撑。
 

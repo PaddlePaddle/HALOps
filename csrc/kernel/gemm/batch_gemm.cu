@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 
+#include "kernel/gemm/bf16_cfgs.h"
 #include "kernel/gemm/gemm_dispatch.cuh"
 #include "kernel/gemm/gemm_utils.h"
 
@@ -29,9 +30,10 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const std::optional<torch::Tensor>& gate, const bool use_pdl) {
     const CudaDeviceGuard device_guard(input.device());
     TORCH_CHECK(
-        mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" || mode == "w4a4-mxfp4",
+        mode == "bf16" || mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" ||
+            mode == "w4a4-mxfp4",
         "Unsupported mode: ", mode,
-        ". Expected 'w8a8-mxfp8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
+        ". Expected 'bf16', 'w8a8-mxfp8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
     TORCH_CHECK(input.dim() == 3,
                 "input must be a 3D tensor of shape [B, M, K]");
     TORCH_CHECK(weight.dim() == 3,
@@ -66,7 +68,48 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.max_m_per_expert = m;
     params.use_pdl = use_pdl;
 
-    if (mode == "w8a8-mxfp8") {
+    if (mode == "bf16") {
+        using TypeA = cutlass::bfloat16_t;
+        using TypeB = cutlass::bfloat16_t;
+        using TypeC = cutlass::bfloat16_t;
+        using TypeD = cutlass::bfloat16_t;
+        using TypeSF = cutlass::float_ue8m0_t;  // placeholder, unused
+        using TypeAccumulate = float;
+
+        const int k = weight.size(2);
+        TORCH_CHECK(input.size(2) == k,
+                    "input K must match weight K, got input K=", input.size(2),
+                    ", weight K=", k);
+        TORCH_CHECK(input.dtype() == torch::kBFloat16,
+                    "bf16 batch GEMM: input must be bfloat16");
+        TORCH_CHECK(weight.dtype() == torch::kBFloat16,
+                    "bf16 batch GEMM: weight must be bfloat16");
+        TORCH_CHECK(output.dtype() == torch::kBFloat16,
+                    "bf16 batch GEMM: output must be bfloat16");
+        TORCH_CHECK(epilogue == EpilogueOp::Identity &&
+                        !output_sf.has_value() && !gate.has_value(),
+                    "bf16 batch GEMM supports EpilogueOp.Identity only");
+        params.k = k;
+        params.ptr_a = input.data_ptr();
+        params.ptr_b = weight.data_ptr();
+        params.ptr_sfa = nullptr;
+        params.ptr_sfb = nullptr;
+        params.ptr_alpha = nullptr;
+
+        const int cfg = bf16_dispatch::SelectBF16BatchCfg(m, n, k);
+        TORCH_CHECK(cfg >= 0, "bf16 batch GEMM: unsupported shape B=", batches,
+                    " M=", m, " N=", n, " K=", k,
+                    ". Need one of: (M%256==0 && N%256==0), "
+                    "(M%128==0 && N%256==0), or (M%64==0 && N%128==0).");
+        bf16_dispatch::CheckBF16CfgShape(
+            "bf16 batch GEMM", bf16_dispatch::kBF16BatchCfgs[cfg], m, n, k);
+        bf16_dispatch::DispatchBF16SmallCfg<bf16_dispatch::BF16BatchTiles,
+                                            bf16_dispatch::kBF16BatchCount>(
+            cfg, "bf16 batch", [&]<class KernelConfig>() {
+                gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
+                          KernelConfig>(params, sm, stream);
+            });
+    } else if (mode == "w8a8-mxfp8") {
         const int k = weight.size(2);
         TORCH_CHECK(input.size(2) == k,
                     "input K must match weight K, got input K=", input.size(2),
