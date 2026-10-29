@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda.h>
 #include <torch/extension.h>
 
 #include <cmath>
@@ -240,6 +241,73 @@ uint32_t CalculateGridSize(int device, cudaStream_t stream) {
     return grid_size;
 }
 
+// One 2-D SW128 TMA descriptor: `inner` is the contiguous extent, `outer`
+// the row axis, and `row_bytes` the global stride between rows.
+static CUtensorMap CreateTmaDesc2D(const void* ptr, CUtensorMapDataType type,
+                                   const char* what, uint64_t inner,
+                                   uint64_t outer, uint64_t row_bytes,
+                                   uint32_t box_inner, uint32_t box_outer) {
+    CUtensorMap desc{};
+    uint64_t global_dim[2] = {inner, outer};
+    uint64_t global_strides[1] = {row_bytes};
+    uint32_t box_dim[2] = {box_inner, box_outer};
+    uint32_t element_strides[2] = {1u, 1u};
+    const CUresult res = cuTensorMapEncodeTiled(
+        &desc, type, 2, const_cast<void*>(ptr), global_dim, global_strides,
+        box_dim, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(res == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for ", what,
+                ": CUresult=", static_cast<int>(res), " (inner=", inner,
+                ", outer=", outer, ", box=(", box_inner, ", ", box_outer, "))");
+    return desc;
+}
+
+CUtensorMap CreateUpWeightTmaDesc(const void* weights_ptr, uint32_t num_experts,
+                                  uint32_t n, uint32_t k, uint32_t row_box) {
+    return CreateTmaDesc2D(
+        weights_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8, "up-projection weights",
+        /*inner=*/k,
+        /*outer=*/static_cast<uint64_t>(num_experts) * 2ULL * n,
+        /*row_bytes=*/k, /*box_inner=*/128u, /*box_outer=*/row_box);
+}
+
+CUtensorMap CreateActivationsTmaDesc(const void* activations_ptr,
+                                     uint32_t batch_size_cap,
+                                     uint32_t block_rows, uint32_t K_hidden) {
+    return CreateTmaDesc2D(activations_ptr, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                           "activations",
+                           /*inner=*/K_hidden, /*outer=*/batch_size_cap,
+                           /*row_bytes=*/static_cast<uint64_t>(K_hidden) * 2ULL,
+                           /*box_inner=*/64u, /*box_outer=*/block_rows);
+}
+
+CUtensorMap CreateDownWeightTmaDesc(const void* weights_ptr,
+                                    uint32_t num_experts, uint32_t k,
+                                    uint32_t n, uint32_t row_box) {
+    return CreateTmaDesc2D(
+        weights_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8, "down-projection weights",
+        /*inner=*/n, /*outer=*/static_cast<uint64_t>(num_experts) * k,
+        /*row_bytes=*/n, /*box_inner=*/128u, /*box_outer=*/row_box);
+}
+
+CUtensorMap CreateLatentDownWeightTmaDesc(const void* weights_ptr, uint32_t m,
+                                          uint32_t k, uint32_t row_box) {
+    return CreateTmaDesc2D(
+        weights_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8, "latent-projection weights",
+        /*inner=*/k, /*outer=*/m,
+        /*row_bytes=*/k, /*box_inner=*/128u, /*box_outer=*/row_box);
+}
+
+CUtensorMap CreateDownActivationTmaDesc(const void* activations_ptr,
+                                        uint32_t temp_rows, uint32_t block_rows,
+                                        uint32_t n) {
+    return CreateTmaDesc2D(
+        activations_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        "down-projection activations", /*inner=*/n, /*outer=*/temp_rows,
+        /*row_bytes=*/n, /*box_inner=*/128u, /*box_outer=*/block_rows);
+}
+
 template <typename MoEDims>
 void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
              const torch::Tensor& expert_up_weights,
@@ -362,22 +430,24 @@ torch::Tensor GetWorkspace(const torch::Tensor& input) {
         torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
 }
 
-void MoE(const torch::Tensor& input, const torch::Tensor& router_weight,
-         const torch::Tensor& expert_up_weights,
-         const torch::Tensor& expert_up_weights_scale,
-         const torch::Tensor& expert_down_weights,
-         const torch::Tensor& expert_down_weights_scale,
-         const torch::Tensor& shared_up_weight,
-         const torch::Tensor& shared_up_weight_scale,
-         const torch::Tensor& shared_down_weight,
-         const torch::Tensor& shared_down_weight_scale,
-         const std::optional<torch::Tensor>& latent_down_weight,
-         const std::optional<torch::Tensor>& latent_down_weight_scale,
-         const torch::Tensor& workspace, const torch::Tensor& routed_out,
-         const torch::Tensor& shared_out, int64_t top_k,
-         int64_t num_router_gates, const std::string& scoring_func,
-         bool renormalize, const std::string& activation, double situ_beta,
-         double situ_linear_beta) {
+void LowLatencyMoE(const torch::Tensor& input,
+                   const torch::Tensor& router_weight,
+                   const torch::Tensor& expert_up_weights,
+                   const torch::Tensor& expert_up_weights_scale,
+                   const torch::Tensor& expert_down_weights,
+                   const torch::Tensor& expert_down_weights_scale,
+                   const torch::Tensor& shared_up_weight,
+                   const torch::Tensor& shared_up_weight_scale,
+                   const torch::Tensor& shared_down_weight,
+                   const torch::Tensor& shared_down_weight_scale,
+                   const std::optional<torch::Tensor>& latent_down_weight,
+                   const std::optional<torch::Tensor>& latent_down_weight_scale,
+                   const torch::Tensor& workspace,
+                   const torch::Tensor& routed_out,
+                   const torch::Tensor& shared_out, int64_t top_k,
+                   int64_t num_router_gates, const std::string& scoring_func,
+                   bool renormalize, const std::string& activation,
+                   double situ_beta, double situ_linear_beta) {
     MOE_CHECK_TENSOR_TYPE(input, at::kBFloat16);
     MOE_CHECK_TENSOR_TYPE(router_weight, at::kBFloat16);
     MOE_CHECK_TENSOR_TYPE(expert_up_weights, at::kFloat8_e4m3fn);

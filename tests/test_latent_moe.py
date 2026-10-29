@@ -18,7 +18,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import halops.moe as op
+from halops import (
+    get_workspace_for_moe,
+    latent_moe,
+    transform_weights_for_moe,
+)
 
 _FP8_MAX = 448.0  # e4m3 dynamic range
 
@@ -56,7 +60,7 @@ def _quant_fp8_per_token(x, block_size=128):
 
 
 class MoEParams:
-    """One `op.moe` call: the knobs, plus the operands `init_weights` fills."""
+    """One `latent_moe` call: the knobs, plus the operands `init_weights` fills."""
 
     def __init__(self, use_latent=True, activation="silu"):
         self.hidden_size = 4096
@@ -322,7 +326,7 @@ class MoEFused:
     def __call__(self, input, top_k):
         num_tokens = input.size(0)
         if self.packed_weights is None:
-            self.packed_weights = op.transform_weights_for_moe(
+            self.packed_weights = transform_weights_for_moe(
                 self.moe_params.router_weight,
                 self.moe_params.expert_up_weights,
                 self.moe_params.shared_up_weight,
@@ -332,7 +336,7 @@ class MoEFused:
             )
 
         if self.workspace is None:
-            self.workspace = op.get_workspace_for_moe(input)
+            self.workspace = get_workspace_for_moe(input)
 
         routed_out = torch.empty(
             num_tokens,
@@ -346,7 +350,7 @@ class MoEFused:
             dtype=torch.bfloat16,
             device=input.device,
         )
-        op.moe(
+        latent_moe(
             input,
             self.packed_weights["router_weight"],
             self.packed_weights["expert_up_weights"],

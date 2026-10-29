@@ -31,24 +31,24 @@
 namespace halops::moe {
 
 // Build a `CUtensorMap` for the fp8 up-projection weight `[E, 2*n, k]`.
-CUtensorMap create_up_weight_tma_desc(const void* weights_ptr,
-                                      uint32_t num_experts, uint32_t n,
-                                      uint32_t k, uint32_t row_box = 128u);
+CUtensorMap CreateUpWeightTmaDesc(const void* weights_ptr, uint32_t num_experts,
+                                  uint32_t n, uint32_t k,
+                                  uint32_t row_box = 128u);
 
 // Build a `CUtensorMap` for the bf16 activation `[BS, K_hidden]`.
-CUtensorMap create_activations_tma_desc(const void* activations_ptr,
-                                        uint32_t batch_size_cap,
-                                        uint32_t block_rows, uint32_t K_hidden);
+CUtensorMap CreateActivationsTmaDesc(const void* activations_ptr,
+                                     uint32_t batch_size_cap,
+                                     uint32_t block_rows, uint32_t K_hidden);
 
 // Build a `CUtensorMap` for the fp8 down-projection weight `[E, k, n]`.
-CUtensorMap create_down_weight_tma_desc(const void* weights_ptr,
-                                        uint32_t num_experts, uint32_t k,
-                                        uint32_t n, uint32_t row_box = 128u);
+CUtensorMap CreateDownWeightTmaDesc(const void* weights_ptr,
+                                    uint32_t num_experts, uint32_t k,
+                                    uint32_t n, uint32_t row_box = 128u);
 
 // Build a `CUtensorMap` for the fp8 intermediate activation.
-CUtensorMap create_down_activation_tma_desc(const void* activations_ptr,
-                                            uint32_t temp_rows,
-                                            uint32_t block_rows, uint32_t n);
+CUtensorMap CreateDownActivationTmaDesc(const void* activations_ptr,
+                                        uint32_t temp_rows, uint32_t block_rows,
+                                        uint32_t n);
 
 // L2 eviction hint for the expert weights, streamed once per launch: an
 // active set that fits in L2 is worth keeping, otherwise evict first.
@@ -126,9 +126,8 @@ __device__ __forceinline__ void tma_load_down_umma_tile(
 }
 
 // Build a `CUtensorMap` for the shared latent down weight `[m, k]` (fp8).
-CUtensorMap create_latent_down_weight_tma_desc(const void* weights_ptr,
-                                               uint32_t m, uint32_t k,
-                                               uint32_t row_box);
+CUtensorMap CreateLatentDownWeightTmaDesc(const void* weights_ptr, uint32_t m,
+                                          uint32_t k, uint32_t row_box);
 
 // Issue one 128x128 fp8 weight tile of the latent down-projection into SHM.
 __device__ __forceinline__ void tma_load_latent_down_weight_tile(

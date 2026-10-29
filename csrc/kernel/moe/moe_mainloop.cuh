@@ -163,7 +163,7 @@ struct CollectiveMainloopMoE {
                       Traits::kExpertWeightBytes)
                 : 0xFFFFFFFFu;
 
-        params.tma_up_weights_desc = create_up_weight_tma_desc(
+        params.tma_up_weights_desc = CreateUpWeightTmaDesc(
             reinterpret_cast<const void*>(args.expert_up_weights),
             Dims::kNumExperts, Dims::kIntermediateSize,
             MoEInputSize<Dims>::value);
@@ -171,11 +171,11 @@ struct CollectiveMainloopMoE {
         // against globalDim and zero-fills out-of-bounds box rows.
         // The box is one 8-row swizzle atom; a ring taller than that issues
         // one box per atom.
-        params.tma_input_desc = create_activations_tma_desc(
+        params.tma_input_desc = CreateActivationsTmaDesc(
             reinterpret_cast<const void*>(args.input), args.num_tokens,
             /*block_rows=*/8u, Dims::kHiddenSize);
         if constexpr (Traits::kUseLatent && !Traits::kLatentQuantizeOutput) {
-            params.tma_latent_out_desc = create_activations_tma_desc(
+            params.tma_latent_out_desc = CreateActivationsTmaDesc(
                 reinterpret_cast<const void*>(
                     reinterpret_cast<Workspace*>(args.workspace)
                         ->latent_down_out.data_ptr()),
@@ -183,25 +183,25 @@ struct CollectiveMainloopMoE {
         }
         // row_box pinned to 128: the down tile's M can exceed the
         // 256-row boxDim cap.
-        params.tma_down_weights_desc = create_down_weight_tma_desc(
+        params.tma_down_weights_desc = CreateDownWeightTmaDesc(
             reinterpret_cast<const void*>(args.expert_down_weights),
             Dims::kNumExperts, MoEInputSize<Dims>::value,
             Dims::kIntermediateSize,
             /*row_box=*/128u);
         // The down activations live inside the scratchpad at
         // kUpOutFp8Offset.
-        params.tma_down_activations_desc = create_down_activation_tma_desc(
+        params.tma_down_activations_desc = CreateDownActivationTmaDesc(
             reinterpret_cast<const char*>(args.workspace) +
                 Workspace::kUpOutFp8Offset,
             Workspace::kMaxRoutedRows, Dims::kNumTokens,
             Dims::kIntermediateSize);
         if constexpr (Traits::kUseSharedExpert) {
             if (args.shared_out != nullptr) {
-                params.tma_shared_up_desc = create_up_weight_tma_desc(
+                params.tma_shared_up_desc = CreateUpWeightTmaDesc(
                     reinterpret_cast<const void*>(args.shared_up_weight),
                     /*num_experts=*/1u, Dims::kIntermediateSize,
                     Dims::kHiddenSize, SharedUpGemmTraits<Dims>::kTileShapeM);
-                params.tma_shared_down_desc = create_down_weight_tma_desc(
+                params.tma_shared_down_desc = CreateDownWeightTmaDesc(
                     reinterpret_cast<const void*>(args.shared_down_weight),
                     /*num_experts=*/1u, Dims::kHiddenSize,
                     Dims::kIntermediateSize,
@@ -209,11 +209,10 @@ struct CollectiveMainloopMoE {
             }
         }
         if (args.latent_down_weight != nullptr) {
-            params.tma_latent_down_weight_desc =
-                create_latent_down_weight_tma_desc(
-                    reinterpret_cast<const void*>(args.latent_down_weight),
-                    Dims::kLatentSize, Dims::kHiddenSize,
-                    Traits::LatentDownGemm::kTileShapeM);
+            params.tma_latent_down_weight_desc = CreateLatentDownWeightTmaDesc(
+                reinterpret_cast<const void*>(args.latent_down_weight),
+                Dims::kLatentSize, Dims::kHiddenSize,
+                Traits::LatentDownGemm::kTileShapeM);
         }
         return params;
     }
