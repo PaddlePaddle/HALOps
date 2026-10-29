@@ -163,6 +163,29 @@ void MlaOutputProj(const torch::Tensor& wo_a_weight,
                    const torch::Tensor& wo_b_sf, torch::Tensor& out,
                    const torch::Tensor& workspace);
 
+void MoE(const torch::Tensor& input, const torch::Tensor& router_weight,
+         const torch::Tensor& expert_up_weights,
+         const torch::Tensor& expert_up_weights_scale,
+         const torch::Tensor& expert_down_weights,
+         const torch::Tensor& expert_down_weights_scale,
+         const torch::Tensor& shared_up_weight,
+         const torch::Tensor& shared_up_weight_scale,
+         const torch::Tensor& shared_down_weight,
+         const torch::Tensor& shared_down_weight_scale,
+         const std::optional<torch::Tensor>& latent_down_weight,
+         const std::optional<torch::Tensor>& latent_down_weight_scale,
+         const torch::Tensor& workspace, const torch::Tensor& routed_out,
+         const torch::Tensor& shared_out, int64_t top_k,
+         int64_t num_router_gates, const std::string& scoring_func,
+         bool renormalize, const std::string& activation, double situ_beta,
+         double situ_linear_beta);
+
+torch::Tensor GetWorkspace(const torch::Tensor& input);
+
+int64_t GetWorkspaceSize(const std::optional<torch::Tensor>& input);
+
+int64_t RouterTileM(int64_t num_tokens);
+
 }  // namespace halops
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -191,4 +214,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mla_attention", &halops::MlaAttention);
     m.def("combine_with_rope_quant", &halops::CombineWithRopeQuant);
     m.def("mla_output_proj", &halops::MlaOutputProj);
+
+    m.def("moe", &halops::MoE);
+    m.def("moe_get_workspace", &halops::GetWorkspace, py::arg("input"));
+    m.def("moe_get_workspace_size", &halops::GetWorkspaceSize,
+          py::arg("input") = py::none());
+    m.def("moe_router_tile_m", &halops::RouterTileM, py::arg("num_tokens") = 0);
 }
