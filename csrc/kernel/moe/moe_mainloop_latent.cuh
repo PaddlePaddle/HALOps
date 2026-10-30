@@ -20,14 +20,14 @@
 #include <cstdint>
 #include <cute/tensor.hpp>
 
-#include "mma_core.cuh"
-#include "moe_configs.cuh"
-#include "moe_input.cuh"
-#include "moe_shared_storage.cuh"
-#include "moe_tma.h"
-#include "moe_traits.cuh"
-#include "moe_workspace.cuh"
-#include "ptx_utils.cuh"
+#include "kernel/moe/mma_core.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_input.cuh"
+#include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_tma.cuh"
+#include "kernel/moe/moe_traits.cuh"
+#include "kernel/moe/moe_workspace.cuh"
+#include "kernel/moe/ptx_utils.cuh"
 
 namespace halops::moe {
 
@@ -179,7 +179,7 @@ struct LatentDownProjectionBase {
         WarpRole::sync_calc_threads();
         if (threadIdx.x == 0u) {
             __threadfence();
-            workspace->handoff.publish_latent_tasks(smem->launch_parity, 1u);
+            workspace->cta_comm.publish_latent_tasks(smem->launch_parity, 1u);
         }
     }
 
@@ -313,7 +313,7 @@ struct LatentDownProjectionBase {
         __syncthreads();
         if (threadIdx.x == 0u) {
             __threadfence();
-            workspace->handoff.publish_latent_tasks(smem->launch_parity, 1u);
+            workspace->cta_comm.publish_latent_tasks(smem->launch_parity, 1u);
         }
     }
 };

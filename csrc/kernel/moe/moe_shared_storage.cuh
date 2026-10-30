@@ -22,10 +22,9 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/tensor.hpp>
 
-#include "moe_configs.cuh"
-#include "moe_interface.h"
-#include "moe_traits.cuh"
-#include "ptx_utils.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_traits.cuh"
+#include "kernel/moe/ptx_utils.cuh"
 
 namespace halops::moe {
 
@@ -138,18 +137,17 @@ struct TransactionBarrier : BarrierRingBase<N> {
 template <typename Dims>
 struct MoEBarriers {
     static constexpr std::uint32_t kNumUpWeightSlots =
-        NumUpWeightSlots<Dims>::value;
+        Dims::KernelConfig::kNumUpWeightSlots;
     static constexpr std::uint32_t kNumDownWeightSlots =
-        NumDownWeightSlots<Dims>::value;
+        Dims::KernelConfig::kNumDownWeightSlots;
     static constexpr std::uint32_t kNumScaleSlots = 2;
     static constexpr std::uint32_t kNumActivationSlots = kNumDownWeightSlots;
     static constexpr std::uint32_t kNumAccumulatorSlots =
-        NumAccSlots<Dims>::value;
+        Dims::KernelConfig::kNumAccSlots;
     static constexpr std::uint32_t kNumRouterWeightSlots =
         RouterGemmTraits<Dims>::kNumWeightSlots;
 
     // LatentDown
-    static constexpr std::uint32_t kNumInputSlots = NumInputSlots<Dims>::value;
     static constexpr std::uint32_t kNumLatentWeightSlots =
         LatentDownGemmTraits<Dims>::kNumWeightSlots;
     TransactionBarrier<MoEKernelTraits<Dims>::kLatentInputSlots>

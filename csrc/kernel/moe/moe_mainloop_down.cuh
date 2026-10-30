@@ -22,16 +22,15 @@
 #include <cute/atom/mma_traits_sm100.hpp>
 #include <cute/tensor.hpp>
 
-#include "mma_core.cuh"
-#include "moe_configs.cuh"
-#include "moe_handoff.cuh"
-#include "moe_interface.h"
-#include "moe_scheduler.cuh"
-#include "moe_shared_storage.cuh"
-#include "moe_tma.h"
-#include "moe_traits.cuh"
-#include "moe_workspace.cuh"
-#include "ptx_utils.cuh"
+#include "kernel/moe/mma_core.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_cta_comm.cuh"
+#include "kernel/moe/moe_scheduler.cuh"
+#include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_tma.cuh"
+#include "kernel/moe/moe_traits.cuh"
+#include "kernel/moe/moe_workspace.cuh"
+#include "kernel/moe/ptx_utils.cuh"
 
 namespace halops::moe {
 
@@ -284,7 +283,7 @@ struct DownProjection {
         while (sched.get_next_task(task)) {
             std::uint64_t done_inc = 1u;
             if constexpr (Traits::kCombineWaitPerToken) {
-                done_inc = TokenCountFields<Dims>::increment(
+                done_inc = PackedTokenCounts<Dims>::increment(
                     smem->routing.token_mask(task.local_expert_idx));
             }
             // Polled at full rate: a backoff would delay the publish it
@@ -292,8 +291,8 @@ struct DownProjection {
             while (shared_load_acquire_u32(&smem->down_task_stores) <
                    WarpRole::kCalcWarpCount * (task.task_id + 1u)) {
             }
-            workspace->handoff.publish_down_task(smem->launch_parity,
-                                                 task.m_block_idx, done_inc);
+            workspace->cta_comm.publish_down_task(smem->launch_parity,
+                                                  task.m_block_idx, done_inc);
         }
     }
 
@@ -312,9 +311,9 @@ struct DownProjection {
                 smem->routed_experts.w_down_scale);
         } else if (warp_idx == 1u) {
             // Every lane acquires: each lane loads up_out_scale itself.
-            workspace->handoff.wait_up_out(smem->launch_parity, expert_start,
-                                           routed_count,
-                                           Workspace::kUpOutReadyFull);
+            workspace->cta_comm.wait_up_out(smem->launch_parity, expert_start,
+                                            routed_count,
+                                            Workspace::kUpOutReadyFull);
             load_down_act_scale<
                 Dims, DownGemm::kGemmK / Traits::UpGemm::kActQuantBlock,
                 DownGemm::kTileShapeN>(workspace, expert_start, routed_count,
@@ -398,9 +397,9 @@ struct DownProjection {
         std::uint32_t local_id, std::uint32_t expert_start,
         std::uint32_t routed_count) {
         // Acquire the routed_up_out readiness bitmask.
-        workspace->handoff.wait_up_out(smem->launch_parity, expert_start,
-                                       routed_count,
-                                       Workspace::kUpOutReadyFull);
+        workspace->cta_comm.wait_up_out(smem->launch_parity, expert_start,
+                                        routed_count,
+                                        Workspace::kUpOutReadyFull);
 
 #pragma unroll
         for (std::uint32_t k_iter_id = 0; k_iter_id < kNumTilesK; ++k_iter_id) {

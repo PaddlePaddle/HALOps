@@ -217,7 +217,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("combine_with_rope_quant", &halops::CombineWithRopeQuant);
     m.def("mla_output_proj", &halops::MlaOutputProj);
 
-    m.def("moe", &halops::LowLatencyMoE);
+    m.def("low_latency_moe", &halops::LowLatencyMoE);
     m.def("moe_get_workspace", &halops::GetWorkspace, py::arg("input"));
     m.def("moe_get_workspace_size", &halops::GetWorkspaceSize,
           py::arg("input") = py::none());

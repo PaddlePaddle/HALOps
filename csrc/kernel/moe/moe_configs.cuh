@@ -14,15 +14,113 @@
 
 #pragma once
 
+#include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cutlass/cutlass.h>
 
 #include <cstdint>
 
-#include "moe_interface.h"
-
 #define FULL_MASK 0xFFFFFFFFU
 
 namespace halops::moe {
+
+// Tensor-core instruction family of an MMA.
+enum class MmaKind : uint32_t {
+    kUmma = 0,  // tcgen05 UMMA on the MMA issuer warp; calc warps stay free
+    kHmma = 1,  // warp-level mma.sync on the calc warps
+};
+
+template <bool UseLatent = true>
+struct Dims_BS8_E512_N512_K2048_SM100 {
+    static constexpr uint32_t kHiddenSize = 4096;
+    static constexpr uint32_t kIntermediateSize = 512;
+    static constexpr std::uint32_t kLatentSize = 2048;
+    static constexpr uint32_t kNumTokens = 8;
+    static constexpr uint32_t kNumExperts = 512;
+    static constexpr uint32_t kMaxTopk = 10;
+    static constexpr uint32_t kQuantBlockM = 128;
+    static constexpr uint32_t kQuantBlockK = 128;
+    static constexpr bool kUseLatent = UseLatent;
+    static constexpr std::uint32_t kNumRouterGates = 2;
+    struct KernelConfig {
+        static constexpr std::uint32_t kBlockSize = 384;
+        static constexpr std::uint32_t kNumRouterInputSlots = 8;
+        static constexpr std::uint32_t kNumLatentInputSlots = 8;
+        static constexpr std::uint32_t kNumUpInputSlots = 8;
+        // Router configs.
+        static constexpr std::uint32_t kNumRouterWeightSlots = 16;
+        static constexpr std::uint32_t kNumCtasForRouter = 32;
+        static constexpr MmaKind kRouterMma = MmaKind::kHmma;
+        // LatentDown configs.
+        static constexpr std::uint32_t kNumLatentDownWeightSlots = 16;
+        static constexpr std::uint32_t kNumCtasForLatentDown = 64;
+        static constexpr MmaKind kLatentDownMma = MmaKind::kHmma;
+        static constexpr bool kLatentDownUseSplitK = false;
+        static constexpr bool kLatentQuantizeOutput = true;
+        // SharedExpert configs.
+        static constexpr bool kUseSharedExpert = true;
+        static constexpr std::uint32_t kNumCtasForShared = 16;
+        static constexpr bool kSharedUseSplitK = false;
+        static constexpr std::uint32_t kNumSharedUpWeightSlots = 4;
+        static constexpr std::uint32_t kNumSharedDownWeightSlots = 4;
+        // MoE configs.
+        static constexpr std::uint32_t kCtasPerExpert = 8;
+        static constexpr std::uint32_t kUpTileShapeK = 256;
+        static constexpr std::uint32_t kNumUpWeightSlots = 4;
+        static constexpr std::uint32_t kNumDownWeightSlots = 4;
+        static constexpr std::uint32_t kNumAccSlots = 4;
+        static constexpr bool kCombineWaitPerToken = true;
+    };
+};
+
+template <bool UseLatent = true>
+struct Dims_BS16_E512_N512_K2048_SM100
+    : Dims_BS8_E512_N512_K2048_SM100<UseLatent> {
+    static constexpr uint32_t kNumTokens = 16;
+    struct KernelConfig
+        : Dims_BS8_E512_N512_K2048_SM100<UseLatent>::KernelConfig {
+        static constexpr std::uint32_t kNumUpInputSlots = 4;
+        // Router configs.
+        static constexpr std::uint32_t kNumCtasForRouter = 32;
+        static constexpr std::uint32_t kNumRouterWeightSlots = 8;
+        static constexpr std::uint32_t kNumRouterInputSlots = 16;
+        static constexpr MmaKind kRouterMma = MmaKind::kHmma;
+        // LatentDown configs.
+        static constexpr std::uint32_t kNumCtasForLatentDown = 64;
+        static constexpr std::uint32_t kNumLatentDownWeightSlots = 8;
+        static constexpr MmaKind kLatentDownMma = MmaKind::kUmma;
+        static constexpr bool kLatentDownUseSplitK = true;
+        // SharedExpert configs.
+        static constexpr bool kSharedUseSplitK = true;
+    };
+};
+
+// Scoring function for the router.
+enum class ScoringFunc : uint32_t {
+    kSigmoid = 0,
+    kSoftmax = 1,
+};
+
+// Expert activation of the up-projection epilogue: how the gate and up halves
+// of the expert's fc1 output are combined before re-quantization.
+enum class Activation : uint32_t {
+    kSilu = 0,  // silu(gate) * up -- unbounded
+    kSitu = 1,  // SiTU-GLU -- output bounded by beta * linear_beta
+};
+
+// The MMA's B operand walks K in 16-B chunks, its descriptor's leading byte
+// offset.
+inline constexpr std::uint32_t kFp8ActChunkK = 16u;
+
+struct DataType {
+    using ElementW = __nv_fp8_e4m3;    // expert weights
+    using ElementA = __nv_bfloat16;    // activations as they go into the GEMM
+    using ElementQA = __nv_fp8_e4m3;   // activations after quantization
+    using ElementScale = float;        // scaling factors
+    using ElementOut = __nv_bfloat16;  // MoE output
+    using ElementAcc = float;          // fp32 accumulators
+};
 
 // A register fragment of `N` elements of `T`, left uninitialized.
 template <typename T, std::uint32_t N>
@@ -75,154 +173,9 @@ struct ZeroedFragment<N, 1u> {
     }
 };
 
-// Down-proj weight/activation TMA pipeline depth (`kNumDownWeightSlots`).
-template <typename Dims>
-struct NumDownWeightSlots {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumDownWeightSlots)) {
-        return static_cast<std::uint32_t>(D::KernelConfig::kNumDownWeightSlots);
-    }
-    template <typename D>
-    static constexpr std::uint32_t test(...) {
-        return D::kIntermediateSize / 128u;  // the down tile's K
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-// CTAs sharing one expert.
-template <typename Dims>
-struct CtasPerExpert {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kCtasPerExpert)) {
-        return static_cast<std::uint32_t>(D::KernelConfig::kCtasPerExpert);
-    }
-    template <typename>
-    static constexpr std::uint32_t test(...) {
-        return (Dims::kIntermediateSize * 2) / 128u;
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
 template <bool kCondition, std::uint32_t kTrue, std::uint32_t kFalse>
 struct Select {
     static constexpr std::uint32_t value = kCondition ? kTrue : kFalse;
-};
-
-// CTAs that split the router Linear's expert dimension, one M tile each.
-template <typename Dims>
-struct NumCtasForRouter {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumCtasForRouter)) {
-        return static_cast<std::uint32_t>(D::KernelConfig::kNumCtasForRouter);
-    }
-    template <typename>
-    static constexpr std::uint32_t test(...) {
-        return Dims::kNumExperts / 16u;  // the shipped 16-expert tile
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-// Depth of the router weight ring (`kNumRouterWeightSlots`).
-template <typename Dims>
-struct NumRouterWeightSlots {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumRouterWeightSlots)) {
-        return static_cast<std::uint32_t>(
-            D::KernelConfig::kNumRouterWeightSlots);
-    }
-    template <typename>
-    static constexpr std::uint32_t test(...) {
-        return Dims::kHiddenSize / 256u;  // kNumTilesK at the shipped K tile
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-// Depth of the streamed-input ring (`kNumInputSlots`).
-template <typename Dims>
-struct NumInputSlots {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumInputSlots)) {
-        return static_cast<std::uint32_t>(D::KernelConfig::kNumInputSlots);
-    }
-    template <typename D>
-    static constexpr std::uint32_t test(...) {
-        // One slot per router K tile (256 K) of the latent output.
-        return D::kLatentSize / 256u;
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-// Streamed-input ring depth of the router (`kNumInputSlots`).
-template <typename Dims>
-struct NumRouterInputSlots {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumRouterInputSlots)) {
-        return static_cast<std::uint32_t>(
-            D::KernelConfig::kNumRouterInputSlots);
-    }
-    template <typename>
-    static constexpr std::uint32_t test(...) {
-        return NumInputSlots<Dims>::value;
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-template <typename Dims>
-struct NumLatentInputSlots {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumLatentInputSlots)) {
-        return static_cast<std::uint32_t>(
-            D::KernelConfig::kNumLatentInputSlots);
-    }
-    template <typename>
-    static constexpr std::uint32_t test(...) {
-        return NumInputSlots<Dims>::value;
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-template <typename Dims>
-struct NumUpInputSlots {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumUpInputSlots)) {
-        return static_cast<std::uint32_t>(D::KernelConfig::kNumUpInputSlots);
-    }
-    template <typename>
-    static constexpr std::uint32_t test(...) {
-        return NumInputSlots<Dims>::value;
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
 };
 
 // Width the experts reduce over (`up`) and produce (`down`).
@@ -239,271 +192,6 @@ struct RouterTokenWindows {
     static_assert(Dims::kNumTokens % kWindow == 0u,
                   "the token width must be whole 8-token windows");
     static constexpr std::uint32_t value = Dims::kNumTokens / kWindow;
-};
-
-template <typename Dims>
-struct UpTileShapeK {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kUpTileShapeK)) {
-        return static_cast<std::uint32_t>(D::KernelConfig::kUpTileShapeK);
-    }
-    template <typename>
-    static constexpr std::uint32_t test(...) {
-        return 128u;
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-// Number of physical slots in the up-proj weight-TMA pipeline.
-template <typename Dims>
-struct NumUpWeightSlots {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumUpWeightSlots)) {
-        return static_cast<std::uint32_t>(D::KernelConfig::kNumUpWeightSlots);
-    }
-    template <typename D>
-    static constexpr std::uint32_t test(...) {
-        // A 128 KiB ring of up tiles, M x K fp8 bytes each.
-        constexpr std::uint32_t kSlotBytes =
-            (2u * D::kIntermediateSize / CtasPerExpert<D>::value) *
-            UpTileShapeK<D>::value;
-        return (128u * 1024u) / kSlotBytes;
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-// Latent down-projection weight-TMA pipeline depth
-// (`kNumLatentDownWeightSlots`).
-template <typename Dims>
-struct NumLatentDownWeightSlots {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumLatentDownWeightSlots)) {
-        return static_cast<std::uint32_t>(
-            D::KernelConfig::kNumLatentDownWeightSlots);
-    }
-    template <typename D>
-    static constexpr std::uint32_t test(...) {
-        return (128u * 1024u) / (D::kQuantBlockM * D::kQuantBlockK);
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-// TMEM accumulator ring depth (`kNumAccSlots`).
-template <typename Dims>
-struct NumAccSlots {
-  private:
-    template <typename D>
-    static constexpr auto test(int)
-        -> decltype(static_cast<std::uint32_t>(D::KernelConfig::kNumAccSlots)) {
-        return static_cast<std::uint32_t>(D::KernelConfig::kNumAccSlots);
-    }
-    template <typename D>
-    static constexpr std::uint32_t test(...) {
-        constexpr std::uint32_t kUp = NumUpWeightSlots<D>::value;
-        constexpr std::uint32_t kDown = D::kIntermediateSize / 128u;
-        return (kUp > kDown) ? kUp : kDown;
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-// Router Linear instruction family (`kRouterMma`), UMMA by default.
-template <typename Dims>
-struct RouterMmaKind {
-  private:
-    template <typename D>
-    static constexpr auto test(int)
-        -> decltype(static_cast<MmaKind>(D::KernelConfig::kRouterMma)) {
-        return static_cast<MmaKind>(D::KernelConfig::kRouterMma);
-    }
-    template <typename>
-    static constexpr MmaKind test(...) {
-        return MmaKind::kUmma;
-    }
-
-  public:
-    static constexpr MmaKind value = test<Dims>(0);
-};
-
-// Latent down-projection instruction family (`kLatentDownMma`).
-template <typename Dims>
-struct LatentDownMmaKind {
-  private:
-    template <typename D>
-    static constexpr auto test(int)
-        -> decltype(static_cast<MmaKind>(D::KernelConfig::kLatentDownMma)) {
-        return static_cast<MmaKind>(D::KernelConfig::kLatentDownMma);
-    }
-    template <typename>
-    static constexpr MmaKind test(...) {
-        return MmaKind::kUmma;
-    }
-
-  public:
-    static constexpr MmaKind value = test<Dims>(0);
-};
-
-// Latent down-projection CTA count (`kNumCtasForLatentDown`).
-template <typename Dims>
-struct NumCtasForLatentDown {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumCtasForLatentDown)) {
-        return static_cast<std::uint32_t>(
-            D::KernelConfig::kNumCtasForLatentDown);
-    }
-    template <typename D>
-    static constexpr std::uint32_t test(...) {
-        return D::kLatentSize / 128u;
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-// Which side quantizes the latent projection's output
-// (`kLatentQuantizeOutput`).
-template <typename Dims>
-struct LatentQuantizeOutput {
-  private:
-    template <typename D>
-    static constexpr auto test(int)
-        -> decltype(static_cast<bool>(D::KernelConfig::kLatentQuantizeOutput)) {
-        return static_cast<bool>(D::KernelConfig::kLatentQuantizeOutput);
-    }
-    template <typename>
-    static constexpr bool test(...) {
-        return false;
-    }
-
-  public:
-    static constexpr bool value = test<Dims>(0);
-};
-
-// The shared expert's CTA count (`kNumCtasForShared`).
-template <typename Dims>
-struct NumCtasForShared {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumCtasForShared)) {
-        return static_cast<std::uint32_t>(D::KernelConfig::kNumCtasForShared);
-    }
-    template <typename D>
-    static constexpr std::uint32_t test(...) {
-        return D::kHiddenSize / D::kIntermediateSize;
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-// Whether the shared up splits its reduction over a cluster group
-// (`kSharedUseSplitK`).
-template <typename Dims>
-struct SharedUseSplitK {
-  private:
-    template <typename D>
-    static constexpr auto test(int)
-        -> decltype(static_cast<bool>(D::KernelConfig::kSharedUseSplitK)) {
-        return static_cast<bool>(D::KernelConfig::kSharedUseSplitK);
-    }
-    template <typename D>
-    static constexpr bool test(...) {
-        return true;
-    }
-
-  public:
-    static constexpr bool value = test<Dims>(0);
-};
-
-// Whether the latent projection splits its reduction over a cluster group
-// (`kLatentDownUseSplitK`).
-template <typename Dims>
-struct LatentDownUseSplitK {
-  private:
-    template <typename D>
-    static constexpr auto test(int)
-        -> decltype(static_cast<bool>(D::KernelConfig::kLatentDownUseSplitK)) {
-        return static_cast<bool>(D::KernelConfig::kLatentDownUseSplitK);
-    }
-    template <typename D>
-    static constexpr bool test(...) {
-        return false;
-    }
-
-  public:
-    static constexpr bool value = test<Dims>(0);
-};
-
-// Physical slot counts of the shared expert's two weight rings
-// (`kNumSharedUpWeightSlots` / `kNumSharedDownWeightSlots`).
-template <typename Dims>
-struct NumSharedUpWeightSlots {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumSharedUpWeightSlots)) {
-        return static_cast<std::uint32_t>(
-            D::KernelConfig::kNumSharedUpWeightSlots);
-    }
-    template <typename>
-    static constexpr std::uint32_t test(...) {
-        return 2u;
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-template <typename Dims>
-struct NumSharedDownWeightSlots {
-  private:
-    template <typename D>
-    static constexpr auto test(int) -> decltype(static_cast<std::uint32_t>(
-        D::KernelConfig::kNumSharedDownWeightSlots)) {
-        return static_cast<std::uint32_t>(
-            D::KernelConfig::kNumSharedDownWeightSlots);
-    }
-    template <typename>
-    static constexpr std::uint32_t test(...) {
-        return 2u;
-    }
-
-  public:
-    static constexpr std::uint32_t value = test<Dims>(0);
-};
-
-// Combine readiness granularity (`kCombineWaitPerToken`).
-template <typename Dims>
-struct CombineWaitPerToken {
-  private:
-    template <typename D>
-    static constexpr auto test(int)
-        -> decltype(static_cast<bool>(D::KernelConfig::kCombineWaitPerToken)) {
-        return static_cast<bool>(D::KernelConfig::kCombineWaitPerToken);
-    }
-    template <typename>
-    static constexpr bool test(...) {
-        return false;
-    }
-
-  public:
-    static constexpr bool value = test<Dims>(0);
 };
 
 struct WarpRole {
@@ -584,20 +272,6 @@ struct WarpRole {
         asm volatile("bar.sync 14, %0;\n" ::"n"(kThreads) : "memory");
     }
 };
-
-// Warp-wide max reduction; the result is returned on all lanes.
-__device__ static inline float warp_reduce_max_float(float value) {
-#if defined(__CUDA_ARCH__) && defined(__CUDA_ARCH_FEAT_SM100_ALL)
-    float result;
-    asm("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(result) : "f"(value));
-    return result;
-#else
-    for (int i = 16; i >= 1; i /= 2) {
-        value = fmaxf(__shfl_xor_sync(0xffffffff, value, i, 32), value);
-    }
-    return value;
-#endif
-}
 
 // Upper bound on the launch grid.
 constexpr std::uint32_t kSpecMaxGrid = 256u;

@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from halops import (
     get_workspace_for_moe,
-    latent_moe,
+    low_latency_moe,
     transform_weights_for_moe,
 )
 
@@ -60,7 +60,7 @@ def _quant_fp8_per_token(x, block_size=128):
 
 
 class MoEParams:
-    """One `latent_moe` call: the knobs, plus the operands `init_weights` fills."""
+    """One `low_latency_moe` call: the knobs, plus the operands `init_weights` fills."""
 
     def __init__(self, use_latent=True, activation="silu"):
         self.hidden_size = 4096
@@ -350,7 +350,7 @@ class MoEFused:
             dtype=torch.bfloat16,
             device=input.device,
         )
-        latent_moe(
+        low_latency_moe(
             input,
             self.packed_weights["router_weight"],
             self.packed_weights["expert_up_weights"],

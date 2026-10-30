@@ -19,11 +19,11 @@
 #include <cfloat>
 #include <cstdint>
 
-#include "moe_configs.cuh"
-#include "moe_interface.h"
-#include "moe_shared_storage.cuh"
-#include "moe_traits.cuh"
-#include "moe_workspace.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_input.cuh"
+#include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_traits.cuh"
+#include "kernel/moe/moe_workspace.cuh"
 
 namespace halops::moe {
 

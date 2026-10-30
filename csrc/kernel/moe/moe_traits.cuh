@@ -20,9 +20,9 @@
 #include <cute/atom/mma_traits_sm100.hpp>
 #include <cute/tensor.hpp>
 
-#include "mma_core.cuh"
-#include "moe_configs.cuh"
-#include "ptx_utils.cuh"
+#include "kernel/moe/mma_core.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/ptx_utils.cuh"
 
 namespace halops::moe {
 
@@ -69,16 +69,17 @@ struct LatentDownGemmTraits {
     static constexpr std::uint32_t kGemmK = Dims::kHiddenSize;
 
     static constexpr bool kUseUmma =
-        LatentDownMmaKind<Dims>::value == MmaKind::kUmma;
+        Dims::KernelConfig::kLatentDownMma == MmaKind::kUmma;
 
-    static constexpr std::uint32_t kNumCtas = NumCtasForLatentDown<Dims>::value;
+    static constexpr std::uint32_t kNumCtas =
+        Dims::KernelConfig::kNumCtasForLatentDown;
     static constexpr std::uint32_t kTileShapeN = 8u;
 
     using GemmShape =
         GemmTileShape<kGemmM, kGemmN, kGemmK, kTileShapeN, kNumCtas, kUseUmma>;
 
     // The reduction splits over a cluster when `kLatentDownUseSplitK` is on.
-    static constexpr bool kUseSplitK = LatentDownUseSplitK<Dims>::value;
+    static constexpr bool kUseSplitK = Dims::KernelConfig::kLatentDownUseSplitK;
     static_assert(!kUseSplitK || kUseUmma,
                   "the latent split reduction needs the UMMA path");
     static constexpr std::uint32_t kNumSplits =
@@ -129,8 +130,8 @@ struct LatentDownGemmTraits {
     static constexpr std::uint32_t kWeightRingSlots =
         (128u * 1024u) / (kQuantBlocksPerTile * kTileShapeM * 128u);
     static constexpr std::uint32_t kNumWeightSlots =
-        NumLatentDownWeightSlots<Dims>::value < kWeightRingSlots
-            ? NumLatentDownWeightSlots<Dims>::value
+        Dims::KernelConfig::kNumLatentDownWeightSlots < kWeightRingSlots
+            ? Dims::KernelConfig::kNumLatentDownWeightSlots
             : kWeightRingSlots;
 };
 
@@ -142,12 +143,12 @@ struct RouterGemmTraits {
     static constexpr std::uint32_t kGemmK = Dims::kHiddenSize;
 
     static constexpr std::uint32_t kNumCtasForRouter =
-        NumCtasForRouter<Dims>::value;
+        Dims::KernelConfig::kNumCtasForRouter;
     static_assert(kNumCtasForRouter >= 1u,
                   "the router needs at least one CTA.");
 
     static constexpr bool kUseUmma =
-        RouterMmaKind<Dims>::value == MmaKind::kUmma;
+        Dims::KernelConfig::kRouterMma == MmaKind::kUmma;
 
     static constexpr std::uint32_t kNumRouterGates = Dims::kNumRouterGates;
     static_assert(kNumRouterGates == 1u || kNumRouterGates == 2u,
@@ -168,8 +169,8 @@ struct RouterGemmTraits {
     using TileShape = typename Gemm::TileShape;
 
     static constexpr std::uint32_t kNumWeightSlots =
-        NumRouterWeightSlots<Dims>::value < kNumTilesK
-            ? NumRouterWeightSlots<Dims>::value
+        Dims::KernelConfig::kNumRouterWeightSlots < kNumTilesK
+            ? Dims::KernelConfig::kNumRouterWeightSlots
             : kNumTilesK;
 
     using MmaElement = __nv_bfloat16;
@@ -197,14 +198,16 @@ struct UpGemmTraits {
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = MoEInputSize<Dims>::value;
 
-    static constexpr std::uint32_t kCtasPerExpert = CtasPerExpert<Dims>::value;
+    static constexpr std::uint32_t kCtasPerExpert =
+        Dims::KernelConfig::kCtasPerExpert;
     static constexpr bool kUseLatent = Dims::kUseLatent;
     static_assert(kGemmM % kCtasPerExpert == 0u,
                   "kCtasPerExpert must divide kGemmM (kIntermediateSize * 2).");
 
     static constexpr std::uint32_t kTileShapeM = kGemmM / kCtasPerExpert;
     static constexpr std::uint32_t kTileShapeN = kGemmN;
-    static constexpr std::uint32_t kTileShapeK = UpTileShapeK<Dims>::value;
+    static constexpr std::uint32_t kTileShapeK =
+        Dims::KernelConfig::kUpTileShapeK;
 
     using MmaElement = DataType::ElementW;
     using TileShape =
@@ -238,7 +241,7 @@ struct UpGemmTraits {
     static constexpr std::uint32_t kAccColumns = kNumSubBlocks * kTileShapeN;
 
     static constexpr std::uint32_t kNumWeightSlots =
-        NumUpWeightSlots<Dims>::value;
+        Dims::KernelConfig::kNumUpWeightSlots;
     static_assert(
         kNumWeightSlots >= 2u,
         "kNumWeightSlots must be >= 2 (the up-proj weight pipeline needs at "
@@ -252,7 +255,8 @@ struct DownGemmTraits {
     static constexpr std::uint32_t kGemmK = Dims::kIntermediateSize;
 
     static constexpr bool kUseLatent = Dims::kUseLatent;
-    static constexpr std::uint32_t kCtasPerExpert = CtasPerExpert<Dims>::value;
+    static constexpr std::uint32_t kCtasPerExpert =
+        Dims::KernelConfig::kCtasPerExpert;
     static_assert(kGemmM % kCtasPerExpert == 0u,
                   "kCtasPerExpert must divide kGemmM (kHiddenSize).");
 
@@ -281,7 +285,7 @@ struct DownGemmTraits {
         kGemmK / Dims::kQuantBlockK;
 
     static constexpr std::uint32_t kNumWeightSlots =
-        NumDownWeightSlots<Dims>::value;
+        Dims::KernelConfig::kNumDownWeightSlots;
 
     // Sub-accumulators per K step: one per activation quantization block.
     static constexpr std::uint32_t kNumSubBlocks =
@@ -308,8 +312,8 @@ struct SharedUpGemmTraits {
     static_assert(kGemmM % kTileShapeM == 0u,
                   "the slab must tile the pair layout evenly");
     static constexpr std::uint32_t kNumSplits =
-        SharedUseSplitK<Dims>::value
-            ? NumCtasForShared<Dims>::value / (kGemmM / kTileShapeM)
+        Dims::KernelConfig::kSharedUseSplitK
+            ? Dims::KernelConfig::kNumCtasForShared / (kGemmM / kTileShapeM)
             : 1u;
     static_assert(kNumSplits >= 1u, "the reduction must have a share to run");
     static constexpr std::uint32_t kNumCtas =
@@ -344,7 +348,7 @@ struct SharedUpGemmTraits {
     static constexpr std::uint32_t kAccColumns = kNumSubBlocks * kTileShapeN;
 
     static constexpr std::uint32_t kNumWeightSlots =
-        NumSharedUpWeightSlots<Dims>::value;
+        Dims::KernelConfig::kNumSharedUpWeightSlots;
     static_assert(kNumWeightSlots >= 1u,
                   "the shared up's weight ring needs at least one slot");
     static_assert(kNumWeightSlots <= kTilesKPerCta,
@@ -358,7 +362,8 @@ struct SharedDownGemmTraits {
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = Dims::kIntermediateSize;
 
-    static constexpr std::uint32_t kNumCtas = NumCtasForShared<Dims>::value;
+    static constexpr std::uint32_t kNumCtas =
+        Dims::KernelConfig::kNumCtasForShared;
     static_assert(kGemmM % kNumCtas == 0u,
                   "the blocks must tile the hidden width evenly");
 
@@ -388,7 +393,7 @@ struct SharedDownGemmTraits {
         MmaCore::kNumAtomMs * kNumSubBlocks * kTileShapeN;
 
     static constexpr std::uint32_t kNumWeightSlots =
-        NumSharedDownWeightSlots<Dims>::value;
+        Dims::KernelConfig::kNumSharedDownWeightSlots;
     static_assert(kNumWeightSlots >= 1u,
                   "the shared down's weight ring needs at least one slot");
 };
@@ -402,13 +407,14 @@ struct MoEKernelTraits {
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
 
     static constexpr std::uint32_t kThreads = Dims::KernelConfig::kBlockSize;
-    static constexpr std::uint32_t kCtasPerExpert = CtasPerExpert<Dims>::value;
+    static constexpr std::uint32_t kCtasPerExpert =
+        Dims::KernelConfig::kCtasPerExpert;
 
     static constexpr bool kUseLatent = Dims::kUseLatent;
 
     // Whether the projection quantizes its own output.
     static constexpr bool kLatentQuantizeOutput =
-        kUseLatent && LatentQuantizeOutput<Dims>::value;
+        kUseLatent && Dims::KernelConfig::kLatentQuantizeOutput;
     // The projection meets in a cluster for its scale or split reduction.
     static constexpr std::uint32_t kLatentScaleCluster =
         kLatentQuantizeOutput ? LatentDownGemm::kClusterSize : 1u;
@@ -435,12 +441,12 @@ struct MoEKernelTraits {
     static_assert(LatentDownGemm::kNumCtas % LatentDownGemm::kClusterSize == 0u,
                   "the projection's groups must be whole blocks");
 
-    static constexpr std::uint32_t kInputSlots = NumInputSlots<Dims>::value;
     static constexpr std::uint32_t kRouterInputSlots =
-        NumRouterInputSlots<Dims>::value;
+        Dims::KernelConfig::kNumRouterInputSlots;
     static constexpr std::uint32_t kLatentInputSlots =
-        NumLatentInputSlots<Dims>::value;
-    static constexpr std::uint32_t kUpInputSlots = NumUpInputSlots<Dims>::value;
+        Dims::KernelConfig::kNumLatentInputSlots;
+    static constexpr std::uint32_t kUpInputSlots =
+        Dims::KernelConfig::kNumUpInputSlots;
     static_assert(RouterGemm::kTileShapeN <=
                       (kUpInputSlots * RouterGemm::kTileShapeK),
                   "the up ring must hold the latent output");
@@ -460,9 +466,10 @@ struct MoEKernelTraits {
 
     // Combine readiness granularity.
     static constexpr bool kCombineWaitPerToken =
-        CombineWaitPerToken<Dims>::value;
+        Dims::KernelConfig::kCombineWaitPerToken;
 
-    static constexpr std::uint32_t kNumAccSlots = NumAccSlots<Dims>::value;
+    static constexpr std::uint32_t kNumAccSlots =
+        Dims::KernelConfig::kNumAccSlots;
     static_assert(kNumAccSlots >= 2u,
                   "kNumAccSlots must be >= 2 so the dequant warpgroup can lag "
                   "the MMA by one K-iteration.");

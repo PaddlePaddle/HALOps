@@ -17,12 +17,11 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "mma_core.cuh"
-#include "moe_configs.cuh"
-#include "moe_handoff.cuh"
-#include "moe_interface.h"
-#include "moe_shared_storage.cuh"
-#include "moe_traits.cuh"
+#include "kernel/moe/mma_core.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_cta_comm.cuh"
+#include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_traits.cuh"
 
 namespace halops::moe {
 
@@ -249,13 +248,14 @@ struct MoEWorkspace {
 
     MoERoutingTables<Dims> router_tables;
 
-    static constexpr uint32_t kCtasPerExpert = CtasPerExpert<Dims>::value;
+    static constexpr uint32_t kCtasPerExpert =
+        Dims::KernelConfig::kCtasPerExpert;
 
-    using Handoff = MoEHandoff<kSpecMaxGrid, kMaxRoutedRows,
+    using CtaComm = MoECtaComm<kSpecMaxGrid, kMaxRoutedRows,
                                RoutedUpOut::kNumScaleCols, kCtasPerExpert>;
-    static constexpr uint32_t kUpOutReadyFull = Handoff::kUpOutReadyFull;
+    static constexpr uint32_t kUpOutReadyFull = CtaComm::kUpOutReadyFull;
 
-    Handoff handoff;
+    CtaComm cta_comm;
 };
 
 }  // namespace halops::moe

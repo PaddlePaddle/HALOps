@@ -20,12 +20,11 @@
 #include <cstdint>
 #include <cute/arch/copy_sm90_tma.hpp>
 
-#include "moe_interface.h"
+#include "kernel/moe/moe_configs.cuh"
 
-// TMA descriptor encoding requires CUDA toolkit 12.0+.
 #if defined(CUDA_VERSION) && (CUDA_VERSION < 12000)
 #    error \
-        "moe_tma.h requires CUDA 12.0 or later for CUtensorMap / cuTensorMapEncodeTiled"
+        "CUDA 12.0 or later is reqiured for CUtensorMap / cuTensorMapEncodeTiled."
 #endif
 
 namespace halops::moe {

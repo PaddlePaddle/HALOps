@@ -16,8 +16,8 @@
 
 #include <cstdint>
 
-#include "moe_configs.cuh"
-#include "ptx_utils.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/ptx_utils.cuh"
 
 namespace halops::moe {
 
@@ -27,7 +27,7 @@ namespace halops::moe {
 // refills the other half for the next launch, so no consumer observes a
 // leftover from the previous launch.
 template <typename Dims>
-struct TokenCountFields {
+struct PackedTokenCounts {
     using Word = std::uint64_t;
     static constexpr std::uint32_t kWordBits = 64u;
     static constexpr std::uint32_t kNumFields = Dims::kNumTokens;
@@ -52,7 +52,7 @@ struct TokenCountFields {
 
 template <std::uint32_t kSpecMaxGrid, std::uint32_t kMaxRoutedRows,
           std::uint32_t kUpOutScaleCols, std::uint32_t kCtasPerExpert>
-struct MoEHandoff {
+struct MoECtaComm {
     // Per-block launch counter; its parity selects the double-buffer half.
     std::uint32_t launch_flip[kSpecMaxGrid];
 

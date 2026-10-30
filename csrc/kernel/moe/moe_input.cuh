@@ -21,13 +21,26 @@
 #include <cstdint>
 #include <cstring>
 
-#include "moe_configs.cuh"
-#include "moe_interface.h"
-#include "moe_shared_storage.cuh"
-#include "moe_tma.h"
-#include "moe_traits.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_tma.cuh"
+#include "kernel/moe/moe_traits.cuh"
 
 namespace halops::moe {
+
+// Warp-wide max reduction; the result is returned on all lanes.
+__device__ static inline float warp_reduce_max_float(float value) {
+#if defined(__CUDA_ARCH__) && defined(__CUDA_ARCH_FEAT_SM100_ALL)
+    float result;
+    asm("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(result) : "f"(value));
+    return result;
+#else
+    for (int i = 16; i >= 1; i /= 2) {
+        value = fmaxf(__shfl_xor_sync(0xffffffff, value, i, 32), value);
+    }
+    return value;
+#endif
+}
 
 // Issue the full per-block BF16 input TMA load: one 64-k SW128 box per
 // issue, box `kk` into `dest[kk]`.

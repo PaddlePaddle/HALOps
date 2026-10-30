@@ -21,17 +21,8 @@
 #include <optional>
 #include <string>
 
-#include "moe_kernel.cuh"
-
-#ifndef CHECK_CUDA
-#    define CHECK_CUDA(call)                                           \
-        do {                                                           \
-            cudaError_t _e = (call);                                   \
-            TORCH_CHECK(_e == cudaSuccess, "CUDA error ",              \
-                        cudaGetErrorString(_e), " at ", __FILE__, ":", \
-                        __LINE__);                                     \
-        } while (0)
-#endif
+#include "common/cuda_utils.h"
+#include "kernel/moe/moe_kernel.cuh"
 
 namespace halops {
 
@@ -210,7 +201,7 @@ uint32_t CalculateGridSize(int device, cudaStream_t stream) {
         // The >48 KB carve-out has to be opted into before the driver can
         // size the block.
         if (smem_size >= 48 * 1024) {
-            CHECK_CUDA(cudaFuncSetAttribute(
+            HALOPS_CUDA_CHECK(cudaFuncSetAttribute(
                 kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(smem_size)));
         }

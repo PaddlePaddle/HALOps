@@ -22,17 +22,16 @@
 #include <cute/atom/mma_traits_sm100.hpp>
 #include <cute/tensor.hpp>
 
-#include "mma_core.cuh"
-#include "moe_configs.cuh"
-#include "moe_handoff.cuh"
-#include "moe_input.cuh"
-#include "moe_interface.h"
-#include "moe_scheduler.cuh"
-#include "moe_shared_storage.cuh"
-#include "moe_tma.h"
-#include "moe_traits.cuh"
-#include "moe_workspace.cuh"
-#include "ptx_utils.cuh"
+#include "kernel/moe/mma_core.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_cta_comm.cuh"
+#include "kernel/moe/moe_input.cuh"
+#include "kernel/moe/moe_scheduler.cuh"
+#include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_tma.cuh"
+#include "kernel/moe/moe_traits.cuh"
+#include "kernel/moe/moe_workspace.cuh"
+#include "kernel/moe/ptx_utils.cuh"
 
 namespace halops::moe {
 
@@ -337,8 +336,8 @@ struct UpProjection {
             workspace->routed_up_out.scale_row(dest_row)[m_block_idx] =
                 block_scale;
         }
-        workspace->handoff.publish_up_out(smem->launch_parity, dest_row,
-                                          m_block_idx, lane_idx);
+        workspace->cta_comm.publish_up_out(smem->launch_parity, dest_row,
+                                           m_block_idx, lane_idx);
     }
 
     // Epilogue: the gated activation into act_up_out, then one warp per token

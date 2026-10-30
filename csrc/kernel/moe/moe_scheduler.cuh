@@ -18,9 +18,9 @@
 
 #include <cstdint>
 
-#include "moe_shared_storage.cuh"
-#include "moe_traits.cuh"
-#include "moe_workspace.cuh"
+#include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_traits.cuh"
+#include "kernel/moe/moe_workspace.cuh"
 
 namespace halops::moe {
 
@@ -90,7 +90,7 @@ class TaskScheduler {
             if (static_task < num_tasks) grid_task = static_task;
         } else if (num_tasks > num_static_tasks) {
             const std::uint32_t claimed =
-                workspace_->handoff.claim_down_task(smem_->launch_parity);
+                workspace_->cta_comm.claim_down_task(smem_->launch_parity);
             if (claimed < num_tasks - num_static_tasks)
                 grid_task = num_static_tasks + claimed;
         }

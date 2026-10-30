@@ -19,19 +19,19 @@
 
 #include <cute/arch/copy_sm90_desc.hpp>
 
-#include "moe_handoff.cuh"
-#include "moe_input.cuh"
-#include "moe_interface.h"
-#include "moe_mainloop_down.cuh"
-#include "moe_mainloop_latent.cuh"
-#include "moe_mainloop_router.cuh"
-#include "moe_mainloop_shared.cuh"
-#include "moe_mainloop_up.cuh"
-#include "moe_scheduler.cuh"
-#include "moe_shared_storage.cuh"
-#include "moe_tma.h"
-#include "moe_traits.cuh"
-#include "moe_workspace.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_cta_comm.cuh"
+#include "kernel/moe/moe_input.cuh"
+#include "kernel/moe/moe_mainloop_down.cuh"
+#include "kernel/moe/moe_mainloop_latent.cuh"
+#include "kernel/moe/moe_mainloop_router.cuh"
+#include "kernel/moe/moe_mainloop_shared.cuh"
+#include "kernel/moe/moe_mainloop_up.cuh"
+#include "kernel/moe/moe_scheduler.cuh"
+#include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_tma.cuh"
+#include "kernel/moe/moe_traits.cuh"
+#include "kernel/moe/moe_workspace.cuh"
 
 namespace halops::moe {
 
@@ -259,8 +259,8 @@ struct CollectiveMainloopMoE {
                                params.token_count > WarpRole::kCalcWarpCount;
         if (threadIdx.x == 0u) {
             // One task per router CTA, whatever its M tile or K slice.
-            workspace->handoff.wait_router_tasks(smem->launch_parity,
-                                                 Traits::RouterGemm::kNumCtas);
+            workspace->cta_comm.wait_router_tasks(smem->launch_parity,
+                                                  Traits::RouterGemm::kNumCtas);
         }
         WarpRole::sync_calc_threads();
         const std::uint32_t calc_warp_idx = WarpRole::get_calc_warp_idx();
@@ -373,7 +373,7 @@ struct CollectiveMainloopMoE {
             // After the projection: one warp copies block 0's tables, and it
             // does not contend with the projection's own warps.
             if (lane_idx == 0u) {
-                workspace->handoff.wait_router_tables(smem->launch_parity);
+                workspace->cta_comm.wait_router_tables(smem->launch_parity);
             }
             __syncwarp();
             load_routing_tables(workspace, smem, lane_idx);
@@ -395,7 +395,7 @@ struct CollectiveMainloopMoE {
         __threadfence();
         __syncwarp();
         if (lane_idx == 0u) {
-            workspace->handoff.publish_router_tables(smem->launch_parity);
+            workspace->cta_comm.publish_router_tables(smem->launch_parity);
         }
     }
 
@@ -557,7 +557,7 @@ struct CollectiveMainloopMoE {
             Traits::kUpInputSlots * Traits::UpGemm::kTileShapeK;
         if (WarpRole::is_other_loader_thread()) {
             if constexpr (Traits::kUseLatent) {
-                workspace->handoff.wait_latent_tasks(
+                workspace->cta_comm.wait_latent_tasks(
                     smem->launch_parity, Traits::LatentDownGemm::kNumCtas);
             }
             if constexpr (Traits::kLatentQuantizeOutput) {
@@ -657,7 +657,7 @@ struct CollectiveMainloopMoE {
             prefetch_tma_descriptors(params);
         } else if (warp_idx == 3 && lane_idx == 0) {
             // Per-CTA private launch counter.
-            smem->launch_parity = workspace->handoff.claim_parity();
+            smem->launch_parity = workspace->cta_comm.claim_parity();
             // The down task queue starts empty.
             smem->down_tasks_claimed = 0u;
             smem->down_task_stores = 0u;
@@ -684,7 +684,7 @@ struct CollectiveMainloopMoE {
             // covered.
             for (std::uint32_t rank = blockIdx.x * kZeroThreads + zero_tid;
                  rank < Workspace::kMaxRoutedRows; rank += kZeroThreads) {
-                workspace->handoff.reset_inactive(launch_parity, rank);
+                workspace->cta_comm.reset_inactive(launch_parity, rank);
             }
         }
     }
@@ -722,10 +722,10 @@ struct CollectiveMainloopMoE {
             for (std::uint32_t flat = first_cell; flat < num_cells;
                  flat += cell_stride) {
                 const std::uint32_t tok = flat / kDownOutputColsPerCta;
-                workspace->handoff.wait_down_out_field(
+                workspace->cta_comm.wait_down_out_field(
                     smem->launch_parity, m_block,
-                    tok * TokenCountFields<Dims>::kBits,
-                    TokenCountFields<Dims>::kMask, top_k);
+                    tok * PackedTokenCounts<Dims>::kBits,
+                    PackedTokenCounts<Dims>::kMask, top_k);
                 gather_cell(workspace, activations_out, tok,
                             base_col + flat % kDownOutputColsPerCta, top_k);
             }
@@ -735,8 +735,9 @@ struct CollectiveMainloopMoE {
         // Readiness wait: this block's m-block completes once every active
         // expert's task of it has been published.
         if (threadIdx.x == 0) {
-            workspace->handoff.wait_down_out(smem->launch_parity, m_block,
-                                             smem->routing.active_expert_count);
+            workspace->cta_comm.wait_down_out(
+                smem->launch_parity, m_block,
+                smem->routing.active_expert_count);
         }
         __syncthreads();
 

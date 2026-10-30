@@ -21,10 +21,9 @@
 #include <cstdint>
 #include <cstring>
 
-#include "moe_configs.cuh"
-#include "moe_interface.h"
-#include "moe_shared_storage.cuh"
-#include "moe_traits.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_traits.cuh"
 
 namespace halops::moe {
 

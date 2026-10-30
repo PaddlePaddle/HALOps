@@ -22,15 +22,15 @@
 #include <cute/atom/mma_traits_sm100.hpp>
 #include <cute/tensor.hpp>
 
-#include "mma_core.cuh"
-#include "moe_configs.cuh"
-#include "moe_input.cuh"
-#include "moe_mainloop_up.cuh"
-#include "moe_shared_storage.cuh"
-#include "moe_tma.h"
-#include "moe_traits.cuh"
-#include "moe_workspace.cuh"
-#include "ptx_utils.cuh"
+#include "kernel/moe/mma_core.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_input.cuh"
+#include "kernel/moe/moe_mainloop_up.cuh"
+#include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_tma.cuh"
+#include "kernel/moe/moe_traits.cuh"
+#include "kernel/moe/moe_workspace.cuh"
+#include "kernel/moe/ptx_utils.cuh"
 
 namespace halops::moe {
 
@@ -161,7 +161,7 @@ struct SharedExpertProjection {
         __syncthreads();
         if (cta_idx() < kNumUpCtas && split_idx() == 0u && threadIdx.x == 0u) {
             __threadfence();
-            workspace->handoff.publish_shared_up_out(smem->launch_parity, 1u);
+            workspace->cta_comm.publish_shared_up_out(smem->launch_parity, 1u);
         }
         run_down(tma_down_desc, down_scale, out, workspace, smem, batch_size);
     }
@@ -520,8 +520,8 @@ struct SharedExpertProjection {
     __device__ static void run_down_load_input_k_loop(
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem) {
         SharedExpertSmem<Dims>& sh = smem->shared_expert;
-        workspace->handoff.wait_shared_up_out(smem->launch_parity,
-                                              kNumUpPublishers);
+        workspace->cta_comm.wait_shared_up_out(smem->launch_parity,
+                                               kNumUpPublishers);
         // The ring's slots tile the published image exactly.
         static_assert(sizeof(decltype(workspace->shared_up_out.data)) ==
                           sizeof(decltype(sh.act_down_input.data)),

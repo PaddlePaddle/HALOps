@@ -22,15 +22,15 @@
 #include <cstdint>
 #include <cute/tensor.hpp>
 
-#include "mma_core.cuh"
-#include "moe_configs.cuh"
-#include "moe_routing.cuh"
-#include "moe_routing_topk.cuh"
-#include "moe_shared_storage.cuh"
-#include "moe_tma.h"
-#include "moe_traits.cuh"
-#include "moe_workspace.cuh"
-#include "ptx_utils.cuh"
+#include "kernel/moe/mma_core.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_routing.cuh"
+#include "kernel/moe/moe_routing_topk.cuh"
+#include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_tma.cuh"
+#include "kernel/moe/moe_traits.cuh"
+#include "kernel/moe/moe_workspace.cuh"
+#include "kernel/moe/ptx_utils.cuh"
 
 namespace halops::moe {
 
@@ -286,7 +286,7 @@ struct RouterProjection<KernelTraits, true>
         WarpRole::sync_calc_threads();
         tcgen05_fence_after_thread_sync();
         if (warp_idx == 0u && lane_idx == 0u) {
-            workspace->handoff.publish_router_tasks(smem->launch_parity, 1u);
+            workspace->cta_comm.publish_router_tasks(smem->launch_parity, 1u);
         }
     }
 
@@ -456,7 +456,7 @@ struct RouterProjection<KernelTraits, false>
         // Join the writers, then count the block's tiles in.
         WarpRole::sync_calc_threads();
         if (threadIdx.x == 0u) {
-            workspace->handoff.publish_router_tasks(smem->launch_parity, 1u);
+            workspace->cta_comm.publish_router_tasks(smem->launch_parity, 1u);
         }
     }
 
