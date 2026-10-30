@@ -44,6 +44,19 @@ struct TileScheduler {
     static constexpr bool UseTileSwizzle = KernelTraits::UseTileSwizzle;
     static constexpr bool KDenseW8A8MXFP8 = KernelTraits::KDenseW8A8MXFP8;
 
+    // --- Preamble-cost specializations ---
+    // The constructor runs in every warp of the CTA and is pure per-CTA
+    // preamble; these constants let the compiler drop provably dead parts.
+    //
+    // kAlwaysCompact: host sets use_compact_sched = (S == 1), and S > 1 only
+    // with UseTileSwizzle, so without swizzle only the compact path is
+    // reachable (tile_num_m_/tile_num_n_ are then dead too).
+    static constexpr bool kAlwaysCompact = !UseTileSwizzle;
+    // kIsSingleCtaCluster: cluster == CTA, so cluster queries reduce to
+    // gridDim/blockIdx (cheaper than CuTe's %%nclusterid/%%clusterid reads).
+    static constexpr bool kIsSingleCtaCluster =
+        (KernelTraits::KNumCTA == 1) && (cute::size(ClusterShape_MNK{}) == 1);
+
     struct Params {
         int m;
         int n;
@@ -55,19 +68,47 @@ struct TileScheduler {
         int expert_ctm;    // per-expert cluster-tiles in M
         int expert_ctn;    // per-expert cluster-tiles in N
         int total_tiles;   // num_logical_experts * tiles_per_expert
-        cutlass::FastDivmod divmod_tiles;   // ÷ tiles_per_expert
-        cutlass::FastDivmod divmod_ss;      // ÷ S*S
-        cutlass::FastDivmod divmod_blocks;  // ÷ blocks along the fast dim
-        cutlass::FastDivmod divmod_s;       // ÷ S
+        // Host-precomputed fast divmod (avoid runtime integer division)
+        cutlass::FastDivmod divmod_tiles;  // ÷ tiles_per_expert
+        cutlass::FastDivmod divmod_ss;     // ÷ S*S
+        cutlass::FastDivmod
+            divmod_blocks;  // ÷ blocks_fast (mode-dependent, see below)
+        cutlass::FastDivmod divmod_s;  // ÷ S
 
-        // Other compact state is derived on device (no D2H sync).
-        bool use_compact_sched;
+        // Compact scheduling flag (set by host, all other compact state
+        // computed on device — no D2H sync needed).
+        bool use_compact_sched;  // true for Masked mode with linear path (S=1)
+
+        // Linear-path traversal orientation (Naive only; see
+        // to_underlying_arguments).
+        //   false → N-fast (tile_id ÷ expert_ctn): consecutive tiles sweep N.
+        //   true  → M-fast (tile_id ÷ expert_ctm): consecutive tiles sweep M.
+        bool traverse_m_fast;
+
+        // Contiguous-range tile assignment instead of strided (Batch SwapAB
+        // only). See to_underlying_arguments.
+        bool chunked_assign;
+
+        // --- Tail-only stream-K (Naive only; streamk_rem == 0 disables) ---
+        // C clusters over W tiles: the first streamk_tail_base = (W/C)*C tiles
+        // stay data-parallel (full K); each of the remaining streamk_rem tiles
+        // is split into streamk_splits K-chunks on different clusters, so the
+        // makespan drops from ceil(W/C) to W/C + 1/splits tile-times and only
+        // the tail needs fp32 partials. Fused work-id space, one launch:
+        //   [0, tail_base)                         whole tiles, full K range
+        //   [tail_base, tail_base + rem * splits)  (tail tile, K-chunk) pairs
+        int streamk_tail_base;
+        int streamk_rem;
+        int streamk_splits;
+        int k_tiles;  // ceil_div(k, KBlockK); chunk bounds are derived from it
     };
 
     static Params to_underlying_arguments(int m, int n, int num_experts = 0,
                                           int max_m_per_expert = 0,
                                           int const* masked_m = nullptr,
-                                          int const* expert_ids = nullptr) {
+                                          int const* expert_ids = nullptr,
+                                          int num_clusters = 0,
+                                          int k_tiles = 0) {
         constexpr int kTileM = cute::size<0>(TileShape{});
         constexpr int kTileN = cute::size<1>(TileShape{});
 
@@ -123,15 +164,125 @@ struct TileScheduler {
         int tiles_per_expert = blocks_m * blocks_n * S * S;
         int total_tiles = num_logical_experts * tiles_per_expert;
 
-        int divmod_blocks_divisor = SwapAB ? blocks_m : blocks_n;
+        // --- Linear-path traversal orientation (Naive only) ---
+        // The operand indexed by the fast dimension stays L2-resident; the
+        // other is streamed once. Keep the smaller one resident:
+        //   N-fast → B (N×K) resident; right when N <= M.
+        //   M-fast → A (M×K) resident; right when M <  N.
+        // Naive non-SwapAB uses M-fast when m < n (N-fast re-reads a large B
+        // from DRAM every wave). HALOPS_TRAVERSE_MFAST=0 forces N-fast.
+        bool traverse_m_fast = false;
+        if constexpr (KernelTraits::KernelType == KernelMode::Dense &&
+                      !SwapAB) {
+            static const bool mfast_enabled = [] {
+                const char* e = std::getenv("HALOPS_TRAVERSE_MFAST");
+                return e == nullptr || e[0] != '0';
+            }();
+            traverse_m_fast = mfast_enabled && (S == 1) && (m < n);
+        }
+
+        int divmod_blocks_divisor;
+        if (S == 1 && traverse_m_fast) {
+            divmod_blocks_divisor = expert_ctm;
+        } else {
+            divmod_blocks_divisor = SwapAB ? blocks_m : blocks_n;
+        }
         cutlass::FastDivmod divmod_tiles(tiles_per_expert);
         cutlass::FastDivmod divmod_ss(S * S);
         cutlass::FastDivmod divmod_blocks(divmod_blocks_divisor);
         cutlass::FastDivmod divmod_s(S);
 
+        // --- Tail-only stream-K decomposition (Naive only; see Params) ---
+        // splits must divide k_tiles so every chunk has the same length.
+        int streamk_tail_base = total_tiles;
+        int streamk_rem = 0;
+        int streamk_splits = 1;
+        // KSupportsStreamK (kernel_traits.h) limits this to BF16 dense without
+        // bias/alpha (they cannot deposit a partial) and without SwapAB.
+        if constexpr (KernelTraits::KSupportsStreamK) {
+            // Default ON; rejected shapes keep streamk_rem == 0 and run the
+            // plain data-parallel path (no workspace, no reduce launch).
+            // HALOPS_STREAMK=0 forces the data-parallel path.
+            static const bool streamk_enabled = [] {
+                const char* e = std::getenv("HALOPS_STREAMK");
+                return e == nullptr || e[0] != '0';
+            }();
+            const int C = num_clusters;
+            // Grid-underfill extension: total_tiles > 0 (not > C) also admits
+            // whole == 0 (thin M, total_tiles < C), where every tile is split
+            // so the existing tiles occupy more SMs. p_cap = C / rem keeps
+            // near-full grids at p = 1 and bounds the workspace at <= C slots.
+            // HALOPS_STREAMK_FILL=0 restores the tail-only gate.
+            static const bool streamk_fill = [] {
+                const char* e = std::getenv("HALOPS_STREAMK_FILL");
+                return e == nullptr || e[0] != '0';
+            }();
+            const bool size_ok =
+                streamk_fill ? (total_tiles > 0) : (total_tiles > C);
+            if (streamk_enabled && S == 1 && C > 0 && k_tiles > 0 && size_ok) {
+                const int whole = total_tiles / C;
+                const int rem = total_tiles - whole * C;
+                // Split only when the remainder idles >= 5% of total SM-time
+                // (break-even for the rem*splits partial-tile reduction).
+                const bool worth_it =
+                    rem > 0 && (C - rem) * 20 >= (whole + 1) * C;
+                if (worth_it) {
+                    // Use the largest p <= min(C / rem, 8) dividing k_tiles:
+                    // the overhead is fixed, not per-split.
+                    // HALOPS_STREAMK_P=<p> overrides the cap.
+                    int p_cap = C / rem < 8 ? C / rem : 8;
+                    static const int p_forced = [] {
+                        const char* e = std::getenv("HALOPS_STREAMK_P");
+                        return e != nullptr ? atoi(e) : 0;
+                    }();
+                    if (p_forced > 0) {
+                        p_cap = p_forced;
+                    }
+                    int p = 1;
+                    for (int cand = p_cap; cand >= 2; --cand) {
+                        if (k_tiles % cand == 0) {
+                            p = cand;
+                            break;
+                        }
+                    }
+                    if (p >= 2 && (whole > 0 || p >= 4)) {
+                        // Underfill gate: with whole == 0, only p >= 4 repays
+                        // the fp32 workspace round-trip and reduce launch.
+
+                        streamk_tail_base = whole * C;
+                        streamk_rem = rem;
+                        streamk_splits = p;
+                        // Tail items become the (whole+1)-th item of clusters
+                        // 0..rem*p-1, reusing the resident mainloop pipeline.
+                        total_tiles = streamk_tail_base + rem * p;
+                    }
+                }
+            }
+        }
+
+        // Compact scheduling: enabled for Masked and Contiguous modes with S=1
+        // (linear path). All compact scheduling state (total_valid_tiles,
+        // expert cache) is computed on the device — no D2H copy or host-side
+        // masked_m access.
         bool use_compact_sched = false;
         if (S == 1) {
             use_compact_sched = true;
+        }
+
+        // --- Contiguous-range assignment (Batch SwapAB only) ---
+        // SwapAB numbering keeps one item's N segments consecutive, but the
+        // persistent stride spreads them over different CTAs, so the shared
+        // activation's L2 reuse becomes a race. Chunked assignment gives CTA i
+        // the range [i*chunk, (i+1)*chunk), so one CTA processes them
+        // back-to-back. Only when expert_ctm > 1 (otherwise nothing is
+        // shared). HALOPS_BATCH_CHUNK=0 restores the stride.
+        bool chunked_assign = false;
+        if constexpr (KernelTraits::KernelType == KernelMode::Batch && SwapAB) {
+            static const bool chunk_enabled = [] {
+                const char* e = std::getenv("HALOPS_BATCH_CHUNK");
+                return e == nullptr || e[0] != '0';
+            }();
+            chunked_assign = chunk_enabled && S == 1 && expert_ctm > 1;
         }
 
         return {m,
@@ -148,7 +299,13 @@ struct TileScheduler {
                 divmod_ss,
                 divmod_blocks,
                 divmod_s,
-                use_compact_sched};
+                use_compact_sched,
+                traverse_m_fast,
+                chunked_assign,
+                streamk_tail_base,
+                streamk_rem,
+                streamk_splits,
+                k_tiles};
     }
 
     uint32_t tile_num_m_;
@@ -161,6 +318,11 @@ struct TileScheduler {
 
     uint32_t cluster_num_;      // stride = number of clusters
     uint32_t current_tile_id_;  // current position in global tile space
+    // Chunked assignment (Batch SwapAB): step is 1 and each CTA iterates a
+    // contiguous range ending at tile_end_. Otherwise step = cluster_num_ and
+    // the range ends at the total tile count.
+    uint32_t advance_step_;
+    uint32_t tile_end_;
 
     uint32_t expert_ctm_;
     uint32_t expert_ctn_;
@@ -176,6 +338,18 @@ struct TileScheduler {
     int const* expert_ids_;
 
     bool use_compact_sched_;
+    bool traverse_m_fast_;
+    bool chunked_assign_;
+
+    // Tail-only stream-K state (see Params). streamk_rem_ == 0 disables.
+    uint32_t streamk_tail_base_;
+    uint32_t streamk_rem_;
+    uint32_t streamk_splits_;
+    uint32_t k_tiles_;
+    // Resolved for the current work item by find_next_valid_tile().
+    uint32_t k_begin_;
+    uint32_t k_end_;
+    int partial_slot_;  // -1 = write straight to D; else index into the fp32 ws
     uint32_t
         total_valid_tiles_;  // sum of valid cluster-tiles across all experts
     // tile ids only grow, so the expert cache is advanced by forward scan.
@@ -218,29 +392,55 @@ struct TileScheduler {
           divmod_ss_(params.divmod_ss),
           divmod_blocks_(params.divmod_blocks),
           divmod_s_(params.divmod_s),
-          use_compact_sched_(params.use_compact_sched) {
-        tile_num_m_ = cute::ceil_div(params.m, cute::size<0>(TileShape{}));
-        tile_num_n_ = cute::ceil_div(params.n, cute::size<1>(TileShape{}));
+          use_compact_sched_(params.use_compact_sched),
+          traverse_m_fast_(params.traverse_m_fast),
+          chunked_assign_(params.chunked_assign),
+          streamk_tail_base_(params.streamk_tail_base),
+          streamk_rem_(params.streamk_rem),
+          streamk_splits_(params.streamk_splits),
+          k_tiles_(params.k_tiles) {
+        // tile_num_m_/tile_num_n_ only feed the non-compact bounds check, so
+        // skip the two ceil_div's when that path is statically unreachable.
+        if constexpr (!kAlwaysCompact) {
+            tile_num_m_ = ceil_div(params.m, size<0>(TileShape{}));
+            tile_num_n_ = ceil_div(params.n, size<1>(TileShape{}));
+        }
 
-        cluster_num_ =
-            cute::cluster_grid_dims().x * cute::cluster_grid_dims().y;
-        int cluster_idx =
-            cute::cluster_id_in_grid().x * cute::cluster_grid_dims().y +
-            cute::cluster_id_in_grid().y;
+        int cluster_idx;
+        if constexpr (kIsSingleCtaCluster) {
+            // cluster == CTA: read gridDim/blockIdx directly (cheaper than
+            // CuTe's %%nclusterid / %%clusterid reads).
+            cluster_num_ = gridDim.x * gridDim.y;
+            cluster_idx = blockIdx.x * gridDim.y + blockIdx.y;
+            // Single-CTA cluster: block_rank 0, flat coord (0,0,0).
+            cluster_m_tiles_ = kClusterMTiles;
+            cluster_n_tiles_ = kClusterNTiles;
+            cta_m_offset_ = 0;
+            cta_n_offset_ = 0;
+            cta_v_ = 0;
+        } else {
+            cluster_num_ =
+                cute::cluster_grid_dims().x * cute::cluster_grid_dims().y;
+            cluster_idx =
+                cute::cluster_id_in_grid().x * cute::cluster_grid_dims().y +
+                cute::cluster_id_in_grid().y;
 
-        cute::Layout cluster_layout_vmnk =
-            cute::tiled_divide(cute::make_layout(ClusterShape_MNK{}),
-                               cute::make_tile(typename TiledMma::AtomThrID{}));
-        int block_rank = cute::block_rank_in_cluster();
-        auto cta_coord_vmnk = cluster_layout_vmnk.get_flat_coord(block_rank);
+            cute::Layout cluster_layout_vmnk = cute::tiled_divide(
+                cute::make_layout(ClusterShape_MNK{}),
+                cute::make_tile(typename TiledMma::AtomThrID{}));
+            int block_rank = cute::block_rank_in_cluster();
+            auto cta_coord_vmnk =
+                cluster_layout_vmnk.get_flat_coord(block_rank);
 
-        cluster_m_tiles_ = cute::size<1>(cluster_layout_vmnk);
-        cluster_n_tiles_ = cute::size<2>(cluster_layout_vmnk);
-        cta_m_offset_ = cute::get<1>(cta_coord_vmnk);
-        cta_n_offset_ = cute::get<2>(cta_coord_vmnk);
-        cta_v_ = cute::get<0>(cta_coord_vmnk);
+            cluster_m_tiles_ = cute::size<1>(cluster_layout_vmnk);
+            cluster_n_tiles_ = cute::size<2>(cluster_layout_vmnk);
+            cta_m_offset_ = cute::get<1>(cta_coord_vmnk);
+            cta_n_offset_ = cute::get<2>(cta_coord_vmnk);
+            cta_v_ = get<0>(cta_coord_vmnk);
+        }
 
-        if (use_compact_sched_) {
+        // Compute compact scheduling state on device
+        if (kAlwaysCompact || use_compact_sched_) {
             if constexpr (KernelTraits::KernelType == KernelMode::Contiguous ||
                           KernelTraits::KernelType == KernelMode::Dense ||
                           KernelTraits::KernelType == KernelMode::Batch) {
@@ -248,7 +448,10 @@ struct TileScheduler {
                 total_valid_tiles_ = total_tiles_;
                 cached_expert_ = 0;
                 cached_expert_start_ = 0;
-                cached_expert_end_ = total_tiles_;
+                // Single logical expert: the expert-cache fast path must
+                // always hit (the slow path dereferences masked_m, nullptr
+                // here), including for folded stream-K base tile ids.
+                cached_expert_end_ = 0xFFFFFFFFu;
             } else {
                 total_valid_tiles_ = 0;
                 for (uint32_t e = 0; e < num_experts_; e++) {
@@ -265,7 +468,32 @@ struct TileScheduler {
             cached_expert_end_ = 0;
         }
 
+        // Defaults for the non-compact path (stream-K is compact/Naive-only).
+        k_begin_ = 0;
+        k_end_ = k_tiles_;
+        partial_slot_ = -1;
+
+        // Start at this cluster's first tile
         current_tile_id_ = cluster_idx;
+        advance_step_ = cluster_num_;
+        // Strided default; stream-K tail work ids lie inside
+        // total_valid_tiles_ by construction.
+        tile_end_ = total_valid_tiles_;
+        if (chunked_assign_) {
+            // Range [cluster_idx*chunk, +chunk), clamped to the tile count.
+            uint32_t chunk =
+                (total_valid_tiles_ + cluster_num_ - 1) / cluster_num_;
+            uint32_t base = cluster_idx * chunk;
+            current_tile_id_ = base;
+            tile_end_ = base + chunk;
+            if (tile_end_ > total_valid_tiles_ || chunk == 0) {
+                tile_end_ = total_valid_tiles_;
+            }
+            if (current_tile_id_ > total_valid_tiles_) {
+                current_tile_id_ = total_valid_tiles_;
+            }
+            advance_step_ = 1;
+        }
         find_next_valid_tile();
     }
 
@@ -274,9 +502,16 @@ struct TileScheduler {
     CUTLASS_DEVICE uint32_t m_idx() const { return m_idx_; }
     CUTLASS_DEVICE uint32_t n_idx() const { return n_idx_; }
     CUTLASS_DEVICE uint32_t expert_idx() const { return expert_idx_; }
+    // K-tile range of the current work item. Producer and consumer MUST use
+    // the same bounds or the mainloop pipeline deadlocks.
+    CUTLASS_DEVICE uint32_t k_begin() const { return k_begin_; }
+    CUTLASS_DEVICE uint32_t k_end() const { return k_end_; }
+    // >= 0 when this work item computed only a K-slice and must deposit an
+    // fp32 partial instead of the final bf16 result.
+    CUTLASS_DEVICE int partial_slot() const { return partial_slot_; }
 
     CUTLASS_DEVICE void advance() {
-        current_tile_id_ += cluster_num_;
+        current_tile_id_ += advance_step_;
         find_next_valid_tile();
     }
 
@@ -323,6 +558,10 @@ struct TileScheduler {
             uint32_t local_cluster_n = q;
             cluster_m = local_cluster_m;
             cluster_n = expert * expert_ctn_ + local_cluster_n;
+        } else if (traverse_m_fast_) {
+            // M-fast: divisor was expert_ctm_, so r indexes M and q indexes N.
+            cluster_m = expert * expert_ctm_ + static_cast<uint32_t>(r);
+            cluster_n = static_cast<uint32_t>(q);
         } else {
             uint32_t local_cluster_m = q;
             uint32_t local_cluster_n = r;
@@ -394,30 +633,64 @@ struct TileScheduler {
     // Scan forward from current_tile_id_ to find the next valid tile,
     // caching its coordinates in m_idx_/n_idx_/expert_idx_/is_valid_.
     CUTLASS_DEVICE void find_next_valid_tile() {
-        if constexpr (KDenseW8A8MXFP8 && !UseTileSwizzle) {
-            while (current_tile_id_ < total_tiles_) {
-                int q, r;
-                divmod_blocks_.fast_divmod(q, r,
-                                           static_cast<int>(current_tile_id_));
-                if constexpr (SwapAB) {
-                    m_idx_ = r * cluster_m_tiles_ + cta_m_offset_;
-                    n_idx_ = q * cluster_n_tiles_ + cta_n_offset_;
-                } else {
-                    m_idx_ = q * cluster_m_tiles_ + cta_m_offset_;
-                    n_idx_ = r * cluster_n_tiles_ + cta_n_offset_;
+        // W8A8-dense fast path (quantized only): every tile is valid, so a
+        // plain divmod resolves the tile without the compact-scan bookkeeping.
+        // Guarded to !KIsBF16 (BF16 needs the stream-K fold and M-fast
+        // traversal handled in the compact path below) and !traverse_m_fast_
+        // (the divmod orientation below assumes N-fast).
+        if constexpr (KDenseW8A8MXFP8 && !UseTileSwizzle &&
+                      !KernelTraits::KIsBF16) {
+            if (!traverse_m_fast_) {
+                while (current_tile_id_ < total_tiles_) {
+                    int q, r;
+                    divmod_blocks_.fast_divmod(
+                        q, r, static_cast<int>(current_tile_id_));
+                    if constexpr (SwapAB) {
+                        m_idx_ = r * cluster_m_tiles_ + cta_m_offset_;
+                        n_idx_ = q * cluster_n_tiles_ + cta_n_offset_;
+                    } else {
+                        m_idx_ = q * cluster_m_tiles_ + cta_m_offset_;
+                        n_idx_ = r * cluster_n_tiles_ + cta_n_offset_;
+                    }
+                    expert_idx_ = 0;
+                    is_valid_ = true;
+                    return;
                 }
-                expert_idx_ = 0;
-                is_valid_ = true;
+                is_valid_ = false;
                 return;
             }
-            is_valid_ = false;
-            return;
         }
-        if (use_compact_sched_) {
-            while (current_tile_id_ < total_valid_tiles_) {
+        if (kAlwaysCompact || use_compact_sched_) {
+            // Compact path: the tile space only contains valid cluster-tiles,
+            // so we skip directly to the current tile without iterating through
+            // large swaths of padding. Only need a lightweight per-CTA check
+            // for the edge case where the last cluster row of an expert has
+            // some CTAs with tiles beyond masked_m. With chunked_assign_ the
+            // per-CTA range ends at tile_end_ instead of total_valid_tiles_.
+            while (current_tile_id_ < tile_end_) {
                 uint32_t cluster_m, cluster_n, expert;
-                uint32_t tile_id = current_tile_id_;
-                tile_id_to_coords_compact(tile_id, cluster_m, cluster_n,
+                // Stream-K: ids >= streamk_tail_base_ are (tail tile, K-chunk)
+                // pairs. Fold to the base tile id and resolve the K range and
+                // partial slot here so all roles see identical values.
+                uint32_t base_tile_id = current_tile_id_;
+                k_begin_ = 0;
+                k_end_ = k_tiles_;
+                partial_slot_ = -1;
+                if constexpr (KernelTraits::KernelType == KernelMode::Dense) {
+                    if (streamk_rem_ > 0 &&
+                        current_tile_id_ >= streamk_tail_base_) {
+                        uint32_t local = current_tile_id_ - streamk_tail_base_;
+                        uint32_t t = local / streamk_splits_;
+                        uint32_t s = local - t * streamk_splits_;
+                        base_tile_id = streamk_tail_base_ + t;
+                        // streamk_splits_ divides k_tiles_ (host-enforced).
+                        uint32_t chunk = k_tiles_ / streamk_splits_;
+                        k_begin_ = s * chunk;
+                        k_end_ = k_begin_ + chunk;
+                        partial_slot_ = static_cast<int>(local);
+                    }
+                }
+                tile_id_to_coords_compact(base_tile_id, cluster_m, cluster_n,
                                           expert);
 
                 uint32_t m_idx = cluster_m * cluster_m_tiles_ + cta_m_offset_;

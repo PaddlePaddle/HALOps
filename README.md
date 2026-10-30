@@ -99,9 +99,17 @@ dense_gemm(a_fp8, b_fp8, scale_a, scale_b, output, mode="w8a8-mxfp8")
 print(output.shape, output.dtype)
 ```
 
+Native BF16 needs no quantization; pass `None` for the scale factors:
+
+```python
+output = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+dense_gemm(a, b, None, None, output, mode="bf16")
+print(output.shape, output.dtype)
+```
+
 ## Roadmap
 
-- **Complete GEMM coverage**: add W4A8, BF16 and other GEMM types to build a full quantization-type support matrix, so users can pick the trade-off between inference speed and accuracy they need.
+- **Complete GEMM coverage**: add W4A8 and other GEMM types to build a full quantization-type support matrix, so users can pick the trade-off between inference speed and accuracy they need.
 - **Higher-performance MegaKernels**: cover more compute-communication fusion scenarios and further overlap compute with memory traffic.
 - **High-performance kernels for small workloads**: kernels tuned for small problem sizes that deliver the lowest latency at low concurrency.
 

@@ -103,8 +103,19 @@
 
 普通参数：
 
-- `mode`（默认 `w8a8-mxfp8`）：支持 `w8a8-mxfp8` 和 `w4a4-nvfp4`（kernel 与 `group_wise_quant` 也支持 `w4a4-mxfp4`，但 benchmark 暂未生成对应的量化输入）。
+- `mode`（默认 `w8a8-mxfp8`）：支持 `w8a8-mxfp8`、`w4a4-nvfp4` 与原生 BF16 `bf16`（kernel 与 `group_wise_quant` 也支持 `w4a4-mxfp4`，但 benchmark 暂未生成对应的量化输入）。`bf16` 模式下不生成量化输入，`sfa`/`sfb` 为 `None`，且要求 `K` 为 `64` 的倍数。
 - `sm_count`（默认 `-1`）：`-1` 表示不限制 SM 数量。
+
+### `batch_gemm`
+
+遍历维度参数：
+
+- `shapes`（必选）：`[B, M, N, K]` 列表，每项生成一个 case；第 `b` 个 batch 计算 `input[b] @ weight[b]^T`。
+
+普通参数：
+
+- `mode`（默认 `bf16`）：当前仅支持原生 BF16 `bf16`，要求 `K` 为 `64` 的倍数。
+- `sm_count`（默认 `-1`）。
 
 ### `group_masked` 和 `group_contiguous`
 
@@ -114,7 +125,7 @@
 
 普通参数：
 
-- `mode`（默认 `w8a8-mxfp8`）：支持 `w8a8-mxfp8` 和 `w4a4-nvfp4`（grouped kernel 与 `group_wise_quant` 也支持 `w4a4-mxfp4`，但 benchmark 暂未生成对应的量化输入）。
+- `mode`（默认 `w8a8-mxfp8`）：支持 `w8a8-mxfp8`、`w4a4-nvfp4` 与原生 BF16 `bf16`（grouped kernel 与 `group_wise_quant` 也支持 `w4a4-mxfp4`，但 benchmark 暂未生成对应的量化输入）。`bf16` 模式要求 `K` 为 `64` 的倍数。
 - `sm_count`（默认 `-1`）。
 
-所有现有 GEMM 场景均要求 `K` 为 `32` 的倍数。
+量化模式要求 `K` 为 `32` 的倍数；原生 BF16 模式要求 `K` 为 `64` 的倍数。

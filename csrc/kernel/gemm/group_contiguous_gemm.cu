@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 
+#include "kernel/gemm/bf16_cfgs.h"
 #include "kernel/gemm/gemm_dispatch.cuh"
 #include "kernel/gemm/gemm_utils.h"
 
@@ -30,9 +31,10 @@ void GroupContiguousGemm(const torch::Tensor& input,
                          const std::string& mode = "w8a8-mxfp8") {
     const CudaDeviceGuard device_guard(input.device());
     TORCH_CHECK(
-        mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" || mode == "w4a4-mxfp4",
+        mode == "bf16" || mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" ||
+            mode == "w4a4-mxfp4",
         "Unsupported mode: ", mode,
-        ". Expected 'w8a8-mxfp8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
+        ". Expected 'bf16', 'w8a8-mxfp8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
     TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor of shape [M, K]");
     TORCH_CHECK(weight.dim() == 3,
                 "weight must be a 3D tensor of shape [num_experts, N, K]");
@@ -61,7 +63,45 @@ void GroupContiguousGemm(const torch::Tensor& input,
     params.n = n;
     params.num_experts = num_experts;
 
-    if (mode == "w8a8-mxfp8") {
+    if (mode == "bf16") {
+        using TypeA = cutlass::bfloat16_t;
+        using TypeB = cutlass::bfloat16_t;
+        using TypeC = cutlass::bfloat16_t;
+        using TypeD = cutlass::bfloat16_t;
+        using TypeSF = cutlass::float_ue8m0_t;  // placeholder, unused
+        using TypeAccumulate = float;
+
+        const int k = weight.size(2);
+        TORCH_CHECK(input.size(1) == k,
+                    "input K must match weight K, got input K=", input.size(1),
+                    ", weight K=", k);
+        TORCH_CHECK(input.dtype() == torch::kBFloat16,
+                    "bf16 contiguous GEMM: input must be bfloat16");
+        TORCH_CHECK(weight.dtype() == torch::kBFloat16,
+                    "bf16 contiguous GEMM: weight must be bfloat16");
+        TORCH_CHECK(output.dtype() == torch::kBFloat16,
+                    "bf16 contiguous GEMM: output must be bfloat16");
+        params.k = k;
+        params.ptr_a = input.data_ptr();
+        params.ptr_b = weight.data_ptr();
+        params.ptr_sfa = nullptr;
+        params.ptr_sfb = nullptr;
+        params.ptr_alpha = nullptr;
+
+        const int cfg = bf16_dispatch::SelectBF16ContiguousCfg(m, n, k, sm);
+        TORCH_CHECK(cfg >= 0, "bf16 contiguous GEMM: unsupported shape M=", m,
+                    " N=", n, " K=", k);
+        bf16_dispatch::CheckBF16CfgShape(
+            "bf16 contiguous GEMM", bf16_dispatch::kBF16ContiguousCfgs[cfg], m,
+            n, k);
+        bf16_dispatch::DispatchBF16SmallCfg<
+            bf16_dispatch::BF16ContiguousTiles,
+            bf16_dispatch::kBF16ContiguousCount>(
+            cfg, "bf16 contiguous", [&]<class KernelConfig>() {
+                gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
+                          KernelConfig>(params, sm, stream);
+            });
+    } else if (mode == "w8a8-mxfp8") {
         const int k = weight.size(2);
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),

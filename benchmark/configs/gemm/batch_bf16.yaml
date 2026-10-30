@@ -1,0 +1,36 @@
+# Batch GEMM BF16 baseline: representative model shapes vs cuBLAS (torch.bmm).
+#
+# The [B, M, N, K] convention: batch item b computes input[b] @ weight[b]^T,
+# i.e. [M, K] @ [K, N] -> [M, N]. batch_gemm dispatches on total_m = B*M.
+#
+# Backends:
+#   halops     -- our native BF16 batch GEMM (3-tier dispatch: 256x256 pair /
+#                 128x256 / SwapAB 128x64)
+#   fi         -- flashinfer.bmm_bf16, cuDNN backend (the default the dense
+#                 bf16 path also uses)
+#   fi_cutlass -- flashinfer.bmm_bf16, CUTLASS backend, so flashinfer's own
+#                 kernels and its cuDNN fallback can be told apart
+#   bmm        -- torch.bmm (cuBLAS)
+scenario: batch_gemm
+mode: bf16
+
+shapes:
+  # batched output projection (8 experts)
+  - [8, 8192, 1024, 4096]
+  # per-token bmms (batch=8192, M=64)
+  - [8192, 64, 128, 4096]
+  - [8192, 64, 512, 576]
+  - [8192, 64, 512, 64]
+  - [8192, 64, 256, 64]
+  # smaller batch variants to cover the dispatch tiers
+  - [8, 1024, 4096, 4096]
+  - [8, 128, 4096, 4096]
+  - [4, 256, 7168, 4096]
+  - [1, 8192, 4096, 4096]
+
+sm_count: -1
+
+backends: [halops, fi, fi_cutlass, bmm]
+cold_l2_cache: true
+refcheck: true
+refcheck_reference: golden
