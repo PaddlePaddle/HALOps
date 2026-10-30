@@ -17,6 +17,7 @@
 #include <cuda.h>
 #include <cuda_fp8.h>
 #include <cutlass/arch/barrier.h>
+#include <cutlass/array.h>
 
 #include <cute/algorithm/gemm.hpp>
 #include <cute/atom/mma_traits_sm100.hpp>
@@ -123,9 +124,9 @@ struct UpProjection {
         UpGemm::kNumScaleBlocksK;
     static constexpr std::uint32_t kPairLayoutGranularity =
         Traits::kPairLayoutGranularity;
-    // Register accumulators of one dequant thread, as [feature][token].
-    static constexpr std::uint32_t kAccFeatures = 1u;
+    // Register accumulators of one dequant thread, one per token column.
     static constexpr std::uint32_t kAccTokens = UpGemm::kTileShapeN / 4u;
+    using Accumulator = cutlass::Array<float, kAccTokens>;
     static constexpr std::uint32_t kQuantGroups = UpGemm::kActQuantBlock / 32u;
     static_assert(UpGemm::kTileShapeN % WarpRole::kCalcWarpCount == 0u,
                   "every calc warp must publish the same number of tokens.");
@@ -169,8 +170,7 @@ struct UpProjection {
         return 8u * (dequant_row_base() >> 4);
     }
     static_assert(UpGemm::kActQuantBlock * Dims::kNumTokens ==
-                      WarpRole::kCalcWarpCount * 32u * kAccFeatures *
-                          kAccTokens,
+                      WarpRole::kCalcWarpCount * 32u * kAccTokens,
                   "The pair-layout epilogue's register file must cover the "
                   "block's features x kNumTokens exactly.");
     static_assert(
@@ -225,8 +225,8 @@ struct UpProjection {
             } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
                 run_mma_k_loop(smem, tmem_base, task_id);
             } else if (WarpRole::is_calc_warp(warp_idx)) {
-                ZeroedFragment<kAccFeatures, kAccTokens> acc_gate_out;
-                ZeroedFragment<kAccFeatures, kAccTokens> acc_up_out;
+                Accumulator acc_gate_out{};
+                Accumulator acc_up_out{};
                 run_dequant_k_loop(smem, acc_gate_out, acc_up_out,
                                    cur_scale_slot, tmem_base, task_id,
                                    expert_id);
@@ -256,9 +256,7 @@ struct UpProjection {
     template <bool kSitu>
     __device__ static void combine_gated_activation(
         SharedStorage* __restrict__ smem, std::uint32_t e,
-        std::uint32_t batch_size,
-        ZeroedFragment<kAccFeatures, kAccTokens>& acc_gate,
-        ZeroedFragment<kAccFeatures, kAccTokens>& acc_up,
+        std::uint32_t batch_size, Accumulator& acc_gate, Accumulator& acc_up,
         GatedActParams const& act_params) {
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         // Pair layout: `t0` is the column pair, `t1` the row in a group.
@@ -267,22 +265,18 @@ struct UpProjection {
         const RoutingTables& tables = smem->routing;
         const std::uint32_t slab = tables.slab_begin(e);
 #pragma unroll
-        for (std::uint32_t f = 0; f < kAccFeatures; ++f) {
-#pragma unroll
-            for (std::uint32_t ti = 0; ti < kAccTokens; ++ti) {
-                const std::uint32_t tok = 8u * (ti / 2u) + 2u * t0 + ti % 2u;
-                if (tok < batch_size) {
-                    // `rank_of` returns 0xFF when the token misses this expert.
-                    const std::uint8_t rank = tables.rank_of(e, tok);
-                    if (rank != 0xFFu) {
-                        const float rw = tables.expert_row_weight[slab + rank];
-                        // Rows t1 and t1 + 8 are one feature's gate and up.
-                        const std::uint32_t frow =
-                            dequant_feature_base() + t1 + 8u * f;
-                        smem->routed_experts.up_down_act.act_up_out[frow][tok] =
-                            moe_gated_act<kSitu>(acc_gate[f][ti], acc_up[f][ti],
-                                                 rw, act_params);
-                    }
+        for (std::uint32_t ti = 0; ti < kAccTokens; ++ti) {
+            const std::uint32_t tok = 8u * (ti / 2u) + 2u * t0 + ti % 2u;
+            if (tok < batch_size) {
+                // `rank_of` returns 0xFF when the token misses this expert.
+                const std::uint8_t rank = tables.rank_of(e, tok);
+                if (rank != 0xFFu) {
+                    const float rw = tables.expert_row_weight[slab + rank];
+                    // Rows t1 and t1 + 8 are one feature's gate and up.
+                    const std::uint32_t frow = dequant_feature_base() + t1;
+                    smem->routed_experts.up_down_act.act_up_out[frow][tok] =
+                        moe_gated_act<kSitu>(acc_gate[ti], acc_up[ti], rw,
+                                             act_params);
                 }
             }
         }
@@ -346,9 +340,8 @@ struct UpProjection {
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         std::uint32_t e, std::uint32_t batch_size, std::uint32_t base_feature,
         std::uint32_t m_block_idx, Activation activation,
-        GatedActParams const& act_params,
-        ZeroedFragment<kAccFeatures, kAccTokens>& acc_gate,
-        ZeroedFragment<kAccFeatures, kAccTokens>& acc_up) {
+        GatedActParams const& act_params, Accumulator& acc_gate,
+        Accumulator& acc_up) {
         [[maybe_unused]] const std::uint32_t expert_id =
             smem->routing.active_experts[e];
 
@@ -428,12 +421,13 @@ struct UpProjection {
 
     // The calc warps' loop lags the UMMA by one iteration and drains one past
     // the K-steps.
-    __device__ static void run_dequant_k_loop(
-        SharedStorage* __restrict__ smem,
-        ZeroedFragment<kAccFeatures, kAccTokens>& acc_gate_out,
-        ZeroedFragment<kAccFeatures, kAccTokens>& acc_up_out,
-        std::uint32_t cur_scale_slot, std::uint32_t tmem_base,
-        std::uint32_t task_id, std::uint32_t expert_id) {
+    __device__ static void run_dequant_k_loop(SharedStorage* __restrict__ smem,
+                                              Accumulator& acc_gate_out,
+                                              Accumulator& acc_up_out,
+                                              std::uint32_t cur_scale_slot,
+                                              std::uint32_t tmem_base,
+                                              std::uint32_t task_id,
+                                              std::uint32_t expert_id) {
         smem->barriers.wait_weight_scale_ready(task_id, cur_scale_slot);
 
 #pragma unroll 1
@@ -474,12 +468,11 @@ struct UpProjection {
             tCrB, tCt_gate, tmem_addr(tmem_base, 0u, acc_slot * kAccColumns));
     }
 
-    __device__ static void dequant(
-        SharedStorage* __restrict__ smem,
-        ZeroedFragment<kAccFeatures, kAccTokens>& acc_gate,
-        ZeroedFragment<kAccFeatures, kAccTokens>& acc_up,
-        std::uint32_t cur_scale_slot, std::uint32_t ring_iter_id,
-        std::uint32_t s, std::uint32_t tmem_base) {
+    __device__ static void dequant(SharedStorage* __restrict__ smem,
+                                   Accumulator& acc_gate, Accumulator& acc_up,
+                                   std::uint32_t cur_scale_slot,
+                                   std::uint32_t ring_iter_id, std::uint32_t s,
+                                   std::uint32_t tmem_base) {
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         const std::uint32_t prev_slot = (ring_iter_id - 1u) % kNumAccSlots;
 
@@ -518,8 +511,8 @@ struct UpProjection {
                     // v[0..1] is row t1 (gate), v[2..3] is row t1+8 (up).
                     const float as = smem->routed_experts.quantized_input
                                          .scale[kblk][g * 8u + 2u * t0 + ti];
-                    acc_gate[0][g * 2u + ti] += v[ti] * ws_buf[kblk] * as;
-                    acc_up[0][g * 2u + ti] +=
+                    acc_gate[g * 2u + ti] += v[ti] * ws_buf[kblk] * as;
+                    acc_up[g * 2u + ti] +=
                         v[ti + 2u] * ws_buf[kblk + kNumUpScaleBlocksK] * as;
                 }
             }

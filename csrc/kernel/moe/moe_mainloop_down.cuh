@@ -17,6 +17,7 @@
 #include <cuda.h>
 #include <cuda_fp8.h>
 #include <cutlass/arch/barrier.h>
+#include <cutlass/array.h>
 
 #include <cute/algorithm/gemm.hpp>
 #include <cute/atom/mma_traits_sm100.hpp>
@@ -248,7 +249,7 @@ struct DownProjection {
                                           expert_id, base_m, expert_start,
                                           routed_count);
 
-                ZeroedFragment<DownGemm::kTileShapeN> acc_out;
+                cutlass::Array<float, DownGemm::kTileShapeN> acc_out{};
                 run_dequant_k_loop(smem, acc_out, m_tile_idx, lane_base,
                                    tmem_base, ring_iter_id, local_id);
 
@@ -325,8 +326,9 @@ struct DownProjection {
     // 128-N substep's weight and activation scales.
     __device__ static void dequant(
         SharedStorage* __restrict__ smem, std::uint32_t ring_iter_id,
-        ZeroedFragment<DownGemm::kTileShapeN>& acc_out, unsigned m_tile_idx,
-        unsigned lane_base, std::uint32_t k_iter_id, std::uint32_t tmem_base) {
+        cutlass::Array<float, DownGemm::kTileShapeN>& acc_out,
+        unsigned m_tile_idx, unsigned lane_base, std::uint32_t k_iter_id,
+        std::uint32_t tmem_base) {
         // Tile ring_iter_id - 1: the dequant lags the UMMA by one iteration.
         const std::uint32_t prev = (ring_iter_id - 1u) % kNumAccSlots;
 
@@ -453,9 +455,9 @@ struct DownProjection {
     // to drain the expert's last substep.
     __device__ static void run_dequant_k_loop(
         SharedStorage* __restrict__ smem,
-        ZeroedFragment<DownGemm::kTileShapeN>& acc_out, unsigned m_tile_idx,
-        unsigned lane_base, std::uint32_t tmem_base, std::uint32_t ring_iter_id,
-        std::uint32_t local_id) {
+        cutlass::Array<float, DownGemm::kTileShapeN>& acc_out,
+        unsigned m_tile_idx, unsigned lane_base, std::uint32_t tmem_base,
+        std::uint32_t ring_iter_id, std::uint32_t local_id) {
         // A wide tile's drain is a long TMEM-read chain; two unrolled copies
         // cover it and stay small.
         constexpr std::uint32_t kDrainUnroll = Dims::kNumTokens > 8u ? 2u : 8u;

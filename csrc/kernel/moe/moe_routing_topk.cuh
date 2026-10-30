@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cutlass/array.h>
 
 #include <cfloat>
 #include <cstdint>
@@ -29,14 +30,14 @@ namespace halops::moe {
 
 // Warp `token` reads the token's logits row, lane l its expert slice.
 template <typename Dims, std::uint32_t kExpertsPerThread>
-__device__ static Fragment<float, kExpertsPerThread> load_logits_one_token(
-    const MoEWorkspace<Dims>* __restrict__ workspace, std::uint32_t gate,
-    std::uint32_t token_idx) {
+__device__ static cutlass::Array<float, kExpertsPerThread>
+load_logits_one_token(const MoEWorkspace<Dims>* __restrict__ workspace,
+                      std::uint32_t gate, std::uint32_t token_idx) {
     using RouterGemm = RouterGemmTraits<Dims>;
     static_assert(kExpertsPerThread % 8u == 0u,
                   "a lane's logits slice must be whole 16-B words");
 
-    Fragment<float, kExpertsPerThread> slice;
+    cutlass::Array<float, kExpertsPerThread> slice;
     const std::uint32_t lane_base =
         WarpRole::get_lane_idx() * kExpertsPerThread;
 
@@ -121,7 +122,7 @@ __device__ static __forceinline__ void warp_argmax_expert(
 // Turns the lane's logits into fp32 candidates; NaN/Inf become -FLT_MAX.
 template <uint32_t kExpertsPerThread>
 __device__ static void fp32_candidates(
-    uint32_t lane_idx, const float (&logits)[kExpertsPerThread],
+    uint32_t lane_idx, const cutlass::Array<float, kExpertsPerThread>& logits,
     float (&scores)[kExpertsPerThread],
     uint32_t (&expert_id)[kExpertsPerThread]) {
     const uint32_t lane_base = lane_idx * kExpertsPerThread;
@@ -147,7 +148,7 @@ __device__ static __forceinline__ uint32_t pack_logit_bits(uint32_t bits,
 // Turns the lane's logits into packed scores, one per owned expert.
 template <uint32_t kExpertsPerThread>
 __device__ static __forceinline__ void packed_candidates(
-    uint32_t lane_idx, const float (&logits)[kExpertsPerThread],
+    uint32_t lane_idx, const cutlass::Array<float, kExpertsPerThread>& logits,
     uint32_t (&packed_scores)[kExpertsPerThread]) {
     const uint32_t lane_base = lane_idx * kExpertsPerThread;
 #pragma unroll
@@ -448,20 +449,19 @@ __device__ static void topk_one_token(
     constexpr uint32_t kNumGates = RouterGemmTraits<Dims>::kNumRouterGates;
     const uint32_t lane_idx = WarpRole::get_lane_idx();
 
-    const Fragment<float, kExpertsPerThread> logits =
+    const cutlass::Array<float, kExpertsPerThread> logits =
         load_logits_one_token<Dims, kExpertsPerThread>(workspace, 0u,
                                                        token_idx);
     if constexpr (kNumGates > 1u) {
         // DualRouter: select on the sum of the two gates' scores.
-        const Fragment<float, kExpertsPerThread> other =
+        const cutlass::Array<float, kExpertsPerThread> other =
             load_logits_one_token<Dims, kExpertsPerThread>(workspace, 1u,
                                                            token_idx);
         float hi[kExpertsPerThread];
         float lo[kExpertsPerThread];
         uint32_t expert_id[kExpertsPerThread];
-        fp32_candidates<kExpertsPerThread>(lane_idx, logits.data, hi,
-                                           expert_id);
-        fp32_candidates<kExpertsPerThread>(lane_idx, other.data, lo, expert_id);
+        fp32_candidates<kExpertsPerThread>(lane_idx, logits, hi, expert_id);
+        fp32_candidates<kExpertsPerThread>(lane_idx, other, lo, expert_id);
         if (scoring_func == ScoringFunc::kSoftmax) {
             // Each gate's row is normalized on its own, then the scores add.
             warp_softmax_inplace<kExpertsPerThread>(hi);
@@ -481,15 +481,13 @@ __device__ static void topk_one_token(
     if (scoring_func == ScoringFunc::kSoftmax && !renormalize) {
         float scores[kExpertsPerThread];
         uint32_t expert_id[kExpertsPerThread];
-        fp32_candidates<kExpertsPerThread>(lane_idx, logits.data, scores,
-                                           expert_id);
+        fp32_candidates<kExpertsPerThread>(lane_idx, logits, scores, expert_id);
         topk_weights_from_softmax_probs<kExpertsPerThread, kMaxTopk>(
             token_idx, top_k, scores, expert_id, smem->routing_scratch.topk_ids,
             smem->routing_scratch.topk_weights);
     } else {
         uint32_t packed_scores[kExpertsPerThread];
-        packed_candidates<kExpertsPerThread>(lane_idx, logits.data,
-                                             packed_scores);
+        packed_candidates<kExpertsPerThread>(lane_idx, logits, packed_scores);
         topk_weights_from_logits<kExpertsPerThread, kMaxTopk>(
             token_idx, top_k, scoring_func, renormalize, packed_scores,
             smem->routing_scratch.topk_ids, smem->routing_scratch.topk_weights);

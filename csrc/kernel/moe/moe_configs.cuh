@@ -122,57 +122,6 @@ struct DataType {
     using ElementAcc = float;          // fp32 accumulators
 };
 
-// A register fragment of `N` elements of `T`, left uninitialized.
-template <typename T, std::uint32_t N>
-struct Fragment {
-    T data[N];
-    __device__ __forceinline__ T& operator[](std::uint32_t i) {
-        return data[i];
-    }
-    __device__ __forceinline__ T operator[](std::uint32_t i) const {
-        return data[i];
-    }
-};
-
-// A register fragment of floats, zero-initialized on construction.
-template <std::uint32_t R, std::uint32_t C = 1u>
-struct ZeroedFragment {
-    float data[R][C];
-    __device__ __forceinline__ ZeroedFragment() {
-#pragma unroll
-        for (std::uint32_t i = 0; i < R; ++i) {
-#pragma unroll
-            for (std::uint32_t j = 0; j < C; ++j) {
-                data[i][j] = 0.f;
-            }
-        }
-    }
-    __device__ __forceinline__ float (&operator[](std::uint32_t i))[C] {
-        return data[i];
-    }
-    __device__ __forceinline__ const float (&operator[](std::uint32_t i)
-                                                const)[C] {
-        return data[i];
-    }
-};
-
-template <std::uint32_t N>
-struct ZeroedFragment<N, 1u> {
-    float data[N];
-    __device__ __forceinline__ ZeroedFragment() {
-#pragma unroll
-        for (std::uint32_t i = 0; i < N; ++i) {
-            data[i] = 0.f;
-        }
-    }
-    __device__ __forceinline__ float& operator[](std::uint32_t i) {
-        return data[i];
-    }
-    __device__ __forceinline__ float operator[](std::uint32_t i) const {
-        return data[i];
-    }
-};
-
 template <bool kCondition, std::uint32_t kTrue, std::uint32_t kFalse>
 struct Select {
     static constexpr std::uint32_t value = kCondition ? kTrue : kFalse;

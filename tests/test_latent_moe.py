@@ -47,12 +47,12 @@ def _quant_fp8_block_wise(w, block_row=128, block_col=128):
     return w_fp8.to(torch.float8_e4m3fn), scales
 
 
-def _quant_fp8_per_token(x, block_size=128):
+def _quant_fp8_group_wise(x, group_size=128):
     """Per-token-dynamic quant over the last dim; `x` is [..., K], bf16 or fp32."""
     x_float = x.float()
     shape = x_float.shape
-    groups = shape[-1] // block_size
-    blocks = x_float.reshape(*shape[:-1], groups, block_size)
+    groups = shape[-1] // group_size
+    blocks = x_float.reshape(*shape[:-1], groups, group_size)
     amax = blocks.abs().amax(dim=-1).clamp(min=1e-10)
     scales = amax * (1.0 / _FP8_MAX)
     q = (blocks / scales[..., None]).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
@@ -124,88 +124,19 @@ class MoEParams:
         return self
 
 
-_SHARED_CACHE: dict = {}
-
-
 @pytest.fixture(autouse=True)
 def _seed():
     torch.manual_seed(1)
     torch.cuda.manual_seed_all(1)
 
 
-def _shared_operands(device, m: int):
-    """Placeholder shared-expert operands (the tests ignore its output)."""
-    key = (str(device), m)
-    cached = _SHARED_CACHE.get(key)
-    if cached is None:
-        h, n = 4096, 512
-        up = torch.zeros(2 * n, h, dtype=torch.float8_e4m3fn, device=device)
-        up_s = torch.full((2 * n // 128, h // 128), 1.0, device=device)
-        down = torch.zeros(h, n, dtype=torch.float8_e4m3fn, device=device)
-        down_s = torch.full((h // 128, n // 128), 1.0, device=device)
-        out = torch.empty(m, h, dtype=torch.bfloat16, device=device)
-        cached = (up, up_s, down, down_s, out)
-        _SHARED_CACHE[key] = cached
-    return cached
+def _situ_glu(gate, up, beta, linear_beta):
+    """SiTU: sigmoid(gate) times the soft-capped gate and up operands."""
 
+    def _soft_cap(x, beta):
+        return x if beta <= 0.0 else beta * torch.tanh(x / beta)
 
-def _block_wise_gemm(
-    w_fp8,
-    scales_bw,
-    x_fp8,
-    x_scales,
-    block_row=128,
-    block_col=128,
-    act_group_size=128,
-):
-    """Dequantize each reduction block before accumulating FP32 outputs."""
-    rows, cols = w_fp8.shape
-    assert block_col % act_group_size == 0
-    assert x_scales.numel() == cols // act_group_size
-    wf, xf = w_fp8.bfloat16(), x_fp8.bfloat16()  # matmul in bf16
-    rb, cb = scales_bw.shape
-    assert rb == (rows + block_row - 1) // block_row
-    assert cb == (cols + block_col - 1) // block_col
-    result = torch.zeros(rows, device=w_fp8.device, dtype=torch.float32)
-    for ri in range(rb):
-        r0, r1 = ri * block_row, min((ri + 1) * block_row, rows)
-        for ci in range(cb):
-            c0, c1 = ci * block_col, min((ci + 1) * block_col, cols)
-            partial = None
-            for a0 in range(c0, c1, act_group_size):
-                a1 = min(a0 + act_group_size, c1)
-                subblock = (wf[r0:r1, a0:a1] @ xf[a0:a1]) * x_scales[
-                    a0 // act_group_size
-                ]
-                partial = subblock if partial is None else partial + subblock
-            result[r0:r1] += partial * scales_bw[ri, ci]
-    return result
-
-
-def _routing_sigmoid_topk_from_scores(scores, top_k):
-    """The greedy topk->renormalize over already-scored rows."""
-    M = scores.shape[0]
-    ids = torch.zeros(M, top_k, dtype=torch.int64, device=scores.device)
-    wts = torch.zeros(M, top_k, dtype=torch.float32, device=scores.device)
-    s = scores.clone()
-    for k in range(top_k):
-        v, idx = s.max(dim=-1)
-        wts[:, k] = v
-        ids[:, k] = idx
-        s.scatter_(1, idx.unsqueeze(1), float("-inf"))
-    wts = wts / wts.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-    return wts, ids
-
-
-def _soft_cap(x, beta):
-    """SiTU's scaled-tanh soft cap: beta * tanh(x / beta), identity when <= 0."""
-    return x if beta <= 0.0 else beta * torch.tanh(x / beta)
-
-
-def _router_logits(x, router_weight):
-    """The router Linear, at the shapes the tests build (bf16 matmul, FP32)."""
-    row = (x.bfloat16() @ router_weight.bfloat16()).float()
-    return row.bfloat16() if router_weight.dim() == 2 else row
+    return _soft_cap(gate, beta) * torch.sigmoid(gate) * _soft_cap(up, linear_beta)
 
 
 class MoERef:
@@ -214,49 +145,81 @@ class MoERef:
     def __init__(self, moe_params):
         self.moe_params = moe_params
 
-    def _router_logits(self, input):
-        """The router Linear as the kernel computes it: bf16 operands, FP32 result."""
+    def _router_scores(self, input):
+        """The router's selection key: sigmoid of each gate's logits, summed."""
         router_weight = self.moe_params.router_weight
-        row = (input.bfloat16() @ router_weight.bfloat16()).float()
-        return row.bfloat16() if router_weight.dim() == 2 else row
+        logits = (input.bfloat16() @ router_weight.bfloat16()).float()
+        if router_weight.dim() == 2:
+            # The kernel round-trips the logits through bf16 before scoring.
+            logits = logits.bfloat16()
+        scores = torch.sigmoid(logits.float())
+        return scores.sum(0) if scores.dim() == 3 else scores
 
-    def _shared_expert(self, input):
-        """The shared expert: gate/up over the hidden space, then down."""
-        p = self.moe_params
-        n = p.intermediate_size
+    def _routing_sigmoid_topk_from_scores(self, scores, top_k):
+        """The greedy topk->renormalize over already-scored rows."""
+        M = scores.shape[0]
+        ids = torch.zeros(M, top_k, dtype=torch.int64, device=scores.device)
+        weights = torch.zeros(M, top_k, dtype=torch.float32, device=scores.device)
+        s = scores.clone()
+        for k in range(top_k):
+            v, idx = s.max(dim=-1)
+            weights[:, k] = v
+            ids[:, k] = idx
+            s.scatter_(1, idx.unsqueeze(1), float("-inf"))
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        return weights, ids
+
+    def matmul_fp8(self, x_fp8, y_fp8, x_scale, y_scale):
+        """Return dequantized ``x @ y.T`` in FP32.
+
+        Activations are [K] or [M, K], with one scale per 64/128 K values.
+        Weights are [N, K], with one scale per 128x128 block.
+        """
+        assert x_fp8.ndim in (1, 2)
+        assert y_fp8.ndim == 2 and x_fp8.shape[-1] == y_fp8.shape[-1]
+        assert x_scale.ndim == x_fp8.ndim
+        assert x_scale.shape[:-1] == x_fp8.shape[:-1]
+        assert x_scale.shape[-1] > 0
+        group_size, remainder = divmod(x_fp8.shape[-1], x_scale.shape[-1])
+        assert remainder == 0 and group_size in (64, 128)
 
         def dequant(weight, scale):
             rows, cols = weight.shape
-            blocks = weight.float().reshape(rows // 128, 128, cols // 128, 128)
-            return (blocks * scale[:, None, :, None]).reshape(rows, cols)
+            assert scale.shape == ((rows + 127) // 128, (cols + 127) // 128)
+            expanded = scale.float().repeat_interleave(128, 0).repeat_interleave(128, 1)
+            return weight.float() * expanded[:rows, :cols]
 
-        up = dequant(p.shared_up_weight, p.shared_up_weight_scale)  # [2N, H]
-        down = dequant(p.shared_down_weight, p.shared_down_weight_scale)  # [H, N]
+        blocks = x_fp8.float().reshape(*x_scale.shape, group_size)
+        activations = (blocks * x_scale.float().unsqueeze(-1)).reshape(x_fp8.shape)
+        return activations @ dequant(y_fp8, y_scale).T
 
-        su = (input.bfloat16() @ up.bfloat16().T).float()
-        act = self._gated_act(su[:, :n], su[:, n:], 1.0)
+    def _shared_expert(self, input):
+        """The shared expert: gate/up over the hidden space, then down."""
+        n = self.moe_params.intermediate_size
 
-        m = act.shape[0]
-        q, scale = _quant_fp8_per_token(act, block_size=64)
-        dequant = (q.float().reshape(m, n // 64, 64) * scale[..., None]).reshape(m, n)
-        return (dequant.bfloat16() @ down.bfloat16().T).bfloat16()
+        input_fp8, input_scale = _quant_fp8_group_wise(input, group_size=128)
+        up_out = self.matmul_fp8(
+            input_fp8,
+            self.moe_params.shared_up_weight,
+            input_scale,
+            self.moe_params.shared_up_weight_scale,
+        )
+        act = self._gated_act(up_out[:, :n], up_out[:, n:], 1.0)
+
+        act_fp8, act_scale = _quant_fp8_group_wise(act, group_size=64)
+        return self.matmul_fp8(
+            act_fp8,
+            self.moe_params.shared_down_weight,
+            act_scale,
+            self.moe_params.shared_down_weight_scale,
+        ).bfloat16()
 
     def _gated_act(self, gate, up, rw):
         """The kernel's epilogue combine, fp32; the knobs come from the params."""
         p = self.moe_params
-        activation, situ_beta, situ_linear_beta = (
-            p.activation,
-            p.situ_beta,
-            p.situ_linear_beta,
-        )
-        if activation == "silu":
-            return rw * (up * gate) / (1.0 + torch.exp(-gate))
-        return (
-            rw
-            * _soft_cap(gate, situ_beta)
-            * torch.sigmoid(gate)
-            * _soft_cap(up, situ_linear_beta)
-        )
+        if p.activation == "silu":
+            return rw * up * F.silu(gate)
+        return rw * _situ_glu(gate, up, p.situ_beta, p.situ_linear_beta)
 
     def routed_experts(
         self,
@@ -273,33 +236,34 @@ class MoERef:
         """Block-FP8 expert stage over `z`, the activation the experts read."""
         out = torch.zeros(z.shape[0], k, device=z.device, dtype=torch.float32)
         for tok in range(z.shape[0]):
-            xq, x_scales = _quant_fp8_per_token(z[tok].float(), block_size=128)
+            xq, x_scales = _quant_fp8_group_wise(z[tok].float(), group_size=128)
             for ki in range(topk_ids.shape[1]):
                 eid = int(topk_ids[tok, ki])
                 weight = float(topk_w[tok, ki])
-                raw = _block_wise_gemm(up_weights[eid], up_scales[eid], xq, x_scales)
+                raw = self.matmul_fp8(xq, up_weights[eid], x_scales, up_scales[eid])
                 act = self._gated_act(raw[:n], raw[n:], weight)
-                sq, act_scale = _quant_fp8_per_token(act, block_size=64)
-                out[tok] += _block_wise_gemm(
-                    down_weights[eid],
-                    down_scales[eid],
+                sq, act_scale = _quant_fp8_group_wise(act, group_size=64)
+                out[tok] += self.matmul_fp8(
                     sq,
+                    down_weights[eid],
                     act_scale,
-                    act_group_size=64,
+                    down_scales[eid],
                 )
         return out.bfloat16()
 
     def __call__(self, input, top_k):
         shared_out = self._shared_expert(input)
 
-        scores = _router_scores(self._router_logits(input))
-        topk_w, topk_ids = _routing_sigmoid_topk_from_scores(scores, top_k)
+        scores = self._router_scores(input)
+        topk_w, topk_ids = self._routing_sigmoid_topk_from_scores(scores, top_k)
 
-        # z = x @ W_latent^T; the [L/128, H/128] scales transpose onto [H, L].
-        weight = self.moe_params.latent_down_weight.float()
-        scale = self.moe_params.latent_down_weight_scale
-        dequant = weight * scale.T.repeat_interleave(128, 0).repeat_interleave(128, 1)
-        latent_out = (input.bfloat16() @ dequant.bfloat16()).bfloat16()
+        input_fp8, input_scale = _quant_fp8_group_wise(input, group_size=128)
+        latent_out = self.matmul_fp8(
+            input_fp8,
+            self.moe_params.latent_down_weight.T,
+            input_scale,
+            self.moe_params.latent_down_weight_scale,
+        ).bfloat16()
 
         routed_out = self.routed_experts(
             latent_out,
@@ -382,29 +346,6 @@ def _cosine(a, b):
     return F.cosine_similarity(
         a.float().reshape(-1), b.float().reshape(-1), dim=0
     ).item()
-
-
-def _router_scores(logits):
-    """The router's selection key: sigmoid of each gate's logits, summed."""
-    scores = torch.sigmoid(logits.float())
-    return scores.sum(0) if scores.dim() == 3 else scores
-
-
-def _make_weights(dev, E, N, K, scale=0.1, seed=42):
-    """Quantized block-FP8 up/down weights (fp8 tensors + scales) for a shape."""
-    g = torch.Generator(device=dev).manual_seed(seed)
-    w13_f = torch.randn(E, 2 * N, K, device=dev, generator=g) * scale
-    w2_f = torch.randn(E, K, N, device=dev, generator=g) * scale
-    w13_fp8, s13 = _quant_fp8_block_wise(w13_f)
-    w2_fp8, s2 = _quant_fp8_block_wise(w2_f)
-    return w13_fp8, s13, w2_fp8, s2
-
-
-def _router_weight(dev, K, E, x_std=1.0, seed=0):
-    """Random bf16 router Linear weight ``[K, E]`` giving unit-variance logits."""
-    g = torch.Generator(device=dev).manual_seed(seed)
-    w = torch.randn(K, E, device=dev, generator=g) / (x_std * K**0.5)
-    return w.bfloat16()
 
 
 def _run_and_compare(moe_params, num_tokens=1, top_k=8):
