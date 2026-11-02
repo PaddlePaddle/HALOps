@@ -98,12 +98,13 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
 
 void LowLatencyMmaGemm(const torch::Tensor& input, const torch::Tensor& weight,
                        const torch::Tensor& sfa, const torch::Tensor& sfb,
-                       torch::Tensor& output, const int sm_count,
-                       const std::optional<torch::Tensor>& output2,
-                       const int n_split,
+                       torch::Tensor& output,
                        const std::optional<torch::Tensor>& input2,
+                       const std::optional<torch::Tensor>& weight2,
                        const std::optional<torch::Tensor>& sfa2,
-                       const bool use_pdl);
+                       const std::optional<torch::Tensor>& sfb2,
+                       const std::optional<torch::Tensor>& output2,
+                       const int sm_count, const bool use_pdl);
 
 std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
                                           const std::string& mode,
@@ -190,8 +191,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("batch_gemm", &halops::BatchGemm);
     m.def("low_latency_mma_gemm", &halops::LowLatencyMmaGemm, py::arg("input"),
           py::arg("weight"), py::arg("sfa"), py::arg("sfb"), py::arg("output"),
-          py::arg("sm_count"), py::arg("output2"), py::arg("n_split"),
-          py::arg("input2"), py::arg("sfa2"), py::arg("use_pdl") = true);
+          py::arg("input2"), py::arg("weight2"), py::arg("sfa2"),
+          py::arg("sfb2"), py::arg("output2"), py::arg("sm_count"),
+          py::arg("use_pdl") = true);
     m.def("group_wise_quant", &halops::GroupWiseQuant, py::arg("input"),
           py::arg("mode"), py::arg("use_swizzle") = true,
           py::arg("use_pdl") = true);
