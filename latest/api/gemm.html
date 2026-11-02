@@ -279,7 +279,10 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#halops.group_wise_quant" title="halops.group_wise_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_wise_quant</span></code></a></p></td>
 <td><p>Group-wise quantization from BF16/FP16 to FP8/FP4 with scale factors.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#halops.prefill_permute_to_masked_gemm" title="halops.prefill_permute_to_masked_gemm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">prefill_permute_to_masked_gemm</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.low_latency_mma_gemm" title="halops.low_latency_mma_gemm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">low_latency_mma_gemm</span></code></a></p></td>
+<td><p>Low-latency W8A8-MXFP8 GEMM for decode-sized M (M &lt;= 16).</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.prefill_permute_to_masked_gemm" title="halops.prefill_permute_to_masked_gemm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">prefill_permute_to_masked_gemm</span></code></a></p></td>
 <td><p>Permute tokens into padded expert layout for masked GEMM.</p></td>
 </tr>
 </tbody>
@@ -733,6 +736,85 @@ plain row-major scale layout.</p></li>
 </dd></dl>
 
 </section>
+<section class="api-entry" id="low-latency-mma-gemm">
+<h2>low_latency_mma_gemm<a class="headerlink" href="#low-latency-mma-gemm" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.low_latency_mma_gemm">
+<span class="sig-name descname"><span class="pre">low_latency_mma_gemm</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">input</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">sfa</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">sfb</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">output</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">input2</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">weight2</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">sfa2</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">sfb2</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">output2</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">sm_count</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.low_latency_mma_gemm" title="Link to this definition">¶</a></dt>
+<dd><p>Low-latency W8A8-MXFP8 GEMM for decode-sized M (M &lt;= 16).</p>
+<p>Computes <code class="docutils literal notranslate"><span class="pre">output</span> <span class="pre">=</span> <span class="pre">input</span> <span class="pre">&#64;</span> <span class="pre">weight^T</span></code>. Two fused variants take a second
+weight:</p>
+<ul class="simple">
+<li><p>concat-K, with <code class="docutils literal notranslate"><span class="pre">input2</span></code>: <code class="docutils literal notranslate"><span class="pre">output</span> <span class="pre">=</span> <span class="pre">input</span> <span class="pre">&#64;</span> <span class="pre">weight^T</span> <span class="pre">+</span> <span class="pre">input2</span> <span class="pre">&#64;</span>
+<span class="pre">weight2^T</span></code>.</p></li>
+<li><p>dual output, with <code class="docutils literal notranslate"><span class="pre">output2</span></code>: <code class="docutils literal notranslate"><span class="pre">output2</span> <span class="pre">=</span> <span class="pre">input</span> <span class="pre">&#64;</span> <span class="pre">weight2^T</span></code> as well.</p></li>
+</ul>
+<p>Scales use the plain row-major layout from
+<code class="docutils literal notranslate"><span class="pre">group_wise_quant(...,</span> <span class="pre">use_swizzle=False)</span></code>, not the SfAtom layout
+<code class="docutils literal notranslate"><span class="pre">dense_gemm</span></code> takes. Every scale row stride must be a multiple of 16
+bytes: this holds when its K is a multiple of 512; otherwise pass the
+[rows, K // 32] view of a [rows, round_up(K // 32, 16)] buffer. An SfAtom
+sfb is not detected when N % 128 == 0 and gives wrong results.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>input</strong> (<em>torch.Tensor</em>) – [M, K1] float8_e4m3fn. The whole input is kept in shared
+memory; a K (K1 + K2 with concat-K) too large for it raises an
+error. K must be a multiple of 256.</p></li>
+<li><p><strong>weight</strong> (<em>torch.Tensor</em>) – [N, K1] float8_e4m3fn, N % 8 == 0.</p></li>
+<li><p><strong>sfa</strong> (<em>torch.Tensor</em>) – [M, K1 // 32] uint8 UE8M0 scale of input.</p></li>
+<li><p><strong>sfb</strong> (<em>torch.Tensor</em>) – [N, K1 // 32] uint8 UE8M0 scale of weight. With <code class="docutils literal notranslate"><span class="pre">use_pdl</span></code> it is
+read before waiting for the previous kernel, so that kernel must
+not write it.</p></li>
+<li><p><strong>output</strong> (<em>torch.Tensor</em>) – [M, N] bfloat16, written in-place.</p></li>
+<li><p><strong>input2</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional [M, K2] float8_e4m3fn, enables concat-K. K1 must be
+a multiple of 512.</p></li>
+<li><p><strong>weight2</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [N, K2] with <code class="docutils literal notranslate"><span class="pre">input2</span></code>, [N2, K1] with <code class="docutils literal notranslate"><span class="pre">output2</span></code>;
+N2 % 8 == 0.</p></li>
+<li><p><strong>sfa2</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [M, K2 // 32] scale of input2.</p></li>
+<li><p><strong>sfb2</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Scale of weight2.</p></li>
+<li><p><strong>output2</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional [M, N2] bfloat16, enables dual output. Not
+combinable with <code class="docutils literal notranslate"><span class="pre">input2</span></code>.</p></li>
+<li><p><strong>sm_count</strong> (<em>int</em>) – Number of SMs to use (-1 for all available).</p></li>
+<li><p><strong>use_pdl</strong> (<em>bool</em>) – Enable Programmatic Dependent Launch (on by default).</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>None. The result is written in-place to output (and output2).</p>
+</dd>
+</dl>
+<p class="rubric">Example</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">halops</span><span class="w"> </span><span class="kn">import</span> <span class="n">group_wise_quant</span><span class="p">,</span> <span class="n">low_latency_mma_gemm</span>
+
+<span class="n">m</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">k</span> <span class="o">=</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="mi">4096</span>
+<span class="n">x_bf16</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">w_bf16</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">x</span><span class="p">,</span> <span class="n">sfa</span> <span class="o">=</span> <span class="n">group_wise_quant</span><span class="p">(</span><span class="n">x_bf16</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"w8a8-mxfp8"</span><span class="p">,</span> <span class="n">use_swizzle</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="n">w</span><span class="p">,</span> <span class="n">sfb</span> <span class="o">=</span> <span class="n">group_wise_quant</span><span class="p">(</span><span class="n">w_bf16</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"w8a8-mxfp8"</span><span class="p">,</span> <span class="n">use_swizzle</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="n">out</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">low_latency_mma_gemm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">,</span> <span class="n">sfa</span><span class="p">,</span> <span class="n">sfb</span><span class="p">,</span> <span class="n">out</span><span class="p">)</span>
+</pre></div>
+</div>
+</dd></dl>
+
+</section>
 <section class="api-entry" id="prefill-permute-to-masked-gemm">
 <h2>prefill_permute_to_masked_gemm<a class="headerlink" href="#prefill-permute-to-masked-gemm" title="Link to this heading">¶</a></h2>
 <dl class="py function">
@@ -879,6 +961,7 @@ of bounds (illegal memory access). Size it with headroom above
 <li><a class="reference internal" href="#group-contiguous-gemm">group_contiguous_gemm</a></li>
 <li><a class="reference internal" href="#group-masked-gemm">group_masked_gemm</a></li>
 <li><a class="reference internal" href="#group-wise-quant">group_wise_quant</a></li>
+<li><a class="reference internal" href="#low-latency-mma-gemm">low_latency_mma_gemm</a></li>
 <li><a class="reference internal" href="#prefill-permute-to-masked-gemm">prefill_permute_to_masked_gemm</a></li>
 </ul>
 </li>

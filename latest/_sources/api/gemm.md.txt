@@ -12,6 +12,7 @@
    group_contiguous_gemm
    group_masked_gemm
    group_wise_quant
+   low_latency_mma_gemm
    prefill_permute_to_masked_gemm
 ```
 
@@ -79,6 +80,17 @@
 .. currentmodule:: halops
 
 .. autofunction:: group_wise_quant
+```
+
+```{rst-class} api-entry
+```
+
+## low_latency_mma_gemm
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: low_latency_mma_gemm
 ```
 
 ```{rst-class} api-entry
