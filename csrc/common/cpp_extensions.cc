@@ -190,7 +190,8 @@ void LowLatencyMoE(const torch::Tensor& input,
                    const torch::Tensor& shared_out, int64_t top_k,
                    int64_t num_router_gates, const std::string& scoring_func,
                    bool renormalize, const std::string& activation,
-                   double situ_beta, double situ_linear_beta);
+                   double situ_beta, double situ_linear_beta,
+                   const std::string& quant_mode);
 
 torch::Tensor GetWorkspace(const torch::Tensor& input);
 

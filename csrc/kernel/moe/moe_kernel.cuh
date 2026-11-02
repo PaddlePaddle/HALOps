@@ -86,6 +86,13 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     // Phase boundary: publishes the routing tables and orders the router's
     // SMEM traffic before the next phase's TMA writes into those bytes.
     __syncthreads();
+    if (warp_idx == 0u && WarpRole::get_lane_idx() == 0u) {
+        // The prologue may leave the shared accumulator ring on an odd
+        // phase; the expert phases restart it at iteration 0.
+        smem->barriers.init_accumulator_ring();
+        cutlass::arch::fence_barrier_init();
+    }
+    __syncthreads();
     if (WarpRole::is_weight_loader_thread()) {
         CollectiveMainloop::Router::release_weight_smem();
     }
@@ -115,7 +122,6 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     }
 }
 
-// Launches `fused_moe_kernel` on `stream` with the caller's final grid.
 template <typename MoEDims>
 cudaError_t LaunchMoEKernel(
     typename CollectiveMainloopMoE<MoEKernelTraits<MoEDims>>::Arguments& args,

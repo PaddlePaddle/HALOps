@@ -71,19 +71,36 @@ struct LatentDownGemmTraits {
     static constexpr bool kUseUmma =
         Dims::KernelConfig::kLatentDownMma == MmaKind::kUmma;
 
+    // MXFP8 latent: UE8M0 scales, one per 32-K block.  The weight scales use
+    // the SfAtom layout and the blockscaled UMMA instruction.
+    using WeightQuant = QuantSpec<Dims::kQuantConfig.kLatentQuant>;
+    using ElementScale = typename WeightQuant::ScaleType;
+    static_assert(WeightQuant::kMethod != QuantMethod::kMXFP8 || kUseUmma,
+                  "MXFP8 latent weights use the SfAtom layout and UMMA");
+
     static constexpr std::uint32_t kNumCtas =
         Dims::KernelConfig::kNumCtasForLatentDown;
     static constexpr std::uint32_t kTileShapeN = 8u;
-
-    using GemmShape =
-        GemmTileShape<kGemmM, kGemmN, kGemmK, kTileShapeN, kNumCtas, kUseUmma>;
+    static constexpr std::uint32_t kNumTilesN = kGemmN / kTileShapeN;
+    static_assert(kGemmN % kTileShapeN == 0u,
+                  "the token width must be whole N tiles");
 
     // The reduction splits over a cluster when `kLatentDownUseSplitK` is on.
     static constexpr bool kUseSplitK = Dims::KernelConfig::kLatentDownUseSplitK;
     static_assert(!kUseSplitK || kUseUmma,
                   "the latent split reduction needs the UMMA path");
+
+    // Split-K pins the M tile at 128 rows, so one split group covers one M
+    // tile per N tile; the shape helper is fed that group's CTA count so its
+    // UMMA M asserts see the real tile.
     static constexpr std::uint32_t kNumSplits =
-        kUseSplitK ? kNumCtas / ((kGemmM / 128u) * GemmShape::kNumTilesN) : 1u;
+        kUseSplitK ? kNumCtas / ((kGemmM / 128u) * kNumTilesN) : 1u;
+    static_assert(!kUseSplitK ||
+                      kNumCtas % ((kGemmM / 128u) * kNumTilesN) == 0u,
+                  "the split groups must divide the CTAs");
+
+    using GemmShape = GemmTileShape<kGemmM, kGemmN, kGemmK, kTileShapeN,
+                                    kNumCtas / kNumSplits, kUseUmma>;
 
     static constexpr std::uint32_t kTileShapeM =
         kUseSplitK ? 128u : GemmShape::kTileShapeM;
@@ -92,7 +109,6 @@ struct LatentDownGemmTraits {
         cute::Shape<cute::Int<kTileShapeM>, cute::Int<kTileShapeN>,
                     cute::Int<kTileShapeK>>;
 
-    static constexpr std::uint32_t kNumTilesN = GemmShape::kNumTilesN;
     static constexpr std::uint32_t kNumTilesM = kGemmM / kTileShapeM;
     static constexpr std::uint32_t kNumTilesK = GemmShape::kNumTilesK;
     static constexpr std::uint32_t kTilesKPerCta = kNumTilesK / kNumSplits;
@@ -101,12 +117,12 @@ struct LatentDownGemmTraits {
 
     // A K tile spans this many 128-K quantization blocks.
     static constexpr std::uint32_t kQuantBlocksPerTile =
-        kTileShapeK / Dims::kQuantBlockK;
+        kTileShapeK / Dims::kQuantConfig.kBlockSize;
 
     // The cluster is one 128-latent block's blocks of one token window.
     static constexpr std::uint32_t kClusterSize =
-        (Dims::kQuantBlockM + kTileShapeM - 1) / kTileShapeM;
-    static_assert(Dims::kQuantBlockM % kTileShapeM == 0u,
+        (Dims::kQuantConfig.kBlockSize + kTileShapeM - 1) / kTileShapeM;
+    static_assert(Dims::kQuantConfig.kBlockSize % kTileShapeM == 0u,
                   "a CTA's rows must sit inside one 128-row block");
     static_assert(kNumTilesM % kClusterSize == 0u,
                   "a cluster must not straddle a token window");
@@ -115,16 +131,17 @@ struct LatentDownGemmTraits {
 
     // The 128-latent weight-scale blocks.
     static constexpr std::uint32_t kNumScaleBlocksM =
-        kGemmM / Dims::kQuantBlockM;
+        kGemmM / Dims::kQuantConfig.kBlockSize;
     static constexpr std::uint32_t kNumScaleBlocksK =
-        kGemmK / Dims::kQuantBlockK;
+        kGemmK / Dims::kQuantConfig.kBlockSize;
     static_assert(kNumCtas % kNumScaleBlocksM == 0u,
                   "the CTAs must cover whole 128-row scale blocks");
 
-    using MmaElement = DataType::ElementW;
+    using ActQuant = QuantSpec<Dims::kQuantConfig.kLatentQuant>;
+    using MmaElement = typename WeightQuant::ElementType;
     using MmaCore = std::conditional_t<
-        kUseUmma, moe::UmmaCore<MmaElement, MmaElement, float, TileShape>,
-        moe::HmmaCore<MmaElement, float, TileShape>>;
+        kUseUmma, moe::UmmaCore<WeightQuant, ActQuant, float, TileShape>,
+        moe::HmmaCore<WeightQuant, ActQuant, float, TileShape>>;
 
     // The weight ring is sized in bytes, not slots.
     static constexpr std::uint32_t kWeightRingSlots =
@@ -173,13 +190,15 @@ struct RouterGemmTraits {
             ? Dims::KernelConfig::kNumRouterWeightSlots
             : kNumTilesK;
 
-    using MmaElement = __nv_bfloat16;
+    using WeightQuant = QuantSpec<QuantMethod::kNone>;
+    using ActQuant = QuantSpec<QuantMethod::kNone>;
+    using MmaElement = typename WeightQuant::ElementType;
     static constexpr std::uint32_t kSwizzleBoxK =
         SwizzleBoxK<MmaElement>::value;
 
     using MmaCore = cute::conditional_t<
-        kUseUmma, moe::UmmaCore<MmaElement, MmaElement, float, TileShape>,
-        moe::HmmaCore<MmaElement, float, TileShape>>;
+        kUseUmma, moe::UmmaCore<WeightQuant, ActQuant, float, TileShape>,
+        moe::HmmaCore<WeightQuant, ActQuant, float, TileShape>>;
     static_assert(MmaCore::kSwizzleBoxK == kSwizzleBoxK,
                   "the MMA must read the packed SW128 boxes");
     static_assert(kTileShapeK % kSwizzleBoxK == 0u,
@@ -209,12 +228,21 @@ struct UpGemmTraits {
     static constexpr std::uint32_t kTileShapeK =
         Dims::KernelConfig::kUpTileShapeK;
 
-    using MmaElement = DataType::ElementW;
+    using WeightQuant = QuantSpec<Dims::kQuantConfig.kExpertsQuant>;
+    using ActQuant = QuantSpec<Dims::kQuantConfig.kExpertsActQuant,
+                               Dims::kQuantConfig.kBlockSize>;
+    using MmaElement = typename WeightQuant::ElementType;
+    using ElementScale = typename WeightQuant::ScaleType;
     using TileShape =
         cute::Shape<cute::Int<kTileShapeM>, cute::Int<kTileShapeN>,
                     cute::Int<kTileShapeK>>;
-    using MmaCore = moe::UmmaCore<MmaElement, MmaElement, float, TileShape>;
+    using MmaCore = moe::UmmaCore<WeightQuant, ActQuant, float, TileShape>;
     using TiledMma = typename MmaCore::TiledMma;
+    using ScaleTraits = typename MmaCore::ScaleTraits;
+    // w4a8 stages a 4-bit weight one value per SMEM byte, and its activation
+    // stays fp8: the two staging elements are no longer the same type.
+    using WeightSmemElement = typename MmaCore::SmemElementA;
+    using ActElement = typename ActQuant::ElementType;
 
     static_assert(kGemmK % kTileShapeK == 0,
                   "kGemmK (the MoE input width) must be a multiple of the "
@@ -222,23 +250,25 @@ struct UpGemmTraits {
     static constexpr std::uint32_t kNumTilesK = kGemmK / kTileShapeK;
 
     // Weight-scale tile: one fp32 per 128x128 block of the [M, K] weight.
-    static_assert(kGemmM % Dims::kQuantBlockM == 0u &&
-                      kGemmK % Dims::kQuantBlockK == 0u,
+    static_assert(kGemmM % Dims::kQuantConfig.kBlockSize == 0u &&
+                      kGemmK % Dims::kQuantConfig.kBlockSize == 0u,
                   "the up weight must be whole 128x128 scale blocks.");
     static constexpr std::uint32_t kNumScaleBlocksM =
-        kGemmM / Dims::kQuantBlockM;
+        kGemmM / Dims::kQuantConfig.kBlockSize;
     static constexpr std::uint32_t kNumScaleBlocksK =
-        kGemmK / Dims::kQuantBlockK;
+        kGemmK / Dims::kQuantConfig.kBlockSize;
 
     // The down's activation quantization block: half the up tile.
     static constexpr std::uint32_t kActQuantBlock = kTileShapeM / 2u;
 
     // Sub-accumulators per K step, one per input quantization block.
     static constexpr std::uint32_t kNumSubBlocks =
-        kTileShapeK / Dims::kQuantBlockK;
-    static_assert(kTileShapeK % Dims::kQuantBlockK == 0u,
+        kTileShapeK / Dims::kQuantConfig.kBlockSize;
+    static_assert(kTileShapeK % Dims::kQuantConfig.kBlockSize == 0u,
                   "an input quantization block must divide the K tile");
-    static constexpr std::uint32_t kAccColumns = kNumSubBlocks * kTileShapeN;
+    static constexpr std::uint32_t kAccColumns =
+        MmaCore::kUseBlockscaled ? MmaCore::kNumAtomMs * kTileShapeN
+                                 : kNumSubBlocks * kTileShapeN;
 
     static constexpr std::uint32_t kNumWeightSlots =
         Dims::KernelConfig::kNumUpWeightSlots;
@@ -264,25 +294,32 @@ struct DownGemmTraits {
     static constexpr std::uint32_t kTileShapeN = kGemmN;
     static constexpr std::uint32_t kTileShapeK = 128;
 
-    using MmaElement = DataType::ElementW;
+    using WeightQuant = QuantSpec<Dims::kQuantConfig.kExpertsQuant>;
+    using ActQuant = QuantSpec<Dims::kQuantConfig.kExpertsActQuant,
+                               UpGemmTraits<Dims>::kActQuantBlock>;
+    using MmaElement = typename WeightQuant::ElementType;
+    using ElementScale = typename WeightQuant::ScaleType;
     using TileShape =
         cute::Shape<cute::Int<kTileShapeM>, cute::Int<kTileShapeN>,
                     cute::Int<kTileShapeK>>;
-    using MmaCore = moe::UmmaCore<MmaElement, MmaElement, float, TileShape>;
+    using MmaCore = moe::UmmaCore<WeightQuant, ActQuant, float, TileShape>;
     using TiledMma = typename MmaCore::TiledMma;
+    using ScaleTraits = typename MmaCore::ScaleTraits;
+    using WeightSmemElement = typename MmaCore::SmemElementA;
+    using ActElement = typename ActQuant::ElementType;
 
     static_assert(kGemmK % kTileShapeK == 0,
                   "kGemmK (kIntermediateSize) must be a multiple of 128.");
     static constexpr std::uint32_t kNumTilesK = kGemmK / kTileShapeK;
 
     // Weight-scale tile: one fp32 per 128x128 block of the [M, K] weight.
-    static_assert(kGemmM % Dims::kQuantBlockM == 0u &&
-                      kGemmK % Dims::kQuantBlockK == 0u,
+    static_assert(kGemmM % Dims::kQuantConfig.kBlockSize == 0u &&
+                      kGemmK % Dims::kQuantConfig.kBlockSize == 0u,
                   "the down weight must be whole 128x128 scale blocks.");
     static constexpr std::uint32_t kNumScaleBlocksM =
-        kGemmM / Dims::kQuantBlockM;
+        kGemmM / Dims::kQuantConfig.kBlockSize;
     static constexpr std::uint32_t kNumScaleBlocksK =
-        kGemmK / Dims::kQuantBlockK;
+        kGemmK / Dims::kQuantConfig.kBlockSize;
 
     static constexpr std::uint32_t kNumWeightSlots =
         Dims::KernelConfig::kNumDownWeightSlots;
@@ -294,7 +331,9 @@ struct DownGemmTraits {
                   "the activation quantization block must divide the 128-K "
                   "step the down projection accumulates in one go");
     static constexpr std::uint32_t kAccColumns =
-        MmaCore::kNumAtomMs * kNumSubBlocks * kTileShapeN;
+        MmaCore::kUseBlockscaled
+            ? MmaCore::kNumAtomMs * kTileShapeN
+            : MmaCore::kNumAtomMs * kNumSubBlocks * kTileShapeN;
 };
 
 // The shared expert's up-projection: one expert every token goes through, in
@@ -319,12 +358,17 @@ struct SharedUpGemmTraits {
     static constexpr std::uint32_t kNumCtas =
         kNumSplits * (kGemmM / kTileShapeM);
 
-    using MmaElement = DataType::ElementW;
+    using WeightQuant = QuantSpec<Dims::kQuantConfig.kSharedQuant>;
+    using ActQuant = QuantSpec<Dims::kQuantConfig.kSharedQuant,
+                               Dims::kQuantConfig.kBlockSize>;
+    using MmaElement = typename WeightQuant::ElementType;
+    using ElementScale = typename WeightQuant::ScaleType;
     using TileShape =
         cute::Shape<cute::Int<kTileShapeM>, cute::Int<kTileShapeN>,
                     cute::Int<kTileShapeK>>;
-    using MmaCore = moe::UmmaCore<MmaElement, MmaElement, float, TileShape>;
+    using MmaCore = moe::UmmaCore<WeightQuant, ActQuant, float, TileShape>;
     using TiledMma = typename MmaCore::TiledMma;
+    using ScaleTraits = typename MmaCore::ScaleTraits;
 
     static_assert(kGemmK % kTileShapeK == 0u,
                   "kGemmK (kHiddenSize) must be a whole number of K tiles");
@@ -332,10 +376,11 @@ struct SharedUpGemmTraits {
 
     static constexpr std::uint32_t kTilesKPerCta = kNumTilesK / kNumSplits;
     static constexpr std::uint32_t kQuantBlocksPerCta =
-        kGemmK / kNumSplits / Dims::kQuantBlockK;
+        kGemmK / kNumSplits / Dims::kQuantConfig.kBlockSize;
     static_assert(kNumTilesK % kNumSplits == 0u,
                   "the K tiles must split evenly over the groups");
-    static_assert(kTilesKPerCta * (kTileShapeK / Dims::kQuantBlockK) ==
+    static_assert(kTilesKPerCta *
+                          (kTileShapeK / Dims::kQuantConfig.kBlockSize) ==
                       kQuantBlocksPerCta,
                   "the block's K tiles must be its quantization blocks");
 
@@ -344,8 +389,10 @@ struct SharedUpGemmTraits {
 
     // Sub-accumulators per K step, one per input quantization block.
     static constexpr std::uint32_t kNumSubBlocks =
-        kTileShapeK / Dims::kQuantBlockK;
-    static constexpr std::uint32_t kAccColumns = kNumSubBlocks * kTileShapeN;
+        kTileShapeK / Dims::kQuantConfig.kBlockSize;
+    static constexpr std::uint32_t kAccColumns =
+        MmaCore::kUseBlockscaled ? MmaCore::kNumAtomMs * kTileShapeN
+                                 : kNumSubBlocks * kTileShapeN;
 
     static constexpr std::uint32_t kNumWeightSlots =
         Dims::KernelConfig::kNumSharedUpWeightSlots;
@@ -362,6 +409,8 @@ struct SharedDownGemmTraits {
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = Dims::kIntermediateSize;
 
+    using WeightQuant = QuantSpec<Dims::kQuantConfig.kSharedQuant>;
+
     static constexpr std::uint32_t kNumCtas =
         Dims::KernelConfig::kNumCtasForShared;
     static_assert(kGemmM % kNumCtas == 0u,
@@ -371,12 +420,16 @@ struct SharedDownGemmTraits {
     static constexpr std::uint32_t kTileShapeN = kGemmN;
     static constexpr std::uint32_t kTileShapeK = 128u;
 
-    using MmaElement = DataType::ElementW;
+    using ActQuant = QuantSpec<Dims::kQuantConfig.kSharedQuant,
+                               SharedUpGemmTraits<Dims>::kActQuantBlock>;
+    using MmaElement = typename WeightQuant::ElementType;
+    using ElementScale = typename WeightQuant::ScaleType;
     using TileShape =
         cute::Shape<cute::Int<kTileShapeM>, cute::Int<kTileShapeN>,
                     cute::Int<kTileShapeK>>;
-    using MmaCore = moe::UmmaCore<MmaElement, MmaElement, float, TileShape>;
+    using MmaCore = moe::UmmaCore<WeightQuant, ActQuant, float, TileShape>;
     using TiledMma = typename MmaCore::TiledMma;
+    using ScaleTraits = typename MmaCore::ScaleTraits;
 
     static_assert(kGemmK % kTileShapeK == 0u,
                   "kGemmK (kIntermediateSize) must be a whole number of K "
@@ -390,7 +443,9 @@ struct SharedDownGemmTraits {
                   "an activation quantization block must divide the K step the "
                   "down accumulates in one go");
     static constexpr std::uint32_t kAccColumns =
-        MmaCore::kNumAtomMs * kNumSubBlocks * kTileShapeN;
+        MmaCore::kUseBlockscaled
+            ? MmaCore::kNumAtomMs * kTileShapeN
+            : MmaCore::kNumAtomMs * kNumSubBlocks * kTileShapeN;
 
     static constexpr std::uint32_t kNumWeightSlots =
         Dims::KernelConfig::kNumSharedDownWeightSlots;
@@ -412,7 +467,9 @@ struct MoEKernelTraits {
 
     static constexpr bool kUseLatent = Dims::kUseLatent;
 
-    // Whether the projection quantizes its own output.
+    // Whether the projection quantizes its own output.  The output is the up
+    // phase's B operand, so it follows that GEMM's activation recipe: the
+    // wholesale copy below expects the projection's image of both recipes.
     static constexpr bool kLatentQuantizeOutput =
         kUseLatent && Dims::KernelConfig::kLatentQuantizeOutput;
     // The projection meets in a cluster for its scale or split reduction.
@@ -477,14 +534,17 @@ struct MoEKernelTraits {
     // K per 16-B chunk, the granularity the MMA's SMEM descriptor walks.
     static constexpr std::uint32_t kLboChunkK = kFp8ActChunkK;
     static constexpr std::uint32_t kFp8ActChunksPerBlock =
-        Dims::kQuantBlockK / kLboChunkK;
+        Dims::kQuantConfig.kBlockSize / kLboChunkK;
     static constexpr std::uint32_t kQuantBlocksPerTile =
-        UpGemm::kTileShapeK / Dims::kQuantBlockK;
+        UpGemm::kTileShapeK / Dims::kQuantConfig.kBlockSize;
 
-    // fp8 expert weights one active expert streams.
+    // Bytes of expert weights one active expert streams through the L2.
     static constexpr std::uint64_t kExpertWeightBytes =
-        static_cast<std::uint64_t>(UpGemm::kGemmM) * UpGemm::kGemmK +
-        static_cast<std::uint64_t>(DownGemm::kGemmM) * DownGemm::kGemmK;
+        (static_cast<std::uint64_t>(UpGemm::kGemmM) * UpGemm::kGemmK *
+             UpGemm::MmaCore::kElementABits +
+         static_cast<std::uint64_t>(DownGemm::kGemmM) * DownGemm::kGemmK *
+             DownGemm::MmaCore::kElementABits) /
+        8u;
 
     // Gate/up pair layout: the Python repack interleaves gate and up in
     // groups of kPairLayoutGranularity rows.
@@ -497,18 +557,44 @@ struct MoEKernelTraits {
         (DownGemm::kTileShapeM * DownGemm::kTileShapeK) /
         (UpGemm::kTileShapeM * UpGemm::kTileShapeK);
 
-    // SM100 TMEM allocation, shared by every phase of the block.
+    // SM100 TMEM allocation, shared by every phase of the block.  The
+    // blockscaled phases stage one SFA/SFB set beside their accumulator ring.
+    static constexpr std::uint32_t kUpSfColumns =
+        UpGemm::MmaCore::kUseBlockscaled
+            ? UpGemm::ScaleTraits::kSfaTmemColumns +
+                  UpGemm::ScaleTraits::kSfbTmemColumns
+            : 0u;
+    static constexpr std::uint32_t kDownSfColumns =
+        DownGemm::MmaCore::kUseBlockscaled
+            ? DownGemm::ScaleTraits::kSfaTmemColumns +
+                  DownGemm::ScaleTraits::kSfbTmemColumns
+            : 0u;
+    static constexpr std::uint32_t kRingUpTmemColumns =
+        UpGemm::kAccColumns * kNumAccSlots + kUpSfColumns;
+    static constexpr std::uint32_t kRingDownTmemColumns =
+        DownGemm::kAccColumns * kNumAccSlots + kDownSfColumns;
     static constexpr std::uint32_t kRingTmemColumns =
-        ((UpGemm::kAccColumns > DownGemm::kAccColumns)
-             ? UpGemm::kAccColumns
-             : DownGemm::kAccColumns) *
-        kNumAccSlots;
+        kRingUpTmemColumns > kRingDownTmemColumns ? kRingUpTmemColumns
+                                                  : kRingDownTmemColumns;
+    // The blockscaled phases stage one SFA/SFB set beside their accumulators.
+    static constexpr std::uint32_t kSharedUpSfColumns =
+        SharedUpGemmTraits<Dims>::MmaCore::kUseBlockscaled
+            ? SharedUpGemmTraits<Dims>::ScaleTraits::kSfaTmemColumns +
+                  SharedUpGemmTraits<Dims>::ScaleTraits::kSfbTmemColumns
+            : 0u;
+    static constexpr std::uint32_t kSharedDownSfColumns =
+        SharedDownGemmTraits<Dims>::MmaCore::kUseBlockscaled
+            ? SharedDownGemmTraits<Dims>::ScaleTraits::kSfaTmemColumns +
+                  SharedDownGemmTraits<Dims>::ScaleTraits::kSfbTmemColumns
+            : 0u;
     static constexpr std::uint32_t kSharedUpTmemColumns =
-        kNumAccSlots * SharedUpGemmTraits<Dims>::kAccColumns;
+        kNumAccSlots * SharedUpGemmTraits<Dims>::kAccColumns +
+        kSharedUpSfColumns;
     static constexpr std::uint32_t kSharedDownTmemColumns =
         SharedDownGemmTraits<Dims>::kNumTilesK *
-        SharedDownGemmTraits<Dims>::kAccColumns;
-    static constexpr std::uint32_t kTmemColumns =
+            SharedDownGemmTraits<Dims>::kAccColumns +
+        kSharedDownSfColumns;
+    static constexpr std::uint32_t kTmemNeededColumns =
         kRingTmemColumns > kSharedUpTmemColumns
             ? (kRingTmemColumns > kSharedDownTmemColumns
                    ? kRingTmemColumns
@@ -516,10 +602,17 @@ struct MoEKernelTraits {
             : (kSharedUpTmemColumns > kSharedDownTmemColumns
                    ? kSharedUpTmemColumns
                    : kSharedDownTmemColumns);
-    static_assert((kTmemColumns >= 32u && kTmemColumns <= 512u &&
-                   (kTmemColumns & (kTmemColumns - 1u)) == 0u),
-                  "kTmemColumns must be a power of two in [32, 512] "
-                  "(tcgen05.alloc granularity).");
+    // tcgen05.alloc takes a power-of-two column count in [32, 512].
+    static constexpr std::uint32_t kTmemColumns =
+        kTmemNeededColumns <= 32u
+            ? 32u
+            : (kTmemNeededColumns <= 64u
+                   ? 64u
+                   : (kTmemNeededColumns <= 128u
+                          ? 128u
+                          : (kTmemNeededColumns <= 256u ? 256u : 512u)));
+    static_assert(kTmemNeededColumns <= 512u,
+                  "the TMEM allocation must fit 512 columns.");
     static_assert(RouterGemm::kTileShapeN <= kTmemColumns,
                   "the router accumulator must fit the TMEM allocation");
 };

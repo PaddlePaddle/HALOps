@@ -54,7 +54,7 @@ __device__ inline void load_down_act_scale(
         Traits::DownGemm::kGemmK / Traits::UpGemm::kActQuantBlock;
     const unsigned lane_idx = WarpRole::get_lane_idx();
 
-    const float* __restrict__ src = workspace->routed_up_out.scale;
+    const float* __restrict__ src = workspace->routed_up_out.scale.blockwise;
 
     constexpr unsigned kTotal = static_cast<unsigned>(ScaleTok * ScaleBlocks);
     for (unsigned i = lane_idx; i < kTotal; i += 32u) {
@@ -94,7 +94,7 @@ __device__ inline void load_down_weight_scale_per_expert(
         const uint32_t rb =
             (base_m +
              m_tile * MoEKernelTraits<Dims>::DownGemm::MmaCore::kAtomShapeM) /
-            Dims::kQuantBlockM;
+            Dims::kQuantConfig.kBlockSize;
         dest[m_tile][k_block] =
             expert_scales_down[expert_id * kNumScaleBlocksM * kNumScaleBlocksK +
                                rb * kNumScaleBlocksK + k_block];
@@ -116,13 +116,30 @@ struct DownProjection {
     static constexpr std::uint32_t kNumAccSlots = Traits::kNumAccSlots;
     // TMEM columns one accumulator-ring slot occupies.
     static constexpr std::uint32_t kAccColumns = DownGemm::kAccColumns;
+    // The blockscaled recipe stages one SFA/SFB set past the accumulator ring.
+    using DownScaleTraits = typename DownGemm::ScaleTraits;
+    static constexpr std::uint32_t kDownSfaTmemOffset =
+        kNumAccSlots * kAccColumns;
+    static constexpr std::uint32_t kDownSfbTmemOffset =
+        kDownSfaTmemOffset + DownScaleTraits::kSfaTmemColumns;
+    static_assert(!DownGemm::MmaCore::kUseBlockscaled ||
+                      kDownSfbTmemOffset + DownScaleTraits::kSfbTmemColumns <=
+                          Traits::kTmemColumns,
+                  "the down's scale factors must fit the TMEM allocation");
 
     // Sub-accumulators per (K-step, m-tile), one per activation quant block.
     static constexpr std::uint32_t kNumDownSubBlocks = DownGemm::kNumSubBlocks;
     static constexpr std::uint32_t kNumDownWeightScaleBlocksK =
         DownGemm::kNumScaleBlocksK;
     static constexpr std::uint32_t kDownWeightTxBytes =
-        DownGemm::MmaCore::kWeightTileBytes;
+        DownGemm::MmaCore::kWeightTileBytes +
+        (DownGemm::MmaCore::kUseBlockscaled
+             ? DownGemm::ScaleTraits::kSfaSmemBytes
+             : 0u);
+    static constexpr std::uint32_t kDownActScaleBytes =
+        DownGemm::MmaCore::kUseBlockscaled
+            ? 128u * (DownGemm::kTileShapeK / 32u)
+            : 0u;
     static constexpr std::uint32_t kDownActTxBytes =
         DownGemm::kTileShapeN * Traits::kFp8ActChunksPerBlock *
         Traits::kLboChunkK;  // 1 KB
@@ -142,9 +159,9 @@ struct DownProjection {
                   "The down weight ring must alias whole groups of up weight "
                   "slots.");
 
-    static_assert(kTileShapeM % Dims::kQuantBlockM == 0u &&
-                      128u % Dims::kQuantBlockM == 0u,
-                  "The down-proj m-tile base must be kQuantBlockM-aligned for "
+    static_assert(kTileShapeM % Dims::kQuantConfig.kBlockSize == 0u &&
+                      128u % Dims::kQuantConfig.kBlockSize == 0u,
+                  "The down-proj m-tile base must be kQuantBlock-aligned for "
                   "the per-m-tile weight-scale load.");
     static_assert(Dims::kNumTokens <= 16, "SM100 down-proj supports BS<=16.");
 
@@ -174,7 +191,7 @@ struct DownProjection {
                   "B: K=32 step must be 32 B.");
 
     __device__ static void run(
-        const DataType::ElementScale* __restrict__ expert_scales_down,
+        const typename DownGemm::ElementScale* __restrict__ expert_scales_down,
         MoEWorkspace<Dims>* __restrict__ workspace,
         MoESharedStorage<Dims>* __restrict__ smem,
         CUtensorMap const& tma_down_weights_desc,
@@ -233,9 +250,9 @@ struct DownProjection {
             const std::uint32_t expert_start = smem->routing.slab_begin(e);
 
             if (WarpRole::is_weight_loader_thread()) {
-                run_load_weights_k_loop(smem, tma_down_weights_desc, id_base,
-                                        local_id, expert_id, base_m,
-                                        weight_cache_hint);
+                run_load_weights_k_loop(smem, tma_down_weights_desc,
+                                        expert_scales_down, id_base, local_id,
+                                        expert_id, base_m, weight_cache_hint);
             } else if (WarpRole::is_other_loader_warp(warp_idx)) {
                 run_load_activations_k_loop(
                     smem, workspace, tma_down_activations_desc, id_base,
@@ -301,24 +318,26 @@ struct DownProjection {
     // the activation scales.
     __device__ static void load_weight_and_act_scale(
         SharedStorage* __restrict__ smem, Workspace* __restrict__ workspace,
-        const DataType::ElementScale* __restrict__ expert_scales_down,
+        const typename DownGemm::ElementScale* __restrict__ expert_scales_down,
         std::uint32_t expert_id, std::uint32_t base_m,
         std::uint32_t expert_start, std::uint32_t routed_count) {
         const unsigned warp_idx = WarpRole::get_warp_idx();
-
-        if (warp_idx == 0u) {
-            load_down_weight_scale_per_expert<Dims>(
-                expert_scales_down, expert_id, base_m,
-                smem->routed_experts.w_down_scale);
-        } else if (warp_idx == 1u) {
-            // Every lane acquires: each lane loads up_out_scale itself.
-            workspace->cta_comm.wait_up_out(smem->launch_parity, expert_start,
-                                            routed_count,
-                                            Workspace::kUpOutReadyFull);
-            load_down_act_scale<
-                Dims, DownGemm::kGemmK / Traits::UpGemm::kActQuantBlock,
-                DownGemm::kTileShapeN>(workspace, expert_start, routed_count,
-                                       smem->routed_experts.act_down_scale);
+        if constexpr (!DownGemm::MmaCore::kUseBlockscaled) {
+            if (warp_idx == 0u) {
+                load_down_weight_scale_per_expert<Dims>(
+                    expert_scales_down, expert_id, base_m,
+                    smem->routed_experts.w_down_scale);
+            } else if (warp_idx == 1u) {
+                // Every lane acquires: each lane loads up_out_scale itself.
+                workspace->cta_comm.wait_up_out(smem->launch_parity,
+                                                expert_start, routed_count,
+                                                Workspace::kUpOutReadyFull);
+                load_down_act_scale<
+                    Dims, DownGemm::kGemmK / Traits::UpGemm::kActQuantBlock,
+                    DownGemm::kTileShapeN>(workspace, expert_start,
+                                           routed_count,
+                                           smem->routed_experts.act_down_scale);
+            }
         }
     }
 
@@ -333,6 +352,24 @@ struct DownProjection {
         const std::uint32_t prev = (ring_iter_id - 1u) % kNumAccSlots;
 
         smem->barriers.accumulator_ready.wait(ring_iter_id - 1u);
+
+        if constexpr (DownGemm::MmaCore::kUseBlockscaled) {
+            float v[DownGemm::kTileShapeN];
+            tmem_ld_tokens(tmem_addr(tmem_base, lane_base,
+                                     prev * kAccColumns +
+                                         m_tile_idx * DownGemm::kTileShapeN),
+                           v);
+            cutlass::arch::fence_view_async_tmem_load();
+            WarpRole::sync_calc_threads();
+            if (WarpRole::get_lane_idx() == 0u) {
+                smem->barriers.accumulator_empty.arrive(ring_iter_id - 1u);
+            }
+#pragma unroll
+            for (std::uint32_t r = 0; r < DownGemm::kTileShapeN; ++r) {
+                acc_out[r] += v[r];
+            }
+            return;
+        }
 
         float v[kNumDownSubBlocks][DownGemm::kTileShapeN];
 #pragma unroll
@@ -376,9 +413,10 @@ struct DownProjection {
     // Arm the weight ring: one TMA per K-step, gated on its slot's occupant.
     __device__ static void run_load_weights_k_loop(
         SharedStorage* __restrict__ smem,
-        const CUtensorMap& tma_down_weights_desc, std::uint32_t id_base,
-        std::uint32_t local_id, std::uint32_t expert_id, std::uint32_t base_m,
-        std::uint64_t weight_cache_hint) {
+        const CUtensorMap& tma_down_weights_desc,
+        const typename DownGemm::ElementScale* __restrict__ down_scale,
+        std::uint32_t id_base, std::uint32_t local_id, std::uint32_t expert_id,
+        std::uint32_t base_m, std::uint64_t weight_cache_hint) {
         const std::uint32_t ring_iter_id = id_base + local_id;
 
 #pragma unroll
@@ -386,8 +424,9 @@ struct DownProjection {
             const std::uint32_t slot = (local_id + k_iter_id) % kNumWeightSlots;
             wait_down_weight_empty(smem, id_base, ring_iter_id + k_iter_id,
                                    slot);
-            prefetch_down_weights(smem, tma_down_weights_desc, expert_id,
-                                  base_m, slot, k_iter_id, weight_cache_hint);
+            prefetch_down_weights(smem, tma_down_weights_desc, down_scale,
+                                  expert_id, base_m, slot, k_iter_id,
+                                  weight_cache_hint);
         }
     }
 
@@ -406,9 +445,10 @@ struct DownProjection {
 #pragma unroll
         for (std::uint32_t k_iter_id = 0; k_iter_id < kNumTilesK; ++k_iter_id) {
             wait_activation_empty(smem, id_base + local_id + k_iter_id);
-            prefetch_down_activation(
-                smem, tma_down_activations_desc, expert_start, routed_count,
-                (local_id + k_iter_id) % kNumWeightSlots, k_iter_id);
+            prefetch_down_activation(smem, workspace, tma_down_activations_desc,
+                                     expert_start, routed_count,
+                                     (local_id + k_iter_id) % kNumWeightSlots,
+                                     k_iter_id);
         }
     }
 
@@ -485,48 +525,116 @@ struct DownProjection {
                                        .act_down_input[cur_w_slot][0])),
                               sB_layout);
         cute::Tensor tCrB = cta_mma.make_fragment_B(tCsB);
-        // One sub-accumulator per activation quantization block, scaled in
-        // `dequant`.
-        DownGemm::MmaCore::run<kNumDownSubBlocks>(
-            tiled_mma, cta_mma,
-            reinterpret_cast<MmaElement*>(
-                &smem->routed_experts.w_down[cur_w_slot][0][0]),
-            tCrB, tCt, tmem_addr(tmem_base, 0u, acc * kAccColumns));
+        if constexpr (DownGemm::MmaCore::kUseBlockscaled) {
+            std::uint8_t* const sfa =
+                smem->routed_experts.down_weight_sfa[cur_w_slot];
+            std::uint8_t* const sfb =
+                smem->routed_experts.act_down_sfb[cur_w_slot];
+            if (WarpRole::get_lane_idx() == 0u) {
+                // Each 128-row atom's scales sit in their own TMEM slab.
+                for (std::uint32_t atom = 0;
+                     atom < DownScaleTraits::kNumSfaAtoms; ++atom) {
+                    DownScaleTraits::copy_to_tmem(
+                        sfa + atom * DownScaleTraits::kSfaAtomBytes, sfb,
+                        tmem_addr(tmem_base, 0u,
+                                  kDownSfaTmemOffset +
+                                      atom * DownScaleTraits::kSfaAtomColumns),
+                        tmem_addr(tmem_base, 0u, kDownSfbTmemOffset));
+                }
+            }
+            DownGemm::MmaCore::run(
+                tiled_mma, cta_mma,
+                reinterpret_cast<MmaElement*>(
+                    &smem->routed_experts.w_down[cur_w_slot][0][0]),
+                tCrB, tCt, tmem_addr(tmem_base, 0u, acc * kAccColumns),
+                tmem_addr(tmem_base, 0u, kDownSfaTmemOffset),
+                tmem_addr(tmem_base, 0u, kDownSfbTmemOffset));
+        } else {
+            // One sub-accumulator per activation quantization block, scaled
+            // in `dequant`.
+            DownGemm::MmaCore::run<kNumDownSubBlocks>(
+                tiled_mma, cta_mma,
+                reinterpret_cast<MmaElement*>(
+                    &smem->routed_experts.w_down[cur_w_slot][0][0]),
+                tCrB, tCt, tmem_addr(tmem_base, 0u, acc * kAccColumns));
+        }
     }
 
     // Issue the weight TMAs for one (expert, N-step): one TMA per M instruction
     // (kNumAtomMs 128-row boxes), all armed on the step's weight mbarrier.
     __device__ static void prefetch_down_weights(
         SharedStorage* __restrict__ smem,
-        const CUtensorMap& tma_down_weights_desc, std::uint32_t expert_id,
-        std::uint32_t base_m, std::uint32_t slot, std::uint32_t k_iter_id,
-        std::uint64_t weight_cache_hint) {
+        const CUtensorMap& tma_down_weights_desc,
+        const typename DownGemm::ElementScale* __restrict__ down_scale,
+        std::uint32_t expert_id, std::uint32_t base_m, std::uint32_t slot,
+        std::uint32_t k_iter_id, std::uint64_t weight_cache_hint) {
         smem->barriers.down_weight_ready.arrive(slot, kDownWeightTxBytes);
 #pragma unroll
         for (std::uint32_t h = 0; h < DownGemm::MmaCore::kNumAtomMs; ++h) {
             constexpr std::uint32_t kAtomM = DownGemm::MmaCore::kAtomShapeM;
-            tma_load_down_umma_tile(
-                tma_down_weights_desc, expert_id,
-                /*K=*/DownGemm::kGemmM,
-                /*base_col=*/base_m + h * kAtomM,
-                /*k_start=*/k_iter_id * 128u,
-                &smem->routed_experts.w_down[slot][h * kAtomM][0],
-                smem->barriers.down_weight_ready.raw(slot), weight_cache_hint);
+            // coord0 = n, coord1 = row of `[E, k, n]`.
+            const std::uint32_t global_row =
+                expert_id * DownGemm::kGemmM + base_m + h * kAtomM;
+            tma_load_2d(tma_down_weights_desc,
+                        /*coord0=*/k_iter_id * 128u,
+                        /*coord1=*/global_row,
+                        &smem->routed_experts.w_down[slot][h * kAtomM][0],
+                        smem->barriers.down_weight_ready.raw(slot),
+                        weight_cache_hint);
+        }
+        if constexpr (DownGemm::MmaCore::kUseBlockscaled) {
+            // One 512-B SfAtom per 128 weight rows, spread across the host
+            // table's row atoms.
+            constexpr std::uint32_t kSfAtomBytes = 512u;
+            constexpr std::uint32_t kSfKBlocksPerRow = DownGemm::kGemmK / 128u;
+            constexpr std::uint32_t kSfAtomsPerTile =
+                DownGemm::kTileShapeM / 128u;
+            const std::uint32_t row_atom =
+                expert_id * (DownGemm::kGemmM / 128u) + base_m / 128u;
+#pragma unroll
+            for (std::uint32_t atom = 0; atom < kSfAtomsPerTile; ++atom) {
+                const std::uint8_t* const sfa =
+                    reinterpret_cast<const std::uint8_t*>(down_scale) +
+                    ((row_atom + atom) * kSfKBlocksPerRow + k_iter_id) *
+                        kSfAtomBytes;
+                tma_load_1d(sfa, kSfAtomBytes,
+                            smem->routed_experts.down_weight_sfa[slot] +
+                                atom * kSfAtomBytes,
+                            smem->barriers.down_weight_ready.raw(slot));
+            }
         }
     }
 
     // Issue the bulk activation TMA for one N-step; a zero-row expert arms
     // nothing.
     __device__ static void prefetch_down_activation(
-        SharedStorage* __restrict__ smem,
+        SharedStorage* __restrict__ smem, Workspace* __restrict__ workspace,
         const CUtensorMap& tma_down_activations_desc,
         std::uint32_t expert_start, std::uint32_t routed_count,
         std::uint32_t slot, std::uint32_t k_iter_id) {
         if (routed_count > 0u) {
+            if constexpr (DownGemm::MmaCore::kUseBlockscaled) {
+                // Pack this K tile's SfAtom slab from the plain UE8M0 image;
+                // the padded rows stay zero for UTCCP.
+                constexpr std::uint32_t kGroups = DownGemm::kTileShapeK / 32u;
+                std::uint8_t* const sf =
+                    smem->routed_experts.act_down_sfb[slot];
+                for (std::uint32_t i = 0; i < 128u * kGroups; ++i) {
+                    const std::uint32_t row = i / kGroups;
+                    const std::uint32_t g = i % kGroups;
+                    std::uint8_t byte = 0u;
+                    if (row < routed_count) {
+                        byte = workspace->routed_up_out.mx_scale_row(
+                            expert_start + row)[k_iter_id * kGroups + g];
+                    }
+                    sf[sf_atom_offset(row, g)] = byte;
+                }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            }
             smem->barriers.activation_ready.arrive(slot, kDownActTxBytes);
-            tma_load_down_umma_activation_bulk(
-                tma_down_activations_desc, /*k_start=*/k_iter_id * 128u,
-                /*first_row=*/expert_start,
+            tma_load_2d(
+                tma_down_activations_desc, /*coord0=*/k_iter_id * 128u,
+                /*coord1=*/expert_start,
                 &smem->routed_experts.up_down_act.act_down_input[slot][0],
                 smem->barriers.activation_ready.raw(slot));
         }

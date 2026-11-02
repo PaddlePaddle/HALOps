@@ -113,11 +113,14 @@ struct RouterProjectionBase {
             }
             smem->barriers.router_weight_ready.arrive(
                 j, RouterGemm::MmaCore::kWeightTileBytes);
-            tma_load_router_weight_tile(
-                router_weight, tile, j, RouterGemm::kNumTilesK,
-                RouterGemm::MmaCore::kWeightTileBytes,
-                &smem->router.w_router[slot][0],
-                smem->barriers.router_weight_ready.raw(slot));
+            // The tile's byte range inside the `[m, k]` weight matrix.
+            const char* src =
+                reinterpret_cast<const char*>(router_weight) +
+                static_cast<std::size_t>(tile * RouterGemm::kNumTilesK + j) *
+                    RouterGemm::MmaCore::kWeightTileBytes;
+            tma_load_1d(src, RouterGemm::MmaCore::kWeightTileBytes,
+                        &smem->router.w_router[slot][0],
+                        smem->barriers.router_weight_ready.raw(slot));
         }
     }
 

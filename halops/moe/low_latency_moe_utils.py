@@ -14,7 +14,7 @@
 # limitations under the License.
 """
 
-from typing import Optional, Sequence, Union
+from typing import Sequence, Union
 
 import torch
 
@@ -24,6 +24,11 @@ __all__ = []
 
 # Gate/up interleave granularity: fixed by the TMEM read pattern, not a knob.
 _PAIR_GRAN = 8
+
+# One CUTLASS SfAtom: 128 weight rows x 4 K/32 blocks, 512 B in total.
+_SF_ATOM_ROWS = 128
+_SF_ATOM_COLS = 4
+_SF_ATOM_BYTES = 512
 
 # K width of one router SW128 box.
 _ROUTER_SWIZZLE_K = 64
@@ -73,21 +78,6 @@ def _pack_router_gate(router_weight: torch.Tensor, tile_m: int) -> torch.Tensor:
     )
 
 
-def _prepare_latent_down_weight(
-    latent_down_weight: torch.Tensor, device: Optional[torch.device] = None
-) -> torch.Tensor:
-    """Transpose the fp8 latent down weight ``[H, L]`` into ``[L, H]``."""
-    if latent_down_weight.dim() != 2:
-        raise ValueError(
-            "latent_down_weight must be 2-D [hidden_size, latent_size], got "
-            f"{tuple(latent_down_weight.shape)}."
-        )
-    packed = latent_down_weight.transpose(0, 1).contiguous()
-    if device is not None:
-        packed = packed.to(device)
-    return packed
-
-
 def _pack_router_weight(
     router_weights: Union[torch.Tensor, Sequence[torch.Tensor]], num_tokens: int
 ) -> torch.Tensor:
@@ -109,17 +99,9 @@ def _pack_router_weight(
     return packed.contiguous()
 
 
-def _prepare_shared_expert_up_weight(shared_up_weight: torch.Tensor) -> torch.Tensor:
-    """Pack the shared expert's up weight ``[2N, H]`` into the pair layout.
-
-    Pack after quantizing: the scales belong to the raw ``[gate | up]`` layout.
-    """
-    if shared_up_weight.dim() != 2:
-        raise ValueError(
-            "shared_up_weight must be 2-D [2*N, hidden_size], got "
-            f"{tuple(shared_up_weight.shape)}."
-        )
-    rows, k = shared_up_weight.shape
+def _pair_layout_rows(w: torch.Tensor) -> torch.Tensor:
+    """Repack ``[..., 2N, K]`` rows from ``[gate | up]`` into gran-8 pairs."""
+    rows, k = int(w.shape[-2]), int(w.shape[-1])
     if rows % 2 != 0:
         raise ValueError(f"expected rows = 2*N, got rows={rows}")
     half = rows // 2
@@ -127,9 +109,67 @@ def _prepare_shared_expert_up_weight(shared_up_weight: torch.Tensor) -> torch.Te
         raise ValueError(
             f"N (half of rows) must be a multiple of {_PAIR_GRAN}; got N={half}"
         )
-    gate = shared_up_weight[:half].reshape(half // _PAIR_GRAN, _PAIR_GRAN, k)
-    up = shared_up_weight[half:].reshape(half // _PAIR_GRAN, _PAIR_GRAN, k)
-    return torch.stack([gate, up], dim=1).reshape(rows, k).contiguous()
+    lead = w.shape[:-2]
+    gate = w[..., :half, :].reshape(*lead, half // _PAIR_GRAN, _PAIR_GRAN, k)
+    up = w[..., half:, :].reshape(*lead, half // _PAIR_GRAN, _PAIR_GRAN, k)
+    return torch.stack([gate, up], dim=-3).reshape(w.shape).contiguous()
+
+
+def _prepare_shared_expert_up_weight(shared_up_weight: torch.Tensor) -> torch.Tensor:
+    """Pack the shared expert's up weight ``[2N, H]`` into the pair layout.
+
+    Pack after quantizing: the weight rows move, so an MXFP8 SfAtom scale
+    table must be moved with them (``_prepare_shared_expert_up_scale``).
+    """
+    if shared_up_weight.dim() != 2:
+        raise ValueError(
+            "shared_up_weight must be 2-D [2*N, hidden_size], got "
+            f"{tuple(shared_up_weight.shape)}."
+        )
+    return _pair_layout_rows(shared_up_weight)
+
+
+def _sf_atom_offsets(rows: int, cols: int, device) -> torch.Tensor:
+    """Flat offsets of a logical ``[rows, cols]`` table in a CUTLASS SfAtom.
+
+    One 512-B atom holds 128 rows x 4 K/32 blocks, so ``rows`` and ``cols``
+    must cover whole atoms.
+    """
+    m = torch.arange(rows, device=device)
+    g = torch.arange(cols, device=device)
+    return (
+        (m[:, None] // _SF_ATOM_ROWS) * (cols // _SF_ATOM_COLS) * _SF_ATOM_BYTES
+        + (g[None, :] // _SF_ATOM_COLS) * _SF_ATOM_BYTES
+        + (m[:, None] % 32) * 16
+        + ((m[:, None] % _SF_ATOM_ROWS) // 32) * _SF_ATOM_COLS
+        + (g[None, :] % _SF_ATOM_COLS)
+    )
+
+
+def _prepare_up_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Move an MXFP8 up-weight SfAtom table onto the packed pair rows.
+
+    ``scale`` is ``[..., 2N, K/32]``: one table per expert, or a single one
+    for the shared expert.  The table is indexed by raw row, so the gate/up
+    pairing that the weight packing applies has to be applied here as well.
+    Block-wise f32 tables stay on the raw ``[gate | up]`` layout, the one
+    every down-projection scale uses, and are returned untouched.
+    """
+    if scale.dtype != torch.uint8:
+        return scale
+    rows, cols = int(scale.shape[-2]), int(scale.shape[-1])
+    if rows % _SF_ATOM_ROWS or cols % _SF_ATOM_COLS:
+        raise ValueError(
+            "an MXFP8 SfAtom table packs whole 128-rows-x-4-blocks atoms; got "
+            f"{tuple(scale.shape)}."
+        )
+    offsets = _sf_atom_offsets(rows, cols, scale.device).reshape(-1)
+    tables = scale.reshape(-1, rows * cols)
+    plain = tables[:, offsets]
+    packed = _pair_layout_rows(plain.reshape(*scale.shape[:-2], rows, cols))
+    out = torch.empty_like(tables)
+    out[:, offsets] = packed.reshape(-1, rows * cols)
+    return out.reshape(scale.shape)
 
 
 def _router_gates(

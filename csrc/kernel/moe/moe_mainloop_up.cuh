@@ -26,13 +26,13 @@
 #include "kernel/moe/mma_core.cuh"
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_cta_comm.cuh"
-#include "kernel/moe/moe_input.cuh"
 #include "kernel/moe/moe_scheduler.cuh"
 #include "kernel/moe/moe_shared_storage.cuh"
 #include "kernel/moe/moe_tma.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/moe_workspace.cuh"
 #include "kernel/moe/ptx_utils.cuh"
+#include "kernel/moe/quant_utils.cuh"
 
 namespace halops::moe {
 
@@ -94,7 +94,7 @@ __device__ inline void load_up_weight_scale_per_expert_async(
         uint32_t rb_local = i / kNumScaleBlocksK;
         uint32_t kb = i % kNumScaleBlocksK;
         uint32_t row = base_row_up + rb_local * Dims::kIntermediateSize;
-        uint32_t rb_global = row / Dims::kQuantBlockM;
+        uint32_t rb_global = row / Dims::kQuantConfig.kBlockSize;
         const DataType::ElementScale* src =
             &expert_scales_up[expert_id * kNumScaleBlocksM * kNumScaleBlocksK +
                               rb_global * kNumScaleBlocksK + kb];
@@ -119,6 +119,16 @@ struct UpProjection {
     static constexpr std::uint32_t kNumAccSlots = Traits::kNumAccSlots;
     // TMEM columns one accumulator-ring slot occupies.
     static constexpr std::uint32_t kAccColumns = UpGemm::kAccColumns;
+    // The blockscaled recipe stages one SFA/SFB set past the accumulator ring.
+    using UpScaleTraits = typename UpGemm::ScaleTraits;
+    static constexpr std::uint32_t kUpSfaTmemOffset =
+        kNumAccSlots * kAccColumns;
+    static constexpr std::uint32_t kUpSfbTmemOffset =
+        kUpSfaTmemOffset + UpScaleTraits::kSfaTmemColumns;
+    static_assert(!UpGemm::MmaCore::kUseBlockscaled ||
+                      kUpSfbTmemOffset + UpScaleTraits::kSfbTmemColumns <=
+                          Traits::kTmemColumns,
+                  "the up's scale factors must fit the TMEM allocation");
     static constexpr std::uint32_t kNumUpSubBlocks = UpGemm::kNumSubBlocks;
     static constexpr std::uint32_t kNumUpScaleBlocksK =
         UpGemm::kNumScaleBlocksK;
@@ -137,7 +147,9 @@ struct UpProjection {
     static constexpr std::uint32_t kBKStride =
         2u * static_cast<std::uint32_t>(kBLbo);
     static constexpr std::uint32_t kUpWeightTxBytes =
-        UpGemm::MmaCore::kWeightTileBytes;
+        UpGemm::MmaCore::kWeightTileBytes +
+        (UpGemm::MmaCore::kUseBlockscaled ? UpGemm::ScaleTraits::kSfaSmemBytes
+                                          : 0u);
 
     // B operand: the padded `quantized_input` staging tile, [8 chunks][N + 1
     // token rows][16 B] with SWIZZLE_NONE, written out explicitly.
@@ -181,7 +193,7 @@ struct UpProjection {
 
     // Run up-projection over this block's expert sequence.
     __device__ static void run(
-        const DataType::ElementScale* __restrict__ expert_scales_up,
+        const typename UpGemm::ElementScale* __restrict__ expert_scales_up,
         std::uint32_t batch_size, Activation activation,
         GatedActParams const& act_params,
         MoEWorkspace<Dims>* __restrict__ workspace,
@@ -202,10 +214,12 @@ struct UpProjection {
         constexpr std::uint32_t kScaleSlots =
             RoutedExpertsSmem<Dims>::kNumUpScaleSlots;
 
-        if (WarpRole::is_other_loader_warp(warp_idx) && sched.is_active()) {
-            prefetch_up_weight_scale(expert_scales_up,
-                                     smem->routing.active_experts[first_e],
-                                     base_feature, 0u, smem);
+        if constexpr (!UpGemm::MmaCore::kUseBlockscaled) {
+            if (WarpRole::is_other_loader_warp(warp_idx) && sched.is_active()) {
+                prefetch_up_weight_scale(expert_scales_up,
+                                         smem->routing.active_experts[first_e],
+                                         base_feature, 0u, smem);
+            }
         }
 
         TaskInfo task;
@@ -220,8 +234,9 @@ struct UpProjection {
             const bool has_next_e = (task.next_expert_idx != kNoExpert);
 
             if (WarpRole::is_weight_loader_thread()) {
-                run_load_k_loop(smem, tma_up_weights_desc, weight_row_base,
-                                task_id, expert_id, weight_cache_hint);
+                run_load_k_loop(smem, tma_up_weights_desc, expert_scales_up,
+                                weight_row_base, task_id, expert_id,
+                                weight_cache_hint);
             } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
                 run_mma_k_loop(smem, tmem_base, task_id);
             } else if (WarpRole::is_calc_warp(warp_idx)) {
@@ -234,6 +249,8 @@ struct UpProjection {
                 epilogue(workspace, smem, task.local_expert_idx, batch_size,
                          base_feature, m_block, activation, act_params,
                          acc_gate_out, acc_up_out);
+            } else if constexpr (UpGemm::MmaCore::kUseBlockscaled) {
+                // The MX recipe loads each weight tile's SFA with the tile.
             } else if (WarpRole::is_other_loader_warp(warp_idx) && has_next_e) {
                 const std::uint32_t next_scale_slot =
                     (task_id + 1u) % kScaleSlots;
@@ -299,6 +316,32 @@ struct UpProjection {
         }
 
         if (!store) {
+            return;
+        }
+
+        if constexpr (UpGemm::MmaCore::kUseBlockscaled) {
+            // One UE8M0 byte per 32 features; the down repacks them into its
+            // SfAtom slab on the way in.
+            std::uint8_t* const sf =
+                workspace->routed_up_out.mx_scale_row(dest_row);
+#pragma unroll
+            for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
+                const float v = smem->routed_experts.up_down_act
+                                    .act_up_out[lane_idx + i * 32u][tok];
+                const float amax = __uint_as_float(
+                    __reduce_max_sync(0xffffffffu, __float_as_uint(fabsf(v))));
+                std::uint32_t biased;
+                const float inv = mxfp8_ue8m0_scale(amax, biased);
+                const std::uint32_t col = base_feature + lane_idx + i * 32u;
+                workspace->routed_up_out.row(dest_row)[col] =
+                    static_cast<DataType::ElementQA>(v * inv);
+                if (lane_idx == 0u) {
+                    sf[base_feature / 32u + i] =
+                        static_cast<std::uint8_t>(biased);
+                }
+            }
+            workspace->cta_comm.publish_up_out(smem->launch_parity, dest_row,
+                                               m_block_idx, lane_idx);
             return;
         }
 
@@ -368,16 +411,17 @@ struct UpProjection {
     // The launcher: arm ring id r with K-iteration r's tile, one ring ahead.
     __device__ static void run_load_k_loop(
         SharedStorage* __restrict__ smem,
-        const CUtensorMap& tma_up_weights_desc, std::uint32_t weight_row_base,
-        std::uint32_t task_id, std::uint32_t expert_id,
-        std::uint64_t weight_cache_hint) {
+        const CUtensorMap& tma_up_weights_desc,
+        const typename UpGemm::ElementScale* __restrict__ up_scale,
+        std::uint32_t weight_row_base, std::uint32_t task_id,
+        std::uint32_t expert_id, std::uint64_t weight_cache_hint) {
 #pragma unroll
         for (std::uint32_t k_iter_id = 0; k_iter_id < kNumTilesK; ++k_iter_id) {
             const std::uint32_t ring_iter_id = task_id * kNumTilesK + k_iter_id;
             wait_weight_empty(smem, ring_iter_id);
-            prefetch_up_weights(smem, tma_up_weights_desc, ring_iter_id,
-                                expert_id, k_iter_id, weight_row_base,
-                                weight_cache_hint);
+            prefetch_up_weights(smem, tma_up_weights_desc, up_scale,
+                                ring_iter_id, expert_id, k_iter_id,
+                                weight_row_base, weight_cache_hint);
         }
     }
 
@@ -428,7 +472,9 @@ struct UpProjection {
                                               std::uint32_t tmem_base,
                                               std::uint32_t task_id,
                                               std::uint32_t expert_id) {
-        smem->barriers.wait_weight_scale_ready(task_id, cur_scale_slot);
+        if constexpr (!UpGemm::MmaCore::kUseBlockscaled) {
+            smem->barriers.wait_weight_scale_ready(task_id, cur_scale_slot);
+        }
 
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 1; k_iter_id <= kNumTilesK;
@@ -438,8 +484,10 @@ struct UpProjection {
         }
 
         WarpRole::sync_calc_threads();
-        if (WarpRole::get_lane_idx() == 0u) {
-            smem->barriers.weight_scale_empty.arrive(cur_scale_slot);
+        if constexpr (!UpGemm::MmaCore::kUseBlockscaled) {
+            if (WarpRole::get_lane_idx() == 0u) {
+                smem->barriers.weight_scale_empty.arrive(cur_scale_slot);
+            }
         }
     }
 
@@ -459,13 +507,36 @@ struct UpProjection {
                 &smem->routed_experts.quantized_input.data[s][0][0][0])),
             sB_layout);
         cute::Tensor tCrB = cta_mma.make_fragment_B(tCsB);
-        // One 128-row slab of interleaved gate/up rows; one sub-accumulator
-        // per activation quantization block.
-        UpGemm::MmaCore::run<kNumUpSubBlocks>(
-            tiled_mma, cta_mma,
-            reinterpret_cast<MmaElement*>(
-                &smem->routed_experts.w_up[weight_slot][0]),
-            tCrB, tCt_gate, tmem_addr(tmem_base, 0u, acc_slot * kAccColumns));
+        if constexpr (UpGemm::MmaCore::kUseBlockscaled) {
+            // SFA rides the weight ring's slot, SFB the staging slot; both
+            // are in SfAtom layout, UTCCP moves them into TMEM.
+            std::uint8_t* const sfa =
+                smem->routed_experts.up_weight_sfa[weight_slot];
+            std::uint8_t* const sfb =
+                &smem->routed_experts.quantized_input.scale[s][0];
+            if (WarpRole::get_lane_idx() == 0u) {
+                UpScaleTraits::copy_to_tmem(
+                    sfa, sfb, tmem_addr(tmem_base, 0u, kUpSfaTmemOffset),
+                    tmem_addr(tmem_base, 0u, kUpSfbTmemOffset));
+            }
+            UpGemm::MmaCore::run(
+                tiled_mma, cta_mma,
+                reinterpret_cast<MmaElement*>(
+                    &smem->routed_experts.w_up[weight_slot][0]),
+                tCrB, tCt_gate,
+                tmem_addr(tmem_base, 0u, acc_slot * kAccColumns),
+                tmem_addr(tmem_base, 0u, kUpSfaTmemOffset),
+                tmem_addr(tmem_base, 0u, kUpSfbTmemOffset));
+        } else {
+            // One 128-row slab of interleaved gate/up rows; one sub-accumulator
+            // per activation quantization block.
+            UpGemm::MmaCore::run<kNumUpSubBlocks>(
+                tiled_mma, cta_mma,
+                reinterpret_cast<MmaElement*>(
+                    &smem->routed_experts.w_up[weight_slot][0]),
+                tCrB, tCt_gate,
+                tmem_addr(tmem_base, 0u, acc_slot * kAccColumns));
+        }
     }
 
     __device__ static void dequant(SharedStorage* __restrict__ smem,
@@ -487,12 +558,30 @@ struct UpProjection {
             }
         };
 
-        const DataType::ElementScale* ws_buf =
-            smem->routed_experts.w_up_scale[cur_scale_slot];
-
         // One 16-row group per warp; rows t1 and t1 + 8 are gate and up.
         const std::uint32_t t0 = lane_idx & 3u;
         const std::uint32_t lane_base = dequant_row_base();
+        if constexpr (UpGemm::MmaCore::kUseBlockscaled) {
+            // The instruction applied both scales, so the accumulator is the
+            // tile's final sum.
+#pragma unroll
+            for (std::uint32_t g = 0; g < kAccTokens / 2u; ++g) {
+                float v[4];
+                tmem_ld_16x256b1x(tmem_addr(tmem_base, lane_base,
+                                            prev_slot * kAccColumns + g * 8u),
+                                  v);
+#pragma unroll
+                for (std::uint32_t ti = 0; ti < 2u; ++ti) {
+                    acc_gate[g * 2u + ti] += v[ti];
+                    acc_up[g * 2u + ti] += v[ti + 2u];
+                }
+            }
+            release_slot();
+            return;
+        }
+
+        const DataType::ElementScale* ws_buf =
+            smem->routed_experts.w_up_scale[cur_scale_slot];
 #pragma unroll
         for (std::uint32_t sub = 0; sub < kNumUpSubBlocks; ++sub) {
             // Each sub-accumulator is one activation quant block; kblk is its
@@ -538,21 +627,43 @@ struct UpProjection {
     // Issue the weight TMA(s) for one (expert, K-tile) into its ring slot.
     __device__ static void prefetch_up_weights(
         SharedStorage* __restrict__ smem,
-        const CUtensorMap& tma_up_weights_desc, std::uint32_t ring_iter_id,
-        std::uint32_t expert_id, std::uint32_t k_tile,
-        std::uint32_t weight_row_base, std::uint64_t weight_cache_hint) {
+        const CUtensorMap& tma_up_weights_desc,
+        const typename UpGemm::ElementScale* __restrict__ up_scale,
+        std::uint32_t ring_iter_id, std::uint32_t expert_id,
+        std::uint32_t k_tile, std::uint32_t weight_row_base,
+        std::uint64_t weight_cache_hint) {
         const std::uint32_t slot = ring_iter_id % kNumWeightSlots;
         smem->barriers.up_weight_ready.arrive(slot, kUpWeightTxBytes);
         // SWIZZLE_128B caps a box at 128 B of K; a wider tile is many boxes.
         using MmaCore = typename UpGemm::MmaCore;
         const std::uint32_t k_start = k_tile * MmaCore::kTileShapeK;
+        // coord1 is the gate/up pair's row inside `[E, 2*n, k]`; an expert
+        // owns `kGemmM` rows.
+        const std::uint32_t global_row =
+            expert_id * UpGemm::kGemmM + weight_row_base;
 #pragma unroll 1
         for (std::uint32_t h = 0; h < MmaCore::kNumSwizzleBoxKs; ++h) {
-            tma_load_up_tcgen05_pair_tile(
-                tma_up_weights_desc, expert_id, Dims::kIntermediateSize,
-                weight_row_base, k_start + h * MmaCore::kSwizzleBoxK,
-                &smem->routed_experts.w_up[slot][h][0],
+            tma_load_2d(
+                tma_up_weights_desc,
+                /*coord0=*/k_start + h * MmaCore::kSwizzleBoxK,
+                /*coord1=*/global_row, &smem->routed_experts.w_up[slot][h][0],
                 smem->barriers.up_weight_ready.raw(slot), weight_cache_hint);
+        }
+        if constexpr (UpGemm::MmaCore::kUseBlockscaled) {
+            // The host packs each expert's pair-layout SfAtom table; one
+            // 512-B atom per (weight row atom, 128-K block).
+            constexpr std::uint32_t kSfAtomBytes = 512u;
+            constexpr std::uint32_t kSfKBlocksPerRow = UpGemm::kGemmK / 128u;
+            const std::uint32_t row_atom = weight_row_base / 128u;
+            const std::uint8_t* const sfa =
+                reinterpret_cast<const std::uint8_t*>(up_scale) +
+                ((expert_id * (UpGemm::kGemmM / 128u) + row_atom) *
+                     kSfKBlocksPerRow +
+                 k_tile * (MmaCore::kTileShapeK / 128u)) *
+                    kSfAtomBytes;
+            tma_load_1d(sfa, UpGemm::ScaleTraits::kSfaSmemBytes,
+                        smem->routed_experts.up_weight_sfa[slot],
+                        smem->barriers.up_weight_ready.raw(slot));
         }
     }
 
