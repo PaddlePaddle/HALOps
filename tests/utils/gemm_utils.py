@@ -26,6 +26,7 @@ from tests.utils.fp4_utils import (
 
 # Comparison tolerances shared by the GEMM tests.
 W8A8_MXFP8_TOL = dict(rtol=2e-2, atol=2e-3)
+MXFP8_BLOCK_SIZE = 32
 W4A4_TOL = dict(rtol=5e-2, atol=5e-2)
 
 # =====================================================================
