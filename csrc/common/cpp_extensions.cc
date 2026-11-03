@@ -173,26 +173,29 @@ void MlaOutputProj(const torch::Tensor& wo_a_weight,
                    const torch::Tensor& wo_b_sf, torch::Tensor& out,
                    const torch::Tensor& workspace);
 
-void LowLatencyMoE(const torch::Tensor& input,
-                   const torch::Tensor& router_weight,
-                   const torch::Tensor& expert_up_weights,
-                   const torch::Tensor& expert_up_weights_scale,
-                   const torch::Tensor& expert_down_weights,
-                   const torch::Tensor& expert_down_weights_scale,
-                   const torch::Tensor& shared_up_weight,
-                   const torch::Tensor& shared_up_weight_scale,
-                   const torch::Tensor& shared_down_weight,
-                   const torch::Tensor& shared_down_weight_scale,
-                   const std::optional<torch::Tensor>& latent_down_weight,
-                   const std::optional<torch::Tensor>& latent_down_weight_scale,
-                   const torch::Tensor& workspace,
-                   const torch::Tensor& routed_out,
-                   const torch::Tensor& shared_out, int64_t top_k,
-                   int64_t num_router_gates, const std::string& scoring_func,
-                   bool renormalize, const std::string& activation,
-                   double situ_beta, double situ_linear_beta);
+void LowLatencyMoE(
+    const torch::Tensor& input, const torch::Tensor& router_weight,
+    const torch::Tensor& expert_up_weights,
+    const torch::Tensor& expert_up_weights_scale,
+    const torch::Tensor& expert_down_weights,
+    const torch::Tensor& expert_down_weights_scale,
+    const torch::Tensor& shared_up_weight,
+    const torch::Tensor& shared_up_weight_scale,
+    const torch::Tensor& shared_down_weight,
+    const torch::Tensor& shared_down_weight_scale,
+    const torch::Tensor& latent_down_weight,
+    const torch::Tensor& latent_down_weight_scale,
+    const torch::Tensor& workspace, const torch::Tensor& shared_out,
+    const torch::Tensor& tail_fc2_weight, const torch::Tensor& tail_fc2_scale,
+    const torch::Tensor& tail_norm_weight, const torch::Tensor& tail_out,
+    const torch::Tensor& tail_epochs, const torch::Tensor& tail_uc_bases,
+    int64_t top_k, int64_t num_router_gates, int64_t tail_rank,
+    int64_t tail_mc_base, int64_t tail_grid_cap,
+    const std::string& scoring_func, const std::string& activation,
+    bool renormalize, double situ_beta, double situ_linear_beta,
+    double tail_eps);
 
-torch::Tensor GetWorkspace(const torch::Tensor& input);
+int64_t MoETailRegionBytes(bool wide);
 
 int64_t GetWorkspaceSize(const std::optional<torch::Tensor>& input);
 
@@ -233,7 +236,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mla_output_proj", &halops::MlaOutputProj);
 
     m.def("low_latency_moe", &halops::LowLatencyMoE);
-    m.def("moe_get_workspace", &halops::GetWorkspace, py::arg("input"));
+    m.def("moe_tail_region_bytes", &halops::MoETailRegionBytes);
     m.def("moe_get_workspace_size", &halops::GetWorkspaceSize,
           py::arg("input") = py::none());
     m.def("moe_router_tile_m", &halops::RouterTileM, py::arg("num_tokens") = 0);

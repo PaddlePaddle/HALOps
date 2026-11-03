@@ -14,8 +14,15 @@
 # limitations under the License.
 """
 
+import os
+import re
+import subprocess
+import sys
+import zlib
+
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from halops import (
@@ -25,6 +32,10 @@ from halops import (
 )
 
 _FP8_MAX = 448.0  # e4m3 dynamic range
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_WORLD = 4
+_ROW = re.compile(r"\[rank (\d+)\] (\S+): [^\n]*? -> (OK|FAIL)")
+_TOL = 1.5e-1
 
 
 def _quant_fp8_block_wise(w, block_row=128, block_col=128):
@@ -47,6 +58,16 @@ def _quant_fp8_block_wise(w, block_row=128, block_col=128):
     return w_fp8.to(torch.float8_e4m3fn), scales
 
 
+def _pow2_block_quant(w):
+    """[rows, cols] -> (fp8 e4m3, fp32 scales [rows/128, cols/128]), power-of-two scales."""
+    r, c = w.shape
+    blocks = w.float().reshape(r // 128, 128, c // 128, 128)
+    amax = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-12)
+    s = torch.exp2(torch.ceil(torch.log2(amax / _FP8_MAX)))
+    q = (blocks / s).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+    return q.reshape(r, c).contiguous(), s.reshape(r // 128, c // 128).contiguous()
+
+
 def _quant_fp8_group_wise(x, group_size=128):
     """Per-token-dynamic quant over the last dim; `x` is [..., K], bf16 or fp32."""
     x_float = x.float()
@@ -62,7 +83,7 @@ def _quant_fp8_group_wise(x, group_size=128):
 class MoEParams:
     """One `low_latency_moe` call: the knobs, plus the operands `init_weights` fills."""
 
-    def __init__(self, use_latent=True, activation="silu"):
+    def __init__(self, use_latent=True, activation="silu", **weight_kwargs):
         self.hidden_size = 4096
         self.intermediate_size = 512
         self.latent_size = 2048
@@ -74,17 +95,27 @@ class MoEParams:
         self.activation = activation
         self.situ_beta = 4.0
         self.situ_linear_beta = 25.0
-        self.init_weights()
+        self.init_weights(**weight_kwargs)
 
-    def init_weights(self, *, seed: int = 0, device=None):
-        """Random weights and buffers for the launch this instance describes."""
+    def init_weights(self, *, seed: int = 0, device=None, common_seed=None):
+        """Random weights and buffers for the launch this instance describes.
+
+        With ``common_seed`` the router and the latent-down weight come from their own
+        stream, so instances that differ in ``seed`` (the ranks of a TP group, each with
+        its own experts) still share them.
+        """
         dev = torch.device(device or "cuda")
 
         e, h, n = self.num_experts, self.hidden_size, self.intermediate_size
         z = self.latent_size if self.use_latent else h
         g = torch.Generator(device=dev).manual_seed(seed)
+        gc = (
+            g
+            if common_seed is None
+            else torch.Generator(device=dev).manual_seed(common_seed)
+        )
 
-        router = (torch.randn(h, e, device=dev, generator=g) / h**0.5).bfloat16()
+        router = (torch.randn(h, e, device=dev, generator=gc) / h**0.5).bfloat16()
         if self.num_router_gates == 2:
             router = torch.stack([router, router.flip(0)])
 
@@ -98,7 +129,7 @@ class MoEParams:
         if self.use_latent:
             # The kernel reads [L, H], so the scales are transposed.
             lw, ls = _quant_fp8_block_wise(
-                torch.randn(1, h, z, device=dev, generator=g) * 0.1
+                torch.randn(1, h, z, device=dev, generator=gc) * 0.1
             )
             latent_w = lw[0]
             latent_s = ls[0].t().contiguous()
@@ -121,6 +152,20 @@ class MoEParams:
         self.shared_up_weight_scale = shared_up_s[0]
         self.shared_down_weight = shared_down[0]
         self.shared_down_weight_scale = shared_down_s[0]
+        return self
+
+    def init_tail_weights(self, *, seed: int = 1, device=None):
+        """The fused tail's operands: fc2 (e4m3, power-of-two 128x128 scales) and the RMSNorm weight."""
+        dev = torch.device(device or "cuda")
+        g = torch.Generator(device=dev).manual_seed(seed)
+        h, z = self.hidden_size, self.latent_size
+        self.fc2_weight, self.fc2_scale = _pow2_block_quant(
+            torch.randn(h, z, device=dev, generator=g) * 0.05
+        )
+        self.norm_weight = (
+            1.0 + 0.1 * torch.randn(z, device=dev, generator=g)
+        ).bfloat16()
+        self.eps = 1e-5
         return self
 
 
@@ -251,6 +296,18 @@ class MoERef:
                 )
         return out.bfloat16()
 
+    def tail(self, routed_outs, shared_outs):
+        """The fused tail over the TP ranks' outputs, in fp32:
+        fc2(RMSNorm(sum of routed)) + sum of shared."""
+        p = self.moe_params
+        routed = torch.stack([t.float() for t in routed_outs]).sum(0).bfloat16().float()
+        rms = torch.rsqrt(routed.pow(2).mean(-1, keepdim=True) + p.eps)
+        normed = (routed * rms * p.norm_weight.float()).bfloat16().float()
+        fc2 = p.fc2_weight.float() * p.fc2_scale.repeat_interleave(
+            128, 0
+        ).repeat_interleave(128, 1)
+        return normed @ fc2.t() + torch.stack([t.float() for t in shared_outs]).sum(0)
+
     def __call__(self, input, top_k):
         shared_out = self._shared_expert(input)
 
@@ -280,65 +337,65 @@ class MoERef:
 
 
 class MoEFused:
-    """The prebuilt op behind one object: the weights are packed once."""
 
-    def __init__(self, moe_params):
+    def __init__(self, moe_params, tp, grid_cap=0):
         self.moe_params = moe_params
+        self.tp = tp
+        self.grid_cap = grid_cap
         self.workspace = None
         self.packed_weights = None
 
     def __call__(self, input, top_k):
+        p = self.moe_params
         num_tokens = input.size(0)
         if self.packed_weights is None:
             self.packed_weights = transform_weights_for_moe(
-                self.moe_params.router_weight,
-                self.moe_params.expert_up_weights,
-                self.moe_params.shared_up_weight,
-                self.moe_params.latent_down_weight,
+                p.router_weight,
+                p.expert_up_weights,
+                p.shared_up_weight,
+                p.latent_down_weight,
                 num_tokens,
-                self.moe_params.num_router_gates,
+                p.num_router_gates,
+            )
+        if self.workspace is None:
+            self.workspace = get_workspace_for_moe(input, *self.tp)
+
+        def empty(cols):
+            return torch.empty(
+                num_tokens, cols, dtype=torch.bfloat16, device=input.device
             )
 
-        if self.workspace is None:
-            self.workspace = get_workspace_for_moe(input)
-
-        routed_out = torch.empty(
-            num_tokens,
-            self.moe_params.latent_size,
-            dtype=torch.bfloat16,
-            device=input.device,
-        )
-        shared_out = torch.empty(
-            num_tokens,
-            self.moe_params.hidden_size,
-            dtype=torch.bfloat16,
-            device=input.device,
-        )
+        shared_out, out = empty(p.hidden_size), empty(p.hidden_size)
         low_latency_moe(
             input,
             self.packed_weights["router_weight"],
             self.packed_weights["expert_up_weights"],
-            self.moe_params.expert_up_weights_scale,
-            self.moe_params.expert_down_weights,
-            self.moe_params.expert_down_weights_scale,
+            p.expert_up_weights_scale,
+            p.expert_down_weights,
+            p.expert_down_weights_scale,
             self.packed_weights["shared_up_weight"],
-            self.moe_params.shared_up_weight_scale,
-            self.moe_params.shared_down_weight,
-            self.moe_params.shared_down_weight_scale,
-            self.packed_weights.get("latent_down_weight"),
-            self.moe_params.latent_down_weight_scale,
+            p.shared_up_weight_scale,
+            p.shared_down_weight,
+            p.shared_down_weight_scale,
+            self.packed_weights["latent_down_weight"],
+            p.latent_down_weight_scale,
             self.workspace,
-            routed_out,
             shared_out,
             top_k,
-            self.moe_params.num_router_gates,
-            self.moe_params.scoring_func,
-            self.moe_params.renormalize,
-            self.moe_params.activation,
-            self.moe_params.situ_beta,
-            self.moe_params.situ_linear_beta,
+            p.num_router_gates,
+            p.scoring_func,
+            p.renormalize,
+            p.activation,
+            p.situ_beta,
+            p.situ_linear_beta,
+            fc2_weight=p.fc2_weight,
+            fc2_scale=p.fc2_scale,
+            norm_weight=p.norm_weight,
+            out=out,
+            eps=p.eps,
+            grid_cap=self.grid_cap,
         )
-        return routed_out, shared_out
+        return out
 
 
 def _cosine(a, b):
@@ -348,83 +405,195 @@ def _cosine(a, b):
     ).item()
 
 
-def _run_and_compare(moe_params, num_tokens=1, top_k=8):
-    """Run moe against the block-FP8 reference; return (cos routed, cos shared)."""
-    dev = torch.device("cuda")
-    input = torch.randn(
-        num_tokens, moe_params.hidden_size, device=dev, dtype=torch.bfloat16
+def test_transform_weights_partial():
+    """Packing the operands one at a time gives the same tensors as packing them together."""
+    p = MoEParams(use_latent=True)
+    full = transform_weights_for_moe(
+        p.router_weight,
+        p.expert_up_weights,
+        p.shared_up_weight,
+        p.latent_down_weight,
+        16,
     )
+    assert set(full) == {
+        "router_weight",
+        "expert_up_weights",
+        "shared_up_weight",
+        "latent_down_weight",
+    }
+    parts = [
+        transform_weights_for_moe(p.router_weight, None, None, num_tokens=16),
+        transform_weights_for_moe(None, p.expert_up_weights, None),
+        transform_weights_for_moe(None, None, p.shared_up_weight, p.latent_down_weight),
+    ]
+    assert [sorted(d) for d in parts] == [
+        ["router_weight"],
+        ["expert_up_weights"],
+        ["latent_down_weight", "shared_up_weight"],
+    ]
+    for d in parts:
+        for key, value in d.items():
+            assert torch.equal(value, full[key]), key
 
-    moe_ref = MoERef(moe_params)
-    moe_fused = MoEFused(moe_params)
 
-    routed_out_ref, shared_out_ref = moe_ref(input, top_k)
-    routed_out, shared_out = moe_fused(input, top_k)
+def _all_gather(t, world):
+    gathered = [torch.empty_like(t) for _ in range(world)]
+    dist.all_gather(gathered, t)
+    return gathered
 
-    cos_routed = _cosine(routed_out, routed_out_ref)
-    cos_shared = _cosine(shared_out, shared_out_ref)
-    return cos_routed, cos_shared
+
+def _check_outputs(ref, x, top_k, out):
+    """(ok, text) for one launch: the end-to-end output against MoERef (all ranks' routed / shared, then the tail)."""
+    expected = ref.tail(*(_all_gather(t, _WORLD) for t in ref(x, top_k)))
+    err = (out.float() - expected).norm(dim=-1) / expected.norm(dim=-1)
+    ok = bool((err < _TOL).all()) and bool(torch.isfinite(out).all())
+    return ok, f"max_token_rel_l2={err.max().item():.2e}"
+
+
+def _run_accuracy(p, tp, grid_cap, m, top_k, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(m, p.hidden_size, device="cuda", generator=g).bfloat16()
+    out = MoEFused(p, tp, grid_cap)(x, top_k)
+    torch.cuda.synchronize()
+    return _check_outputs(MoERef(p), x, top_k, out)
+
+
+def _run_graph(p, tp, grid_cap, m, top_k, seed):
+    """CUDA graph capture + multi-replay must produce correct results."""
+    ref = MoERef(p)
+    x = torch.randn(m, p.hidden_size, device="cuda", dtype=torch.bfloat16)
+    fused = MoEFused(p, tp, grid_cap)
+    # Warmup: packs the weights and allocates the workspace outside the capture.
+    for _ in range(3):
+        fused(x, top_k)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = fused(x, top_k)
+    torch.cuda.synchronize()
+    ok, texts = True, []
+    for i in range(4):
+        g = torch.Generator(device="cuda").manual_seed(seed + 200 + i)
+        x.copy_(torch.randn(m, p.hidden_size, device="cuda", generator=g))
+        graph.replay()
+        torch.cuda.synchronize()
+        good, text = _check_outputs(ref, x, top_k, out)
+        ok &= good
+        texts.append(text)
+    return ok, f"replays: {' | '.join(texts)}"
+
+
+def _tail_worker():
+    """One rank of the 4-GPU run (launched by ``moe_run`` or directly under torchrun)."""
+    rank = int(os.environ["RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(rank)
+    dev = torch.device("cuda", rank)
+    torch.set_default_device(dev)
+    dist.init_process_group("nccl", device_id=dev)
+    group = dist.group.WORLD.group_name
+    tp = (group, rank, world)
+    grid_cap = int(os.environ.get("TAIL_GRID_CAP", "0"))
+
+    params = {}
+
+    def get_params(activation):
+        if activation not in params:
+            p = MoEParams(
+                use_latent=True,
+                activation=activation,
+                seed=100 + rank,
+                common_seed=0,
+                device=dev,
+            )
+            params[activation] = p.init_tail_weights(device=dev)
+        return params[activation]
+
+    ok = True
+    for case in os.environ["MOE_CASES"].split(","):
+        fields = case.split("-")
+        m = int(fields[1][1:])
+        if fields[0] == "accuracy":
+            top_k, activation = int(fields[2][1:]), fields[3]
+            run = _run_accuracy
+        else:  # graph
+            top_k, activation = 8, "silu"
+            run = _run_graph
+        seed = zlib.crc32(case.encode())
+        good, text = run(get_params(activation), tp, grid_cap, m, top_k, seed)
+        ok &= good
+        print(f"[rank {rank}] {case}: {text} -> {'OK' if good else 'FAIL'}", flush=True)
+    dist.barrier()
+    if rank == 0:
+        print("RESULT:", "ALL_OK" if ok else "FAILED", flush=True)
+    dist.destroy_process_group()
+    sys.exit(0 if ok else 1)
+
+
+def _case_id(item):
+    """The worker case of an accuracy / CUDA graph test item; None for the other tests."""
+    callspec = getattr(item, "callspec", None)
+    if callspec is None:
+        return None
+    p = callspec.params
+    if item.originalname == "test_moe_accuracy":
+        return f"accuracy-m{p['num_tokens']}-k{p['top_k']}-{p['activation']}"
+    if item.originalname == "test_moe_cuda_graph_replay":
+        return f"graph-m{p['num_tokens']}"
+    return None
+
+
+@pytest.fixture(scope="module")
+def moe_run(request):
+    """Run the worker once under torchrun for the cases of the selected tests; return its output by (case, rank)."""
+    if torch.cuda.device_count() < _WORLD:
+        pytest.skip(f"needs {_WORLD} GPUs")
+    cases = [case for case in map(_case_id, request.session.items) if case]
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={_WORLD}",
+        os.path.abspath(__file__),
+    ]
+    env = dict(os.environ, MOE_CASES=",".join(cases), PYTHONPATH=_ROOT)
+    proc = subprocess.run(
+        cmd, cwd=_ROOT, env=env, capture_output=True, text=True, timeout=3600
+    )
+    out = proc.stdout + proc.stderr
+    if "NVLS multicast" in out:
+        pytest.skip("the fused tail needs an NVLS multicast capable node")
+    status = {}
+    for rank, case, res in _ROW.findall(out):
+        status[(case, int(rank))] = res == "OK"
+    return status, out
+
+
+def _check_case(moe_run, case):
+    status, out = moe_run
+    ranks = [status.get((case, r)) for r in range(_WORLD)]
+    # The launcher's own summary hides the worker's exception, so show the error lines as well.
+    errors = "\n".join(line for line in out.splitlines() if "Error" in line)
+    details = f"{errors[-1500:]}\n--- end of worker output ---\n{out[-1500:]}"
+    assert None not in ranks, f"no result for {case} on every rank:\n{details}"
+    assert all(ranks), f"{case} failed on some rank:\n{details}"
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 9, 16])
 @pytest.mark.parametrize("top_k", [1, 8, 10])
 @pytest.mark.parametrize("activation", ["silu", "situ"])
-def test_moe_accuracy(num_tokens, top_k, activation):
-    moe_params = MoEParams(use_latent=True, activation=activation)
-    cos_routed, cos_shared = _run_and_compare(moe_params, num_tokens, top_k)
-    print(
-        f"\n[moe] num_experts={moe_params.num_experts} hidden_size={moe_params.hidden_size} intermediate_size={moe_params.intermediate_size} num_tokens={num_tokens} top_k={top_k}: cos_sim={cos_routed:.5f}, {cos_shared:.5f}"
-    )
-    assert cos_routed > 0.98, f"cosine similarity too low: {cos_routed:.5f}"
-    assert cos_shared > 0.98, f"cosine similarity too low: {cos_shared:.5f}"
+def test_moe_accuracy(request, moe_run, num_tokens, top_k, activation):
+    _check_case(moe_run, _case_id(request.node))
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
-def test_moe_cuda_graph_replay(num_tokens):
-    """CUDA graph capture + multi-replay must produce correct results."""
-    top_k = 8
-    dev = torch.device("cuda")
-    moe_params = MoEParams(use_latent=True)
-    moe_params.init_weights()
-
-    input = torch.randn(
-        num_tokens, moe_params.hidden_size, device=dev, dtype=torch.bfloat16
-    )
-
-    moe_ref = MoERef(moe_params)
-    moe_fused = MoEFused(moe_params)
-
-    # Warmup: packs the weights and allocates the workspace outside the capture.
-    for _ in range(3):
-        moe_fused(input, top_k)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        routed_out, shared_out = moe_fused(input, top_k)
-    torch.cuda.synchronize()
-
-    for i in range(4):
-        torch.manual_seed(200 + i)
-        input.copy_(torch.randn_like(input))
-
-        graph.replay()
-        torch.cuda.synchronize()
-
-        routed_ref, shared_ref = moe_ref(input, top_k)
-        cos = _cosine(routed_out, routed_ref)
-        cos_shared = _cosine(shared_out, shared_ref)
-        print(
-            f"\n[moe graph] m={num_tokens} replay={i}: cos={cos:.5f}, {cos_shared:.5f}"
-        )
-        assert cos > 0.98, f"graph replay {i}: routed cos too low: {cos:.5f}"
-        assert (
-            cos_shared > 0.98
-        ), f"graph replay {i}: shared cos too low: {cos_shared:.5f}"
-        assert torch.isfinite(
-            routed_out.float()
-        ).all(), f"graph replay {i}: NaN/Inf in output"
+def test_moe_cuda_graph_replay(request, moe_run, num_tokens):
+    _check_case(moe_run, _case_id(request.node))
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    if "WORLD_SIZE" in os.environ:  # one rank of the 4-GPU run, started by torchrun
+        _tail_worker()
+    else:
+        pytest.main([__file__, "-v", "-s"])
