@@ -231,6 +231,8 @@ struct UpProjection {
             const std::uint32_t cur_scale_slot = task_id % kScaleSlots;
 
             const bool has_next_e = (task.next_expert_idx != kNoExpert);
+            const auto task_span =
+                KERNEL_TIMER_BEGIN(smem->timer(), "up_expert_task", expert_id);
 
             if (WarpRole::is_weight_loader_thread()) {
                 run_load_k_loop(smem, tma_up_weights_desc, expert_scales_up,
@@ -245,9 +247,12 @@ struct UpProjection {
                                    cur_scale_slot, tmem_base, task_id,
                                    expert_id);
 
+                const auto epilogue_span =
+                    KERNEL_TIMER_BEGIN(smem->timer(), "up_epilogue", expert_id);
                 epilogue(workspace, smem, task.local_expert_idx, batch_size,
                          base_feature, m_block, activation, act_params,
                          acc_gate_out, acc_up_out);
+                KERNEL_TIMER_END(smem->timer(), epilogue_span);
             } else if constexpr (UpGemm::MmaCore::kUseBlockscaled) {
                 // The MX recipe loads each weight tile's SFA with the tile.
             } else if (WarpRole::is_other_loader_warp(warp_idx) && has_next_e) {
@@ -259,12 +264,17 @@ struct UpProjection {
                         : 0u;
                 if (task_id + 1u >= kScaleSlots) {
                     // Throttle edge: wait for calc warps to release the slot.
+                    const auto scale_empty_span = KERNEL_TIMER_BEGIN(
+                        smem->timer(), "up_wait_weight_scale_empty",
+                        next_expert_id);
                     smem->barriers.wait_weight_scale_empty(
                         task_id + 1u - kScaleSlots, next_scale_slot);
+                    KERNEL_TIMER_END(smem->timer(), scale_empty_span);
                 }
                 prefetch_up_weight_scale(expert_scales_up, next_expert_id,
                                          base_feature, next_scale_slot, smem);
             }
+            KERNEL_TIMER_END(smem->timer(), task_span);
         }
     }
 
@@ -341,6 +351,8 @@ struct UpProjection {
             }
             workspace->cta_comm.publish_up_out(smem->launch_parity, dest_row,
                                                m_block_idx, lane_idx);
+            KERNEL_TIMER_MARK(smem->timer(), "up_handoff_publish",
+                              smem->routing.active_experts[e]);
             return;
         }
 
@@ -374,6 +386,8 @@ struct UpProjection {
         }
         workspace->cta_comm.publish_up_out(smem->launch_parity, dest_row,
                                            m_block_idx, lane_idx);
+        KERNEL_TIMER_MARK(smem->timer(), "up_handoff_publish",
+                          smem->routing.active_experts[e]);
     }
 
     // Epilogue: the gated activation into act_up_out, then one warp per token
@@ -387,6 +401,8 @@ struct UpProjection {
         [[maybe_unused]] const std::uint32_t expert_id =
             smem->routing.active_experts[e];
 
+        const auto act_span = KERNEL_TIMER_BEGIN(
+            smem->timer(), "up_combine_gated_activation", expert_id);
         if (activation == Activation::kSitu) {
             combine_gated_activation<true>(smem, e, batch_size, acc_gate,
                                            acc_up, act_params);
@@ -394,7 +410,11 @@ struct UpProjection {
             combine_gated_activation<false>(smem, e, batch_size, acc_gate,
                                             acc_up, act_params);
         }
+        KERNEL_TIMER_END(smem->timer(), act_span);
         WarpRole::sync_calc_threads();
+
+        const auto publish_span = KERNEL_TIMER_BEGIN(
+            smem->timer(), "up_quantize_publish_rows", expert_id);
 
         constexpr std::uint32_t kTokensPerWarp =
             UpGemm::kTileShapeN / WarpRole::kCalcWarpCount;
@@ -404,6 +424,7 @@ struct UpProjection {
                 workspace, smem, e, batch_size, base_feature, m_block_idx,
                 WarpRole::get_warp_idx() + g * WarpRole::kCalcWarpCount);
         }
+        KERNEL_TIMER_END(smem->timer(), publish_span);
         WarpRole::sync_calc_threads();
     }
 
@@ -447,12 +468,21 @@ struct UpProjection {
             // Previous occupant is ring_iter_id - kNumAccSlots; none on the
             // launch's first lap.
             if (ring_iter_id >= kNumAccSlots) {
+                const auto acc_empty_span = KERNEL_TIMER_BEGIN(
+                    smem->timer(), "up_wait_accumulator_empty", ring_iter_id);
                 smem->barriers.wait_accumulator_empty(ring_iter_id);
+                KERNEL_TIMER_END(smem->timer(), acc_empty_span);
             }
+            const auto weight_span = KERNEL_TIMER_BEGIN(
+                smem->timer(), "up_wait_weight", ring_iter_id);
             smem->barriers.up_weight_ready.wait(ring_iter_id);
+            KERNEL_TIMER_END(smem->timer(), weight_span);
             if (task_id == 0u) {
                 // Staging lands one K tile at a time; later tasks are ready.
+                const auto input_span = KERNEL_TIMER_BEGIN(
+                    smem->timer(), "up_wait_input_ready", k_iter_id);
                 smem->barriers.up_staging_ready.wait(k_iter_id);
+                KERNEL_TIMER_END(smem->timer(), input_span);
             }
             mma(smem, tiled_mma, cta_mma, sB_layout, tCt_gate, tCt_up,
                 weight_slot, acc_slot, k_iter_id, tmem_base);
@@ -472,7 +502,10 @@ struct UpProjection {
                                               std::uint32_t task_id,
                                               std::uint32_t expert_id) {
         if constexpr (!UpGemm::MmaCore::kUseBlockscaled) {
+            const auto scale_span = KERNEL_TIMER_BEGIN(
+                smem->timer(), "up_wait_weight_scale_ready", expert_id);
             smem->barriers.wait_weight_scale_ready(task_id, cur_scale_slot);
+            KERNEL_TIMER_END(smem->timer(), scale_span);
         }
 
 #pragma unroll 1
@@ -514,7 +547,7 @@ struct UpProjection {
                 smem->routed_experts.up_weight_sfa[weight_slot];
             std::uint8_t* const sfb =
                 &smem->routed_experts.quantized_input.scale[s][0];
-            if (WarpRole::get_lane_idx() == 0u) {
+            if (cute::elect_one_sync()) {
                 UpScaleTraits::copy_to_tmem(
                     sfa, sfb, tmem_addr(tmem_base, 0u, kUpSfaTmemOffset),
                     tmem_addr(tmem_base, 0u, kUpSfbTmemOffset));
@@ -548,7 +581,10 @@ struct UpProjection {
         const std::uint32_t prev_slot = (ring_iter_id - 1u) % kNumAccSlots;
 
         // Tile ring_iter_id - 1: the dequant lags the UMMA by one iteration.
+        const auto acc_ready_span = KERNEL_TIMER_BEGIN(
+            smem->timer(), "up_wait_accumulator_ready", ring_iter_id);
         smem->barriers.accumulator_ready.wait(ring_iter_id - 1u);
+        KERNEL_TIMER_END(smem->timer(), acc_ready_span);
 
         const auto release_slot = [&]() {
             cutlass::arch::fence_view_async_tmem_load();
@@ -613,6 +649,8 @@ struct UpProjection {
         const float* __restrict__ expert_scales_up, std::uint32_t expert_id,
         unsigned base_row_up, std::uint32_t slot,
         SharedStorage* __restrict__ smem) {
+        const auto prefetch_span = KERNEL_TIMER_BEGIN(
+            smem->timer(), "up_prefetch_weight_scale", expert_id);
         load_up_weight_scale_per_expert_async<Dims>(
             expert_scales_up, expert_id, base_row_up,
             smem->routed_experts.w_up_scale[slot]);
@@ -621,6 +659,7 @@ struct UpProjection {
         if (WarpRole::get_lane_idx() == 0u) {
             smem->barriers.weight_scale_ready.arrive(slot);
         }
+        KERNEL_TIMER_END(smem->timer(), prefetch_span);
     }
 
     // Issue the weight TMA(s) for one (expert, K-tile) into its ring slot.
@@ -675,7 +714,10 @@ struct UpProjection {
         if (arm_id < kNumWeightSlots) {
             return;
         }
+        const auto weight_empty_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "up_wait_weight_empty", arm_id);
         smem->barriers.accumulator_ready.wait(arm_id - kNumWeightSlots);
+        KERNEL_TIMER_END(smem->timer(), weight_empty_span);
     }
 };
 

@@ -80,6 +80,8 @@ struct RouterProjectionBase {
     // per slot.
     __device__ static void run_load_input_k_loop(
         CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem) {
+        const auto load_input_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "run_load_input_k_loop");
         constexpr std::uint32_t kInputTileBytes =
             RouterGemm::kNumSwizzleBoxKs * RouterGemm::kTileShapeN *
             RouterGemm::kSwizzleBoxK *
@@ -90,7 +92,10 @@ struct RouterProjectionBase {
              ++k_iter_id) {
             const std::uint32_t slot = k_iter_id % Traits::kRouterInputSlots;
             // The slot about to be overwritten must have been consumed.
+            const auto input_empty_span = KERNEL_TIMER_BEGIN(
+                smem->timer(), "router_wait_input_empty", k_iter_id);
             smem->barriers.wait_router_input_empty(k_iter_id);
+            KERNEL_TIMER_END(smem->timer(), input_empty_span);
             smem->barriers.router_input_ready.arrive(k_iter_id,
                                                      kInputTileBytes);
             load_input_tile<RouterGemm::kTileShapeN>(
@@ -98,6 +103,7 @@ struct RouterProjectionBase {
                 smem->router.input.data[slot],
                 smem->barriers.router_input_ready.raw(slot));
         }
+        KERNEL_TIMER_END(smem->timer(), load_input_span);
     }
 
     // TMA launcher thread: the block's slice of its router M tile, one bulk
@@ -109,7 +115,10 @@ struct RouterProjectionBase {
         for (std::uint32_t j = 0; j < RouterGemm::kNumTilesK; ++j) {
             const std::uint32_t slot = j % KernelTraits::kNumRouterWeightSlots;
             if (j >= KernelTraits::kNumRouterWeightSlots) {
+                const auto weight_empty_span = KERNEL_TIMER_BEGIN(
+                    smem->timer(), "router_wait_weight_empty");
                 smem->barriers.wait_router_weight_empty(j);
+                KERNEL_TIMER_END(smem->timer(), weight_empty_span);
             }
             smem->barriers.router_weight_ready.arrive(
                 j, RouterGemm::MmaCore::kWeightTileBytes);
@@ -232,8 +241,14 @@ struct RouterProjection<KernelTraits, true>
         for (std::uint32_t j = 0; j < RouterGemm::kNumTilesK; ++j) {
             const std::uint32_t k_iter_id = j;
             const std::uint32_t slot = k_iter_id % kInputSlots;
+            const auto input_ready_span = KERNEL_TIMER_BEGIN(
+                smem->timer(), "router_wait_input_ready", k_iter_id);
             smem->barriers.router_input_ready.wait(k_iter_id);
+            KERNEL_TIMER_END(smem->timer(), input_ready_span);
+            const auto weight_ready_span = KERNEL_TIMER_BEGIN(
+                smem->timer(), "router_wait_weight_ready", k_iter_id);
             smem->barriers.router_weight_ready.wait(j);
+            KERNEL_TIMER_END(smem->timer(), weight_ready_span);
             cute::Tensor tCrB = cta_mma.make_fragment_B(cute::make_tensor(
                 cute::make_smem_ptr(
                     reinterpret_cast<typename MmaCore::TiledMma::ValTypeB*>(
@@ -261,6 +276,8 @@ struct RouterProjection<KernelTraits, true>
     __device__ static void store_and_publish_logits(
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         std::uint32_t tile, ScoringFunc scoring) {
+        const auto publish_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "router_publish_logits");
         static_assert(RouterGemm::kTileShapeN % 8u == 0u,
                       "the token columns are whole 8-wide TMEM reads");
         static_assert(kTileShapeM <= 128u,
@@ -291,6 +308,7 @@ struct RouterProjection<KernelTraits, true>
         if (warp_idx == 0u && lane_idx == 0u) {
             workspace->cta_comm.publish_router_tasks(smem->launch_parity, 1u);
         }
+        KERNEL_TIMER_END(smem->timer(), publish_span);
     }
 
     // The weight tiles were read through the async proxy only: no fence.
@@ -415,6 +433,8 @@ struct RouterProjection<KernelTraits, false>
     __device__ static void store_and_publish_logits(
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         std::uint32_t tile, ScoringFunc scoring) {
+        const auto publish_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "router_publish_logits");
         // One thread per (token, 4 experts), summing the warps in order.
         WarpRole::sync_calc_threads();
         constexpr std::uint32_t kTokens = RouterGemm::kTileShapeN;
@@ -461,6 +481,7 @@ struct RouterProjection<KernelTraits, false>
         if (threadIdx.x == 0u) {
             workspace->cta_comm.publish_router_tasks(smem->launch_parity, 1u);
         }
+        KERNEL_TIMER_END(smem->timer(), publish_span);
     }
 
     // TMA launcher thread, after the block barrier that ends routing: the

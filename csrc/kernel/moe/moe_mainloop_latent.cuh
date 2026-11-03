@@ -120,8 +120,11 @@ struct LatentDownProjection {
         for (std::uint32_t local = 0; local < kTilesKPerCta; ++local) {
             const std::uint32_t slot = local % kInputSlots;
             if (local >= kInputSlots) {
+                const auto empty_span = KERNEL_TIMER_BEGIN(
+                    smem->timer(), "latent_wait_input_empty", local);
                 smem->barriers.latent_down_input_empty.wait(local -
                                                             kInputSlots);
+                KERNEL_TIMER_END(smem->timer(), empty_span);
             }
 
             smem->barriers.latent_down_input_ready.arrive(local,
@@ -146,7 +149,10 @@ struct LatentDownProjection {
         for (std::uint32_t local = 0; local < kTilesKPerCta; ++local) {
             const std::uint32_t slot = local % kNumWeightSlots;
             if (local >= kNumWeightSlots) {
+                const auto empty_span = KERNEL_TIMER_BEGIN(
+                    smem->timer(), "latent_wait_weight_empty", local);
                 smem->barriers.wait_latent_down_weight_empty(local);
+                KERNEL_TIMER_END(smem->timer(), empty_span);
             }
 
             if constexpr (kBlockscaled) {
@@ -472,10 +478,16 @@ struct LatentDownProjection {
             run_load_weight_k_loop(tma_latent_down_weight_desc,
                                    latent_down_weight_scale, smem);
         } else if (WarpRole::is_mma_issuer_warp(WarpRole::get_warp_idx())) {
+            const auto mma_span =
+                KERNEL_TIMER_BEGIN(smem->timer(), "latent_down_umma");
             run_mma_k_loop(smem, smem->tmem_ptr);
+            KERNEL_TIMER_END(smem->timer(), mma_span);
         } else if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
+            const auto quant_span = KERNEL_TIMER_BEGIN(
+                smem->timer(), "latent_quantize_and_dequant");
             run_quantize_and_dequant_k_loop(smem, latent_down_weight_scale,
                                             workspace, batch_size);
+            KERNEL_TIMER_END(smem->timer(), quant_span);
         }
         if constexpr (LatentDownGemm::kNumSplits > 1u) {
             // Every thread joins: the cluster barrier is block-collective.
@@ -523,10 +535,19 @@ struct LatentDownProjection {
             const std::uint32_t w_slot = local % kNumWeightSlots;
 
             if (local >= kNumAccSlots) {
+                const auto acc_empty_span = KERNEL_TIMER_BEGIN(
+                    smem->timer(), "latent_wait_accumulator_empty", local);
                 smem->barriers.wait_accumulator_empty(local);
+                KERNEL_TIMER_END(smem->timer(), acc_empty_span);
             }
+            const auto input_empty_span = KERNEL_TIMER_BEGIN(
+                smem->timer(), "latent_wait_quantized_input", local);
             smem->barriers.latent_down_input_empty.wait(local);
+            KERNEL_TIMER_END(smem->timer(), input_empty_span);
+            const auto weight_ready_span = KERNEL_TIMER_BEGIN(
+                smem->timer(), "latent_wait_weight_ready", local);
             smem->barriers.latent_down_weight_ready.wait(local);
+            KERNEL_TIMER_END(smem->timer(), weight_ready_span);
             auto tCsB = cute::make_tensor(
                 cute::make_smem_ptr(staged_block(smem, local)), SBLayout{});
             cute::Tensor tCrB = cta_mma.make_fragment_B(tCsB);
@@ -538,7 +559,7 @@ struct LatentDownProjection {
                 std::uint8_t* const sfb =
                     &smem->latent_down.quantized_input
                          .scale[local % Traits::kLatentInputSlots][0];
-                if (WarpRole::get_lane_idx() == 0u) {
+                if (cute::elect_one_sync()) {
                     ScaleTraits::copy_to_tmem(sfa, sfb,
                                               tmem_base + kSfaTmemOffset,
                                               tmem_base + kSfbTmemOffset);
@@ -570,7 +591,13 @@ struct LatentDownProjection {
         const std::uint32_t slot = local % Traits::kLatentInputSlots;
         const std::uint32_t k_iter_id = k_tile(local);
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
+        const auto ready_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "latent_wait_input_ready", local);
         smem->barriers.latent_down_input_ready.wait(local);
+        KERNEL_TIMER_END(smem->timer(), ready_span);
+
+        const auto quantize_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "quantize_fp8_blockwise_128");
         if constexpr (kBlockscaled) {
             quantize_mxfp8_groupwise_1x32<
                 /*Staged=*/true, kTileShapeN,
@@ -599,6 +626,7 @@ struct LatentDownProjection {
                 k_iter_id * kBlocksPerTile, batch_size, token_begin(), warp_idx,
                 WarpRole::kCalcWarpCount);
         }
+        KERNEL_TIMER_END(smem->timer(), quantize_span);
         // The fp8 stores must reach the async proxy before the tile is
         // signalled: the issuer reads them through tcgen05.
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -722,7 +750,10 @@ struct LatentDownProjection {
 
         // Every calc warp waits for the slice's UMMA before arriving: a warp
         // that raced ahead would complete the phase its own k never filled.
+        const auto acc_ready_span = KERNEL_TIMER_BEGIN(
+            smem->timer(), "latent_wait_accumulator_ready", k_iter_id);
         smem->barriers.accumulator_ready.wait(k_iter_id);
+        KERNEL_TIMER_END(smem->timer(), acc_ready_span);
         // The blockscaled instruction already applied the per-32K scales.
         constexpr std::uint32_t kSubBlocks =
             kBlockscaled ? 1u : kQuantBlocksPerTile;
@@ -780,6 +811,8 @@ struct LatentDownProjection {
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         constexpr std::uint32_t kWriterWarps = kTileShapeM / 16u;
         if (warp_idx >= kWriterWarps) return;
+        const auto store_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "latent_reduce_and_store");
         const std::uint32_t row =
             row_base() + 16u * group_idx(warp_idx) + lane_idx / 4u;
 #pragma unroll
@@ -799,6 +832,7 @@ struct LatentDownProjection {
                 }
             }
         }
+        KERNEL_TIMER_END(smem->timer(), store_span);
     }
 };
 

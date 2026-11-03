@@ -79,6 +79,9 @@ struct CollectiveMainloopMoE {
         DataType::ElementOut* routed_out;
         DataType::ElementOut* shared_out;
         void* workspace;
+        // Device event timer: the per-CTA record pool (null = off) and
+        // whether the per-block detail probes should fire.
+        std::uint64_t* timer_events;
         std::uint32_t top_k;
         ScoringFunc scoring_func;
         bool renormalize;
@@ -120,6 +123,7 @@ struct CollectiveMainloopMoE {
             Dims>::ElementScale* __restrict__ shared_down_scale;
         DataType::ElementOut* __restrict__ shared_out;
         void* __restrict__ scratchpad;
+        std::uint64_t* timer_events;
         std::uint32_t top_k;
         cutlass::FastDivmod topk_divmod;
         ScoringFunc scoring_func;
@@ -162,6 +166,7 @@ struct CollectiveMainloopMoE {
         params.shared_down_scale = args.shared_down_weight_scale;
         params.shared_out = args.shared_out;
         params.scratchpad = args.workspace;
+        params.timer_events = args.timer_events;
         params.top_k = args.top_k;
         params.topk_divmod = cutlass::FastDivmod(static_cast<int>(args.top_k));
         params.scoring_func = args.scoring_func;
@@ -214,22 +219,18 @@ struct CollectiveMainloopMoE {
                             Workspace::kMaxRoutedRows, Dims::kIntermediateSize,
                             /*box_rows=*/Dims::kNumTokens, /*box_cols=*/128u);
 
-        if constexpr (Traits::kUseSharedExpert) {
-            if (args.shared_out != nullptr) {
-                params.tma_shared_up_desc = CreateTmaDesc2D(
-                    "up-projection weights", args.shared_up_weight,
-                    /*rows=*/Dims::kIntermediateSize * 2u,
-                    /*cols=*/Dims::kHiddenSize,
-                    /*box_rows=*/SharedUpGemmTraits<Dims>::kTileShapeM,
-                    /*box_cols=*/128u);
-                params.tma_shared_down_desc = CreateTmaDesc2D(
-                    "down-projection weights", args.shared_down_weight,
-                    /*rows=*/Dims::kHiddenSize,
-                    /*cols=*/Dims::kIntermediateSize,
-                    /*box_rows=*/SharedDownGemmTraits<Dims>::kTileShapeM,
-                    /*box_cols=*/128u);
-            }
-        }
+        params.tma_shared_up_desc =
+            CreateTmaDesc2D("up-projection weights", args.shared_up_weight,
+                            /*rows=*/Dims::kIntermediateSize * 2u,
+                            /*cols=*/Dims::kHiddenSize,
+                            /*box_rows=*/SharedUpGemmTraits<Dims>::kTileShapeM,
+                            /*box_cols=*/128u);
+        params.tma_shared_down_desc = CreateTmaDesc2D(
+            "down-projection weights", args.shared_down_weight,
+            /*rows=*/Dims::kHiddenSize,
+            /*cols=*/Dims::kIntermediateSize,
+            /*box_rows=*/SharedDownGemmTraits<Dims>::kTileShapeM,
+            /*box_cols=*/128u);
         if (args.latent_down_weight != nullptr) {
             params.tma_latent_down_weight_desc = CreateTmaDesc2D(
                 "latent-projection weights", args.latent_down_weight,
@@ -256,16 +257,13 @@ struct CollectiveMainloopMoE {
     // latent down-projection occupies.
     __device__ void run_shared(Params const& params,
                                SharedStorage* __restrict__ smem) {
-        if (params.shared_out != nullptr) {
-            SharedExpertProjection<Traits>::run(
-                params.tma_shared_up_desc, params.tma_shared_down_desc,
-                params.tma_input_desc, params.shared_up_scale,
-                params.shared_down_scale, params.shared_out,
-                reinterpret_cast<Workspace*>(params.scratchpad), smem,
-                static_cast<std::uint32_t>(params.num_tokens),
-                params.activation,
-                GatedActParams{params.situ_beta, params.situ_linear_beta});
-        }
+        SharedExpertProjection<Traits>::run(
+            params.tma_shared_up_desc, params.tma_shared_down_desc,
+            params.tma_input_desc, params.shared_up_scale,
+            params.shared_down_scale, params.shared_out,
+            reinterpret_cast<Workspace*>(params.scratchpad), smem,
+            static_cast<std::uint32_t>(params.num_tokens), params.activation,
+            GatedActParams{params.situ_beta, params.situ_linear_beta});
     }
 
     // Phase 0c: the router Linear on this block's expert tiles, then this
@@ -282,8 +280,11 @@ struct CollectiveMainloopMoE {
                                params.num_tokens > WarpRole::kCalcWarpCount;
         if (threadIdx.x == 0u) {
             // One task per router CTA, whatever its M tile or K slice.
+            const auto logits_span =
+                KERNEL_TIMER_BEGIN(smem->timer(), "router_wait_logits");
             workspace->cta_comm.wait_router_tasks(smem->launch_parity,
                                                   Traits::RouterGemm::kNumCtas);
+            KERNEL_TIMER_END(smem->timer(), logits_span);
         }
         WarpRole::sync_calc_threads();
         const std::uint32_t calc_warp_idx = WarpRole::get_calc_warp_idx();
@@ -298,9 +299,12 @@ struct CollectiveMainloopMoE {
             // One warp per token, and this block runs only its half.
             const std::uint32_t tok = tok_base + calc_warp_idx;
             if (calc_warp_idx < kTokensPerCta && tok < params.num_tokens) {
+                const auto topk_span =
+                    KERNEL_TIMER_BEGIN(smem->timer(), "topk_one_token");
                 topk_one_token<Dims, kExpertsPerThread>(
                     tok, params.top_k, params.scoring_func, params.renormalize,
                     workspace, smem);
+                KERNEL_TIMER_END(smem->timer(), topk_span);
             }
         } else {
             constexpr std::uint32_t kTokensPerWarp =
@@ -312,9 +316,12 @@ struct CollectiveMainloopMoE {
                 const std::uint32_t tok =
                     calc_warp_idx + g * WarpRole::kCalcWarpCount;
                 if (tok >= params.num_tokens) break;
+                const auto topk_span =
+                    KERNEL_TIMER_BEGIN(smem->timer(), "topk_one_token");
                 topk_one_token<Dims, kExpertsPerThread>(
                     tok, params.top_k, params.scoring_func, params.renormalize,
                     workspace, smem);
+                KERNEL_TIMER_END(smem->timer(), topk_span);
             }
         }
         WarpRole::sync_calc_threads();
@@ -327,9 +334,12 @@ struct CollectiveMainloopMoE {
                 const std::uint32_t peer_rank =
                     (blockIdx.x % Traits::kClusterSize) ^ 1u;
                 if (lane_idx == 0u) {
+                    const auto coop_span = KERNEL_TIMER_BEGIN(
+                        smem->timer(), "router_coop_exchange");
                     smem->barriers.router_coop.arrive();
                     Coop::arrive_remote(
                         smem->barriers.router_coop.partner(peer_rank));
+                    KERNEL_TIMER_END(smem->timer(), coop_span);
                 }
                 smem->barriers.router_coop.wait();
                 // The partner's half as 16-B words, its ids and then its
@@ -383,8 +393,11 @@ struct CollectiveMainloopMoE {
             if (WarpRole::get_calc_warp_idx() == 0u) {
                 // Every router block holds the whole selection by now (a
                 // coop pair has swapped halves), so it builds its own.
+                const auto tables_span =
+                    KERNEL_TIMER_BEGIN(smem->timer(), "prepare_routing_tables");
                 prepare_routing_tables<Dims>(params.num_tokens, params.top_k,
                                              params.topk_divmod, smem);
+                KERNEL_TIMER_END(smem->timer(), tables_span);
                 // Block 0 hands its finished tables to the other blocks.
                 if (blockIdx.x == 0u) {
                     publish_routing_tables(workspace, smem, lane_idx);
@@ -395,10 +408,16 @@ struct CollectiveMainloopMoE {
             // After the projection: one warp copies block 0's tables, and it
             // does not contend with the projection's own warps.
             if (lane_idx == 0u) {
+                const auto wait_span =
+                    KERNEL_TIMER_BEGIN(smem->timer(), "router_wait_tables");
                 workspace->cta_comm.wait_router_tables(smem->launch_parity);
+                KERNEL_TIMER_END(smem->timer(), wait_span);
             }
             __syncwarp();
+            const auto load_span =
+                KERNEL_TIMER_BEGIN(smem->timer(), "load_routing_tables");
             load_routing_tables(workspace, smem, lane_idx);
+            KERNEL_TIMER_END(smem->timer(), load_span);
         }
     }
 
@@ -474,6 +493,8 @@ struct CollectiveMainloopMoE {
     // input ring holds the projection output outright.
     __device__ void quantize_up_input_whole(SharedStorage* __restrict__ smem,
                                             int batch_size) {
+        const auto quantize_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "up_quantize_input");
         if constexpr (Traits::UpGemm::MmaCore::kUseBlockscaled) {
             quantize_mxfp8_groupwise_1x32<
                 /*Staged=*/false, Dims::kNumTokens, Dims::kLatentSize,
@@ -503,6 +524,7 @@ struct CollectiveMainloopMoE {
         }
         // One pass, every tile at once: the issuer's waits all pass straight
         // through.
+        KERNEL_TIMER_END(smem->timer(), quantize_span);
         WarpRole::sync_calc_threads();
         if (WarpRole::get_calc_warp_idx() == 0u &&
             WarpRole::get_lane_idx() == 0u) {
@@ -518,6 +540,8 @@ struct CollectiveMainloopMoE {
     __device__ void quantize_up_input(std::uint32_t num_tiles,
                                       SharedStorage* __restrict__ smem,
                                       int batch_size) {
+        const auto quantize_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "up_quantize_input");
         constexpr std::uint32_t kInputTileK = Traits::UpGemm::kTileShapeK;
         constexpr std::uint32_t kBlocksPerTile =
             kInputTileK / Dims::kQuantConfig.kBlockSize;
@@ -562,6 +586,7 @@ struct CollectiveMainloopMoE {
                 smem->barriers.up_staging_ready.arrive(tile);
             }
         }
+        KERNEL_TIMER_END(smem->timer(), quantize_span);
     }
 
     // The up entry's staging when the projection quantized its output: both
@@ -605,9 +630,14 @@ struct CollectiveMainloopMoE {
             Traits::kUpInputSlots * Traits::UpGemm::kTileShapeK;
         if (WarpRole::is_other_loader_thread()) {
             if constexpr (Traits::kUseLatent) {
+                const auto latent_span =
+                    KERNEL_TIMER_BEGIN(smem->timer(), "up_wait_latent");
                 workspace->cta_comm.wait_latent_tasks(
                     smem->launch_parity, Traits::LatentDownGemm::kNumCtas);
+                KERNEL_TIMER_END(smem->timer(), latent_span);
             }
+            const auto activation_span =
+                KERNEL_TIMER_BEGIN(smem->timer(), "up_load_activation");
             if constexpr (Traits::kLatentQuantizeOutput) {
                 load_quantized_activation(workspace, smem);
             } else if constexpr (Traits::kUseLatent && kWholeLatentFits) {
@@ -628,6 +658,7 @@ struct CollectiveMainloopMoE {
                 run_load_up_input_k_loop(params.tma_input_desc,
                                          Traits::UpGemm::kNumTilesK, smem);
             }
+            KERNEL_TIMER_END(smem->timer(), activation_span);
         }
         if constexpr (!Traits::kLatentQuantizeOutput) {
             if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
@@ -696,9 +727,7 @@ struct CollectiveMainloopMoE {
             smem->barriers.init_router_ring();
             smem->barriers.init_latent_ring();
             smem->barriers.init_expert_ring();
-            if constexpr (Traits::kUseSharedExpert) {
-                smem->barriers.init_shared_ring();
-            }
+            smem->barriers.init_shared_ring();
             cutlass::arch::fence_barrier_init();
         } else if (warp_idx == 2 && lane_idx == 0) {
             // A warp with no other setup role; one thread covers the block.
@@ -770,31 +799,43 @@ struct CollectiveMainloopMoE {
             for (std::uint32_t flat = first_cell; flat < num_cells;
                  flat += cell_stride) {
                 const std::uint32_t tok = flat / kDownOutputColsPerCta;
+                const auto wait_span =
+                    KERNEL_TIMER_BEGIN(smem->timer(), "wait_down_out", tok);
                 workspace->cta_comm.wait_down_out_field(
                     smem->launch_parity, m_block,
                     tok * PackedTokenCounts<Dims>::kBits,
                     PackedTokenCounts<Dims>::kMask, top_k);
+                KERNEL_TIMER_END(smem->timer(), wait_span);
+                const auto gather_span = KERNEL_TIMER_BEGIN(
+                    smem->timer(), "gather_and_combine", tok);
                 gather_cell(workspace, activations_out, tok,
                             base_col + flat % kDownOutputColsPerCta, top_k);
+                KERNEL_TIMER_END(smem->timer(), gather_span);
             }
             return;
         }
 
         // Readiness wait: this block's m-block completes once every active
         // expert's task of it has been published.
+        const auto m_block_wait =
+            KERNEL_TIMER_BEGIN(smem->timer(), "wait_down_out");
         if (threadIdx.x == 0) {
             workspace->cta_comm.wait_down_out(
                 smem->launch_parity, m_block,
                 smem->routing.active_expert_count);
         }
         __syncthreads();
+        KERNEL_TIMER_END(smem->timer(), m_block_wait);
 
+        const auto gather_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "gather_and_combine");
         for (std::uint32_t flat = first_cell; flat < num_cells;
              flat += cell_stride) {
             gather_cell(workspace, activations_out,
                         flat / kDownOutputColsPerCta,
                         base_col + flat % kDownOutputColsPerCta, top_k);
         }
+        KERNEL_TIMER_END(smem->timer(), gather_span);
     }
 
     // One output cell: sums token `tok`'s top_k combine slots at column `col`

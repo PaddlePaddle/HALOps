@@ -179,28 +179,41 @@ struct UmmaScaleTraits<TiledMma, TileShape, true> {
                                         std::uint8_t* __restrict__ sfb,
                                         std::uint32_t sfa_addr,
                                         std::uint32_t sfb_addr) {
+        copy_sfa_to_tmem(sfa, sfa_addr);
+        copy_sfb_to_tmem(sfb, sfb_addr);
+    }
+
+    // One operand's half of the pair, for the paths that stage each from the
+    // warp that loads it.
+    __device__ static void copy_sfa_to_tmem(std::uint8_t* __restrict__ sfa,
+                                            std::uint32_t sfa_addr) {
         using UtccpOp = cute::SM100_UTCCP_4x32dp128bit_1cta;
-        TmemSfa tmem_sfa = make_tmem_sfa(sfa_addr);
-        TmemSfb tmem_sfb = make_tmem_sfb(sfb_addr);
         auto sfa_compact = cute::make_tensor(
             cute::make_smem_ptr(reinterpret_cast<cute::float_ue8m0_t*>(sfa)),
             cute::filter_zeros(SfaAtomLayout{}));
+        TmemSfa tmem_sfa = make_tmem_sfa(sfa_addr);
+        auto tmem_sfa_compact = cute::make_tensor(
+            tmem_sfa.data(), cute::filter_zeros(tmem_sfa.layout()));
+        auto copy_sfa = cute::make_utccp_copy(UtccpOp{}, tmem_sfa_compact);
+        auto thr_sfa = copy_sfa.get_slice(0);
+        auto s_sfa = cute::get_utccp_smem_desc_tensor<UtccpOp>(
+            thr_sfa.partition_S(sfa_compact));
+        cute::copy(copy_sfa, s_sfa, thr_sfa.partition_D(tmem_sfa_compact));
+    }
+
+    __device__ static void copy_sfb_to_tmem(std::uint8_t* __restrict__ sfb,
+                                            std::uint32_t sfb_addr) {
+        using UtccpOp = cute::SM100_UTCCP_4x32dp128bit_1cta;
         auto sfb_compact = cute::make_tensor(
             cute::make_smem_ptr(reinterpret_cast<cute::float_ue8m0_t*>(sfb)),
             cute::filter_zeros(SfbAtomLayout{}));
-        auto tmem_sfa_compact = cute::make_tensor(
-            tmem_sfa.data(), cute::filter_zeros(tmem_sfa.layout()));
+        TmemSfb tmem_sfb = make_tmem_sfb(sfb_addr);
         auto tmem_sfb_compact = cute::make_tensor(
             tmem_sfb.data(), cute::filter_zeros(tmem_sfb.layout()));
-        auto copy_sfa = cute::make_utccp_copy(UtccpOp{}, tmem_sfa_compact);
         auto copy_sfb = cute::make_utccp_copy(UtccpOp{}, tmem_sfb_compact);
-        auto thr_sfa = copy_sfa.get_slice(0);
         auto thr_sfb = copy_sfb.get_slice(0);
-        auto s_sfa = cute::get_utccp_smem_desc_tensor<UtccpOp>(
-            thr_sfa.partition_S(sfa_compact));
         auto s_sfb = cute::get_utccp_smem_desc_tensor<UtccpOp>(
             thr_sfb.partition_S(sfb_compact));
-        cute::copy(copy_sfa, s_sfa, thr_sfa.partition_D(tmem_sfa_compact));
         cute::copy(copy_sfb, s_sfb, thr_sfb.partition_D(tmem_sfb_compact));
     }
 };

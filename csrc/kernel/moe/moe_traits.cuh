@@ -473,11 +473,8 @@ struct MoEKernelTraits {
             : kLatentScaleCluster;
 
     // The shared expert: one expert every token goes through.
-    static constexpr bool kUseSharedExpert =
-        Dims::KernelConfig::kUseSharedExpert;
-
     static constexpr std::uint32_t kSharedClusterSize =
-        kUseSharedExpert ? SharedUpGemmTraits<Dims>::kNumSplits : 1u;
+        SharedUpGemmTraits<Dims>::kNumSplits;
     static constexpr std::uint32_t kClusterSize =
         kLatentClusterSize > kSharedClusterSize ? kLatentClusterSize
                                                 : kSharedClusterSize;
@@ -541,6 +538,12 @@ struct MoEKernelTraits {
         (DownGemm::kTileShapeM * DownGemm::kTileShapeK) /
         (UpGemm::kTileShapeM * UpGemm::kTileShapeK);
 
+    // The down projection's TMEM scale ring.  The issuer stages a step's
+    // SFA/SFB just before that step's MMA; a slot is reusable once the MMA
+    // that read it completed, which the accumulator ring already gates one
+    // lap deep -- so the scale ring matches it.
+    static constexpr std::uint32_t kDownScaleSlots = kNumAccSlots;
+
     // SM100 TMEM allocation, shared by every phase of the block.  The
     // blockscaled phases stage one SFA/SFB set beside their accumulator ring.
     static constexpr std::uint32_t kUpSfColumns =
@@ -556,7 +559,7 @@ struct MoEKernelTraits {
     static constexpr std::uint32_t kRingUpTmemColumns =
         UpGemm::kAccColumns * kNumAccSlots + kUpSfColumns;
     static constexpr std::uint32_t kRingDownTmemColumns =
-        DownGemm::kAccColumns * kNumAccSlots + kDownSfColumns;
+        DownGemm::kAccColumns * kNumAccSlots + kDownScaleSlots * kDownSfColumns;
     static constexpr std::uint32_t kRingTmemColumns =
         kRingUpTmemColumns > kRingDownTmemColumns ? kRingUpTmemColumns
                                                   : kRingDownTmemColumns;

@@ -24,6 +24,7 @@
 #include <type_traits>
 
 #include "common/cuda_utils.h"
+#include "common/kernel_timer_host.hpp"
 #include "kernel/moe/moe_kernel.cuh"
 
 namespace halops {
@@ -152,9 +153,6 @@ void CheckSharedExpertShape(const torch::Tensor& input,
                             const torch::Tensor& shared_down_weight,
                             const torch::Tensor& shared_down_weight_scale,
                             const torch::Tensor& shared_out) {
-    static_assert(moe::MoEKernelTraits<MoEDims>::kUseSharedExpert,
-                  "this interface takes the shared expert's operands, so the "
-                  "schedule it builds must run the shared expert.");
     constexpr std::int64_t kUpRows = 2 * MoEDims::kIntermediateSize;
     // The scale table follows the group's recipe: 128x128 fp32 blocks, or
     // one UE8M0 byte per 32-K group.
@@ -203,17 +201,15 @@ uint32_t CalculateGridSize(int device, cudaStream_t stream) {
     TORCH_CHECK(sm_count >= static_cast<int>(Traits::kMinGrid),
                 "moe: needs at least kMinGrid (=", Traits::kMinGrid,
                 ") SMs for the co-residency invariant; got ", sm_count);
-    if constexpr (Traits::kUseSharedExpert) {
-        // It runs on the blocks the router and the projection leave idle.
-        constexpr std::uint32_t kSharedCtas =
-            Traits::RouterGemm::kNumCtas + Traits::LatentDownGemm::kNumCtas +
-            moe::SharedDownGemmTraits<MoEDims>::kNumCtas;
-        TORCH_CHECK(static_cast<std::uint32_t>(sm_count) >= kSharedCtas,
-                    "moe: the shared expert needs the grid to reach its ",
-                    moe::SharedDownGemmTraits<MoEDims>::kNumCtas,
-                    " blocks, i.e. at least ", kSharedCtas, " SMs; got ",
-                    sm_count);
-    }
+    // The shared expert runs on the blocks the router and the projection
+    // leave idle.
+    constexpr std::uint32_t kSharedCtas =
+        Traits::RouterGemm::kNumCtas + Traits::LatentDownGemm::kNumCtas +
+        moe::SharedDownGemmTraits<MoEDims>::kNumCtas;
+    TORCH_CHECK(static_cast<std::uint32_t>(sm_count) >= kSharedCtas,
+                "moe: the shared expert needs the grid to reach its ",
+                moe::SharedDownGemmTraits<MoEDims>::kNumCtas,
+                " blocks, i.e. at least ", kSharedCtas, " SMs; got ", sm_count);
     uint32_t grid_size =
         std::min(static_cast<std::uint32_t>(sm_count), Traits::kMaxGrid);
 
@@ -375,10 +371,28 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device).stream();
     const uint32_t grid_size = CalculateGridSize<MoEDims>(device, stream);
 
+    // Device event timer: zero this launch's slice of the record pool, hand
+    // its pointer to the kernel, and copy the records back afterwards.  It is
+    // a debug path, so a CUDA-graph capture runs with the pool off.
+#if defined(HALOPS_KERNEL_TIMER_ENABLED)
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    cudaStreamIsCapturing(stream, &capture);
+    const bool timer_on = capture == cudaStreamCaptureStatusNone;
+    if (timer_on) {
+        halops::TimerStage(static_cast<int>(grid_size), stream);
+    }
+    args.timer_events = timer_on ? halops::TimerDeviceBuffer() : nullptr;
+#endif
+
     const cudaError_t launch_status =
         moe::LaunchMoEKernel<MoEDims>(args, grid_size, stream);
     TORCH_CHECK(launch_status == cudaSuccess, "moe: kernel launch failed: ",
                 cudaGetErrorString(launch_status));
+#if defined(HALOPS_KERNEL_TIMER_ENABLED)
+    if (timer_on) {
+        halops::TimerCollect(stream);
+    }
+#endif
 }
 
 }  // namespace moe

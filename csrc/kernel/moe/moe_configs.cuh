@@ -140,11 +140,10 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr bool kLatentDownUseSplitK = true;
         static constexpr bool kLatentQuantizeOutput = true;
         // SharedExpert configs.
-        static constexpr bool kUseSharedExpert = true;
         static constexpr std::uint32_t kNumCtasForShared = 16;
-        static constexpr bool kSharedUseSplitK = false;
         static constexpr std::uint32_t kNumSharedUpWeightSlots = 4;
         static constexpr std::uint32_t kNumSharedDownWeightSlots = 4;
+        static constexpr bool kSharedUseSplitK = true;
         // MoE configs.
         static constexpr std::uint32_t kCtasPerExpert = 8;
         static constexpr std::uint32_t kUpTileShapeK = 256;

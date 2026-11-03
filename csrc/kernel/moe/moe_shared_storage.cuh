@@ -22,6 +22,7 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/tensor.hpp>
 
+#include "common/device_timer.hpp"
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/ptx_utils.cuh"
@@ -672,6 +673,25 @@ struct MoESharedStorage {
     uint16_t down_grid_task[kMaxDownTasks + 1];
     uint32_t down_tasks_claimed;
     uint32_t down_task_stores;
+
+#if defined(HALOPS_KERNEL_TIMER_ENABLED)
+    // Per-warp slot write-cursors for the device event timer, zeroed in the
+    // kernel prologue (before any probe) and published by its __syncthreads.
+    // One entry per warp; the block must not exceed kTimerWarps warps.
+    uint32_t timer_next[halops::kTimerWarps];
+    static_assert(Dims::KernelConfig::kBlockSize / 32u <= halops::kTimerWarps,
+                  "block has more warps than the timer's per-warp cursors");
+    // The per-CTA record pool pointer (null = timer off), parked here by the
+    // prologue so any phase can mint a writer via `timer()`
+    // without threading it through its call chain.
+    std::uint64_t* timer_base;
+
+    __device__ __forceinline__ halops::DeviceTimer timer() {
+        return halops::DeviceTimer::make(
+            timer_base, timer_next, static_cast<int>(blockIdx.x),
+            static_cast<int>(WarpRole::get_warp_idx()));
+    }
+#endif
 };
 
 // Dynamic shared memory required by fused_moe_kernel<Dims>.

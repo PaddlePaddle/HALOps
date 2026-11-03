@@ -195,8 +195,11 @@ struct SharedExpertProjection {
         }
         __syncthreads();
         if (cta_idx() < kNumUpCtas && split_idx() == 0u && threadIdx.x == 0u) {
+            const auto publish_span =
+                KERNEL_TIMER_BEGIN(smem->timer(), "shared_publish_up_out");
             __threadfence();
             workspace->cta_comm.publish_shared_up_out(smem->launch_parity, 1u);
+            KERNEL_TIMER_END(smem->timer(), publish_span);
         }
         run_down(tma_down_desc, down_scale, out, workspace, smem, batch_size);
     }
@@ -207,6 +210,8 @@ struct SharedExpertProjection {
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         std::uint32_t batch_size, Activation activation,
         GatedActParams const& act_params) {
+        const auto up_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "shared_expert_up");
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         if (WarpRole::is_other_loader_thread()) {
             run_up_load_input_k_loop(tma_input_desc, smem);
@@ -218,6 +223,7 @@ struct SharedExpertProjection {
             run_up_quantize_and_dequant_k_loop(up_scale, smem, batch_size);
         }
         join_up_split_k(workspace, smem, batch_size, activation, act_params);
+        KERNEL_TIMER_END(smem->timer(), up_span);
     }
 
     // Every thread joins: the cluster barrier is block-collective.
@@ -230,7 +236,10 @@ struct SharedExpertProjection {
         cluster_arrive_and_wait();
         if (split_idx() == 0u &&
             WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
+            const auto join_span =
+                KERNEL_TIMER_BEGIN(smem->timer(), "shared_join_up_split_k");
             combine_up_splited_out(smem, activation, act_params);
+            KERNEL_TIMER_END(smem->timer(), join_span);
             WarpRole::sync_calc_threads();
             quantize_up_output(workspace, smem, batch_size);
         }
@@ -302,8 +311,11 @@ struct SharedExpertProjection {
         for (std::uint32_t k_iter_id = 0; k_iter_id < kUpTilesK; ++k_iter_id) {
             const std::uint32_t slot = k_iter_id % kNumUpSlots;
             if (k_iter_id >= kNumUpSlots) {
+                const auto empty_span = KERNEL_TIMER_BEGIN(
+                    smem->timer(), "shared_wait_up_input_empty", k_iter_id);
                 smem->barriers.shared_up_input_empty.wait(k_iter_id -
                                                           kNumUpSlots);
+                KERNEL_TIMER_END(smem->timer(), empty_span);
             }
             smem->barriers.shared_up_input_ready.arrive(k_iter_id, kInputBytes);
             load_input_tile<Dims::kNumTokens>(
@@ -326,8 +338,11 @@ struct SharedExpertProjection {
         for (std::uint32_t k_iter_id = 0; k_iter_id < kUpTilesK; ++k_iter_id) {
             const std::uint32_t slot = k_iter_id % kNumUpSlots;
             if (k_iter_id >= kNumUpSlots) {
+                const auto empty_span = KERNEL_TIMER_BEGIN(
+                    smem->timer(), "shared_wait_up_weight_empty", k_iter_id);
                 smem->barriers.shared_up_weight_empty.wait(k_iter_id -
                                                            kNumUpSlots);
+                KERNEL_TIMER_END(smem->timer(), empty_span);
             }
             const std::uint32_t k_tile = k_tile_base + k_iter_id;
             smem->barriers.shared_up_weight_ready.arrive(
@@ -373,11 +388,21 @@ struct SharedExpertProjection {
             const std::uint32_t ring = k_iter_id % kNumUpSlots;
             const std::uint32_t acc_slot = k_iter_id % kNumUpAccSlots;
             if (k_iter_id >= kNumUpAccSlots) {
+                const auto acc_empty_span = KERNEL_TIMER_BEGIN(
+                    smem->timer(), "shared_wait_up_accumulator_empty",
+                    k_iter_id);
                 smem->barriers.shared_up_accumulator_empty.wait(k_iter_id -
                                                                 kNumUpAccSlots);
+                KERNEL_TIMER_END(smem->timer(), acc_empty_span);
             }
+            const auto weight_ready_span = KERNEL_TIMER_BEGIN(
+                smem->timer(), "shared_up_wait_weight_ready", k_iter_id);
             smem->barriers.shared_up_weight_ready.wait(k_iter_id);
+            KERNEL_TIMER_END(smem->timer(), weight_ready_span);
+            const auto quantize_ready_span = KERNEL_TIMER_BEGIN(
+                smem->timer(), "shared_up_wait_quantize_ready", k_iter_id);
             smem->barriers.shared_up_quantize_ready.wait(k_iter_id);
+            KERNEL_TIMER_END(smem->timer(), quantize_ready_span);
             {
                 auto tCsB = cute::make_tensor(
                     cute::make_smem_ptr(
@@ -391,7 +416,7 @@ struct SharedExpertProjection {
                     std::uint8_t* const sfa = sh.w_up_scale[ring];
                     std::uint8_t* const sfb =
                         &sh.quantized_input.scale[ring][0];
-                    if (WarpRole::get_lane_idx() == 0u) {
+                    if (cute::elect_one_sync()) {
                         UpScaleTraits::copy_to_tmem(
                             sfa, sfb,
                             tmem_addr(smem->tmem_ptr, 0u, kUpSfaTmemOffset),
@@ -434,15 +459,23 @@ struct SharedExpertProjection {
     __device__ static void quantize_up_input_tile(
         SharedStorage* __restrict__ smem, std::uint32_t batch_size,
         std::uint32_t k_iter_id) {
+        const auto quantize_span = KERNEL_TIMER_BEGIN(
+            smem->timer(), "shared_quantize_up_input_tile", k_iter_id);
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         constexpr std::uint32_t kBlocksPerTile =
             SharedUpGemm::kTileShapeK / Dims::kQuantConfig.kBlockSize;
         const std::uint32_t slot = k_iter_id % kNumUpSlots;
         if (k_iter_id >= kNumUpSlots) {
+            const auto weight_empty_span = KERNEL_TIMER_BEGIN(
+                smem->timer(), "shared_wait_up_weight_empty", k_iter_id);
             smem->barriers.shared_up_weight_empty.wait(k_iter_id - kNumUpSlots);
+            KERNEL_TIMER_END(smem->timer(), weight_empty_span);
         }
+        const auto input_ready_span = KERNEL_TIMER_BEGIN(
+            smem->timer(), "shared_wait_up_input_ready", k_iter_id);
         smem->barriers.shared_up_input_ready.wait(k_iter_id);
+        KERNEL_TIMER_END(smem->timer(), input_ready_span);
         const std::uint32_t k_base =
             (split_idx() * kUpTilesK + k_iter_id) * SharedUpGemm::kTileShapeK;
         const std::uint32_t blocks_base =
@@ -477,16 +510,22 @@ struct SharedExpertProjection {
             smem->barriers.shared_up_input_empty.arrive(k_iter_id);
             smem->barriers.shared_up_quantize_ready.arrive(k_iter_id);
         }
+        KERNEL_TIMER_END(smem->timer(), quantize_span);
     }
 
     __device__ static void dequant_up_tile(
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
         SharedStorage* __restrict__ smem, std::uint32_t k_iter_id,
         float (&gate)[kTokenGroups][2], float (&up)[kTokenGroups][2]) {
+        const auto dequant_span = KERNEL_TIMER_BEGIN(
+            smem->timer(), "shared_dequant_up_tile", k_iter_id);
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         const std::uint32_t acc_slot = k_iter_id % kNumUpAccSlots;
+        const auto acc_ready_span = KERNEL_TIMER_BEGIN(
+            smem->timer(), "shared_up_wait_accumulator", k_iter_id);
         smem->barriers.shared_up_accumulator_ready.wait(k_iter_id);
+        KERNEL_TIMER_END(smem->timer(), acc_ready_span);
         tcgen05_fence_after_thread_sync();
         const std::uint32_t t0 = lane_idx & 3u;
         const std::uint32_t lane_base = up_lane_base(warp_idx);
@@ -550,6 +589,7 @@ struct SharedExpertProjection {
         if (warp_idx == 0u && lane_idx == 0u) {
             smem->barriers.shared_up_accumulator_empty.arrive(k_iter_id);
         }
+        KERNEL_TIMER_END(smem->timer(), dequant_span);
     }
 
     __device__ static void store_up_partial_sums(
@@ -578,6 +618,8 @@ struct SharedExpertProjection {
     __device__ static void quantize_up_output(Workspace* __restrict__ workspace,
                                               SharedStorage* __restrict__ smem,
                                               std::uint32_t batch_size) {
+        const auto quantize_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "shared_quantize_up_output");
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
 
@@ -626,35 +668,37 @@ struct SharedExpertProjection {
                     }
                 }
             }
-            return;
-        }
+        } else {
 #pragma unroll 1
-        for (std::uint32_t tok = warp_idx; tok < batch_size;
-             tok += WarpRole::kCalcWarpCount) {
-            float v[kQuantGroups];
-            float local_max = 0.0f;
+            for (std::uint32_t tok = warp_idx; tok < batch_size;
+                 tok += WarpRole::kCalcWarpCount) {
+                float v[kQuantGroups];
+                float local_max = 0.0f;
 #pragma unroll
-            for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
-                v[i] = smem->shared_expert.act_up_out[lane_idx + i * 32u][tok];
-                local_max = fmaxf(local_max, fabsf(v[i]));
-            }
-            const float clamped =
-                fmaxf(warp_reduce_max_float(local_max), 1e-10f);
-            if (lane_idx == 0u) {
-                workspace->shared_up_out.scale_row(slab_idx())[tok] =
-                    clamped * (1.0f / 448.0f);
-            }
-            const float inv = 448.0f / clamped;
+                for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
+                    v[i] =
+                        smem->shared_expert.act_up_out[lane_idx + i * 32u][tok];
+                    local_max = fmaxf(local_max, fabsf(v[i]));
+                }
+                const float clamped =
+                    fmaxf(warp_reduce_max_float(local_max), 1e-10f);
+                if (lane_idx == 0u) {
+                    workspace->shared_up_out.scale_row(slab_idx())[tok] =
+                        clamped * (1.0f / 448.0f);
+                }
+                const float inv = 448.0f / clamped;
 #pragma unroll
-            for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
-                const std::uint32_t feat = lane_idx + i * 32u;
-                const std::uint32_t feature =
-                    slab_idx() * kActQuantBlock + feat;
-                workspace->shared_up_out.cell(feature / kLboChunk,
-                                              tok)[feat % kLboChunk] =
-                    static_cast<DataType::ElementQA>(v[i] * inv);
+                for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
+                    const std::uint32_t feat = lane_idx + i * 32u;
+                    const std::uint32_t feature =
+                        slab_idx() * kActQuantBlock + feat;
+                    workspace->shared_up_out.cell(feature / kLboChunk,
+                                                  tok)[feat % kLboChunk] =
+                        static_cast<DataType::ElementQA>(v[i] * inv);
+                }
             }
         }
+        KERNEL_TIMER_END(smem->timer(), quantize_span);
     }
 
     __device__ static void run_down(
@@ -663,6 +707,8 @@ struct SharedExpertProjection {
         DataType::ElementOut* __restrict__ out,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         std::uint32_t batch_size) {
+        const auto down_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "shared_expert_down");
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         if (WarpRole::is_other_loader_thread()) {
             run_down_load_input_k_loop(workspace, smem);
@@ -673,13 +719,17 @@ struct SharedExpertProjection {
         } else if (WarpRole::is_calc_warp(warp_idx)) {
             drain_down(down_scale, out, workspace, smem, batch_size);
         }
+        KERNEL_TIMER_END(smem->timer(), down_span);
     }
 
     __device__ static void run_down_load_input_k_loop(
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem) {
         SharedExpertSmem<Dims>& sh = smem->shared_expert;
+        const auto up_out_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "wait_shared_up_out");
         workspace->cta_comm.wait_shared_up_out(smem->launch_parity,
                                                kNumUpPublishers);
+        KERNEL_TIMER_END(smem->timer(), up_out_span);
         // The ring's slots tile the published image exactly.
         static_assert(sizeof(decltype(workspace->shared_up_out.data)) ==
                           sizeof(decltype(sh.act_down_input.data)),
@@ -740,8 +790,11 @@ struct SharedExpertProjection {
              ++k_iter_id) {
             const std::uint32_t ring = k_iter_id % kNumDownSlots;
             if (k_iter_id >= kNumDownSlots) {
+                const auto empty_span = KERNEL_TIMER_BEGIN(
+                    smem->timer(), "shared_wait_down_weight_empty", k_iter_id);
                 smem->barriers.shared_down_weight_empty.wait(k_iter_id -
                                                              kNumDownSlots);
+                KERNEL_TIMER_END(smem->timer(), empty_span);
             }
             smem->barriers.shared_down_weight_ready.arrive(
                 k_iter_id, SharedDownGemm::kTileShapeM * 128u +
@@ -770,6 +823,8 @@ struct SharedExpertProjection {
 
     __device__ static void run_down_mma_k_loop(
         SharedStorage* __restrict__ smem) {
+        const auto mma_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "shared_down_mma");
         SharedExpertSmem<Dims>& sh = smem->shared_expert;
         typename SharedDownGemm::TiledMma tiled_mma{};
         auto cta_mma = tiled_mma.get_slice(cute::_0{});
@@ -790,18 +845,20 @@ struct SharedExpertProjection {
             if constexpr (SharedDownGemm::MmaCore::kUseBlockscaled) {
                 std::uint8_t* const sfa = sh.w_down_scale[ring];
                 std::uint8_t* const sfb = &sh.act_down_input.scale[ring][0];
-                if (WarpRole::get_lane_idx() == 0u) {
-                    // Each 128-row atom's scales sit in their own TMEM slab.
+                if (cute::elect_one_sync()) {
+                    // Each 128-row atom's scales sit in their own TMEM slab;
+                    // SFB is one slab every atom reads, so it moves once.
                     for (std::uint32_t atom = 0;
                          atom < DownScaleTraits::kNumSfaAtoms; ++atom) {
-                        DownScaleTraits::copy_to_tmem(
-                            sfa + atom * DownScaleTraits::kSfaAtomBytes, sfb,
+                        DownScaleTraits::copy_sfa_to_tmem(
+                            sfa + atom * DownScaleTraits::kSfaAtomBytes,
                             tmem_addr(
                                 smem->tmem_ptr, 0u,
                                 kDownSfaTmemOffset +
-                                    atom * DownScaleTraits::kSfaAtomColumns),
-                            tmem_addr(smem->tmem_ptr, 0u, kDownSfbTmemOffset));
+                                    atom * DownScaleTraits::kSfaAtomColumns));
                     }
+                    DownScaleTraits::copy_sfb_to_tmem(
+                        sfb, tmem_addr(smem->tmem_ptr, 0u, kDownSfbTmemOffset));
                 }
                 SharedDownGemm::MmaCore::run(
                     tiled_mma, cta_mma, &sh.w_down[ring][0][0], tCrB, tCt,
@@ -820,6 +877,7 @@ struct SharedExpertProjection {
         }
         cutlass::arch::umma_arrive(
             smem->barriers.shared_down_accumulator_ready.raw(0u));
+        KERNEL_TIMER_END(smem->timer(), mma_span);
     }
 
     __device__ static std::uint32_t row_base() {
@@ -840,7 +898,13 @@ struct SharedExpertProjection {
         const std::uint32_t t0 = lane_idx & 3u;
         const std::uint32_t t1 = lane_idx >> 2;
 
+        const auto done_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "shared_down_wait_done");
         smem->barriers.shared_down_accumulator_ready.wait(0u);
+        KERNEL_TIMER_END(smem->timer(), done_span);
+
+        const auto readout_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "shared_down_readout");
 #pragma unroll
         for (std::uint32_t atom = 0; atom < 2u; ++atom) {
 #pragma unroll
@@ -905,6 +969,7 @@ struct SharedExpertProjection {
                 }
             }
         }
+        KERNEL_TIMER_END(smem->timer(), readout_span);
     }
 };
 
