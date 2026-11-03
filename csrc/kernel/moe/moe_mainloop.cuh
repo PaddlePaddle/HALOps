@@ -42,8 +42,7 @@ struct CollectiveMainloopMoE {
     using SharedStorage = MoESharedStorage<Dims>;
     using Workspace = MoEWorkspace<Dims>;
     using Router = RouterProjection<KernelTraits, Traits::RouterGemm::kUseUmma>;
-    using Latent =
-        LatentDownProjection<KernelTraits, Traits::LatentDownGemm::kUseUmma>;
+    using Latent = LatentDownProjection<KernelTraits>;
 
     // The routing tables as the 8-B words they travel between blocks in.
     static constexpr std::uint32_t kRoutingTableWords =
@@ -137,7 +136,6 @@ struct CollectiveMainloopMoE {
         alignas(128) CUtensorMap tma_down_weights_desc;
         alignas(128) CUtensorMap tma_down_activations_desc;
         alignas(128) CUtensorMap tma_latent_down_weight_desc;
-        alignas(128) CUtensorMap tma_latent_down_scale_desc;
         alignas(128) CUtensorMap tma_shared_up_desc;
         alignas(128) CUtensorMap tma_shared_down_desc;
     };
@@ -239,22 +237,6 @@ struct CollectiveMainloopMoE {
                 /*box_rows=*/Traits::LatentDownGemm::kTileShapeM,
                 /*box_cols=*/128u);
         }
-        if (args.latent_down_weight_scale != nullptr) {
-            // MXFP8 scales ride with the weight tiles as SfAtom slabs; only
-            // the block-wise recipe needs a standalone scale descriptor.
-            if constexpr (Dims::kQuantConfig.kLatentQuant !=
-                          QuantMethod::kMXFP8) {
-                params.tma_latent_down_scale_desc = CreateTmaDesc2D(
-                    "latent-projection scales", args.latent_down_weight_scale,
-                    Dims::kLatentSize / Dims::kQuantConfig.kBlockSize,
-                    Dims::kHiddenSize / Dims::kQuantConfig.kBlockSize,
-                    /*box_rows=*/1u,
-                    /*box_cols=*/Dims::kHiddenSize /
-                        Dims::kQuantConfig.kBlockSize /
-                        Traits::LatentDownGemm::kNumSplits,
-                    /*use_swizzle=*/false);
-            }
-        }
         return params;
     }
 
@@ -264,7 +246,6 @@ struct CollectiveMainloopMoE {
                                     SharedStorage* __restrict__ smem) {
         if constexpr (Traits::kUseLatent) {
             Latent::run(params.tma_latent_down_weight_desc,
-                        params.tma_latent_down_scale_desc,
                         params.tma_input_desc, params.latent_down_weight_scale,
                         reinterpret_cast<Workspace*>(params.scratchpad), smem,
                         static_cast<std::uint32_t>(params.num_tokens));

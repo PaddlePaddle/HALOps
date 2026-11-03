@@ -135,10 +135,6 @@ struct DownProjection {
         (DownGemm::MmaCore::kUseBlockscaled
              ? DownGemm::ScaleTraits::kSfaSmemBytes
              : 0u);
-    static constexpr std::uint32_t kDownActScaleBytes =
-        DownGemm::MmaCore::kUseBlockscaled
-            ? 128u * (DownGemm::kTileShapeK / 32u)
-            : 0u;
     static constexpr std::uint32_t kDownActTxBytes =
         DownGemm::kTileShapeN * Traits::kFp8ActChunksPerBlock *
         Traits::kLboChunkK;  // 1 KB

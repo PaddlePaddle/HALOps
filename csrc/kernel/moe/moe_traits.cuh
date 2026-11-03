@@ -68,15 +68,10 @@ struct LatentDownGemmTraits {
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = Dims::kHiddenSize;
 
-    static constexpr bool kUseUmma =
-        Dims::KernelConfig::kLatentDownMma == MmaKind::kUmma;
-
     // MXFP8 latent: UE8M0 scales, one per 32-K block.  The weight scales use
     // the SfAtom layout and the blockscaled UMMA instruction.
     using WeightQuant = QuantSpec<Dims::kQuantConfig.kLatentQuant>;
     using ElementScale = typename WeightQuant::ScaleType;
-    static_assert(WeightQuant::kMethod != QuantMethod::kMXFP8 || kUseUmma,
-                  "MXFP8 latent weights use the SfAtom layout and UMMA");
 
     static constexpr std::uint32_t kNumCtas =
         Dims::KernelConfig::kNumCtasForLatentDown;
@@ -87,8 +82,6 @@ struct LatentDownGemmTraits {
 
     // The reduction splits over a cluster when `kLatentDownUseSplitK` is on.
     static constexpr bool kUseSplitK = Dims::KernelConfig::kLatentDownUseSplitK;
-    static_assert(!kUseSplitK || kUseUmma,
-                  "the latent split reduction needs the UMMA path");
 
     // Split-K pins the M tile at 128 rows, so one split group covers one M
     // tile per N tile; the shape helper is fed that group's CTA count so its
@@ -100,7 +93,7 @@ struct LatentDownGemmTraits {
                   "the split groups must divide the CTAs");
 
     using GemmShape = GemmTileShape<kGemmM, kGemmN, kGemmK, kTileShapeN,
-                                    kNumCtas / kNumSplits, kUseUmma>;
+                                    kNumCtas / kNumSplits, /*UseUmma=*/true>;
 
     static constexpr std::uint32_t kTileShapeM =
         kUseSplitK ? 128u : GemmShape::kTileShapeM;
@@ -139,9 +132,7 @@ struct LatentDownGemmTraits {
 
     using ActQuant = QuantSpec<Dims::kQuantConfig.kLatentQuant>;
     using MmaElement = typename WeightQuant::ElementType;
-    using MmaCore = std::conditional_t<
-        kUseUmma, moe::UmmaCore<WeightQuant, ActQuant, float, TileShape>,
-        moe::HmmaCore<WeightQuant, ActQuant, float, TileShape>>;
+    using MmaCore = moe::UmmaCore<WeightQuant, ActQuant, float, TileShape>;
 
     // The weight ring is sized in bytes, not slots.
     static constexpr std::uint32_t kWeightRingSlots =
@@ -199,7 +190,7 @@ struct RouterGemmTraits {
 
     using MmaCore = cute::conditional_t<
         kUseUmma, moe::UmmaCore<WeightQuant, ActQuant, float, TileShape>,
-        moe::HmmaCore<WeightQuant, ActQuant, float, TileShape>>;
+        moe::HmmaCore<TileShape>>;
     static_assert(MmaCore::kSwizzleBoxK == kSwizzleBoxK,
                   "the MMA must read the packed SW128 boxes");
     static_assert(kTileShapeK % kSwizzleBoxK == 0u,

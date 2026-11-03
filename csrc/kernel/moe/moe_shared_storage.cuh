@@ -154,13 +154,10 @@ struct MoEBarriers {
         latent_down_input_ready;
     TransactionBarrier<kNumLatentWeightSlots> latent_down_weight_ready;
     SimpleBarrier<kNumLatentWeightSlots> latent_down_weight_empty;
-    TransactionBarrier<1> latent_down_scale_ready;
 
     // The quantize's handshake: the issuer can lag the quantize by a whole K.
     static constexpr std::uint32_t kNumLatentInputEmptySlots =
-        LatentDownGemmTraits<Dims>::kUseUmma
-            ? LatentDownGemmTraits<Dims>::kNumTilesK
-            : MoEKernelTraits<Dims>::kLatentInputSlots;
+        LatentDownGemmTraits<Dims>::kNumTilesK;
     SimpleBarrier<kNumLatentInputEmptySlots> latent_down_input_empty;
 
     // Router
@@ -261,7 +258,6 @@ struct MoEBarriers {
         latent_down_input_empty.init(1);
         latent_down_weight_ready.init(1);
         latent_down_weight_empty.init(1);
-        latent_down_scale_ready.init(1);
     }
 
     __device__ __forceinline__ void init_expert_ring() {
@@ -490,16 +486,6 @@ struct LatentDownSmem {
         Dims::kQuantConfig.kLatentQuant>
         quantized_input;
 
-    static constexpr std::uint32_t kNumMmaWarps =
-        Select<LatentDownGemm::kUseUmma, 1u, WarpRole::kCalcWarpCount>::value;
-    static constexpr std::uint32_t kMmaRows =
-        Select<LatentDownGemm::kUseUmma, 1u,
-               LatentDownGemm::kTileShapeM>::value;
-    static constexpr std::uint32_t kMmaCols =
-        Select<LatentDownGemm::kUseUmma, 1u,
-               LatentDownGemm::kTileShapeN>::value;
-    alignas(16) float mma_out[kNumMmaWarps][kMmaRows][kMmaCols];
-
     // The latent weight scales, staged by recipe: one SfAtom slab per weight
     // slot for the blockscaled instruction, or the plain table the TMA writes
     // into.
@@ -594,8 +580,8 @@ struct RoutedExpertsSmem {
     };
 
     struct UpDownActivation {
-        DataType::ElementAcc act_up_out[Traits::UpGemm::kActQuantBlock]
-                                       [UpGemm::kTileShapeN + 1];
+        float act_up_out[Traits::UpGemm::kActQuantBlock]
+                        [UpGemm::kTileShapeN + 1];
 
         static constexpr uint32_t kNumDownActElems =
             DownGemm::kTileShapeN * DownGemm::kTileShapeK;

@@ -52,11 +52,6 @@ struct QuantSpec<QuantMethod::kNone, BlockSize> {
     static constexpr std::uint32_t kBlockSize = 0u;
     using ElementType = __nv_bfloat16;
     using ScaleType = void;
-
-    template <std::uint32_t M, std::uint32_t N>
-    __host__ __device__ static constexpr std::uint32_t ScaleBytes() {
-        return 0u;
-    }
 };
 
 template <std::uint32_t BlockSize>
@@ -70,14 +65,6 @@ struct QuantSpec<QuantMethod::kBlockwiseFP8, BlockSize> {
     __host__ __device__ static constexpr auto ScaleShape() {
         return cute::make_shape(cute::Int<(M + BlockSize - 1u) / BlockSize>{},
                                 cute::Int<(N + BlockSize - 1u) / BlockSize>{});
-    }
-
-    template <std::uint32_t M, std::uint32_t N>
-    __host__ __device__ static constexpr std::uint32_t ScaleBytes() {
-        constexpr auto kShape = ScaleShape<M, N>();
-        return static_cast<std::uint32_t>(cute::get<0>(kShape)) *
-               static_cast<std::uint32_t>(cute::get<1>(kShape)) *
-               static_cast<std::uint32_t>(sizeof(ScaleType));
     }
 };
 
@@ -93,14 +80,6 @@ struct QuantSpec<QuantMethod::kMXFP8, BlockSize> {
         static_assert(N % kBlockSize == 0u,
                       "K must be whole 32-element scale groups");
         return cute::make_shape(cute::Int<M>{}, cute::Int<N / kBlockSize>{});
-    }
-
-    template <std::uint32_t M, std::uint32_t N>
-    __host__ __device__ static constexpr std::uint32_t ScaleBytes() {
-        constexpr auto kShape = ScaleShape<M, N>();
-        return static_cast<std::uint32_t>(cute::get<0>(kShape)) *
-               static_cast<std::uint32_t>(cute::get<1>(kShape)) *
-               static_cast<std::uint32_t>(sizeof(ScaleType));
     }
 };
 
@@ -119,14 +98,6 @@ struct QuantSpec<QuantMethod::kMXFP4, BlockSize> {
         static_assert(N % kBlockSize == 0u,
                       "K must be whole 32-element scale groups");
         return cute::make_shape(cute::Int<M>{}, cute::Int<N / kBlockSize>{});
-    }
-
-    template <std::uint32_t M, std::uint32_t N>
-    __host__ __device__ static constexpr std::uint32_t ScaleBytes() {
-        constexpr auto kShape = ScaleShape<M, N>();
-        return static_cast<std::uint32_t>(cute::get<0>(kShape)) *
-               static_cast<std::uint32_t>(cute::get<1>(kShape)) *
-               static_cast<std::uint32_t>(sizeof(ScaleType));
     }
 };
 
@@ -166,7 +137,6 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         // LatentDown configs.
         static constexpr std::uint32_t kNumLatentDownWeightSlots = 8;
         static constexpr std::uint32_t kNumCtasForLatentDown = 64;
-        static constexpr MmaKind kLatentDownMma = MmaKind::kUmma;
         static constexpr bool kLatentDownUseSplitK = true;
         static constexpr bool kLatentQuantizeOutput = true;
         // SharedExpert configs.
@@ -200,7 +170,6 @@ struct Dims_BS16_E512_N512_K2048_SM100
         // LatentDown configs.
         static constexpr std::uint32_t kNumCtasForLatentDown = 64;
         static constexpr std::uint32_t kNumLatentDownWeightSlots = 8;
-        static constexpr MmaKind kLatentDownMma = MmaKind::kUmma;
         static constexpr bool kLatentDownUseSplitK = true;
         // SharedExpert configs.
         static constexpr bool kSharedUseSplitK = true;
@@ -228,7 +197,6 @@ struct DataType {
     using ElementA = __nv_bfloat16;    // activations as they go into the GEMM
     using ElementQA = __nv_fp8_e4m3;   // activations after quantization
     using ElementOut = __nv_bfloat16;  // MoE output
-    using ElementAcc = float;          // fp32 accumulators
 };
 
 template <bool kCondition, std::uint32_t kTrue, std::uint32_t kFalse>

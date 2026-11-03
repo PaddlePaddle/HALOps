@@ -300,7 +300,6 @@ struct MoEWorkspace {
 
     static constexpr uint32_t kMaxTopk = Dims::kMaxTopk;
 
-    static constexpr uint32_t kMaxRoutedRowsPadding = RoutedUpOut::kNumRows;
     static constexpr uint32_t kMaxRoutedRows = RoutedDownOut::kNumRows;
 
     static constexpr uint32_t kSpecMaxGrid = moe::kSpecMaxGrid;
