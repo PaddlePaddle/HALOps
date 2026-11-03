@@ -88,7 +88,11 @@ __device__ __forceinline__ void load_input_tile(
 }
 
 // Create a 2-D TMA descriptor for a dense row-major `[rows, cols]` tensor of
-// `T`; the box is the per-copy tile.
+// `T`; the box is the per-copy tile.  A 4-bit `T` is packed two values per
+// byte, low nibble first, and `cols` and the box still count values: the copy
+// spreads each 16 values over 16 B of SMEM (8 B of nibbles, 8 B untouched),
+// the one-byte-per-value image the f8f6f4 UMMA reads.  Its box is 128 values
+// wide, and the mbarrier is credited with the packed gmem bytes.
 template <typename T>
 inline CUtensorMap CreateTmaDesc2D(const char* debug_name, const T* global_ptr,
                                    std::uint32_t rows, std::uint32_t cols,
@@ -100,12 +104,15 @@ inline CUtensorMap CreateTmaDesc2D(const char* debug_name, const T* global_ptr,
         data_type = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
     } else if constexpr (std::is_same_v<T, float>) {
         data_type = CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+    } else if constexpr (std::is_same_v<T, cutlass::float_e2m1_t>) {
+        data_type = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
     } else {
         static_assert(sizeof(T) == 1u, "unsupported TMA element type");
     }
     CUtensorMap desc{};
     uint64_t global_shape[2] = {cols, rows};
-    uint64_t global_strides[1] = {static_cast<uint64_t>(cols) * sizeof(T)};
+    uint64_t global_strides[1] = {static_cast<uint64_t>(cols) *
+                                  cute::sizeof_bits_v<T> / 8u};
     uint32_t box_dim[2] = {box_cols, box_rows};
     uint32_t element_strides[2] = {1u, 1u};
     const CUresult res = cuTensorMapEncodeTiled(

@@ -107,9 +107,9 @@ void CheckRoutedExpertShape(const torch::Tensor& expert_up_weights,
     constexpr std::int64_t kIntermediate = MoEDims::kIntermediateSize;
     constexpr std::int64_t kExpertK = moe::MoEInputSize<MoEDims>::value;
     constexpr std::int64_t kUpRows = 2 * kIntermediate;
-    // A 4-bit weight arrives expanded to the UMMA's staging image: one byte
-    // per value, 16 values per 16 B.
-    constexpr std::int64_t kWeightBytes = 1;
+    // A 4-bit weight packs two values per byte along K.
+    constexpr std::int64_t kWeightBytes =
+        MoEDims::kQuantConfig.kExpertsQuant == moe::QuantMethod::kMXFP4 ? 2 : 1;
     constexpr auto kUpScaleShape =
         moe::QuantSpec<MoEDims::kQuantConfig.kExpertsQuant>::
             template ScaleShape<kUpRows, kExpertK>();
@@ -307,6 +307,11 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
 
     typename Mainloop::Arguments args{};
     args.num_tokens = num_tokens;
+    args.hidden_size = static_cast<uint32_t>(input.size(1));
+    args.latent_size = MoEDims::kUseLatent
+                           ? static_cast<uint32_t>(latent_down_weight.size(0))
+                           : 0u;
+    args.intermediate_size = static_cast<uint32_t>(shared_down_weight.size(1));
     args.top_k = static_cast<uint32_t>(top_k);
     args.scoring_func = static_cast<ScoringFunc>(scoring_func);
     args.renormalize = renormalize;
@@ -318,32 +323,38 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
     args.router_weight =
         static_cast<const DataType::ElementA*>(router_weight.const_data_ptr());
 
-    args.expert_up_weights = static_cast<const DataType::ElementW*>(
-        expert_up_weights.const_data_ptr());
+    args.expert_up_weights =
+        static_cast<const moe::UpGemmTraits<MoEDims>::MmaElement*>(
+            expert_up_weights.const_data_ptr());
     args.expert_up_weights_scale =
         static_cast<const moe::UpGemmTraits<MoEDims>::ElementScale*>(
             expert_up_weights_scale.const_data_ptr());
-    args.expert_down_weights = static_cast<const DataType::ElementW*>(
-        expert_down_weights.const_data_ptr());
+    args.expert_down_weights =
+        static_cast<const moe::DownGemmTraits<MoEDims>::MmaElement*>(
+            expert_down_weights.const_data_ptr());
     args.expert_down_weights_scale =
         static_cast<const moe::DownGemmTraits<MoEDims>::ElementScale*>(
             expert_down_weights_scale.const_data_ptr());
 
-    args.shared_up_weight = static_cast<const moe::DataType::ElementW*>(
-        shared_up_weight.const_data_ptr());
+    args.shared_up_weight =
+        static_cast<const moe::SharedUpGemmTraits<MoEDims>::MmaElement*>(
+            shared_up_weight.const_data_ptr());
     args.shared_up_weight_scale =
         static_cast<const moe::SharedUpGemmTraits<MoEDims>::ElementScale*>(
             shared_up_weight_scale.const_data_ptr());
-    args.shared_down_weight = static_cast<const DataType::ElementW*>(
-        shared_down_weight.const_data_ptr());
+    args.shared_down_weight =
+        static_cast<const moe::SharedDownGemmTraits<MoEDims>::MmaElement*>(
+            shared_down_weight.const_data_ptr());
     args.shared_down_weight_scale =
         static_cast<const moe::SharedDownGemmTraits<MoEDims>::ElementScale*>(
             shared_down_weight_scale.const_data_ptr());
 
-    args.latent_down_weight = MoEDims::kUseLatent
-                                  ? static_cast<const DataType::ElementW*>(
-                                        latent_down_weight.const_data_ptr())
-                                  : nullptr;
+    args.latent_down_weight =
+        MoEDims::kUseLatent
+            ? static_cast<
+                  const moe::LatentDownGemmTraits<MoEDims>::MmaElement*>(
+                  latent_down_weight.const_data_ptr())
+            : nullptr;
     using LatentScale =
         typename moe::LatentDownGemmTraits<MoEDims>::ElementScale;
     args.latent_down_weight_scale =
@@ -356,6 +367,11 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
     args.shared_out = static_cast<DataType::ElementOut*>(shared_out.data_ptr());
 
     const int device = input.get_device();
+    int l2_cached_bytes = 0;
+    cudaDeviceGetAttribute(&l2_cached_bytes, cudaDevAttrL2CacheSize, device);
+    args.l2_cached_bytes =
+        l2_cached_bytes > 0 ? static_cast<uint32_t>(l2_cached_bytes) : 0u;
+
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device).stream();
     const uint32_t grid_size = CalculateGridSize<MoEDims>(device, stream);
 

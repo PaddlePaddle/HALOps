@@ -100,6 +100,39 @@ def _dequant_mxfp8(q, scale, group_size=32):
     return out.reshape(q.shape).bfloat16()
 
 
+# E2M1 code -> value; the sign bit is the top one.
+_FP4_VALUES = [
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+]
+
+
+def _dequant_mxfp4_weight(weight, scale):
+    """Dequantize an MXFP4 weight [rows, K/2] (low nibble first) to bf16."""
+    rows, packed = weight.shape
+    lut = torch.tensor(_FP4_VALUES, device=weight.device, dtype=torch.float32)
+    codes = torch.stack([weight & 0x0F, weight >> 4], dim=-1).reshape(rows, -1)
+    values = lut[codes.long()]
+    groups = packed * 2 // 32
+    plain = torch.exp2(_sf_to_plain(scale, rows, groups).float() - 127.0)
+    out = values.reshape(rows, groups, 32) * plain[..., None]
+    return out.reshape(rows, packed * 2).bfloat16()
+
+
 def _dequant_mxfp8_weight(weight, scale):
     """Dequantize an MXFP8 weight [rows, K] to bf16; the scale is SfAtom."""
     rows, k = weight.shape
@@ -123,6 +156,9 @@ class MoEParams:
         self.situ_beta = 4.0
         self.situ_linear_beta = 25.0
         self.quant_mode = quant_mode
+        # The latent and shared groups are MXFP8 under both MX recipes.
+        self.mxfp8_groups = quant_mode != "w8a8-blockwise"
+        self.mxfp8_group = "w8a8-mxfp8"
         self.init_weights()
 
     def init_weights(self, *, seed: int = 0, device=None):
@@ -139,7 +175,21 @@ class MoEParams:
 
         w13_raw = torch.randn(e, 2 * n, z, device=dev, generator=g) * 0.1
         w2_raw = torch.randn(e, z, n, device=dev, generator=g) * 0.1
-        if self.quant_mode == "w8a8-mxfp8":
+        if self.quant_mode == "w4a8-mxfp4":
+            # Routed experts only: packed nibbles, one UE8M0 byte per 32.
+            w13, s13 = group_wise_quant(
+                w13_raw.reshape(e * 2 * n, z).bfloat16(),
+                mode="w4a4-mxfp4",
+                use_swizzle=True,
+            )
+            w2, s2 = group_wise_quant(
+                w2_raw.reshape(e * z, n).bfloat16(),
+                mode="w4a4-mxfp4",
+                use_swizzle=True,
+            )
+            w13, s13 = w13.reshape(e, 2 * n, z // 2), s13.reshape(e, 2 * n, z // 32)
+            w2, s2 = w2.reshape(e, z, n // 2), s2.reshape(e, z, n // 32)
+        elif self.quant_mode == "w8a8-mxfp8":
             # One SfAtom table per expert: whole 128-row atoms, so the
             # experts quantize as one stacked [E * rows, K] tensor.
             w13, s13 = group_wise_quant(
@@ -162,10 +212,10 @@ class MoEParams:
             # The kernel reads [L, H]: quantize in that layout, since a 1x32
             # MX scale grid cannot be transposed after quantization.
             raw = torch.randn(1, z, h, device=dev, generator=g) * 0.1
-            if self.quant_mode == "w8a8-mxfp8":
+            if self.mxfp8_groups:
                 latent_w, latent_s = group_wise_quant(
                     raw[0].bfloat16(),
-                    mode=self.quant_mode,
+                    mode=self.mxfp8_group,
                     use_swizzle=True,
                 )
             else:
@@ -182,13 +232,13 @@ class MoEParams:
 
         shared_up_raw = torch.randn(1, 2 * n, h, device=dev, generator=g) * 0.1
         shared_down_raw = torch.randn(1, h, n, device=dev, generator=g) * 0.1
-        if self.quant_mode == "w8a8-mxfp8":
+        if self.mxfp8_groups:
             shared_up, shared_up_s = group_wise_quant(
-                shared_up_raw[0].bfloat16(), mode=self.quant_mode, use_swizzle=True
+                shared_up_raw[0].bfloat16(), mode=self.mxfp8_group, use_swizzle=True
             )
             shared_down, shared_down_s = group_wise_quant(
                 shared_down_raw[0].bfloat16(),
-                mode=self.quant_mode,
+                mode=self.mxfp8_group,
                 use_swizzle=True,
             )
         else:
@@ -275,11 +325,21 @@ class MoERef:
         xq, x_scale = _quant_mxfp8_activation(x)
         return _dequant_mxfp8(xq, x_scale) @ _dequant_mxfp8_weight(y_fp8, y_scale).T
 
+    def matmul_mxfp4(self, x, y_packed, y_scale):
+        """Return dequantized ``x @ y.T`` in bf16: fp8 activations, MXFP4 weights.
+
+        ``x`` is [K] or [M, K] in bf16 and takes the kernel's per-token UE8M0
+        quantization; ``y_packed`` is [N, K/2] with an SfAtom scale table.
+        """
+        xq, x_scale = _quant_mxfp8_activation(x)
+        weight = _dequant_mxfp4_weight(y_packed, y_scale)
+        return _dequant_mxfp8(xq, x_scale) @ weight.T
+
     def _shared_expert(self, input):
         """The shared expert: gate/up over the hidden space, then down."""
         p = self.moe_params
         n = p.intermediate_size
-        if p.quant_mode == "w8a8-mxfp8":
+        if p.mxfp8_groups:
             # The weight is the raw [gate | up] one; the kernel reads the
             # pair layout transform_weights_for_moe packs it into.
             up_out = self.matmul_mxfp8(
@@ -320,17 +380,26 @@ class MoERef:
         k,
     ):
         """The expert stage over `z`, in the recipe the experts run."""
-        mxfp8 = self.moe_params.quant_mode == "w8a8-mxfp8"
+        mode = self.moe_params.quant_mode
+        if mode == "w4a8-mxfp4":
 
-        def up_gemm(x, w, scale):
-            if mxfp8:
-                return self.matmul_mxfp8(x, w, scale)
-            return self.matmul_fp8(x, w, scale)
+            def up_gemm(x, w, scale):
+                return self.matmul_mxfp4(x, w, scale)
 
-        def down_gemm(x, w, scale):
-            if mxfp8:
+            down_gemm = up_gemm
+        elif mode == "w8a8-mxfp8":
+
+            def up_gemm(x, w, scale):
                 return self.matmul_mxfp8(x, w, scale)
-            return self.matmul_fp8(x, w, scale, group_size=64)
+
+            down_gemm = up_gemm
+        else:
+
+            def up_gemm(x, w, scale):
+                return self.matmul_fp8(x, w, scale)
+
+            def down_gemm(x, w, scale):
+                return self.matmul_fp8(x, w, scale, group_size=64)
 
         out = torch.zeros(z.shape[0], k, device=z.device, dtype=torch.float32)
         for tok in range(z.shape[0]):
@@ -345,7 +414,7 @@ class MoERef:
     def _latent_down(self, input):
         """z = x @ W_latent^T in the recipe the latent group runs."""
         p = self.moe_params
-        if p.quant_mode == "w8a8-mxfp8":
+        if p.mxfp8_groups:
             return self.matmul_mxfp8(
                 input, p.latent_down_weight, p.latent_down_weight_scale
             )
@@ -398,6 +467,8 @@ class MoEFused:
                 self.moe_params.shared_up_weight_scale,
             )
 
+        self.expert_down_weights = self.moe_params.expert_down_weights
+
         if self.workspace is None:
             self.workspace = get_workspace_for_moe(input)
 
@@ -418,7 +489,7 @@ class MoEFused:
             self.packed_weights["router_weight"],
             self.packed_weights["expert_up_weights"],
             self.packed_weights["expert_up_weights_scale"],
-            self.moe_params.expert_down_weights,
+            self.expert_down_weights,
             self.moe_params.expert_down_weights_scale,
             self.packed_weights["shared_up_weight"],
             self.packed_weights["shared_up_weight_scale"],
@@ -487,6 +558,20 @@ def test_mxfp8_moe_accuracy(num_tokens):
     cos_routed, cos_shared = _run_and_compare(moe_params, num_tokens, top_k)
     print(
         f"\n[moe mxfp8] num_tokens={num_tokens} top_k={top_k}: "
+        f"cos_sim={cos_routed:.5f}, {cos_shared:.5f}"
+    )
+    assert cos_routed > 0.98, f"cosine similarity too low: {cos_routed:.5f}"
+    assert cos_shared > 0.98, f"cosine similarity too low: {cos_shared:.5f}"
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 9, 16])
+def test_w4a8_mxfp4_moe_accuracy(num_tokens):
+    """Only the routed experts' weights are MXFP4; latent and shared stay MXFP8."""
+    top_k = 8
+    moe_params = MoEParams(use_latent=True, quant_mode="w4a8-mxfp4")
+    cos_routed, cos_shared = _run_and_compare(moe_params, num_tokens, top_k)
+    print(
+        f"\n[moe w4a8] num_tokens={num_tokens} top_k={top_k}: "
         f"cos_sim={cos_routed:.5f}, {cos_shared:.5f}"
     )
     assert cos_routed > 0.98, f"cosine similarity too low: {cos_routed:.5f}"

@@ -732,11 +732,14 @@ struct LatentDownProjection<KernelTraits, true>
         const std::uint32_t row = 16u * group_idx(warp_idx) + lane_idx / 4u;
         const std::uint32_t t0 = lane_idx & 3u;
         float* const local = &smem->latent_down.splited_mma_out[0][0];
+        // The n-th peer split skips this block's own: indexing `shares` by
+        // the compile-time `n` keeps it in registers, where a runtime cursor
+        // (one that skips the own split) would put it in local memory.
         std::uint32_t shares[kNumSplits > 1u ? kNumSplits - 1u : 1u];
 #pragma unroll
-        for (std::uint32_t r = 0, n = 0u; r < kNumSplits; ++r) {
-            if (r == Base::split_idx()) continue;
-            shares[n++] = cluster_map_shared_rank(
+        for (std::uint32_t n = 0; n + 1u < kNumSplits; ++n) {
+            const std::uint32_t r = n + (n >= Base::split_idx() ? 1u : 0u);
+            shares[n] = cluster_map_shared_rank(
                 &smem->latent_down.splited_mma_out[0][0], Base::group_rank(r));
         }
 #pragma unroll

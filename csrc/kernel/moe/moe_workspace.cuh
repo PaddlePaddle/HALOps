@@ -82,7 +82,8 @@ struct LatentScaleImage;
 template <typename Dims>
 struct LatentScaleImage<Dims, false> {
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
-    using Element = DataType::ElementScale;
+    // The block-wise image is fp32 by recipe; the MX one is a byte blob.
+    using Element = float;
 
     static constexpr std::uint32_t kNumBlocks =
         LatentDownGemm::kGemmM / Dims::kQuantConfig.kBlockSize;
@@ -161,7 +162,8 @@ struct LatentDownOutput<Dims, true> {
 template <typename Dims>
 struct SharedUpOutput {
     using ElementType = DataType::ElementQA;
-    using ScaleType = DataType::ElementScale;
+    // The block-wise image is fp32 by recipe; the MX one is a byte blob.
+    using ScaleType = float;
     using SharedUpGemm = SharedUpGemmTraits<Dims>;
     using SharedDownGemm = SharedDownGemmTraits<Dims>;
 
@@ -222,7 +224,8 @@ struct SharedUpOutput {
 template <typename Dims>
 struct RoutedUpOutput {
     using ElementType = DataType::ElementQA;
-    using ScaleType = DataType::ElementScale;
+    // The block-wise image is fp32 by recipe; the MX one is a byte blob.
+    using ScaleType = float;
     using UpGemm = UpGemmTraits<Dims>;
 
     static constexpr std::uint32_t kNumRows = UpGemm::kGemmN * Dims::kMaxTopk;

@@ -55,18 +55,23 @@ struct CollectiveMainloopMoE {
     // Host-side launch arguments: one member per runtime tensor plus the launch
     // scalars.
     struct Arguments {
+        std::uint32_t num_tokens;
+        std::uint32_t hidden_size;
+        std::uint32_t latent_size;
+        std::uint32_t intermediate_size;
         const DataType::ElementA* input;
         const typename Traits::RouterGemm::MmaElement* router_weight;
-        const DataType::ElementW* expert_up_weights;
+        const typename UpGemmTraits<Dims>::MmaElement* expert_up_weights;
         const typename UpGemmTraits<Dims>::ElementScale*
             expert_up_weights_scale;
-        const DataType::ElementW* expert_down_weights;
+        const typename DownGemmTraits<Dims>::MmaElement* expert_down_weights;
         const typename DownGemmTraits<Dims>::ElementScale*
             expert_down_weights_scale;
-        const typename Traits::UpGemm::MmaElement* shared_up_weight;
+        const typename SharedUpGemmTraits<Dims>::MmaElement* shared_up_weight;
         const typename SharedUpGemmTraits<Dims>::ElementScale*
             shared_up_weight_scale;
-        const DataType::ElementW* shared_down_weight;
+        const typename SharedDownGemmTraits<Dims>::MmaElement*
+            shared_down_weight;
         const typename SharedDownGemmTraits<Dims>::ElementScale*
             shared_down_weight_scale;
         const typename Traits::LatentDownGemm::MmaElement* latent_down_weight;
@@ -75,25 +80,30 @@ struct CollectiveMainloopMoE {
         DataType::ElementOut* routed_out;
         DataType::ElementOut* shared_out;
         void* workspace;
-        std::uint32_t num_tokens;
         std::uint32_t top_k;
         ScoringFunc scoring_func;
         bool renormalize;
         Activation activation;
         float situ_beta;
         float situ_linear_beta;
+        std::uint32_t l2_cached_bytes;
     };
 
     // Device-side launch parameters.
     struct Params {
+        std::uint32_t num_tokens;
+        std::uint32_t hidden_size;
+        std::uint32_t latent_size;
+        std::uint32_t intermediate_size;
         const DataType::ElementA* __restrict__ input;
-        std::uint32_t token_count;
         const typename Traits::RouterGemm::
             MmaElement* __restrict__ router_weight;
-        const DataType::ElementW* __restrict__ expert_weights_up;
+        const typename UpGemmTraits<
+            Dims>::MmaElement* __restrict__ expert_weights_up;
         const typename UpGemmTraits<
             Dims>::ElementScale* __restrict__ expert_scales_up;
-        const DataType::ElementW* __restrict__ expert_weights_down;
+        const typename DownGemmTraits<
+            Dims>::MmaElement* __restrict__ expert_weights_down;
         const typename DownGemmTraits<
             Dims>::ElementScale* __restrict__ expert_scales_down;
         DataType::ElementOut* __restrict__ activations_out;
@@ -101,10 +111,12 @@ struct CollectiveMainloopMoE {
             MmaElement* __restrict__ latent_down_weight;
         const typename Traits::LatentDownGemm::
             ElementScale* __restrict__ latent_down_weight_scale;
-        const DataType::ElementW* __restrict__ shared_up_weight;
+        const typename SharedUpGemmTraits<
+            Dims>::MmaElement* __restrict__ shared_up_weight;
         const typename SharedUpGemmTraits<
             Dims>::ElementScale* __restrict__ shared_up_scale;
-        const DataType::ElementW* __restrict__ shared_down_weight;
+        const typename SharedDownGemmTraits<
+            Dims>::MmaElement* __restrict__ shared_down_weight;
         const typename SharedDownGemmTraits<
             Dims>::ElementScale* __restrict__ shared_down_scale;
         DataType::ElementOut* __restrict__ shared_out;
@@ -116,8 +128,9 @@ struct CollectiveMainloopMoE {
         Activation activation;
         float situ_beta;
         float situ_linear_beta;
-        // How many active experts' fp8 weights fit in L2.
-        std::uint32_t expert_weight_l2_capacity;
+        // How many experts' weights fit in L2: the eviction hint flips to
+        // evict-first above it.
+        std::uint32_t l2_expert_capacity;
         alignas(128) CUtensorMap tma_up_weights_desc;
         alignas(128) CUtensorMap tma_input_desc;
         alignas(128) CUtensorMap tma_latent_out_desc;
@@ -132,8 +145,11 @@ struct CollectiveMainloopMoE {
     // Builds the device parameters, including the four TMA descriptors.
     static Params to_underlying_arguments(Arguments const& args) {
         Params params{};
+        params.num_tokens = args.num_tokens;
+        params.hidden_size = args.hidden_size;
+        params.latent_size = args.latent_size;
+        params.intermediate_size = args.intermediate_size;
         params.input = args.input;
-        params.token_count = args.num_tokens;
         params.router_weight = args.router_weight;
         params.expert_weights_up = args.expert_up_weights;
         params.expert_scales_up = args.expert_up_weights_scale;
@@ -155,30 +171,21 @@ struct CollectiveMainloopMoE {
         params.activation = args.activation;
         params.situ_beta = args.situ_beta;
         params.situ_linear_beta = args.situ_linear_beta;
-        // Weight eviction hint gate: the device's L2 size, cached per device
-        // and falling back to "never evict-first" if the query fails.
-        int device = 0;
-        cudaGetDevice(&device);
-        static int cached_device = -1;
-        static int cached_l2_bytes = 0;
-        if (device != cached_device) {
-            cached_l2_bytes = 0;
-            cudaDeviceGetAttribute(&cached_l2_bytes, cudaDevAttrL2CacheSize,
-                                   device);
-            cached_device = device;
-        }
-        params.expert_weight_l2_capacity =
-            cached_l2_bytes > 0
-                ? static_cast<std::uint32_t>(
-                      static_cast<std::uint64_t>(cached_l2_bytes) /
-                      Traits::kExpertWeightBytes)
+
+        const std::uint64_t expert_width =
+            args.latent_size > 0u ? args.latent_size : args.hidden_size;
+        const std::uint64_t expert_weight_bytes =
+            (2ull * args.intermediate_size * expert_width *
+                 Traits::UpGemm::MmaCore::kElementABits +
+             static_cast<std::uint64_t>(args.intermediate_size) * expert_width *
+                 Traits::DownGemm::MmaCore::kElementABits) /
+            8u;
+        params.l2_expert_capacity =
+            args.l2_cached_bytes > 0u && expert_weight_bytes > 0u
+                ? static_cast<std::uint32_t>(args.l2_cached_bytes /
+                                             expert_weight_bytes)
                 : 0xFFFFFFFFu;
 
-        params.tma_up_weights_desc = CreateTmaDesc2D(
-            "up-projection weights", args.expert_up_weights,
-            /*rows=*/Dims::kNumExperts * 2u * Dims::kIntermediateSize,
-            /*cols=*/MoEInputSize<Dims>::value, /*box_rows=*/128u,
-            /*box_cols=*/128u);
         params.tma_input_desc = CreateTmaDesc2D(
             "activations", args.input, args.num_tokens, Dims::kHiddenSize,
             /*box_rows=*/8u, /*box_cols=*/64u);
@@ -190,8 +197,12 @@ struct CollectiveMainloopMoE {
                 Dims::kNumTokens, Dims::kLatentSize, /*box_rows=*/8u,
                 /*box_cols=*/64u);
         }
-        // box_rows pinned to 128: the down tile's M can exceed the
-        // 256-row boxDim cap.
+
+        params.tma_up_weights_desc = CreateTmaDesc2D(
+            "up-projection weights", args.expert_up_weights,
+            /*rows=*/Dims::kNumExperts * 2u * Dims::kIntermediateSize,
+            /*cols=*/MoEInputSize<Dims>::value, /*box_rows=*/128u,
+            /*box_cols=*/128u);
         params.tma_down_weights_desc = CreateTmaDesc2D(
             "down-projection weights", args.expert_down_weights,
             /*rows=*/Dims::kNumExperts * MoEInputSize<Dims>::value,
@@ -199,11 +210,12 @@ struct CollectiveMainloopMoE {
             /*box_cols=*/128u);
         params.tma_down_activations_desc =
             CreateTmaDesc2D("down-projection activations",
-                            reinterpret_cast<const DataType::ElementW*>(
+                            reinterpret_cast<const DataType::ElementQA*>(
                                 static_cast<const char*>(args.workspace) +
                                 Workspace::kUpOutFp8Offset),
                             Workspace::kMaxRoutedRows, Dims::kIntermediateSize,
                             /*box_rows=*/Dims::kNumTokens, /*box_cols=*/128u);
+
         if constexpr (Traits::kUseSharedExpert) {
             if (args.shared_out != nullptr) {
                 params.tma_shared_up_desc = CreateTmaDesc2D(
@@ -255,7 +267,7 @@ struct CollectiveMainloopMoE {
                         params.tma_latent_down_scale_desc,
                         params.tma_input_desc, params.latent_down_weight_scale,
                         reinterpret_cast<Workspace*>(params.scratchpad), smem,
-                        static_cast<std::uint32_t>(params.token_count));
+                        static_cast<std::uint32_t>(params.num_tokens));
         }
     }
 
@@ -269,7 +281,7 @@ struct CollectiveMainloopMoE {
                 params.tma_input_desc, params.shared_up_scale,
                 params.shared_down_scale, params.shared_out,
                 reinterpret_cast<Workspace*>(params.scratchpad), smem,
-                static_cast<std::uint32_t>(params.token_count),
+                static_cast<std::uint32_t>(params.num_tokens),
                 params.activation,
                 GatedActParams{params.situ_beta, params.situ_linear_beta});
         }
@@ -286,7 +298,7 @@ struct CollectiveMainloopMoE {
         // One warp per token, unless the launch has more tokens than the calc
         // warps have: then a cluster pair splits them, one token each.
         const bool coop_topk = Traits::kClusterSize >= 2u &&
-                               params.token_count > WarpRole::kCalcWarpCount;
+                               params.num_tokens > WarpRole::kCalcWarpCount;
         if (threadIdx.x == 0u) {
             // One task per router CTA, whatever its M tile or K slice.
             workspace->cta_comm.wait_router_tasks(smem->launch_parity,
@@ -304,7 +316,7 @@ struct CollectiveMainloopMoE {
         if (coop_topk) {
             // One warp per token, and this block runs only its half.
             const std::uint32_t tok = tok_base + calc_warp_idx;
-            if (calc_warp_idx < kTokensPerCta && tok < params.token_count) {
+            if (calc_warp_idx < kTokensPerCta && tok < params.num_tokens) {
                 topk_one_token<Dims, kExpertsPerThread>(
                     tok, params.top_k, params.scoring_func, params.renormalize,
                     workspace, smem);
@@ -318,7 +330,7 @@ struct CollectiveMainloopMoE {
             for (std::uint32_t g = 0; g < kTokensPerWarp; ++g) {
                 const std::uint32_t tok =
                     calc_warp_idx + g * WarpRole::kCalcWarpCount;
-                if (tok >= params.token_count) break;
+                if (tok >= params.num_tokens) break;
                 topk_one_token<Dims, kExpertsPerThread>(
                     tok, params.top_k, params.scoring_func, params.renormalize,
                     workspace, smem);
@@ -348,8 +360,7 @@ struct CollectiveMainloopMoE {
                 constexpr std::uint32_t kIdWords =
                     kPairs * sizeof(std::uint16_t) / sizeof(uint4);
                 constexpr std::uint32_t kWords =
-                    kIdWords +
-                    kPairs * sizeof(DataType::ElementScale) / sizeof(uint4);
+                    kIdWords + kPairs * sizeof(float) / sizeof(uint4);
                 static_assert(kWords <= WarpRole::kThreadsPerWarp,
                               "one word per lane");
                 const std::uint32_t peer_base =
@@ -391,7 +402,7 @@ struct CollectiveMainloopMoE {
             if (WarpRole::get_calc_warp_idx() == 0u) {
                 // Every router block holds the whole selection by now (a
                 // coop pair has swapped halves), so it builds its own.
-                prepare_routing_tables<Dims>(params.token_count, params.top_k,
+                prepare_routing_tables<Dims>(params.num_tokens, params.top_k,
                                              params.topk_divmod, smem);
                 // Block 0 hands its finished tables to the other blocks.
                 if (blockIdx.x == 0u) {
@@ -622,7 +633,7 @@ struct CollectiveMainloopMoE {
                 // Only the launch's rows: the padding rows are zero-filled by
                 // the quantize, which never reads their source.
                 const std::uint32_t kBytes =
-                    params.token_count * Dims::kLatentSize *
+                    params.num_tokens * Dims::kLatentSize *
                     static_cast<std::uint32_t>(sizeof(DataType::ElementA));
                 smem->barriers.latent_copy_ready.arrive(0u, kBytes);
                 tma_load_1d(workspace->latent_down_out.data_ptr(), kBytes,
@@ -642,10 +653,10 @@ struct CollectiveMainloopMoE {
                 if constexpr (Traits::kUseLatent && kWholeLatentFits) {
                     smem->barriers.latent_copy_ready.wait(0u);
                     quantize_up_input_whole(
-                        smem, static_cast<int>(params.token_count));
+                        smem, static_cast<int>(params.num_tokens));
                 } else {
                     quantize_up_input(Traits::UpGemm::kNumTilesK, smem,
-                                      static_cast<int>(params.token_count));
+                                      static_cast<int>(params.num_tokens));
                 }
                 // The UMMA reads these stores through the async proxy.
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -657,11 +668,11 @@ struct CollectiveMainloopMoE {
         }
 
         UpProjection<KernelTraits>::run(
-            params.expert_scales_up, params.token_count, params.activation,
+            params.expert_scales_up, params.num_tokens, params.activation,
             GatedActParams{params.situ_beta, params.situ_linear_beta},
             workspace, smem, params.tma_up_weights_desc, sched,
             get_tma_cache_hint(smem->routing.active_expert_count >
-                               params.expert_weight_l2_capacity));
+                               params.l2_expert_capacity));
     }
 
     // Phase 3: down-projection over this block's tasks, as enumerated by
@@ -675,7 +686,7 @@ struct CollectiveMainloopMoE {
             params.tma_down_weights_desc, params.tma_down_activations_desc,
             sched,
             get_tma_cache_hint(smem->routing.active_expert_count >
-                               params.expert_weight_l2_capacity));
+                               params.l2_expert_capacity));
     }
 
     // Pulls the TMA descriptors into the descriptor cache, so the first TMA of
@@ -754,7 +765,7 @@ struct CollectiveMainloopMoE {
             reinterpret_cast<Workspace*>(params.scratchpad);
         DataType::ElementOut* __restrict__ activations_out =
             params.activations_out;
-        const std::uint32_t batch_size = params.token_count;
+        const std::uint32_t batch_size = params.num_tokens;
         constexpr std::uint32_t kDownOutputColsPerCta =
             Traits::DownGemm::MmaCore::kTileShapeM;
         // The block combines m-block `cta_idx_in_group`, whose cells the

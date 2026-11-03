@@ -86,14 +86,14 @@ def low_latency_moe(
             [64, 64, 16, 64] for T <= 8 and [32, 64, 32, 64] otherwise.
         expert_up_weights (Tensor): Fused gate/up weights in the pair layout
             returned by ``transform_weights_for_moe``, shape [512, 1024,
-            2048].  Under "w4a8-mxfp4" the dtype is uint8 and the row holds
-            the UMMA's expanded staging image: one 4-bit value per byte, 16
-            values (8 B of packed nibbles plus 8 B of gap) per 16 B.
+            2048].  Under "w4a8-mxfp4" the dtype is uint8 and the shape is
+            [512, 1024, 1024]: two 4-bit values per byte, low nibble first,
+            as ``group_wise_quant(mode="w4a4-mxfp4")`` packs them.
         expert_up_weights_scale (Tensor): Block scales of
             ``expert_up_weights``, shape [512, 8, 16], dtype float32.
         expert_down_weights (Tensor): Down weights, shape [512, 2048, 512],
-            dtype float8_e4m3fn; under "w4a8-mxfp4" uint8 in the same expanded
-            staging image.
+            dtype float8_e4m3fn; under "w4a8-mxfp4" uint8 of shape [512,
+            2048, 256], packed the same way.
         expert_down_weights_scale (Tensor): Block scales of
             ``expert_down_weights``, shape [512, 16, 4], dtype float32.
         shared_up_weight (Tensor): Shared-expert gate/up weights in the pair

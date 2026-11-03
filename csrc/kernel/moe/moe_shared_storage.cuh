@@ -47,7 +47,7 @@ struct alignas(16) MoERoutingTables {
 
     std::uint8_t expert_row_slot[kMaxRoutedPairs];
 
-    DataType::ElementScale expert_row_weight[kMaxRoutedPairs];
+    float expert_row_weight[kMaxRoutedPairs];
 
     std::uint32_t expert_token_mask[kNumExperts];
 
@@ -349,9 +349,9 @@ struct RoutingSmem {
     alignas(16)
         std::uint16_t topk_ids[(Dims::kNumTokens < 8u ? 8u : Dims::kNumTokens) *
                                Dims::kMaxTopk];
-    alignas(16) DataType::ElementScale
-        topk_weights[(Dims::kNumTokens < 8u ? 8u : Dims::kNumTokens) *
-                     Dims::kMaxTopk];
+    alignas(
+        16) float topk_weights[(Dims::kNumTokens < 8u ? 8u : Dims::kNumTokens) *
+                               Dims::kMaxTopk];
 
     std::uint8_t expert_position[Dims::kNumExperts];
 };
@@ -474,7 +474,7 @@ struct LatentDownSmem {
     using Traits = MoEKernelTraits<Dims>;
     using LatentDownGemm = typename Traits::LatentDownGemm;
 
-    alignas(1024) DataType::ElementW
+    alignas(1024) LatentDownGemm::MmaElement
         w_latent_down[LatentDownGemm::kNumWeightSlots]
                      [LatentDownGemm::kQuantBlocksPerTile]
                      [LatentDownGemm::kTileShapeM][128u];
@@ -535,9 +535,10 @@ struct SharedExpertSmem {
     using SharedDownGemm = SharedDownGemmTraits<Dims>;
 
     union {
-        alignas(1024) DataType::ElementW w_up[SharedUpGemm::kNumWeightSlots][2u]
-                                             [SharedUpGemm::kTileShapeM][128u];
-        alignas(1024) DataType::ElementW
+        alignas(1024)
+            SharedUpGemm::MmaElement w_up[SharedUpGemm::kNumWeightSlots][2u]
+                                         [SharedUpGemm::kTileShapeM][128u];
+        alignas(1024) SharedDownGemm::MmaElement
             w_down[SharedDownGemm::kNumWeightSlots][SharedDownGemm::kTileShapeM]
                   [SharedDownGemm::kTileShapeK];
         alignas(1024) float splited_mma_out[2u][SharedUpGemm::kActQuantBlock]
@@ -583,11 +584,11 @@ struct RoutedExpertsSmem {
     using DownGemm = typename Traits::DownGemm;
 
     union {
-        alignas(1024) DataType::ElementW
+        alignas(1024) UpGemm::MmaElement
             w_up[UpGemm::kNumWeightSlots][UpGemm::MmaCore::kNumSwizzleBoxKs]
                 [UpGemm::kTileShapeM * UpGemm::MmaCore::kSwizzleBoxK];
 
-        alignas(1024) DataType::ElementW
+        alignas(1024) DownGemm::MmaElement
             w_down[DownGemm::kNumWeightSlots][DownGemm::kTileShapeM]
                   [DownGemm::kTileShapeK];
     };
@@ -636,15 +637,14 @@ struct RoutedExpertsSmem {
 
     static constexpr std::uint32_t kNumActQuantBlocks =
         Dims::kIntermediateSize / Traits::UpGemm::kActQuantBlock;
-    DataType::ElementScale act_down_scale[kNumActQuantBlocks]
-                                         [DownGemm::kTileShapeN];
+    // The manual-scaling path's fp32 tables (the block-wise recipe).
+    float act_down_scale[kNumActQuantBlocks][DownGemm::kTileShapeN];
 
     static constexpr uint32_t kNumUpScaleSlots = 2;
-    DataType::ElementScale w_up_scale[kNumUpScaleSlots]
-                                     [2 * UpGemm::kNumScaleBlocksK];
+    float w_up_scale[kNumUpScaleSlots][2 * UpGemm::kNumScaleBlocksK];
 
-    DataType::ElementScale w_down_scale[DownGemm::MmaCore::kNumAtomMs]
-                                       [DownGemm::kNumScaleBlocksK];
+    float w_down_scale[DownGemm::MmaCore::kNumAtomMs]
+                      [DownGemm::kNumScaleBlocksK];
 };
 
 template <typename Dims>

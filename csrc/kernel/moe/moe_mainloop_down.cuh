@@ -40,7 +40,7 @@ template <typename Dims, std::size_t ScaleBlocks, std::size_t ScaleTok>
 __device__ inline void load_down_act_scale(
     const MoEWorkspace<Dims>* __restrict__ workspace,
     std::uint32_t expert_start, std::uint32_t routed_count,
-    DataType::ElementScale (&dest_scale)[ScaleBlocks][ScaleTok]) {
+    float (&dest_scale)[ScaleBlocks][ScaleTok]) {
     using Traits = MoEKernelTraits<Dims>;
     static_assert(ScaleTok == Traits::DownGemm::kTileShapeN,
                   "down-proj activation scale tile must have the tile's N "
@@ -74,9 +74,8 @@ __device__ inline void load_down_act_scale(
 // Per-expert weight-scale loader: one lane per (m-tile, K-block).
 template <typename Dims, std::size_t TilesM, std::size_t BlocksK>
 __device__ inline void load_down_weight_scale_per_expert(
-    const DataType::ElementScale* __restrict__ expert_scales_down,
-    std::uint32_t expert_id, std::uint32_t base_m,
-    DataType::ElementScale (&dest)[TilesM][BlocksK]) {
+    const float* __restrict__ expert_scales_down, std::uint32_t expert_id,
+    std::uint32_t base_m, float (&dest)[TilesM][BlocksK]) {
     constexpr uint32_t kNumScaleBlocksM =
         MoEKernelTraits<Dims>::DownGemm::kNumScaleBlocksM;
     constexpr uint32_t kNumScaleBlocksK =
@@ -132,7 +131,7 @@ struct DownProjection {
     static constexpr std::uint32_t kNumDownWeightScaleBlocksK =
         DownGemm::kNumScaleBlocksK;
     static constexpr std::uint32_t kDownWeightTxBytes =
-        DownGemm::MmaCore::kWeightTileBytes +
+        DownGemm::MmaCore::kWeightTileTxBytes +
         (DownGemm::MmaCore::kUseBlockscaled
              ? DownGemm::ScaleTraits::kSfaSmemBytes
              : 0u);
@@ -174,7 +173,7 @@ struct DownProjection {
     // B operand: one tile-N-row x 128-B SW128 slab per N-substep, built from
     // the CUTLASS SWZ128 atom.
     using SBLayout = decltype(cute::UMMA::tile_to_mma_shape(
-        cute::UMMA::Layout_K_SW128_Atom<typename DownGemm::MmaElement>{},
+        cute::UMMA::Layout_K_SW128_Atom<typename DownGemm::ActElement>{},
         cute::partition_shape_B(
             typename DownGemm::TiledMma{},
             cute::make_shape(cute::Int<DownGemm::kTileShapeN>{},
@@ -517,10 +516,11 @@ struct DownProjection {
                                SBLayout const& sB_layout, TCt& tCt,
                                std::uint32_t acc, std::uint32_t cur_w_slot,
                                std::uint32_t tmem_base) {
-        using MmaElement = typename DownGemm::MmaElement;
+        using WeightElement = typename DownGemm::WeightSmemElement;
+        using ActElement = typename DownGemm::ActElement;
 
         auto tCsB =
-            cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<MmaElement*>(
+            cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<ActElement*>(
                                   &smem->routed_experts.up_down_act
                                        .act_down_input[cur_w_slot][0])),
                               sB_layout);
@@ -544,7 +544,7 @@ struct DownProjection {
             }
             DownGemm::MmaCore::run(
                 tiled_mma, cta_mma,
-                reinterpret_cast<MmaElement*>(
+                reinterpret_cast<WeightElement*>(
                     &smem->routed_experts.w_down[cur_w_slot][0][0]),
                 tCrB, tCt, tmem_addr(tmem_base, 0u, acc * kAccColumns),
                 tmem_addr(tmem_base, 0u, kDownSfaTmemOffset),
@@ -554,7 +554,7 @@ struct DownProjection {
             // in `dequant`.
             DownGemm::MmaCore::run<kNumDownSubBlocks>(
                 tiled_mma, cta_mma,
-                reinterpret_cast<MmaElement*>(
+                reinterpret_cast<WeightElement*>(
                     &smem->routed_experts.w_down[cur_w_slot][0][0]),
                 tCrB, tCt, tmem_addr(tmem_base, 0u, acc * kAccColumns));
         }
@@ -569,6 +569,8 @@ struct DownProjection {
         std::uint32_t expert_id, std::uint32_t base_m, std::uint32_t slot,
         std::uint32_t k_iter_id, std::uint64_t weight_cache_hint) {
         smem->barriers.down_weight_ready.arrive(slot, kDownWeightTxBytes);
+        // A 4-bit weight's coordinates count values too: the box is the same
+        // 128 N (64 B of packed gmem), landing as the same SW128 box.
 #pragma unroll
         for (std::uint32_t h = 0; h < DownGemm::MmaCore::kNumAtomMs; ++h) {
             constexpr std::uint32_t kAtomM = DownGemm::MmaCore::kAtomShapeM;
@@ -614,20 +616,33 @@ struct DownProjection {
         std::uint32_t slot, std::uint32_t k_iter_id) {
         if (routed_count > 0u) {
             if constexpr (DownGemm::MmaCore::kUseBlockscaled) {
-                // Pack this K tile's SfAtom slab from the plain UE8M0 image;
-                // the padded rows stay zero for UTCCP.
+                // Pack this K tile's SfAtom slab from the plain UE8M0 image.
+                // A token's four 32-K groups are one word in both, and the MMA
+                // reads only the tile's N rows: N word copies (padded rows
+                // zero), every load issued before a store, since this gates
+                // the step's activation TMA.
                 constexpr std::uint32_t kGroups = DownGemm::kTileShapeK / 32u;
+                static_assert(kGroups == 4u && DownGemm::kTileShapeN <= 32u,
+                              "a token's K-tile scales are one SfAtom word");
                 std::uint8_t* const sf =
                     smem->routed_experts.act_down_sfb[slot];
-                for (std::uint32_t i = 0; i < 128u * kGroups; ++i) {
-                    const std::uint32_t row = i / kGroups;
-                    const std::uint32_t g = i % kGroups;
-                    std::uint8_t byte = 0u;
-                    if (row < routed_count) {
-                        byte = workspace->routed_up_out.mx_scale_row(
-                            expert_start + row)[k_iter_id * kGroups + g];
-                    }
-                    sf[sf_atom_offset(row, g)] = byte;
+                std::uint32_t words[DownGemm::kTileShapeN];
+#pragma unroll
+                for (std::uint32_t row = 0; row < DownGemm::kTileShapeN;
+                     ++row) {
+                    words[row] =
+                        row < routed_count
+                            ? *reinterpret_cast<const std::uint32_t*>(
+                                  workspace->routed_up_out.mx_scale_row(
+                                      expert_start + row) +
+                                  k_iter_id * kGroups)
+                            : 0u;
+                }
+#pragma unroll
+                for (std::uint32_t row = 0; row < DownGemm::kTileShapeN;
+                     ++row) {
+                    *reinterpret_cast<std::uint32_t*>(
+                        sf + sf_atom_offset(row, 0u)) = words[row];
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             }

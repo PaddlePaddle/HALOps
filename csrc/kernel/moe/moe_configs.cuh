@@ -86,7 +86,7 @@ struct QuantSpec<QuantMethod::kMXFP8, BlockSize> {
     static constexpr QuantMethod kMethod = QuantMethod::kMXFP8;
     static constexpr std::uint32_t kBlockSize = 32u;
     using ElementType = __nv_fp8_e4m3;
-    using ScaleType = cutlass::float_ue8m0_t;
+    using ScaleType = std::uint8_t;  // one UE8M0 byte per 32-K group
 
     template <std::uint32_t M, std::uint32_t N>
     __host__ __device__ static constexpr auto ScaleShape() {
@@ -112,7 +112,7 @@ struct QuantSpec<QuantMethod::kMXFP4, BlockSize> {
     // A 4-bit weight occupies one SMEM byte per value (the TMA's
     // 16U4_ALIGN16B expansion); its scale is an E8M0 byte.
     using ElementType = cutlass::float_e2m1_t;
-    using ScaleType = cutlass::float_ue8m0_t;
+    using ScaleType = std::uint8_t;  // one UE8M0 byte per 32-K group
 
     template <std::uint32_t M, std::uint32_t N>
     __host__ __device__ static constexpr auto ScaleShape() {
@@ -225,10 +225,8 @@ enum class Activation : uint32_t {
 inline constexpr std::uint32_t kFp8ActChunkK = 16u;
 
 struct DataType {
-    using ElementW = __nv_fp8_e4m3;    // expert weights
     using ElementA = __nv_bfloat16;    // activations as they go into the GEMM
     using ElementQA = __nv_fp8_e4m3;   // activations after quantization
-    using ElementScale = float;        // scaling factors
     using ElementOut = __nv_bfloat16;  // MoE output
     using ElementAcc = float;          // fp32 accumulators
 };
@@ -243,15 +241,6 @@ template <typename Dims>
 struct MoEInputSize {
     static constexpr std::uint32_t value =
         Dims::kUseLatent ? Dims::kLatentSize : Dims::kHiddenSize;
-};
-
-// The router's token axis is cut into instruction-wide windows, one CTA each.
-template <typename Dims>
-struct RouterTokenWindows {
-    static constexpr std::uint32_t kWindow = 8u;
-    static_assert(Dims::kNumTokens % kWindow == 0u,
-                  "the token width must be whole 8-token windows");
-    static constexpr std::uint32_t value = Dims::kNumTokens / kWindow;
 };
 
 // Byte offset of one 32-K scale in a 128x4 SfAtom: four K groups share a

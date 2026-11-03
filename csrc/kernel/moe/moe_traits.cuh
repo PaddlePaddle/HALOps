@@ -173,8 +173,9 @@ struct RouterGemmTraits {
     static constexpr std::uint32_t kNumCtas =
         kNumRouterGates * kNumCtasForRouter;
 
-    static constexpr std::uint32_t kTileShapeN =
-        RouterTokenWindows<Dims>::kWindow;
+    static constexpr std::uint32_t kTileShapeN = 8u;
+    static_assert(Dims::kNumTokens % 8u == 0u,
+                  "the token width must be whole 8-token windows");
 
     using Gemm = GemmTileShape<kGemmM, kGemmN, kGemmK, kTileShapeN,
                                kNumCtasForRouter, kUseUmma>;
@@ -537,14 +538,6 @@ struct MoEKernelTraits {
         Dims::kQuantConfig.kBlockSize / kLboChunkK;
     static constexpr std::uint32_t kQuantBlocksPerTile =
         UpGemm::kTileShapeK / Dims::kQuantConfig.kBlockSize;
-
-    // Bytes of expert weights one active expert streams through the L2.
-    static constexpr std::uint64_t kExpertWeightBytes =
-        (static_cast<std::uint64_t>(UpGemm::kGemmM) * UpGemm::kGemmK *
-             UpGemm::MmaCore::kElementABits +
-         static_cast<std::uint64_t>(DownGemm::kGemmM) * DownGemm::kGemmK *
-             DownGemm::MmaCore::kElementABits) /
-        8u;
 
     // Gate/up pair layout: the Python repack interleaves gate and up in
     // groups of kPairLayoutGranularity rows.
