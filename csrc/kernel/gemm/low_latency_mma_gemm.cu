@@ -26,10 +26,14 @@ void LowLatencyMmaGemm(const torch::Tensor& input, const torch::Tensor& weight,
                        const std::optional<torch::Tensor>& sfa2,
                        const std::optional<torch::Tensor>& sfb2,
                        const std::optional<torch::Tensor>& output2,
-                       const int sm_count, const bool use_pdl) {
+                       const int sm_count, const bool use_pdl,
+                       const bool use_sigmoid) {
     const CudaDeviceGuard device_guard(input.device());
     ResolveLlShapes(input, weight, sfa, sfb, input2, weight2, sfa2, sfb2,
                     output2);
+    TORCH_CHECK(!use_sigmoid || !weight2.has_value(),
+                "low_latency_mma_gemm use_sigmoid does not support input2 or "
+                "output2");
 
     LlGemmParams params;
     params.ptr_a = input.const_data_ptr<c10::Float8_e4m3fn>();
@@ -67,7 +71,7 @@ void LowLatencyMmaGemm(const torch::Tensor& input, const torch::Tensor& weight,
     TORCH_CHECK(tile.stages > 0, "low_latency_mma_gemm: K=", params.k,
                 " is too large to keep A resident in shared memory");
 
-    LaunchLlKernel(params, tile, rows_a, num_sms, use_pdl,
+    LaunchLlKernel(params, tile, rows_a, num_sms, use_pdl, use_sigmoid,
                    GetCurrentCUDAStream(input));
     HALOPS_CUDA_CHECK(cudaGetLastError());
 }

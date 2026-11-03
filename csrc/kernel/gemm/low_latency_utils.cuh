@@ -141,6 +141,11 @@ struct LlSmemPlan {
     int per_stage_bytes;
 };
 
+__host__ __device__ constexpr bool ll_swap_ab(int rows_a, int warps_n) {
+    return rows_a == LlGemmConfig::KAtomRows &&
+           warps_n * LlGemmConfig::KMmaN % LlGemmConfig::KMaxM == 0;
+}
+
 // With concat-K (k1 < k), each sfb slot holds the sfb rows and then the sfb2
 // rows.
 __host__ __device__ __forceinline__ LlSmemPlan
@@ -166,7 +171,11 @@ ll_smem_plan(int warps_n, int warps_k, int rows_a, int k, int k1, int stages) {
     const int bar_fixed =
         kBarBytes * (k / LlGemmConfig::KGroupK + 1 +
                      2 * LlGemmConfig::KSfbStages + 2 * acc_cols);
-    const int acc_bytes = acc_cols * warps_k * 32 * outs * sizeof(float);
+    const int acc_splits =
+        warps_k * (ll_swap_ab(rows_a, warps_n)
+                       ? LlGemmConfig::KMaxM / LlGemmConfig::KMmaN
+                       : 1);
+    const int acc_bytes = acc_cols * acc_splits * 32 * outs * sizeof(float);
 
     LlSmemPlan plan;
     plan.sfa_pitch = sfa_pitch;
