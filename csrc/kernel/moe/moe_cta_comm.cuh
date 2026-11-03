@@ -81,6 +81,7 @@ struct MoECtaComm {
     std::uint32_t latent_tasks_done[2];
     // Shared expert blocks that have published their activation slice.
     std::uint32_t shared_up_out_done[2];
+    std::uint32_t shared_down_done[2];
 
     // Set once block 0's routing tables are in `router_tables`.  The router's
     // own blocks build theirs; the others copy block 0's.
@@ -111,6 +112,7 @@ struct MoECtaComm {
             router_tasks_done[inactive] = 0u;
             latent_tasks_done[inactive] = 0u;
             shared_up_out_done[inactive] = 0u;
+            shared_down_done[inactive] = 0u;
             router_tables_done[inactive] = 0u;
         }
     }
@@ -165,6 +167,17 @@ struct MoECtaComm {
         std::uint32_t parity, std::uint32_t num_tasks) const {
         while (global_load_acquire_u32(&shared_up_out_done[parity]) <
                num_tasks) {
+        }
+    }
+
+    __device__ __forceinline__ void publish_shared_down_done(
+        std::uint32_t parity, std::uint32_t num_tasks) {
+        global_red_add_release_u32(&shared_down_done[parity], num_tasks);
+    }
+
+    __device__ __forceinline__ void wait_shared_down_done(
+        std::uint32_t parity, std::uint32_t num_tasks) const {
+        while (global_load_acquire_u32(&shared_down_done[parity]) < num_tasks) {
         }
     }
 

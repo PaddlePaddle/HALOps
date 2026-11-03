@@ -164,6 +164,12 @@ struct SharedExpertProjection {
             workspace->cta_comm.publish_shared_up_out(smem->launch_parity, 1u);
         }
         run_down(tma_down_desc, down_scale, out, workspace, smem, batch_size);
+        __syncthreads();
+        if (threadIdx.x == 0u) {
+            __threadfence();
+            workspace->cta_comm.publish_shared_down_done(smem->launch_parity,
+                                                         1u);
+        }
     }
 
     __device__ static void run_up(
