@@ -22,6 +22,7 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/tensor.hpp>
 
+#include "common/device_timer.hpp"
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/ptx_utils.cuh"
@@ -47,7 +48,7 @@ struct alignas(16) MoERoutingTables {
 
     std::uint8_t expert_row_slot[kMaxRoutedPairs];
 
-    DataType::ElementScale expert_row_weight[kMaxRoutedPairs];
+    float expert_row_weight[kMaxRoutedPairs];
 
     std::uint32_t expert_token_mask[kNumExperts];
 
@@ -157,9 +158,7 @@ struct MoEBarriers {
 
     // The quantize's handshake: the issuer can lag the quantize by a whole K.
     static constexpr std::uint32_t kNumLatentInputEmptySlots =
-        LatentDownGemmTraits<Dims>::kUseUmma
-            ? LatentDownGemmTraits<Dims>::kNumTilesK
-            : MoEKernelTraits<Dims>::kLatentInputSlots;
+        LatentDownGemmTraits<Dims>::kNumTilesK;
     SimpleBarrier<kNumLatentInputEmptySlots> latent_down_input_empty;
 
     // Router
@@ -174,17 +173,12 @@ struct MoEBarriers {
     // RoutedUp
     TransactionBarrier<kNumUpWeightSlots> up_weight_ready;
 
-    SimpleBarrier<1> up_input_ready;
     // The up phase's fp8 staging, one slot per K tile.
     static constexpr std::uint32_t kNumUpStagingSlots =
         MoEKernelTraits<Dims>::UpGemm::kNumTilesK;
     SimpleBarrier<kNumUpStagingSlots> up_staging_ready;
-    static constexpr std::uint32_t kNumUpInputSlots =
-        MoEKernelTraits<Dims>::kUpInputSlots;
-    // One bulk copy of the whole projection output, when the ring holds it.
+    // One bulk copy of the whole projection output.
     TransactionBarrier<1> latent_copy_ready;
-    TransactionBarrier<kNumUpInputSlots> up_input_slot_ready;
-    SimpleBarrier<kNumUpInputSlots> up_input_slot_empty;
 
     SimpleBarrier<kNumScaleSlots> weight_scale_ready;
     SimpleBarrier<kNumScaleSlots> weight_scale_empty;
@@ -264,18 +258,14 @@ struct MoEBarriers {
 
     __device__ __forceinline__ void init_expert_ring() {
         const int num_warps = static_cast<int>(WarpRole::kCalcWarpCount);
-        up_input_ready.init(num_warps);
         up_staging_ready.init(1);
         latent_copy_ready.init(1);
-        up_input_slot_ready.init(1);
-        up_input_slot_empty.init(num_warps);
         up_weight_ready.init(1);
         down_weight_ready.init(1);
         activation_ready.init(1);
         weight_scale_ready.init(1);
         weight_scale_empty.init(num_warps);
-        accumulator_ready.init(1);
-        accumulator_empty.init(num_warps);
+        init_accumulator_ring();
     }
 
     __device__ __forceinline__ void init_shared_ring() {
@@ -290,6 +280,13 @@ struct MoEBarriers {
         shared_up_accumulator_ready.init(1);
         shared_up_accumulator_empty.init(1);
         shared_down_accumulator_ready.init(1);
+    }
+
+    // The expert phases' TMEM accumulator ring: the UMMA's completion arms a
+    // slot's `ready`, and every calc warp releases it through `empty`.
+    __device__ __forceinline__ void init_accumulator_ring() {
+        accumulator_ready.init(1);
+        accumulator_empty.init(static_cast<int>(WarpRole::kCalcWarpCount));
     }
 
     __device__ void wait_accumulator_empty(std::uint32_t ring_iter_id) {
@@ -341,13 +338,14 @@ struct RoutingSmem {
     alignas(16)
         std::uint16_t topk_ids[(Dims::kNumTokens < 8u ? 8u : Dims::kNumTokens) *
                                Dims::kMaxTopk];
-    alignas(16) DataType::ElementScale
-        topk_weights[(Dims::kNumTokens < 8u ? 8u : Dims::kNumTokens) *
-                     Dims::kMaxTopk];
+    alignas(
+        16) float topk_weights[(Dims::kNumTokens < 8u ? 8u : Dims::kNumTokens) *
+                               Dims::kMaxTopk];
 
     std::uint8_t expert_position[Dims::kNumExperts];
 };
 
+// A ring of streamed bf16 activation tiles: B operand and quantize source.
 // A ring of streamed bf16 activation tiles: B operand and quantize source.
 template <std::uint32_t NumSlots, std::uint32_t TileShapeN,
           std::uint32_t TileShapeK>
@@ -366,25 +364,76 @@ struct ActivationSmem {
         Element data[kNumSlots][kNumSwizzleBoxesK][TileShapeN][kSwizzleBoxK];
 };
 
+// The weight-scale staging of one GEMM: the plain QuantSpec table for the
+// manual-scaling paths, or one 128-row SfAtom slab per weight slot for the
+// blockscaled instruction (the UTCCP source).
+//
+// Plain shape: `Quant::ScaleShape<TileShapeM, GemmK / NumSplits>()`.
+// SfAtom slab: `128 * (TileShapeK / Quant::kBlockSize)` bytes per slot.
+template <class Quant, bool SfAtom, std::uint32_t NumSlots,
+          std::uint32_t WeightRows, std::uint32_t WeightCols>
+struct WeightScaleStorage {
+    static constexpr auto kScaleShape =
+        Quant::template ScaleShape<WeightRows, WeightCols>();
+    static constexpr std::uint32_t kScaleRows =
+        static_cast<std::uint32_t>(cute::get<0>(kScaleShape));
+    static constexpr std::uint32_t kScaleCols =
+        static_cast<std::uint32_t>(cute::get<1>(kScaleShape));
+    alignas(128) typename Quant::ScaleType scale[kScaleRows][kScaleCols];
+
+    __device__ auto& operator[](std::uint32_t row) { return scale[row]; }
+    __device__ const auto& operator[](std::uint32_t row) const {
+        return scale[row];
+    }
+};
+
+template <class Quant, std::uint32_t NumSlots, std::uint32_t WeightRows,
+          std::uint32_t WeightCols>
+struct WeightScaleStorage<Quant, true, NumSlots, WeightRows, WeightCols> {
+    static_assert(sizeof(typename Quant::ScaleType) == 1u,
+                  "SfAtom scale factors are single bytes");
+    static_assert(WeightRows % 128u == 0u,
+                  "a weight tile's rows are whole 128-row SfAtoms");
+    static constexpr std::uint32_t kGroups = WeightCols / Quant::kBlockSize;
+    static constexpr std::uint32_t kScaleCols =
+        (WeightRows / 128u) * 128u * kGroups;
+    alignas(128) std::uint8_t scale[NumSlots][kScaleCols];
+
+    __device__ auto& operator[](std::uint32_t slot) { return scale[slot]; }
+    __device__ const auto& operator[](std::uint32_t slot) const {
+        return scale[slot];
+    }
+};
+
 // The quantize's fp8 output, which is also the MMA's B operand.
 template <std::uint32_t NumSlots, std::uint32_t TileShapeN,
           std::uint32_t TileShapeK, std::uint32_t GemmN, std::uint32_t GemmK,
-          std::uint32_t QuantBlockK>
+          std::uint32_t QuantBlock,
+          QuantMethod Method = QuantMethod::kBlockwiseFP8>
 struct QuantizedActivationSmem {
-    using Element = DataType::ElementQA;
-    using ElementScale = DataType::ElementScale;
+    using Quant = QuantSpec<Method, QuantBlock>;
+    using ElementType = typename Quant::ElementType;
+    using ElementScale = typename Quant::ScaleType;
 
     static constexpr std::uint32_t kNumSlots = NumSlots;
     static constexpr std::uint32_t kLboChunkK = kFp8ActChunkK;
     static constexpr std::uint32_t kNumLboChunksK = TileShapeK / kLboChunkK;
-    static constexpr std::uint32_t kNumQuantBlocks = GemmK / QuantBlockK;
+    static constexpr std::uint32_t kNumQuantBlocks = GemmK / Quant::kBlockSize;
+    // MXFP8 scales are staged per slot in their SfAtom layout; the other
+    // recipes keep one scale per (block, row).
+    static constexpr bool kSfAtom = Method == QuantMethod::kMXFP8;
+    static constexpr std::uint32_t kSfAtomBytes =
+        128u * (TileShapeK / Quant::kBlockSize);
+    using ScaleArray =
+        std::conditional_t<kSfAtom, std::uint8_t[NumSlots][kSfAtomBytes],
+                           ElementScale[kNumQuantBlocks][GemmN]>;
 
     static_assert(TileShapeK % kLboChunkK == 0u,
                   "a tile must be whole 16-B chunks");
 
-    alignas(1024)
-        Element data[kNumSlots][kNumLboChunksK][TileShapeN + 1u][kLboChunkK];
-    ElementScale scale[kNumQuantBlocks][GemmN];
+    alignas(1024) ElementType
+        data[kNumSlots][kNumLboChunksK][TileShapeN + 1u][kLboChunkK];
+    alignas(128) ScaleArray scale;
 };
 
 template <typename Dims>
@@ -414,7 +463,7 @@ struct LatentDownSmem {
     using Traits = MoEKernelTraits<Dims>;
     using LatentDownGemm = typename Traits::LatentDownGemm;
 
-    alignas(1024) DataType::ElementW
+    alignas(1024) LatentDownGemm::MmaElement
         w_latent_down[LatentDownGemm::kNumWeightSlots]
                      [LatentDownGemm::kQuantBlocksPerTile]
                      [LatentDownGemm::kTileShapeM][128u];
@@ -423,34 +472,33 @@ struct LatentDownSmem {
                    LatentDownGemm::kTileShapeK>
         input;
 
-    QuantizedActivationSmem<Traits::kLatentInputSlots,
-                            LatentDownGemm::kTileShapeN,
-                            LatentDownGemm::kTileShapeK, LatentDownGemm::kGemmN,
-                            LatentDownGemm::kGemmK, Dims::kQuantBlockK>
+    QuantizedActivationSmem<
+        Traits::kLatentInputSlots, LatentDownGemm::kTileShapeN,
+        LatentDownGemm::kTileShapeK, LatentDownGemm::kGemmN,
+        LatentDownGemm::kGemmK, Dims::kQuantConfig.kBlockSize,
+        Dims::kQuantConfig.kLatentQuant>
         quantized_input;
 
-    static constexpr std::uint32_t kNumMmaWarps =
-        Select<LatentDownGemm::kUseUmma, 1u, WarpRole::kCalcWarpCount>::value;
-    static constexpr std::uint32_t kMmaRows =
-        Select<LatentDownGemm::kUseUmma, 1u,
-               LatentDownGemm::kTileShapeM>::value;
-    static constexpr std::uint32_t kMmaCols =
-        Select<LatentDownGemm::kUseUmma, 1u,
-               LatentDownGemm::kTileShapeN>::value;
-    alignas(16) float mma_out[kNumMmaWarps][kMmaRows][kMmaCols];
-
-    DataType::ElementScale
-        w_latent_down_scale[LatentDownGemm::kNumScaleBlocksK];
+    // The latent weight scales, staged by recipe: one SfAtom slab per weight
+    // slot for the blockscaled instruction, or the plain table the TMA writes
+    // into.
+    WeightScaleStorage<typename LatentDownGemm::WeightQuant,
+                       LatentDownGemm::MmaCore::kUseBlockscaled,
+                       LatentDownGemm::kNumWeightSlots,
+                       LatentDownGemm::kTileShapeM, LatentDownGemm::kTileShapeK>
+        w_latent_down_scale;
 
     static constexpr std::uint32_t kNumOutChunks =
-        Select<Traits::kLatentQuantizeOutput,
-               LatentDownGemm::kTileShapeM / kFp8ActChunkK, 1u>::value;
-    static constexpr std::uint32_t kNumOutRows =
-        Select<Traits::kLatentQuantizeOutput, LatentDownGemm::kTileShapeN,
-               1u>::value;
+        LatentDownGemm::kTileShapeM / kFp8ActChunkK;
+    static constexpr std::uint32_t kNumOutRows = LatentDownGemm::kTileShapeN;
     alignas(16)
         DataType::ElementA out_bf16[kNumOutChunks][kNumOutRows][kFp8ActChunkK];
     alignas(16) float token_amax[kNumOutRows];
+    // MXFP8 scales each 32-feature group on its own; the block-wise recipe
+    // reduces the whole block into `token_amax`.
+    static constexpr std::uint32_t kNumOutGroups =
+        LatentDownGemm::kTileShapeM / 32u;
+    alignas(16) float token_group_amax[kNumOutRows][kNumOutGroups];
 
     alignas(16) float splited_mma_out[LatentDownGemm::kTileShapeM]
                                      [LatentDownGemm::kTileShapeN];
@@ -463,9 +511,10 @@ struct SharedExpertSmem {
     using SharedDownGemm = SharedDownGemmTraits<Dims>;
 
     union {
-        alignas(1024) DataType::ElementW w_up[SharedUpGemm::kNumWeightSlots][2u]
-                                             [SharedUpGemm::kTileShapeM][128u];
-        alignas(1024) DataType::ElementW
+        alignas(1024)
+            SharedUpGemm::MmaElement w_up[SharedUpGemm::kNumWeightSlots][2u]
+                                         [SharedUpGemm::kTileShapeM][128u];
+        alignas(1024) SharedDownGemm::MmaElement
             w_down[SharedDownGemm::kNumWeightSlots][SharedDownGemm::kTileShapeM]
                   [SharedDownGemm::kTileShapeK];
         alignas(1024) float splited_mma_out[2u][SharedUpGemm::kActQuantBlock]
@@ -479,12 +528,26 @@ struct SharedExpertSmem {
     alignas(1024) QuantizedActivationSmem<
         SharedUpGemm::kNumWeightSlots, SharedUpGemm::kTileShapeN,
         SharedUpGemm::kTileShapeK, SharedUpGemm::kGemmN, SharedUpGemm::kGemmK,
-        Dims::kQuantBlockK> quantized_input;
+        Dims::kQuantConfig.kBlockSize,
+        SharedUpGemm::ActQuant::kMethod> quantized_input;
 
     alignas(1024) QuantizedActivationSmem<
         SharedDownGemm::kNumWeightSlots, Dims::kNumTokens,
         SharedDownGemm::kTileShapeK, Dims::kNumTokens, Dims::kIntermediateSize,
-        SharedUpGemm::kActQuantBlock> act_down_input;
+        SharedUpGemm::kActQuantBlock,
+        SharedDownGemm::ActQuant::kMethod> act_down_input;
+
+    // The blockscaled recipe stages each weight slot's SfAtom slab here; the
+    // blockwise recipe reads its fp32 table straight from gmem.
+    alignas(1024) WeightScaleStorage<
+        typename SharedUpGemm::WeightQuant,
+        SharedUpGemm::MmaCore::kUseBlockscaled, SharedUpGemm::kNumWeightSlots,
+        SharedUpGemm::kTileShapeM, SharedUpGemm::kTileShapeK> w_up_scale;
+    alignas(1024) WeightScaleStorage<typename SharedDownGemm::WeightQuant,
+                                     SharedDownGemm::MmaCore::kUseBlockscaled,
+                                     SharedDownGemm::kNumWeightSlots,
+                                     SharedDownGemm::kTileShapeM,
+                                     SharedDownGemm::kTileShapeK> w_down_scale;
 
     alignas(16) float act_up_out[SharedUpGemm::kActQuantBlock]
                                 [Dims::kNumTokens + 1u];
@@ -497,18 +560,18 @@ struct RoutedExpertsSmem {
     using DownGemm = typename Traits::DownGemm;
 
     union {
-        alignas(1024) DataType::ElementW
+        alignas(1024) UpGemm::MmaElement
             w_up[UpGemm::kNumWeightSlots][UpGemm::MmaCore::kNumSwizzleBoxKs]
                 [UpGemm::kTileShapeM * UpGemm::MmaCore::kSwizzleBoxK];
 
-        alignas(1024) DataType::ElementW
+        alignas(1024) DownGemm::MmaElement
             w_down[DownGemm::kNumWeightSlots][DownGemm::kTileShapeM]
                   [DownGemm::kTileShapeK];
     };
 
     struct UpDownActivation {
-        DataType::ElementAcc act_up_out[Traits::UpGemm::kActQuantBlock]
-                                       [UpGemm::kTileShapeN + 1];
+        float act_up_out[Traits::UpGemm::kActQuantBlock]
+                        [UpGemm::kTileShapeN + 1];
 
         static constexpr uint32_t kNumDownActElems =
             DownGemm::kTileShapeN * DownGemm::kTileShapeK;
@@ -516,31 +579,42 @@ struct RoutedExpertsSmem {
             act_down_input[DownGemm::kNumWeightSlots][kNumDownActElems];
     };
 
-    static constexpr std::uint32_t kUpInputSlots =
-        Select<Traits::kLatentQuantizeOutput, 1u, Traits::kUpInputSlots>::value;
-    union {
-        ActivationSmem<kUpInputSlots, UpGemm::kTileShapeN, UpGemm::kTileShapeK>
-            input;
-        UpDownActivation up_down_act;
-    };
+    UpDownActivation up_down_act;
 
     static constexpr std::uint32_t kNumStagingSlots = UpGemm::kNumTilesK;
     QuantizedActivationSmem<kNumStagingSlots, UpGemm::kTileShapeN,
                             UpGemm::kTileShapeK, UpGemm::kGemmN, UpGemm::kGemmK,
-                            Dims::kQuantBlockK>
+                            Dims::kQuantConfig.kBlockSize,
+                            UpGemm::ActQuant::kMethod>
         quantized_input;
+
+    // The blockscaled recipes stage one SfAtom slab per weight slot and K
+    // tile, loaded with the weight; the fp32 tables below stay for the
+    // manual-scaling path.
+    alignas(1024) WeightScaleStorage<
+        typename UpGemm::WeightQuant, UpGemm::MmaCore::kUseBlockscaled,
+        UpGemm::kNumWeightSlots, UpGemm::kTileShapeM,
+        UpGemm::kTileShapeK> up_weight_sfa;
+    alignas(1024) WeightScaleStorage<
+        typename DownGemm::WeightQuant, DownGemm::MmaCore::kUseBlockscaled,
+        DownGemm::kNumWeightSlots, DownGemm::kTileShapeM,
+        DownGemm::kTileShapeK> down_weight_sfa;
+
+    // One down K tile's activation SfAtom slab per activation slot.
+    alignas(128) std::uint8_t
+        act_down_sfb[DownGemm::kNumWeightSlots]
+                    [128u * (DownGemm::kTileShapeK / 32u)];
 
     static constexpr std::uint32_t kNumActQuantBlocks =
         Dims::kIntermediateSize / Traits::UpGemm::kActQuantBlock;
-    DataType::ElementScale act_down_scale[kNumActQuantBlocks]
-                                         [DownGemm::kTileShapeN];
+    // The manual-scaling path's fp32 tables (the block-wise recipe).
+    float act_down_scale[kNumActQuantBlocks][DownGemm::kTileShapeN];
 
     static constexpr uint32_t kNumUpScaleSlots = 2;
-    DataType::ElementScale w_up_scale[kNumUpScaleSlots]
-                                     [2 * UpGemm::kNumScaleBlocksK];
+    float w_up_scale[kNumUpScaleSlots][2 * UpGemm::kNumScaleBlocksK];
 
-    DataType::ElementScale w_down_scale[DownGemm::MmaCore::kNumAtomMs]
-                                       [DownGemm::kNumScaleBlocksK];
+    float w_down_scale[DownGemm::MmaCore::kNumAtomMs]
+                      [DownGemm::kNumScaleBlocksK];
 };
 
 template <typename Dims>
@@ -583,6 +657,25 @@ struct MoESharedStorage {
     uint16_t down_grid_task[kMaxDownTasks + 1];
     uint32_t down_tasks_claimed;
     uint32_t down_task_stores;
+
+#if defined(HALOPS_KERNEL_TIMER_ENABLED)
+    // Per-warp slot write-cursors for the device event timer, zeroed in the
+    // kernel prologue (before any probe) and published by its __syncthreads.
+    // One entry per warp; the block must not exceed kTimerWarps warps.
+    uint32_t timer_next[halops::kTimerWarps];
+    static_assert(Dims::KernelConfig::kBlockSize / 32u <= halops::kTimerWarps,
+                  "block has more warps than the timer's per-warp cursors");
+    // The per-CTA record pool pointer (null = timer off), parked here by the
+    // prologue so any phase can mint a writer via `timer()`
+    // without threading it through its call chain.
+    std::uint64_t* timer_base;
+
+    __device__ __forceinline__ halops::DeviceTimer timer() {
+        return halops::DeviceTimer::make(
+            timer_base, timer_next, static_cast<int>(blockIdx.x),
+            static_cast<int>(WarpRole::get_warp_idx()));
+    }
+#endif
 };
 
 // Dynamic shared memory required by fused_moe_kernel<Dims>.

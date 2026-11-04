@@ -187,12 +187,12 @@ template <std::uint32_t kNumExperts, std::uint32_t kNumTokens,
 __device__ void place_expert_rows(
     std::uint32_t n_pairs, cutlass::FastDivmod const& topk_divmod,
     const std::uint16_t (&expert_ids)[5],
-    const DataType::ElementScale* __restrict__ topk_weights,
+    const float* __restrict__ topk_weights,
     const std::uint32_t (&expert_token_mask)[kNumExperts],
     const std::uint8_t (&expert_position)[kNumExperts],
     const std::uint16_t (&expert_token_cumsum)[kActiveExpertCapacity + 1u],
     std::uint8_t (&expert_row_slot)[kNumTokens * kMaxTopk],
-    DataType::ElementScale (&expert_row_weight)[kNumTokens * kMaxTopk]) {
+    float (&expert_row_weight)[kNumTokens * kMaxTopk]) {
     const std::uint32_t tid = WarpRole::get_lane_idx();
     constexpr std::uint32_t kChunks =
         sizeof(expert_ids) / sizeof(expert_ids[0]);

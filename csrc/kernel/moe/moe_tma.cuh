@@ -15,10 +15,12 @@
 #pragma once
 
 #include <cuda.h>
+#include <torch/extension.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <cute/arch/copy_sm90_tma.hpp>
+#include <type_traits>
 
 #include "kernel/moe/moe_configs.cuh"
 
@@ -29,33 +31,23 @@
 
 namespace halops::moe {
 
-// Build a `CUtensorMap` for the fp8 up-projection weight `[E, 2*n, k]`.
-CUtensorMap CreateUpWeightTmaDesc(const void* weights_ptr, uint32_t num_experts,
-                                  uint32_t n, uint32_t k,
-                                  uint32_t row_box = 128u);
-
-// Build a `CUtensorMap` for the bf16 activation `[BS, K_hidden]`.
-CUtensorMap CreateActivationsTmaDesc(const void* activations_ptr,
-                                     uint32_t batch_size_cap,
-                                     uint32_t block_rows, uint32_t K_hidden);
-
-// Build a `CUtensorMap` for the fp8 down-projection weight `[E, k, n]`.
-CUtensorMap CreateDownWeightTmaDesc(const void* weights_ptr,
-                                    uint32_t num_experts, uint32_t k,
-                                    uint32_t n, uint32_t row_box = 128u);
-
-// Build a `CUtensorMap` for the fp8 intermediate activation.
-CUtensorMap CreateDownActivationTmaDesc(const void* activations_ptr,
-                                        uint32_t temp_rows, uint32_t block_rows,
-                                        uint32_t n);
-
-// L2 eviction hint for the expert weights, streamed once per launch: an
-// active set that fits in L2 is worth keeping, otherwise evict first.
-__device__ __forceinline__ constexpr std::uint64_t expert_weight_cache_hint(
+// L2 eviction hint for the streamed TMA loads: a working set that fits in L2
+// is worth keeping, otherwise evict first.
+__device__ __forceinline__ constexpr std::uint64_t get_tma_cache_hint(
     bool evict_first) {
     return static_cast<std::uint64_t>(
         evict_first ? cute::TMA::CacheHintSm90::EVICT_FIRST
                     : cute::TMA::CacheHintSm90::EVICT_NORMAL);
+}
+
+// Issue one 1-D bulk copy (a contiguous byte range, no tensor map), tracked
+// by an mbarrier.
+__device__ static __forceinline__ void tma_load_1d(const void* src_gmem,
+                                                   std::uint32_t bytes,
+                                                   void* dst_smem,
+                                                   std::uint64_t* bar_smem) {
+    cute::SM90_BULK_COPY_G2S::copy(src_gmem, bar_smem, dst_smem,
+                                   static_cast<std::int32_t>(bytes));
 }
 
 // Issue one 2D TMA bulk-tensor load, tracked by an mbarrier.
@@ -69,80 +61,71 @@ __device__ static __forceinline__ void tma_load_2d(
                                  static_cast<std::int32_t>(coord1));
 }
 
-// Issue one non-tensor TMA bulk copy, tracked by an mbarrier.
-__device__ static __forceinline__ void tma_load_bulk(const void* src_gmem,
-                                                     std::uint32_t bytes,
-                                                     void* dst_smem,
-                                                     std::uint64_t* bar_smem) {
-    cute::SM90_BULK_COPY_G2S::copy(src_gmem, bar_smem, dst_smem,
-                                   static_cast<std::int32_t>(bytes));
-}
-
-// Issue one TMA load for one 128-row up-projection gate/up pair tile.
-__device__ __forceinline__ void tma_load_up_tcgen05_pair_tile(
-    CUtensorMap const& tma_up_weights_desc, std::uint32_t expert_id,
-    std::uint32_t n, std::uint32_t row_base, std::uint32_t k_start,
-    void* dest_slot_smem_ptr, std::uint64_t* bar_smem_ptr,
-    std::uint64_t cache_hint =
-        static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL)) {
-    const std::uint32_t global_row = expert_id * 2u * n + row_base;
-    tma_load_2d(tma_up_weights_desc, /*coord0=*/k_start, /*coord1=*/global_row,
-                dest_slot_smem_ptr, bar_smem_ptr, cache_hint);
-}
-
-// Issue one TMA load for the bf16 activation tile used by streaming quantize.
-__device__ __forceinline__ void tma_load_bf16_input_tile(
-    CUtensorMap const& tma_input_desc, std::uint32_t k_start,
-    std::uint32_t token_start, void* dest_smem_ptr,
+// Issue the full per-block BF16 input TMA load: one 64-k SW128 box per
+// issue, box `kk` into `dest[kk]`.
+template <std::size_t NumRows, std::size_t NumSwizzleBoxesK,
+          std::size_t SwizzleBoxK>
+__device__ __forceinline__ void load_input_tile(
+    CUtensorMap const& tma_input_desc, std::uint32_t tile,
+    std::uint32_t token_start,
+    DataType::ElementA (&dest)[NumSwizzleBoxesK][NumRows][SwizzleBoxK],
     std::uint64_t* bar_smem_ptr) {
-    // coord0 = k, coord1 = token; TMA zero-fills rows past `batch_size`.
-    tma_load_2d(tma_input_desc, /*coord0=*/k_start, /*coord1=*/token_start,
-                dest_smem_ptr, bar_smem_ptr);
+    // The box is one 8-row swizzle atom, so the ring's rows are whole atoms.
+    constexpr std::uint32_t kRowGroups = NumRows / 8u;
+    static_assert(NumRows % 8u == 0u, "the ring is whole swizzle atoms");
+#pragma unroll
+    for (std::uint32_t kk = 0u; kk < NumSwizzleBoxesK; ++kk) {
+#pragma unroll
+        for (std::uint32_t g = 0u; g < kRowGroups; ++g) {
+            const std::uint32_t k_start =
+                tile * (NumSwizzleBoxesK * SwizzleBoxK) + kk * SwizzleBoxK;
+            tma_load_2d(tma_input_desc, /*coord0=*/k_start,
+                        /*coord1=*/token_start + 8u * g,
+                        /*dest_smem_ptr=*/&dest[kk][8u * g][0],
+                        /*bar_smem_ptr=*/bar_smem_ptr);
+        }
+    }
 }
 
-// Issue one bulk load of router weight tile (`m_tile`, `k_tile`).
-__device__ __forceinline__ void tma_load_router_weight_tile(
-    const __nv_bfloat16* router_weight, std::uint32_t m_tile,
-    std::uint32_t k_tile, std::uint32_t num_tiles_k, std::uint32_t tile_bytes,
-    void* dest_smem_ptr, std::uint64_t* bar_smem_ptr) {
-    const char* src =
-        reinterpret_cast<const char*>(router_weight) +
-        static_cast<std::size_t>(m_tile * num_tiles_k + k_tile) * tile_bytes;
-    tma_load_bulk(src, tile_bytes, dest_smem_ptr, bar_smem_ptr);
-}
-
-// Issue one TMA load for the full 128×128 fp8 down-projection weight tile.
-__device__ __forceinline__ void tma_load_down_umma_tile(
-    CUtensorMap const& tma_down_weights_desc, std::uint32_t expert_id,
-    std::uint32_t k, std::uint32_t base_col, std::uint32_t k_start,
-    void* dest_smem_ptr, std::uint64_t* bar_smem_ptr,
-    std::uint64_t cache_hint =
-        static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL)) {
-    // coord0 = n, coord1 = row; the row is `expert_id * k + base_col`.
-    const std::uint32_t global_row = expert_id * k + base_col;
-    tma_load_2d(tma_down_weights_desc, /*coord0=*/k_start,
-                /*coord1=*/global_row, dest_smem_ptr, bar_smem_ptr, cache_hint);
-}
-
-// Build a `CUtensorMap` for the shared latent down weight `[m, k]` (fp8).
-CUtensorMap CreateLatentDownWeightTmaDesc(const void* weights_ptr, uint32_t m,
-                                          uint32_t k, uint32_t row_box);
-
-// Issue one 128x128 fp8 weight tile of the latent down-projection into SHM.
-__device__ __forceinline__ void tma_load_latent_down_weight_tile(
-    CUtensorMap const& tma_latent_down_weights_desc, std::uint32_t base_row,
-    std::uint32_t k_start, void* dest_smem_ptr, std::uint64_t* bar_smem_ptr) {
-    tma_load_2d(tma_latent_down_weights_desc, /*coord0=*/k_start,
-                /*coord1=*/base_row, dest_smem_ptr, bar_smem_ptr);
-}
-
-// Issue one TMA load for up to 8 rows of the fp8 down-projection activation.
-__device__ __forceinline__ void tma_load_down_umma_activation_bulk(
-    CUtensorMap const& tma_down_activations_desc, std::uint32_t k_start,
-    std::uint32_t first_row, void* dest_smem_ptr, std::uint64_t* bar_smem_ptr) {
-    // Descriptor axis order (innermost first): coord0 = n, coord1 = row.
-    tma_load_2d(tma_down_activations_desc, /*coord0=*/k_start,
-                /*coord1=*/first_row, dest_smem_ptr, bar_smem_ptr);
+// Create a 2-D TMA descriptor for a dense row-major `[rows, cols]` tensor of
+// `T`; the box is the per-copy tile.  A 4-bit `T` is packed two values per
+// byte, low nibble first, and `cols` and the box still count values: the copy
+// spreads each 16 values over 16 B of SMEM (8 B of nibbles, 8 B untouched),
+// the one-byte-per-value image the f8f6f4 UMMA reads.  Its box is 128 values
+// wide, and the mbarrier is credited with the packed gmem bytes.
+template <typename T>
+inline CUtensorMap CreateTmaDesc2D(const char* debug_name, const T* global_ptr,
+                                   std::uint32_t rows, std::uint32_t cols,
+                                   std::uint32_t box_rows,
+                                   std::uint32_t box_cols,
+                                   bool use_swizzle = true) {
+    CUtensorMapDataType data_type = CU_TENSOR_MAP_DATA_TYPE_UINT8;
+    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        data_type = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+    } else if constexpr (std::is_same_v<T, float>) {
+        data_type = CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+    } else if constexpr (std::is_same_v<T, cutlass::float_e2m1_t>) {
+        data_type = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
+    } else {
+        static_assert(sizeof(T) == 1u, "unsupported TMA element type");
+    }
+    CUtensorMap desc{};
+    uint64_t global_shape[2] = {cols, rows};
+    uint64_t global_strides[1] = {static_cast<uint64_t>(cols) *
+                                  cute::sizeof_bits_v<T> / 8u};
+    uint32_t box_dim[2] = {box_cols, box_rows};
+    uint32_t element_strides[2] = {1u, 1u};
+    const CUresult res = cuTensorMapEncodeTiled(
+        &desc, data_type, 2,
+        const_cast<void*>(static_cast<const void*>(global_ptr)), global_shape,
+        global_strides, box_dim, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        use_swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(res == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for ",
+                debug_name, ": CUresult=", static_cast<int>(res),
+                " (rows=", rows, ", cols=", cols, ", box=(", box_rows, ", ",
+                box_cols, "))");
+    return desc;
 }
 
 }  // namespace halops::moe

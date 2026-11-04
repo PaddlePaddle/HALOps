@@ -49,35 +49,54 @@ struct RouterLogits {
     }
 };
 
-// The latent down-projection's output, as the up phase consumes it.
-template <typename Dims, bool IsQuantized>
-struct LatentDownOutput;
+// The scale image of the projection's output, in the up staging's layout: the
+// block-wise fp32 table, or one SfAtom slab per up K tile for MXFP8.  Either
+// is exactly one up staging tile's scales, so the phase boundary is one blob.
+template <typename Dims, bool IsMx>
+struct LatentScaleImage;
 
 template <typename Dims>
-struct LatentDownOutput<Dims, false> {
+struct LatentScaleImage<Dims, false> {
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
-    using Element = DataType::ElementA;
+    // The block-wise image is fp32 by recipe; the MX one is a byte blob.
+    using Element = float;
 
+    static constexpr std::uint32_t kNumBlocks =
+        LatentDownGemm::kGemmM / Dims::kQuantConfig.kBlockSize;
     static constexpr std::uint32_t kNumRows = LatentDownGemm::kGemmN;
-    static constexpr std::uint32_t kNumCols = LatentDownGemm::kGemmM;
 
-    alignas(16) Element data[kNumRows][kNumCols];
+    alignas(16) Element data[kNumBlocks][kNumRows];
 
-    __device__ __forceinline__ void store(std::uint32_t tok, std::uint32_t col,
-                                          Element value) {
-        data[tok][col] = value;
-    }
-
-    __host__ __device__ __forceinline__ Element* data_ptr() {
-        return &data[0][0];
+    __device__ __forceinline__ Element* row(std::uint32_t block) {
+        return data[block];
     }
 };
 
 template <typename Dims>
-struct LatentDownOutput<Dims, true> {
+struct LatentScaleImage<Dims, true> {
+    using UpGemm = UpGemmTraits<Dims>;
+    using Element = std::uint8_t;
+
+    // One 128-token SfAtom slab per up K tile holds that tile's 32-K groups.
+    static constexpr std::uint32_t kNumSlots = UpGemm::kNumTilesK;
+    static constexpr std::uint32_t kSfAtomBytes =
+        128u * (UpGemm::kTileShapeK / 32u);
+
+    alignas(16) Element data[kNumSlots][kSfAtomBytes];
+
+    __device__ __forceinline__ Element* slab(std::uint32_t slot) {
+        return data[slot];
+    }
+};
+
+// The latent down-projection's output, as the up phase consumes it: the up
+// staging tile's own image, one blob of data plus one of scales.
+template <typename Dims>
+struct LatentDownOutput {
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
+    using UpGemm = UpGemmTraits<Dims>;
     using Element = DataType::ElementQA;
-    using ElementScale = DataType::ElementScale;
+    using ScaleImage = LatentScaleImage<Dims, UpGemm::MmaCore::kUseBlockscaled>;
 
     static constexpr std::uint32_t kNumRows = LatentDownGemm::kGemmN;
     static constexpr std::uint32_t kNumCols = LatentDownGemm::kGemmM;
@@ -85,11 +104,9 @@ struct LatentDownOutput<Dims, true> {
     static constexpr std::uint32_t kLboChunk =
         MoEKernelTraits<Dims>::kLboChunkK;
     static constexpr std::uint32_t kNumChunks = kNumCols / kLboChunk;
-    static constexpr std::uint32_t kNumScaleBlocks =
-        kNumCols / Dims::kQuantBlockM;
 
     alignas(16) Element data[kNumChunks][kNumRows + 1u][kLboChunk];
-    alignas(16) ElementScale scale[kNumScaleBlocks][kNumRows];
+    alignas(16) ScaleImage scale;
 
     static constexpr std::uint32_t kDataBytes = sizeof(data);
     static constexpr std::uint32_t kScaleBytes = sizeof(scale);
@@ -105,24 +122,28 @@ struct LatentDownOutput<Dims, true> {
             make_uint4(0u, 0u, 0u, 0u);
     }
 
-    __device__ __forceinline__ ElementScale* scale_row(std::uint32_t block) {
-        return scale[block];
+    __device__ __forceinline__ auto* scale_row(std::uint32_t block) {
+        return scale.row(block);
+    }
+
+    __device__ __forceinline__ auto* sf_slab(std::uint32_t slot) {
+        return scale.slab(slot);
     }
 
     __host__ __device__ __forceinline__ Element* data_ptr() {
         return &data[0][0][0];
     }
-    __host__ __device__ __forceinline__ ElementScale* scale_ptr() {
-        return &scale[0][0];
-    }
+    __host__ __device__ __forceinline__ void* scale_ptr() { return &scale; }
 };
 
 // The shared expert's up output, in the down's staging layout.
 template <typename Dims>
 struct SharedUpOutput {
     using ElementType = DataType::ElementQA;
-    using ScaleType = DataType::ElementScale;
+    // The block-wise image is fp32 by recipe; the MX one is a byte blob.
+    using ScaleType = float;
     using SharedUpGemm = SharedUpGemmTraits<Dims>;
+    using SharedDownGemm = SharedDownGemmTraits<Dims>;
 
     static constexpr std::uint32_t kQuantBlock = SharedUpGemm::kActQuantBlock;
 
@@ -133,8 +154,18 @@ struct SharedUpOutput {
     static constexpr std::uint32_t kNumChunks = kNumCols / kLboChunk;
     static constexpr std::uint32_t kNumScaleCols = kNumCols / kQuantBlock;
 
+    // The blockscaled down reads one SfAtom slab per K tile.  Both scale
+    // images live in one union sized to the larger, so the workspace size is
+    // the same for every recipe (host sizing reads only the default Dims).
+    static constexpr std::uint32_t kDownTilesK = SharedDownGemm::kNumTilesK;
+    static constexpr std::uint32_t kSfAtomBytes =
+        128u * (SharedDownGemm::kTileShapeK / 32u);
+
     alignas(16) ElementType data[kNumChunks][kNumRows + 1u][kLboChunk];
-    ScaleType scale[kNumScaleCols][kNumRows];
+    union alignas(16) ScaleImage {
+        ScaleType blockwise[kNumScaleCols][kNumRows];
+        std::uint8_t mxfp8[kDownTilesK][kSfAtomBytes];
+    } scale;
 
     __device__ __forceinline__ ElementType* cell(std::uint32_t chunk,
                                                  std::uint32_t row) {
@@ -147,14 +178,23 @@ struct SharedUpOutput {
     }
 
     __device__ __forceinline__ ScaleType* scale_row(std::uint32_t block) {
-        return scale[block];
+        return scale.blockwise[block];
+    }
+
+    // One down K tile's UE8M0 scales, in the SfAtom layout the down's SFB
+    // staging expects.
+    __device__ __forceinline__ std::uint8_t* sf_slab(std::uint32_t tile) {
+        return scale.mxfp8[tile];
     }
 
     __host__ __device__ __forceinline__ ElementType* data_ptr() {
         return &data[0][0][0];
     }
     __host__ __device__ __forceinline__ ScaleType* scale_ptr() {
-        return &scale[0][0];
+        return &scale.blockwise[0][0];
+    }
+    __host__ __device__ __forceinline__ std::uint8_t* scale_bytes() {
+        return &scale.mxfp8[0][0];
     }
 };
 
@@ -162,7 +202,8 @@ struct SharedUpOutput {
 template <typename Dims>
 struct RoutedUpOutput {
     using ElementType = DataType::ElementQA;
-    using ScaleType = DataType::ElementScale;
+    // The block-wise image is fp32 by recipe; the MX one is a byte blob.
+    using ScaleType = float;
     using UpGemm = UpGemmTraits<Dims>;
 
     static constexpr std::uint32_t kNumRows = UpGemm::kGemmN * Dims::kMaxTopk;
@@ -170,9 +211,17 @@ struct RoutedUpOutput {
 
     static constexpr std::uint32_t kQuantBlock = UpGemm::kTileShapeM / 2u;
     static constexpr std::uint32_t kNumScaleCols = kNumCols / kQuantBlock;
+    // The MX recipe stores one UE8M0 byte per row and 32 features; the
+    // blockscaled down repacks them into its SfAtom slab on the way in.
+    static constexpr std::uint32_t kNumMxScaleCols = kNumCols / 32u;
 
     alignas(16) ElementType data[(kNumRows + 8u) * kNumCols];
-    ScaleType scale[kNumRows * kNumScaleCols];
+    // Both scale images share one union so the workspace size is the same for
+    // every recipe (host sizing reads only the default Dims).
+    union alignas(16) ScaleImage {
+        ScaleType blockwise[kNumRows * kNumScaleCols];
+        std::uint8_t mxfp8[kNumRows * kNumMxScaleCols];
+    } scale;
 
     __device__ __forceinline__ ElementType* row(std::uint32_t row_idx) {
         return data + row_idx * kNumCols;
@@ -184,12 +233,17 @@ struct RoutedUpOutput {
     }
 
     __device__ __forceinline__ ScaleType* scale_row(std::uint32_t row_idx) {
-        return scale + row_idx * kNumScaleCols;
+        return scale.blockwise + row_idx * kNumScaleCols;
     }
 
     __device__ __forceinline__ const ScaleType* scale_row(
         std::uint32_t row_idx) const {
-        return scale + row_idx * kNumScaleCols;
+        return scale.blockwise + row_idx * kNumScaleCols;
+    }
+
+    __device__ __forceinline__ std::uint8_t* mx_scale_row(
+        std::uint32_t row_idx) {
+        return scale.mxfp8 + row_idx * kNumMxScaleCols;
     }
 };
 
@@ -224,15 +278,13 @@ struct MoEWorkspace {
 
     static constexpr uint32_t kMaxTopk = Dims::kMaxTopk;
 
-    static constexpr uint32_t kMaxRoutedRowsPadding = RoutedUpOut::kNumRows;
     static constexpr uint32_t kMaxRoutedRows = RoutedDownOut::kNumRows;
 
     static constexpr uint32_t kSpecMaxGrid = moe::kSpecMaxGrid;
 
     SharedUpOut shared_up_out;
 
-    using LatentOut =
-        LatentDownOutput<Dims, MoEKernelTraits<Dims>::kLatentQuantizeOutput>;
+    using LatentOut = LatentDownOutput<Dims>;
     LatentOut latent_down_out;
 
     RouterLogits<Dims> router_logits;

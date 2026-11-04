@@ -103,13 +103,6 @@ __device__ static __forceinline__ void global_red_add_u64(std::uint64_t* addr,
                  : "memory");
 }
 
-// Device-scope release store of a 32-bit word (st.release.gpu).
-__device__ static __forceinline__ void global_store_release_u32(uint32_t* addr,
-                                                                uint32_t v) {
-    asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(addr), "r"(v)
-                 : "memory");
-}
-
 // Device-scope release OR-reduction into a 32-bit word.
 __device__ static __forceinline__ void global_red_or_release_u32(
     uint32_t* addr, uint32_t bits) {
@@ -148,13 +141,6 @@ __device__ static __forceinline__ void shared_red_add_release_u32(
     asm volatile(
         "red.release.cta.shared::cta.add.u32 [%0], %1;" ::"r"(smem_addr), "r"(v)
         : "memory");
-}
-
-// Device-scope relaxed ADD-reduction into a 32-bit word.
-__device__ static __forceinline__ void global_red_add_u32(uint32_t* addr,
-                                                          uint32_t v) {
-    asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;" ::"l"(addr), "r"(v)
-                 : "memory");
 }
 
 // Device-scope release ADD-reduction into a 32-bit word.

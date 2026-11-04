@@ -34,9 +34,7 @@ struct TailGeometryT {
     static constexpr int kXPad = Config::kTailXPad;
     static constexpr int kMaxStageSmemBytes = Config::kTailMaxStageSmemBytes;
     static constexpr std::uint32_t kPrefetchChunk = Config::kTailPrefetchChunk;
-    static constexpr int kScaleBlock = static_cast<int>(Dims::kQuantBlockM);
-    static_assert(Dims::kQuantBlockM == Dims::kQuantBlockK,
-                  "fc2 scales are square blocks");
+    static constexpr int kScaleBlock = Config::kTailScaleBlock;
     static constexpr std::uint32_t kNumCtas = (kMaxM / kTpg) * kGsize;
     static_assert(kMaxM % kTpg == 0, "tail groups tile the token capacity");
     static_assert(kThreads == static_cast<int>(WarpRole::kCalcWarpCount *

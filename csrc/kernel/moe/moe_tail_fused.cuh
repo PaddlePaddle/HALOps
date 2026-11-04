@@ -17,6 +17,7 @@
 
 #include <cstdint>
 
+#include "common/device_timer.hpp"
 #include "moe_tail_prims.cuh"
 
 namespace halops::moe {
@@ -473,10 +474,12 @@ struct TailGroup {
         }
     }
 
+    template <class Timer>
     __device__ static __forceinline__ void run(const P& p, uint32_t cta,
                                                uint32_t tid, uint8_t* scratch,
                                                Sync sync,
-                                               uint32_t launch_parity) {
+                                               uint32_t launch_parity,
+                                               Timer timer) {
         Ctx c = make_ctx(p, cta, tid, scratch, sync);
         const bool active = group_active(c);
         if (active) stage_weights(c);
@@ -487,21 +490,27 @@ struct TailGroup {
             return;
         }
 
+        const auto span_a = KERNEL_TIMER_BEGIN(timer, "tail_round_a");
         if (c.grank < TPG) round_a_produce(c);
         round_a_gather(c);
         sync();
+        KERNEL_TIMER_END(timer, span_a);
         const vec_t vpre = prefetch_round_c(c);
+        const auto span_b = KERNEL_TIMER_BEGIN(timer, "tail_round_b");
         round_b(c);
+        KERNEL_TIMER_END(timer, span_b);
+        const auto span_c = KERNEL_TIMER_BEGIN(timer, "tail_round_c");
         round_c(c, vpre);
+        KERNEL_TIMER_END(timer, span_c);
     }
 };
 
-template <int WORLD, int L, int H, int MAXM, class TC, class Sync>
+template <int WORLD, int L, int H, int MAXM, class TC, class Sync, class Timer>
 __device__ __forceinline__ void eb5_tail_group_body(
     const Params<WORLD, L, H, MAXM>& p, uint32_t cta, uint32_t tid,
-    uint8_t* scratch, Sync sync, uint32_t launch_parity) {
+    uint8_t* scratch, Sync sync, uint32_t launch_parity, Timer timer) {
     TailGroup<WORLD, L, H, MAXM, TC, Sync>::run(p, cta, tid, scratch, sync,
-                                                launch_parity);
+                                                launch_parity, timer);
 }
 
 }  // namespace tail
