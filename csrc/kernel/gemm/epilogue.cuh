@@ -105,6 +105,7 @@ class CollectiveEpilogue {
         cute::TmaDescriptor d_desc;
         SituCoef situ;
         TypeC const* ptr_c = nullptr;
+        int64_t d_ld;
     };
 
     static Params to_underlying_arguments(Arguments const& args) {
@@ -123,16 +124,18 @@ class CollectiveEpilogue {
             cute::make_tma_atom(CopyOpG2S_Bias{}, tensor_c, SmemLayoutStageC{},
                                 EpilogueTile{}, cute::_1{});
 
+        const bool batch = KernelTraits::KernelType == KernelMode::Batch;
+        const int64_t q_n = n / KAccColsPerOut;
+        const int64_t rows = batch ? args.rows_per_batch : m;
+        const int64_t d_ld = batch ? num_experts * q_n : q_n;
         cute::TmaDescriptor d_desc{};
         if constexpr (KQuantD && !SwapAB) {
-            const bool batch = KernelTraits::KernelType == KernelMode::Batch;
-            const cuuint64_t rows = batch ? args.rows_per_batch : m;
             EncodeTmaDesc<3>(
                 &d_desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, args.ptr_d,
-                {static_cast<cuuint64_t>(n / KAccColsPerOut), rows,
+                {static_cast<cuuint64_t>(q_n), static_cast<cuuint64_t>(rows),
                  batch ? static_cast<cuuint64_t>(num_experts) : 1u},
-                {static_cast<cuuint64_t>(n / KAccColsPerOut),
-                 rows * n / KAccColsPerOut},
+                {static_cast<cuuint64_t>(d_ld),
+                 static_cast<cuuint64_t>(batch ? q_n : rows * q_n)},
                 {mxfp8::kGroup, static_cast<cuuint32_t>(KTileRows), 1},
                 CU_TENSOR_MAP_SWIZZLE_32B, "quantized D",
                 CU_TENSOR_MAP_L2_PROMOTION_NONE);
@@ -147,7 +150,8 @@ class CollectiveEpilogue {
                 args.ptr_gate,
                 d_desc,
                 args.situ,
-                args.ptr_c};
+                args.ptr_c,
+                d_ld};
     }
 
     // Producer warp: TMA-loads one bias C stage per scheduled tile.
@@ -242,6 +246,27 @@ class CollectiveEpilogue {
         size_t row0 = (size_t)(SwapAB ? n_idx : block_m_idx) * KTileRows;
         if constexpr (KernelTraits::KActRowTma) row0 = scheduler.act_row0();
         return {lo, hi, row0, row0 >= lo && row0 + KTileRows <= hi};
+    }
+    // D, gate and D scales are row-major with d_ld columns; for Batch, D is
+    // [rows_per_batch, B * N] and batch b owns columns [b * N, (b + 1) * N).
+    CUTLASS_DEVICE static int64_t batch_col0(
+        Params const& p, TileScheduler<KernelTraits> const& scheduler) {
+        if constexpr (KernelTraits::KernelType == KernelMode::Batch) {
+            return (int64_t)scheduler.expert_idx() * (p.n / KAccColsPerOut);
+        } else {
+            return 0;
+        }
+    }
+    CUTLASS_DEVICE static int64_t d_row(Params const& p, TileRows const& rows,
+                                        int64_t row) {
+        return (row - (int64_t)rows.lo) * p.d_ld;
+    }
+    CUTLASS_DEVICE static int64_t sf_offset(Params const& p,
+                                            TileRows const& rows, int64_t row,
+                                            int64_t col) {
+        return mxfp8::sf_atom_offset(row - (int64_t)rows.lo,
+                                     col / mxfp8::kGroup,
+                                     p.d_ld / mxfp8::kGroup);
     }
 
     // R2G of one register tile, dropping elements outside rows.  A normal
@@ -357,9 +382,7 @@ class CollectiveEpilogue {
         const int lane = cutlass::canonical_lane_idx();
         const int tid = w * cutlass::NumThreadsPerWarp + lane;
         const int cta_v = pair_rank();
-        const int64_t n = epilogue_params.n / KAccColsPerOut;
         const SituCoef situ = epilogue_params.situ;
-        const int kb_dim = (int)n / kGroup;
         uint8_t* const stage = reinterpret_cast<uint8_t*>(&shared_storage) +
                                KStagedSmem +
                                wg * 2 * KernelTraits::KEpiBufBytes;
@@ -396,6 +419,10 @@ class CollectiveEpilogue {
                                             block_m_idx, scheduler.n_idx());
             const int col0 =
                 block_m_idx * cutlass::NumThreadsPerWarpGroup / KAccColsPerOut;
+            const int64_t bcol0 = batch_col0(epilogue_params, scheduler);
+            const auto row_off = [&](int64_t r) {
+                return d_row(epilogue_params, rows, r) + bcol0;
+            };
             const auto in_rows = [&](int64_t r) {
                 return r >= (int64_t)rows.lo && r < (int64_t)rows.hi;
             };
@@ -425,7 +452,7 @@ class CollectiveEpilogue {
                             x[i - i0][l] =
                                 in_rows(r)
                                     ? __ldg(reinterpret_cast<const uint4*>(
-                                          base + r * n + dep))
+                                          base + row_off(r) + dep))
                                     : make_uint4(0u, 0u, 0u, 0u);
                         }
                     }
@@ -453,11 +480,12 @@ class CollectiveEpilogue {
             }
             uint8_t* const dst0 =
                 reinterpret_cast<uint8_t*>(epilogue_params.ptr_d) +
-                ((chunk_row(0) + ld_row) * n + col0) * sizeof(TypeD) +
+                (row_off(chunk_row(0) + ld_row) + col0) * sizeof(TypeD) +
                 ld_vec * KVec;
             const int64_t chunk_stride =
-                KEpilogueWgs * kChunk * n * sizeof(TypeD);
-            const int64_t vec_stride = kStores / kRowVecs * n * sizeof(TypeD);
+                KEpilogueWgs * kChunk * epilogue_params.d_ld * sizeof(TypeD);
+            const int64_t vec_stride =
+                kStores / kRowVecs * epilogue_params.d_ld * sizeof(TypeD);
             uint32_t row_ok = 0;
             int sf_off[kMyChunks];
             CUTLASS_PRAGMA_UNROLL
@@ -470,8 +498,8 @@ class CollectiveEpilogue {
                 }
                 sf_off[i] =
                     KQuantD && tid < kChunk && in_rows(chunk_row(i) + tid)
-                        ? (int)sf_atom_offset(chunk_row(i) + tid, col0 / kGroup,
-                                              kb_dim)
+                        ? (int)sf_offset(epilogue_params, rows,
+                                         chunk_row(i) + tid, bcol0 + col0)
                         : -1;
             }
             acc_pipeline.consumer_wait(acc_pipe_consumer_state);
@@ -693,7 +721,7 @@ class CollectiveEpilogue {
             const int tx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
             const size_t out_m = epilogue_params.m;
             const size_t out_n = epilogue_params.n;
-            const size_t q_n = out_n / KAccColsPerOut;
+            const int64_t d_ld = epilogue_params.d_ld;
             const SituCoef situ = epilogue_params.situ;
 
             cute::Tensor acc_sub_tile =
@@ -715,8 +743,8 @@ class CollectiveEpilogue {
                 cute::make_layout(
                     shape_d,
                     cute::conditional_return<SwapAB>(
-                        cute::make_stride(cute::Int<1>{}, out_n, cute::_0{}),
-                        cute::make_stride(out_n, cute::Int<1>{}, cute::_0{}))));
+                        cute::make_stride(cute::Int<1>{}, d_ld, cute::_0{}),
+                        cute::make_stride(d_ld, cute::Int<1>{}, cute::_0{}))));
             const auto sub_tiles = [&](auto t) {
                 return cute::flat_divide(
                     cute::local_tile(
@@ -765,6 +793,8 @@ class CollectiveEpilogue {
                 if constexpr (HasAlpha) {
                     alpha = shared_storage.alpha[scheduler.expert_idx()];
                 }
+                const int64_t bcol0 = batch_col0(epilogue_params, scheduler);
+                const int64_t row_shift = bcol0 - (int64_t)rows.lo * d_ld;
                 const int64_t row = (int64_t)rows.row0 + tx;
                 const bool row_ok =
                     row >= (int64_t)rows.lo && row < (int64_t)rows.hi;
@@ -783,7 +813,8 @@ class CollectiveEpilogue {
                             copy_to_regs<
                                 cute::SM100_LOAD_256bit_CACHE_NOALLOCATION>(
                                 *reinterpret_cast<const cute::uint256_t*>(
-                                    epilogue_params.ptr_gate + row * out_n +
+                                    epilogue_params.ptr_gate +
+                                    d_row(epilogue_params, rows, row) + bcol0 +
                                     col0 + i * kE),
                                 reinterpret_cast<uint32_t(&)[kW]>(g[kW * i]));
                         }
@@ -883,10 +914,12 @@ class CollectiveEpilogue {
                                 d[i] = d[i] + static_cast<TypeD>(thr_rC_sub[i]);
                             }
                         }
+                        const auto dst_tile = cute::make_tensor(
+                            dst_sub.data() + row_shift, dst_sub.layout());
                         store_rows(tiled_r2g, src_sub,
-                                   dst_sub((cute::_, cute::_), cute::_, cute::_,
-                                           cute::Int<0>{}, sub_idx, block_m_idx,
-                                           n_idx),
+                                   dst_tile((cute::_, cute::_), cute::_,
+                                            cute::_, cute::Int<0>{}, sub_idx,
+                                            block_m_idx, n_idx),
                                    dst_coords_sub((cute::_, cute::_), cute::_,
                                                   cute::_, cute::Int<0>{},
                                                   sub_idx, block_m_idx, n_idx),
@@ -956,7 +989,8 @@ class CollectiveEpilogue {
                                 uint4* dst = reinterpret_cast<uint4*>(
                                     reinterpret_cast<uint8_t*>(
                                         epilogue_params.ptr_d) +
-                                    row * q_n + col0 + g * kGroup);
+                                    d_row(epilogue_params, rows, row) + bcol0 +
+                                    col0 + g * kGroup);
                                 dst[0] = lo;
                                 dst[1] = hi;
                             }
@@ -987,8 +1021,8 @@ class CollectiveEpilogue {
                     if (row_ok) {
                         *reinterpret_cast<SfWord*>(
                             epilogue_params.ptr_sfd +
-                            sf_atom_offset(row, col0 / kGroup, q_n / kGroup)) =
-                            sf_word;
+                            sf_offset(epilogue_params, rows, row,
+                                      bcol0 + col0)) = sf_word;
                     }
                 }
                 scheduler.advance();

@@ -71,6 +71,20 @@ def ue8m0_to_float32(scale_ue8m0):
     return torch.pow(torch.tensor(2.0, dtype=torch.float32), exp)
 
 
+def ulp_diff(a, b):
+    """Elementwise distance in ulps of two 1- or 2-byte float tensors (sign-
+    magnitude bit patterns mapped to ordered integers)."""
+    bits = 8 * a.element_size()
+    int_dtype = {8: torch.int8, 16: torch.int16}[bits]
+    magnitude = (1 << (bits - 1)) - 1
+
+    def ordered(t):
+        i = t.view(int_dtype).to(torch.int32)
+        return torch.where(i < 0, -(i & magnitude), i)
+
+    return (ordered(a) - ordered(b)).abs()
+
+
 def per_token_cast_to_fp8(x, block_size=32):
     """Quantize an (m, k) bfloat16 tensor to float8_e4m3fn at block_size granularity along k."""
     assert x.dtype == torch.bfloat16

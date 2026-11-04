@@ -97,6 +97,46 @@ CUTE_DEVICE uint32_t e4m3x4(__nv_bfloat162 v0, __nv_bfloat162 v1,
     return cvt(v0) | (cvt(v1) << 16);
 }
 
+// UE8M0 exponent of the smallest power of two >= scale, and 2^-that.
+CUTE_DEVICE uint8_t ue8m0_scale(float scale, float& inv_scale) {
+    const float biased_exp =
+        fminf(fmaxf(ceilf(log2f(scale)) + float(kUe8m0Bias), 0.0f),
+              float(2 * kUe8m0Bias));
+    inv_scale = exp2f(float(kUe8m0Bias) - biased_exp);
+    return static_cast<uint8_t>(biased_exp);
+}
+
+// One MXFP8 group: kGroup values to e4m3 codes and their UE8M0 scale.
+CUTE_DEVICE uint8_t quant_e4m3_group(const float (&v)[kGroup],
+                                     uint4 (&codes)[2]) {
+    float amax = kAmaxFloor;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kGroup; ++i) amax = fmaxf(amax, fabsf(v[i]));
+    float inv_scale;
+    const uint8_t e = ue8m0_scale(amax / kE4m3Max, inv_scale);
+    auto* pairs = reinterpret_cast<uint16_t*>(codes);
+    const auto clamp = [](float x) {
+        return fminf(fmaxf(x, -kE4m3Max), kE4m3Max);
+    };
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kGroup; i += 2) {
+        pairs[i / 2] = __nv_cvt_float2_to_fp8x2(
+            make_float2(clamp(v[i] * inv_scale), clamp(v[i + 1] * inv_scale)),
+            __NV_SATFINITE, __NV_E4M3);
+    }
+    return e;
+}
+
+// Packs the scale bytes of 4 adjacent lanes (kb % 4 == 0 .. 3 of one row) into
+// the SfAtom word the first of them stores.
+CUTE_DEVICE uint32_t sf_quad_word(uint8_t e) {
+    const uint32_t mask = 0xfu << (cutlass::canonical_lane_idx() & ~3u);
+    uint32_t w = e;
+    w |= __shfl_down_sync(mask, w, 1, kAtomCols) << 8;
+    w |= __shfl_down_sync(mask, w, 2, kAtomCols) << 16;
+    return w;
+}
+
 CUTE_DEVICE int64_t sf_atom_offset(int64_t row, int kb, int kb_dim) {
     const int r = row % kAtomRows;
     return ((row / kAtomRows) * (kb_dim / kAtomCols) + kb / kAtomCols) *

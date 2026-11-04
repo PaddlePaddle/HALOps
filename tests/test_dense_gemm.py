@@ -305,6 +305,30 @@ def test_gemm_situ_quant(m, n, k, with_bias, beta, linear_beta):
     assert (err <= ref.abs() * E4M3_REL_ULP + scale * E4M3_MIN_SUBNORMAL).all()
 
 
+@pytest.mark.parametrize("epilogue", [EpilogueOp.Identity, EpilogueOp.SituQuant])
+@pytest.mark.parametrize("m, n, k", [(1344, 16384, 1024), (100, 7168, 512)])
+def test_gemm_no_out_of_bounds_write(m, n, k, epilogue):
+    """Output and scale tensors are views of larger sentinel-filled buffers;
+    the bytes past the views must stay untouched."""
+    args, _, _, _ = make_mode_inputs("w8a8-mxfp8", m, n, k)
+    guard = 128
+    sentinel = 0x5A
+    quant = epilogue == EpilogueOp.SituQuant
+    out_n = n // 2 if quant else n
+    dtype = torch.float8_e4m3fn if quant else torch.bfloat16
+    out_buf = torch.full(
+        [(m + guard) * out_n * dtype.itemsize], sentinel, dtype=torch.uint8
+    )
+    out = out_buf[: m * out_n * dtype.itemsize].view(dtype).view(m, out_n)
+    sf_len = sfatom_rows(m) * out_n // FP8_BLOCK_SIZE
+    sf_buf = torch.full([sf_len + guard], sentinel, dtype=torch.uint8)
+    sf = sf_buf[:sf_len] if quant else None
+    dense_gemm(*args, out, None, None, -1, "w8a8-mxfp8", True, epilogue, sf)
+    torch.cuda.synchronize()
+    assert (out_buf[m * out_n * dtype.itemsize :] == sentinel).all()
+    assert (sf_buf[sf_len:] == sentinel).all()
+
+
 # =====================================================================
 # W4A4 (NVFP4) tests
 # =====================================================================

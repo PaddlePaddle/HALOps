@@ -115,10 +115,23 @@ void LowLatencyMmaGemm(const torch::Tensor& input, const torch::Tensor& weight,
                        const int sm_count, const bool use_pdl,
                        const bool use_sigmoid);
 
-std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
-                                          const std::string& mode,
-                                          const bool use_swizzle,
-                                          const bool use_pdl);
+std::vector<torch::Tensor> GroupWiseQuant(
+    const torch::Tensor& input, const std::string& mode, const bool use_swizzle,
+    const bool use_pdl, const std::optional<torch::Tensor>& output_quant,
+    const std::optional<torch::Tensor>& output_sf);
+
+std::vector<torch::Tensor> RmsNormQuant(
+    const torch::Tensor& input, const torch::Tensor& weight, const double eps,
+    const bool use_pdl, const std::optional<torch::Tensor>& output_quant,
+    const std::optional<torch::Tensor>& output_sf,
+    const std::optional<torch::Tensor>& output_bf16);
+
+std::vector<torch::Tensor> VhaPostmixQuant(
+    const torch::Tensor& o, const torch::Tensor& mix,
+    const torch::Tensor& freqs, const torch::Tensor& positions,
+    const int64_t groups, const bool group_major, const bool use_pdl,
+    const std::optional<torch::Tensor>& output_quant,
+    const std::optional<torch::Tensor>& output_sf);
 
 std::vector<torch::Tensor> PrefillPermuteToMaskedGemm(
     const torch::Tensor& x, const torch::Tensor& scale,
@@ -244,7 +257,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("use_pdl") = true, py::arg("use_sigmoid") = false);
     m.def("group_wise_quant", &halops::GroupWiseQuant, py::arg("input"),
           py::arg("mode"), py::arg("use_swizzle") = true,
-          py::arg("use_pdl") = true);
+          py::arg("use_pdl") = true, py::arg("output_quant") = py::none(),
+          py::arg("output_sf") = py::none());
+    m.def("rms_norm_quant", &halops::RmsNormQuant, py::arg("input"),
+          py::arg("weight"), py::arg("eps"), py::arg("use_pdl") = true,
+          py::arg("output_quant") = py::none(),
+          py::arg("output_sf") = py::none(),
+          py::arg("output_bf16") = py::none());
     m.def("prefill_permute_to_masked_gemm",
           &halops::PrefillPermuteToMaskedGemm);
     m.def("fused_swiglu_quant", &halops::FusedSwigluQuant);
@@ -254,6 +273,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mla_attention", &halops::MlaAttention);
     m.def("combine_with_rope_quant", &halops::CombineWithRopeQuant);
     m.def("mla_output_proj", &halops::MlaOutputProj);
+    m.def("vha_postmix_quant", &halops::VhaPostmixQuant, py::arg("o"),
+          py::arg("mix"), py::arg("freqs"), py::arg("positions"),
+          py::arg("groups"), py::arg("group_major") = true,
+          py::arg("use_pdl") = true, py::arg("output_quant") = py::none(),
+          py::arg("output_sf") = py::none());
 
     m.def("low_latency_moe", &halops::LowLatencyMoE);
     m.def("moe_get_workspace", &halops::GetWorkspace, py::arg("input"));

@@ -36,8 +36,8 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
                 "input must be a 3D tensor of shape [B, M, K]");
     TORCH_CHECK(weight.dim() == 3,
                 "weight must be a 3D tensor of shape [B, N, K]");
-    TORCH_CHECK(output.dim() == 3,
-                "output must be a 3D tensor of shape [B, M, N]");
+    TORCH_CHECK(output.dim() == 2,
+                "output must be a 2D tensor of shape [M, B * N]");
 
     const int batches = input.size(0);
     const int m = input.size(1);
@@ -45,9 +45,11 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
     TORCH_CHECK(weight.size(0) == batches,
                 "weight batch dim must match input batch dim, got ",
                 weight.size(0));
+    TORCH_CHECK(output.size(0) == m && output.size(1) == int64_t(batches) * n,
+                "output shape must be [M, B * N]");
     TORCH_CHECK(
-        output.size(0) == batches && output.size(1) == m && output.size(2) == n,
-        "output shape must be [B, M, N]");
+        !output_sf.has_value() || n % (mxfp8::kGroup * mxfp8::kAtomCols) == 0,
+        "quantized output needs N % 128 == 0, got ", n);
 
     // sfa/sfb: [B*M, sf_k] or [B, M, sf_k] -- same underlying memory.
 
