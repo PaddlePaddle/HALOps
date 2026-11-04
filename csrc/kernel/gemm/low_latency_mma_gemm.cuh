@@ -33,13 +33,14 @@ struct LlTile : LlGemmConfig {
     static constexpr int KRowsA = RowsA;
     static constexpr int KStages = Stages;
     static constexpr int KAAtoms = RowsA / KAtomRows;
-    static constexpr bool KSwapAB = ll_swap_ab(RowsA, KWarpsN);
+    static constexpr int KPair = ll_warp_pair(KWarpsN);
+    static constexpr bool KSwapAB = RowsA == KAtomRows && KPair > 1;
     // Accumulator floats per lane.
     static constexpr int KOuts = 2 * KAAtoms;
     static constexpr int KATileBytes = KAAtoms * KAtomBytes;
     static constexpr int KBPhaseBytes = KBPhaseGroups * KWarpsN * KAtomBytes;
     static constexpr int KAccCols = KAccStages * KWarpsN;
-    static constexpr int KAccSplits = WarpsK * (KSwapAB ? KMaxM / KMmaN : 1);
+    static constexpr int KAccSplits = WarpsK * KPair;
     static constexpr int KAccSlot = KAccSplits * 32 * KOuts;
     // Warps: consumers, one producer, then KWarpsN epilogue warps.
     static constexpr int KConsumerWarps = KWarpsN * WarpsK;
@@ -260,13 +261,12 @@ __device__ __forceinline__ void ll_consumer_warp(const LlGemmParams& params,
     Barrier* const b_full = smem.b_full + warp_k * Tile::KStages;
     const uint8_t* const b_ring =
         smem.b_rings + warp_k * Tile::KStages * Tile::KBPhaseBytes;
-    const int sfb_col = warp_n * Tile::KMmaN + 2 * col;
     constexpr bool KSwap = Tile::KSwapAB;
-    constexpr int KPair = KSwap ? Tile::KMaxM / Tile::KMmaN : 1;
-    constexpr int KGroups = Tile::KScaleGroups / KPair;
+    constexpr int KPair = Tile::KPair;
+    constexpr int KMmas = KSwap ? 1 : KPair;
     const int pair_rank = warp_n % KPair;
     const int pair_warp_n = warp_n - pair_rank;
-    const int group0 = pair_rank * KGroups;
+    const int sfb_col = pair_warp_n * Tile::KMmaN + 2 * col;
     const int swap_n = pair_warp_n * Tile::KMmaN + row;
 
     cutlass::PipelineState<Tile::KStages> b_state;
@@ -301,8 +301,8 @@ __device__ __forceinline__ void ll_consumer_warp(const LlGemmParams& params,
             __syncwarp();
 
 #pragma unroll
-            for (int sub_block = 0; sub_block < Tile::KBPhaseGroups;
-                 ++sub_block) {
+            for (int i = 0; i < Tile::KBPhaseGroups / KPair; ++i) {
+                const int sub_block = i * KPair + pair_rank;
                 const int block = split_block0 + phase_block + sub_block;
                 const uint8_t* const tile_a =
                     smem.a_resident + block * Tile::KATileBytes;
@@ -313,31 +313,29 @@ __device__ __forceinline__ void ll_consumer_warp(const LlGemmParams& params,
                 const uint8_t* const mma_a = KSwap ? tile_b : tile_a;
                 const uint8_t* const mma_b = KSwap ? tile_a : tile_b;
 
-                float acc[KGroups][4] = {};
+                float acc[Tile::KScaleGroups][KMmas][4] = {};
 #pragma unroll
-                for (int g = 0; g < KGroups; ++g) {
-                    const int group = group0 + g;
+                for (int group = 0; group < Tile::KScaleGroups; ++group) {
                     const uint2 a_top = ll_lds_atom(mma_a, row, col, group);
                     uint2 a_bottom = make_uint2(0u, 0u);
                     if constexpr (KSwap || Tile::KRowsA == 16)
                         a_bottom = ll_lds_atom(mma_a + Tile::KAtomBytes, row,
                                                col, group);
-                    const uint2 b_words = ll_lds_atom(mma_b, row, col, group);
                     const uint32_t frag_a[4] = {a_top.x, a_bottom.x, a_top.y,
                                                 a_bottom.y};
-                    const uint32_t frag_b[2] = {b_words.x, b_words.y};
-                    mma_m16n8k32_e4m3(acc[g], frag_a, frag_b);
+#pragma unroll
+                    for (int j = 0; j < KMmas; ++j) {
+                        const uint2 b_words = ll_lds_atom(
+                            mma_b + j * Tile::KAtomBytes, row, col, group);
+                        const uint32_t frag_b[2] = {b_words.x, b_words.y};
+                        mma_m16n8k32_e4m3(acc[group][j], frag_a, frag_b);
+                    }
                 }
 
-                if (first_tile && block == split_block0) smem.sfa_full->wait(0);
+                if (first_tile && block == split_block0 + pair_rank)
+                    smem.sfa_full->wait(0);
                 const int32_t* const sfa_row = smem.sfa_resident + block;
                 const int32_t* const sfb_row = sfb + sfb_offset + block;
-                const uint32_t col_word0 =
-                    KSwap ? sfa_row[2 * col * smem.sfa_pitch]
-                          : sfb_row[sfb_col * sfb_pitch];
-                const uint32_t col_word1 =
-                    KSwap ? sfa_row[(2 * col + 1) * smem.sfa_pitch]
-                          : sfb_row[(sfb_col + 1) * sfb_pitch];
                 const uint32_t row_word_top =
                     KSwap ? sfb_row[swap_n * sfb_pitch]
                           : sfa_row[row * smem.sfa_pitch];
@@ -345,21 +343,34 @@ __device__ __forceinline__ void ll_consumer_warp(const LlGemmParams& params,
                     KSwap ? sfb_row[(swap_n + Tile::KMmaN) * sfb_pitch]
                           : sfa_row[(row + Tile::KAtomRows) * smem.sfa_pitch];
 #pragma unroll
-                for (int g = 0; g < KGroups; ++g) {
-                    const int group = group0 + g;
-                    const float col_scale0 =
-                        decode_packed_ue8m0_word(col_word0, group);
-                    const float col_scale1 =
-                        decode_packed_ue8m0_word(col_word1, group);
-                    const float row_scale_top =
-                        decode_packed_ue8m0_word(row_word_top, group);
-                    out[0] += acc[g][0] * (row_scale_top * col_scale0);
-                    out[1] += acc[g][1] * (row_scale_top * col_scale1);
-                    if constexpr (KSwap || Tile::KRowsA == 16) {
-                        const float row_scale_bottom =
-                            decode_packed_ue8m0_word(row_word_bottom, group);
-                        out[2] += acc[g][2] * (row_scale_bottom * col_scale0);
-                        out[3] += acc[g][3] * (row_scale_bottom * col_scale1);
+                for (int j = 0; j < KMmas; ++j) {
+                    const int n = sfb_col + j * Tile::KMmaN;
+                    const uint32_t col_word0 =
+                        KSwap ? sfa_row[2 * col * smem.sfa_pitch]
+                              : sfb_row[n * sfb_pitch];
+                    const uint32_t col_word1 =
+                        KSwap ? sfa_row[(2 * col + 1) * smem.sfa_pitch]
+                              : sfb_row[(n + 1) * sfb_pitch];
+                    float* const o = out + j * Tile::KOuts;
+#pragma unroll
+                    for (int group = 0; group < Tile::KScaleGroups; ++group) {
+                        const float col_scale0 =
+                            decode_packed_ue8m0_word(col_word0, group);
+                        const float col_scale1 =
+                            decode_packed_ue8m0_word(col_word1, group);
+                        const float row_scale_top =
+                            decode_packed_ue8m0_word(row_word_top, group);
+                        o[0] += acc[group][j][0] * (row_scale_top * col_scale0);
+                        o[1] += acc[group][j][1] * (row_scale_top * col_scale1);
+                        if constexpr (KSwap || Tile::KRowsA == 16) {
+                            const float row_scale_bottom =
+                                decode_packed_ue8m0_word(row_word_bottom,
+                                                         group);
+                            o[2] += acc[group][j][2] *
+                                    (row_scale_bottom * col_scale0);
+                            o[3] += acc[group][j][3] *
+                                    (row_scale_bottom * col_scale1);
+                        }
                     }
                 }
             }
@@ -377,19 +388,19 @@ __device__ __forceinline__ void ll_consumer_warp(const LlGemmParams& params,
                 acc_state.index() * Tile::KWarpsN + pair_warp_n + half;
             (smem.acc_empty + acc_col)->wait(acc_state.phase());
             float* const slot = smem.acc_slots + acc_col * Tile::KAccSlot;
+            const int split = warp_k * KPair + pair_rank;
+            const float* const o = out + half * Tile::KOuts;
             if constexpr (KSwap) {
-                const int split = warp_k * KPair + pair_rank;
 #pragma unroll
                 for (int t = 0; t < Tile::KOuts; ++t)
                     slot[split * 32 * Tile::KOuts +
-                         (2 * col + t) * Tile::KMmaN + row] =
-                        out[half * Tile::KOuts + t];
+                         (2 * col + t) * Tile::KMmaN + row] = o[t];
             } else if constexpr (Tile::KOuts == 4) {
-                *reinterpret_cast<float4*>(slot + (warp_k * 32 + lane) * 4) =
-                    make_float4(out[0], out[1], out[2], out[3]);
+                *reinterpret_cast<float4*>(slot + (split * 32 + lane) * 4) =
+                    make_float4(o[0], o[1], o[2], o[3]);
             } else {
-                *reinterpret_cast<float2*>(slot + (warp_k * 32 + lane) * 2) =
-                    make_float2(out[0], out[1]);
+                *reinterpret_cast<float2*>(slot + (split * 32 + lane) * 2) =
+                    make_float2(o[0], o[1]);
             }
             __syncwarp();
             if (lane == 0) (smem.acc_full + acc_col)->arrive();
@@ -554,7 +565,9 @@ inline void LaunchLlKernel(LlGemmParams params, const LlTileSpec& tile,
                            bool use_sigmoid, cudaStream_t stream) {
     EncodeLlTmaDescs(params, tile.block_n);
     // An idle CTA would exit with its sfa bulk copy in flight.
-    const int grid = std::clamp(num_sms, 1, params.n / tile.block_n);
+    const int n_tiles = params.n / tile.block_n;
+    const int waves = (n_tiles + num_sms - 1) / num_sms;
+    const int grid = (n_tiles + waves - 1) / waves;
     const int smem_bytes =
         ll_smem_plan(tile.block_n / LlGemmConfig::KMmaN, tile.warps_k, rows_a,
                      params.k, params.k1, tile.stages)
