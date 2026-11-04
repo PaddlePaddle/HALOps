@@ -380,6 +380,12 @@ struct UmmaCore {
                                bool accumulate = false) {
         static_assert(kUseBlockscaled,
                       "the scale-factor run overload is the MXFP8 one");
+        // An SF address's top two bits are its scale-factor ID, which the
+        // instruction descriptor carries.  The staging sits at lane 0, ID 0,
+        // so only the column field is set; saying so lets each K mode's ID
+        // fold into a constant descriptor instead of being rebuilt per MMA.
+        sfa_addr &= 0xFFFFu;
+        sfb_addr &= 0xFFFFu;
         // Each M atom is its own instruction with its own SFA slab, so both
         // the A tile and the accumulator step atom by atom.
         constexpr std::uint32_t kAtomOperandElems = kAtomShapeM * kTileShapeK;

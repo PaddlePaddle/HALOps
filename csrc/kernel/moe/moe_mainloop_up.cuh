@@ -435,7 +435,9 @@ struct UpProjection {
         const typename UpGemm::ElementScale* __restrict__ up_scale,
         std::uint32_t weight_row_base, std::uint32_t task_id,
         std::uint32_t expert_id, std::uint64_t weight_cache_hint) {
-#pragma unroll
+        // Rolled: unrolled, the K-iterations are kNumTilesK copies of the
+        // TMA issue, code a launch with a cold L2 fetches from DRAM.
+#pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < kNumTilesK; ++k_iter_id) {
             const std::uint32_t ring_iter_id = task_id * kNumTilesK + k_iter_id;
             wait_weight_empty(smem, ring_iter_id);
@@ -552,6 +554,8 @@ struct UpProjection {
                     sfa, sfb, tmem_addr(tmem_base, 0u, kUpSfaTmemOffset),
                     tmem_addr(tmem_base, 0u, kUpSfbTmemOffset));
             }
+        }
+        if constexpr (UpGemm::MmaCore::kUseBlockscaled) {
             UpGemm::MmaCore::run(
                 tiled_mma, cta_mma,
                 reinterpret_cast<WeightElement*>(

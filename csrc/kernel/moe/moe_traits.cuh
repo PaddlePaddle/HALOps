@@ -462,11 +462,10 @@ struct MoEKernelTraits {
     // Whether the projection quantizes its own output.  The output is the up
     // phase's B operand, so it follows that GEMM's activation recipe: the
     // wholesale copy below expects the projection's image of both recipes.
-    static constexpr bool kLatentQuantizeOutput =
-        kUseLatent && Dims::KernelConfig::kLatentQuantizeOutput;
-    // The projection meets in a cluster for its scale or split reduction.
+    // The projection quantizes its output in a cluster, for its scale or
+    // split reduction.
     static constexpr std::uint32_t kLatentScaleCluster =
-        kLatentQuantizeOutput ? LatentDownGemm::kClusterSize : 1u;
+        kUseLatent ? LatentDownGemm::kClusterSize : 1u;
     static constexpr std::uint32_t kLatentClusterSize =
         LatentDownGemm::kNumSplits > kLatentScaleCluster
             ? LatentDownGemm::kNumSplits
@@ -491,11 +490,6 @@ struct MoEKernelTraits {
         Dims::KernelConfig::kNumRouterInputSlots;
     static constexpr std::uint32_t kLatentInputSlots =
         Dims::KernelConfig::kNumLatentInputSlots;
-    static constexpr std::uint32_t kUpInputSlots =
-        Dims::KernelConfig::kNumUpInputSlots;
-    static_assert(RouterGemm::kTileShapeN <=
-                      (kUpInputSlots * RouterGemm::kTileShapeK),
-                  "the up ring must hold the latent output");
 
     static constexpr std::uint32_t kNumRouterWeightSlots =
         RouterGemm::kNumWeightSlots;

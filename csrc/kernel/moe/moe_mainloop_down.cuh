@@ -100,7 +100,6 @@ __device__ inline void load_down_weight_scale_per_expert(
     }
 }
 
-// Down-projection for the SM100 (tcgen05 / UMMA) backend.
 template <typename KernelTraits>
 struct DownProjection {
     using Traits = KernelTraits;
@@ -446,7 +445,8 @@ struct DownProjection {
         std::uint32_t base_m, std::uint64_t weight_cache_hint) {
         const std::uint32_t ring_iter_id = id_base + local_id;
 
-#pragma unroll
+        // Rolled, like the other down K loops (see run_mma_k_loop).
+#pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < kNumTilesK; ++k_iter_id) {
             const std::uint32_t slot = (local_id + k_iter_id) % kNumWeightSlots;
             wait_down_weight_empty(smem, id_base, ring_iter_id + k_iter_id,
@@ -495,7 +495,8 @@ struct DownProjection {
                                         Workspace::kUpOutReadyFull);
         KERNEL_TIMER_END(smem->timer(), up_out_span);
 
-#pragma unroll
+        // Rolled, like the other down K loops (see run_mma_k_loop).
+#pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < kNumTilesK; ++k_iter_id) {
             wait_activation_empty(smem, id_base + local_id + k_iter_id);
             prefetch_down_activation(smem, workspace, tma_down_activations_desc,
@@ -520,7 +521,10 @@ struct DownProjection {
                               cute::GenRowMajor{})));
         cute::Tensor tCt = cta_mma.make_fragment_C(tC_proxy);
 
-#pragma unroll
+        // Rolled: unrolled, each K step is its own copy of the scale staging
+        // and UMMA issue, with every slot's descriptors held in registers, and
+        // a launch with a cold L2 fetches all of that code from DRAM.
+#pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < kNumTilesK; ++k_iter_id) {
             const std::uint32_t step_id = ring_iter_id + k_iter_id;
             const std::uint32_t step_local = local_id + k_iter_id;
@@ -562,10 +566,7 @@ struct DownProjection {
         cutlass::Array<float, DownGemm::kTileShapeN>& acc_out,
         unsigned m_tile_idx, unsigned lane_base, std::uint32_t tmem_base,
         std::uint32_t ring_iter_id, std::uint32_t local_id) {
-        // A wide tile's drain is a long TMEM-read chain; two unrolled copies
-        // cover it and stay small.
-        constexpr std::uint32_t kDrainUnroll = Dims::kNumTokens > 8u ? 2u : 8u;
-#pragma unroll(kDrainUnroll)
+#pragma unroll 1
         for (std::uint32_t k_iter_id = 1; k_iter_id <= kNumTilesK;
              ++k_iter_id) {
             dequant(smem, ring_iter_id + k_iter_id, acc_out, m_tile_idx,
@@ -620,8 +621,6 @@ struct DownProjection {
         const typename DownGemm::ElementScale* __restrict__ down_scale,
         std::uint32_t expert_id, std::uint32_t base_m, std::uint32_t slot,
         std::uint32_t k_iter_id, std::uint64_t weight_cache_hint) {
-        const auto prefetch_span = KERNEL_TIMER_BEGIN(
-            smem->timer(), "down_prefetch_weights", k_iter_id);
         smem->barriers.down_weight_ready.arrive(slot, kDownWeightTxBytes);
         // A 4-bit weight's coordinates count values too: the box is the same
         // 128 N (64 B of packed gmem), landing as the same SW128 box.
@@ -659,7 +658,6 @@ struct DownProjection {
                             smem->barriers.down_weight_ready.raw(slot));
             }
         }
-        KERNEL_TIMER_END(smem->timer(), prefetch_span);
     }
 
     // Issue the bulk activation TMA for one N-step; a zero-row expert arms
@@ -670,8 +668,6 @@ struct DownProjection {
         std::uint32_t expert_start, std::uint32_t routed_count,
         std::uint32_t step_local, std::uint32_t k_iter_id) {
         const std::uint32_t slot = step_local % kNumWeightSlots;
-        const auto prefetch_span = KERNEL_TIMER_BEGIN(
-            smem->timer(), "down_prefetch_activation", k_iter_id);
         if (routed_count > 0u) {
             if constexpr (DownGemm::MmaCore::kUseBlockscaled) {
                 // Pack this K tile's SfAtom slab from the plain UE8M0 image.
@@ -711,7 +707,6 @@ struct DownProjection {
                 &smem->routed_experts.up_down_act.act_down_input[slot][0],
                 smem->barriers.activation_ready.raw(slot));
         }
-        KERNEL_TIMER_END(smem->timer(), prefetch_span);
     }
 
     // Hold arm `arm_id` until its previous occupant, arm_id -

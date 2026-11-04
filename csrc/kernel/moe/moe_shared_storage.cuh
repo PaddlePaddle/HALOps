@@ -173,17 +173,12 @@ struct MoEBarriers {
     // RoutedUp
     TransactionBarrier<kNumUpWeightSlots> up_weight_ready;
 
-    SimpleBarrier<1> up_input_ready;
     // The up phase's fp8 staging, one slot per K tile.
     static constexpr std::uint32_t kNumUpStagingSlots =
         MoEKernelTraits<Dims>::UpGemm::kNumTilesK;
     SimpleBarrier<kNumUpStagingSlots> up_staging_ready;
-    static constexpr std::uint32_t kNumUpInputSlots =
-        MoEKernelTraits<Dims>::kUpInputSlots;
-    // One bulk copy of the whole projection output, when the ring holds it.
+    // One bulk copy of the whole projection output.
     TransactionBarrier<1> latent_copy_ready;
-    TransactionBarrier<kNumUpInputSlots> up_input_slot_ready;
-    SimpleBarrier<kNumUpInputSlots> up_input_slot_empty;
 
     SimpleBarrier<kNumScaleSlots> weight_scale_ready;
     SimpleBarrier<kNumScaleSlots> weight_scale_empty;
@@ -263,11 +258,8 @@ struct MoEBarriers {
 
     __device__ __forceinline__ void init_expert_ring() {
         const int num_warps = static_cast<int>(WarpRole::kCalcWarpCount);
-        up_input_ready.init(num_warps);
         up_staging_ready.init(1);
         latent_copy_ready.init(1);
-        up_input_slot_ready.init(1);
-        up_input_slot_empty.init(num_warps);
         up_weight_ready.init(1);
         down_weight_ready.init(1);
         activation_ready.init(1);
@@ -497,11 +489,8 @@ struct LatentDownSmem {
         w_latent_down_scale;
 
     static constexpr std::uint32_t kNumOutChunks =
-        Select<Traits::kLatentQuantizeOutput,
-               LatentDownGemm::kTileShapeM / kFp8ActChunkK, 1u>::value;
-    static constexpr std::uint32_t kNumOutRows =
-        Select<Traits::kLatentQuantizeOutput, LatentDownGemm::kTileShapeN,
-               1u>::value;
+        LatentDownGemm::kTileShapeM / kFp8ActChunkK;
+    static constexpr std::uint32_t kNumOutRows = LatentDownGemm::kTileShapeN;
     alignas(16)
         DataType::ElementA out_bf16[kNumOutChunks][kNumOutRows][kFp8ActChunkK];
     alignas(16) float token_amax[kNumOutRows];
@@ -590,13 +579,7 @@ struct RoutedExpertsSmem {
             act_down_input[DownGemm::kNumWeightSlots][kNumDownActElems];
     };
 
-    static constexpr std::uint32_t kUpInputSlots =
-        Select<Traits::kLatentQuantizeOutput, 1u, Traits::kUpInputSlots>::value;
-    union {
-        ActivationSmem<kUpInputSlots, UpGemm::kTileShapeN, UpGemm::kTileShapeK>
-            input;
-        UpDownActivation up_down_act;
-    };
+    UpDownActivation up_down_act;
 
     static constexpr std::uint32_t kNumStagingSlots = UpGemm::kNumTilesK;
     QuantizedActivationSmem<kNumStagingSlots, UpGemm::kTileShapeN,

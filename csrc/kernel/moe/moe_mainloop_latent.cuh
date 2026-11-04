@@ -499,19 +499,13 @@ struct LatentDownProjection {
                 if (split_idx() == 0u) {
                     writeback(workspace, smem, acc);
                 }
-                if constexpr (Traits::kLatentQuantizeOutput) {
-                    WarpRole::sync_calc_threads();
-                } else if (split_idx() == 0u) {
-                    publish(workspace, smem);
-                }
+                WarpRole::sync_calc_threads();
             }
             // The rendezvous region is reusable once every block has read it.
             __syncthreads();
             cluster_arrive_and_wait();
         }
-        if constexpr (Traits::kLatentQuantizeOutput) {
-            finish_quantized_output(workspace, smem, batch_size);
-        }
+        finish_quantized_output(workspace, smem, batch_size);
     }
 
     __device__ static void run_mma_k_loop(SharedStorage* __restrict__ smem,
@@ -661,11 +655,7 @@ struct LatentDownProjection {
             store_split_share(smem, acc);
         } else {
             writeback(workspace, smem, acc);
-            if constexpr (Traits::kLatentQuantizeOutput) {
-                WarpRole::sync_calc_threads();
-            } else {
-                publish(workspace, smem);
-            }
+            WarpRole::sync_calc_threads();
         }
     }
 
@@ -824,12 +814,7 @@ struct LatentDownProjection {
                 const __nv_bfloat16 value = __float2bfloat16_rn(acc[g][i]);
                 const std::uint32_t row_local =
                     row + 8u * (i / 2u) - row_base();
-                if constexpr (Traits::kLatentQuantizeOutput) {
-                    stash_output(smem, row_local, tok_local + i % 2u, value);
-                } else {
-                    workspace->latent_down_out.store(
-                        tok + i % 2u, row_base() + row_local, value);
-                }
+                stash_output(smem, row_local, tok_local + i % 2u, value);
             }
         }
         KERNEL_TIMER_END(smem->timer(), store_span);
