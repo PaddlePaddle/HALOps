@@ -756,6 +756,7 @@ plain row-major scale layout.</p></li>
 <dd><em class="sig-param"><span class="n"><span class="pre">output2</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">sm_count</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_sigmoid</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="headerlink" href="#halops.low_latency_mma_gemm" title="Link to this definition">¶</a></dt>
@@ -795,6 +796,8 @@ N2 % 8 == 0.</p></li>
 combinable with <code class="docutils literal notranslate"><span class="pre">input2</span></code>.</p></li>
 <li><p><strong>sm_count</strong> (<em>int</em>) – Number of SMs to use (-1 for all available).</p></li>
 <li><p><strong>use_pdl</strong> (<em>bool</em>) – Enable Programmatic Dependent Launch (on by default).</p></li>
+<li><p><strong>use_sigmoid</strong> (<em>bool</em>) – Write <code class="docutils literal notranslate"><span class="pre">torch.sigmoid</span></code> of the bf16 result instead.
+Not combinable with <code class="docutils literal notranslate"><span class="pre">input2</span></code> or <code class="docutils literal notranslate"><span class="pre">output2</span></code>.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
