@@ -44,12 +44,15 @@ struct CollectiveMainloopMoE {
     using Router = RouterProjection<KernelTraits, Traits::RouterGemm::kUseUmma>;
     using Latent = LatentDownProjection<KernelTraits>;
 
-    // The routing tables as the 8-B words they travel between blocks in.
+    // The routing tables as the 4-B words they travel between blocks in.
     static constexpr std::uint32_t kRoutingTableWords =
         static_cast<std::uint32_t>(sizeof(MoERoutingTables<Dims>) /
-                                   sizeof(uint2));
-    static_assert(sizeof(MoERoutingTables<Dims>) % sizeof(uint2) == 0u,
-                  "the routing tables travel as whole 8-B words");
+                                   sizeof(std::uint32_t));
+    static_assert(sizeof(MoERoutingTables<Dims>) % sizeof(std::uint32_t) == 0u,
+                  "the routing tables travel as whole 4-B words");
+    static_assert(Workspace::CtaComm::kRouterTableSlices ==
+                      WarpRole::kThreadsPerWarp,
+                  "one table slice per lane of the copying warp");
 
     // Host-side launch arguments: one member per runtime tensor plus the launch
     // scalars.
@@ -125,7 +128,6 @@ struct CollectiveMainloopMoE {
         void* __restrict__ scratchpad;
         std::uint64_t* timer_events;
         std::uint32_t top_k;
-        cutlass::FastDivmod topk_divmod;
         ScoringFunc scoring_func;
         bool renormalize;
         Activation activation;
@@ -136,6 +138,8 @@ struct CollectiveMainloopMoE {
         std::uint32_t l2_expert_capacity;
         alignas(128) CUtensorMap tma_up_weights_desc;
         alignas(128) CUtensorMap tma_input_desc;
+        // The same input, one box per K tile, for the router and latent.
+        alignas(128) CUtensorMap tma_input_chunks_desc;
         alignas(128) CUtensorMap tma_down_weights_desc;
         alignas(128) CUtensorMap tma_down_activations_desc;
         alignas(128) CUtensorMap tma_latent_down_weight_desc;
@@ -167,7 +171,6 @@ struct CollectiveMainloopMoE {
         params.scratchpad = args.workspace;
         params.timer_events = args.timer_events;
         params.top_k = args.top_k;
-        params.topk_divmod = cutlass::FastDivmod(static_cast<int>(args.top_k));
         params.scoring_func = args.scoring_func;
         params.renormalize = args.renormalize;
         params.activation = args.activation;
@@ -191,6 +194,9 @@ struct CollectiveMainloopMoE {
         params.tma_input_desc = CreateTmaDesc2D(
             "activations", args.input, args.num_tokens, Dims::kHiddenSize,
             /*box_rows=*/8u, /*box_cols=*/64u);
+        params.tma_input_chunks_desc =
+            CreateTmaDescChunks3D("activations (K tiles)", args.input,
+                                  args.num_tokens, Dims::kHiddenSize);
         params.tma_up_weights_desc = CreateTmaDesc2D(
             "up-projection weights", args.expert_up_weights,
             /*rows=*/Dims::kNumExperts * 2u * Dims::kIntermediateSize,
@@ -237,7 +243,8 @@ struct CollectiveMainloopMoE {
                                     SharedStorage* __restrict__ smem) {
         if constexpr (Traits::kUseLatent) {
             Latent::run(params.tma_latent_down_weight_desc,
-                        params.tma_input_desc, params.latent_down_weight_scale,
+                        params.tma_input_chunks_desc,
+                        params.latent_down_weight_scale,
                         reinterpret_cast<Workspace*>(params.scratchpad), smem,
                         static_cast<std::uint32_t>(params.num_tokens));
         }
@@ -253,7 +260,7 @@ struct CollectiveMainloopMoE {
             params.shared_down_scale, params.shared_out,
             reinterpret_cast<Workspace*>(params.scratchpad), smem,
             static_cast<std::uint32_t>(params.num_tokens), params.activation,
-            GatedActParams{params.situ_beta, params.situ_linear_beta});
+            params.situ_beta, params.situ_linear_beta);
     }
 
     // Phase 0c: the router Linear on this block's expert tiles, then this
@@ -368,8 +375,8 @@ struct CollectiveMainloopMoE {
         Workspace* __restrict__ workspace =
             reinterpret_cast<Workspace*>(params.scratchpad);
         if (Router::is_router_cta()) {
-            Router::run(params.router_weight, params.tma_input_desc, workspace,
-                        smem, params.scoring_func);
+            Router::run(params.router_weight, params.tma_input_chunks_desc,
+                        workspace, smem, params.scoring_func);
         }
 
         // Only the router's own blocks run the selection and build the routing
@@ -386,7 +393,7 @@ struct CollectiveMainloopMoE {
                 const auto tables_span =
                     KERNEL_TIMER_BEGIN(smem->timer(), "prepare_routing_tables");
                 prepare_routing_tables<Dims>(params.num_tokens, params.top_k,
-                                             params.topk_divmod, smem);
+                                             smem);
                 KERNEL_TIMER_END(smem->timer(), tables_span);
                 // Block 0 hands its finished tables to the other blocks.
                 if (blockIdx.x == 0u) {
@@ -397,13 +404,6 @@ struct CollectiveMainloopMoE {
                    WarpRole::get_calc_warp_idx() == 0u) {
             // After the projection: one warp copies block 0's tables, and it
             // does not contend with the projection's own warps.
-            if (lane_idx == 0u) {
-                const auto wait_span =
-                    KERNEL_TIMER_BEGIN(smem->timer(), "router_wait_tables");
-                workspace->cta_comm.wait_router_tables(smem->launch_parity);
-                KERNEL_TIMER_END(smem->timer(), wait_span);
-            }
-            __syncwarp();
             const auto load_span =
                 KERNEL_TIMER_BEGIN(smem->timer(), "load_routing_tables");
             load_routing_tables(workspace, smem, lane_idx);
@@ -411,37 +411,50 @@ struct CollectiveMainloopMoE {
         }
     }
 
-    // Block 0's calc warp 0: its tables into the workspace, then the flag.
+    // Block 0's calc warp 0: its tables into the workspace.  Lane l copies
+    // slice l (words l, l + 32, ...) and release-sets that slice's flag, so
+    // the lanes publish in parallel and a reader lane waits only for its own.
     __device__ static __forceinline__ void publish_routing_tables(
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         std::uint32_t lane_idx) {
-        const uint2* src = reinterpret_cast<const uint2*>(&smem->routing);
-        uint2* dst = reinterpret_cast<uint2*>(&workspace->router_tables);
+        constexpr std::uint32_t kPerLane =
+            (kRoutingTableWords + WarpRole::kThreadsPerWarp - 1u) /
+            WarpRole::kThreadsPerWarp;
+        const std::uint32_t* src =
+            reinterpret_cast<const std::uint32_t*>(&smem->routing);
+        std::uint32_t* dst =
+            reinterpret_cast<std::uint32_t*>(&workspace->router_tables);
         // Every lane's build stores land before the copy reads them.
         __syncwarp();
-        for (std::uint32_t i = lane_idx; i < kRoutingTableWords;
-             i += WarpRole::kThreadsPerWarp) {
-            dst[i] = src[i];
+        std::uint32_t words[kPerLane];
+#pragma unroll
+        for (std::uint32_t j = 0; j < kPerLane; ++j) {
+            const std::uint32_t i = lane_idx + j * WarpRole::kThreadsPerWarp;
+            if (i < kRoutingTableWords) words[j] = src[i];
         }
-        __threadfence();
-        __syncwarp();
-        if (lane_idx == 0u) {
-            workspace->cta_comm.publish_router_tables(smem->launch_parity);
+#pragma unroll
+        for (std::uint32_t j = 0; j < kPerLane; ++j) {
+            const std::uint32_t i = lane_idx + j * WarpRole::kThreadsPerWarp;
+            if (i < kRoutingTableWords) dst[i] = words[j];
         }
+        workspace->cta_comm.publish_router_table_slice(smem->launch_parity,
+                                                       lane_idx);
     }
 
-    // A non-router block's calc warp 0: block 0's tables into its own.  Every
-    // load is issued before any store, so the copy is one round trip.
+    // A non-router block's calc warp 0: block 0's tables into its own.  Lane
+    // l waits for slice l, then loads it, every load before any store.
     __device__ static __forceinline__ void load_routing_tables(
         Workspace const* __restrict__ workspace,
         SharedStorage* __restrict__ smem, std::uint32_t lane_idx) {
         constexpr std::uint32_t kPerLane =
             (kRoutingTableWords + WarpRole::kThreadsPerWarp - 1u) /
             WarpRole::kThreadsPerWarp;
-        const uint2* src =
-            reinterpret_cast<const uint2*>(&workspace->router_tables);
-        uint2* dst = reinterpret_cast<uint2*>(&smem->routing);
-        uint2 words[kPerLane];
+        workspace->cta_comm.wait_router_table_slice(smem->launch_parity,
+                                                    lane_idx);
+        const std::uint32_t* src =
+            reinterpret_cast<const std::uint32_t*>(&workspace->router_tables);
+        std::uint32_t* dst = reinterpret_cast<std::uint32_t*>(&smem->routing);
+        std::uint32_t words[kPerLane];
 #pragma unroll
         for (std::uint32_t j = 0; j < kPerLane; ++j) {
             const std::uint32_t i = lane_idx + j * WarpRole::kThreadsPerWarp;
@@ -496,6 +509,9 @@ struct CollectiveMainloopMoE {
                     KERNEL_TIMER_BEGIN(smem->timer(), "up_wait_latent");
                 workspace->cta_comm.wait_latent_tasks(
                     smem->launch_parity, Traits::LatentDownGemm::kNumCtas);
+                // The output was stored by other blocks; the copy below reads
+                // it through TMA.
+                fence_proxy_async_global();
                 KERNEL_TIMER_END(smem->timer(), latent_span);
             }
             const auto activation_span =
@@ -503,12 +519,12 @@ struct CollectiveMainloopMoE {
             load_quantized_activation(workspace, smem);
             KERNEL_TIMER_END(smem->timer(), activation_span);
         }
-        UpProjection<KernelTraits>::run(
-            params.expert_scales_up, params.num_tokens, params.activation,
-            GatedActParams{params.situ_beta, params.situ_linear_beta},
-            workspace, smem, params.tma_up_weights_desc, sched,
-            get_tma_cache_hint(smem->routing.active_expert_count >
-                               params.l2_expert_capacity));
+        UpProjection<KernelTraits, Traits::UpGemm::MmaCore::kUseBlockscaled>::
+            run(params.expert_scales_up, params.num_tokens, params.activation,
+                params.situ_beta, params.situ_linear_beta, workspace, smem,
+                params.tma_up_weights_desc, sched,
+                get_tma_cache_hint(smem->routing.active_expert_count >
+                                   params.l2_expert_capacity));
     }
 
     // Phase 3: down-projection over this block's tasks, as enumerated by
@@ -516,13 +532,14 @@ struct CollectiveMainloopMoE {
     __device__ void run_down(Params const& params,
                              SharedStorage* __restrict__ smem,
                              TaskScheduler<KernelTraits>& sched) {
-        DownProjection<KernelTraits>::run(
-            params.expert_scales_down,
-            reinterpret_cast<Workspace*>(params.scratchpad), smem,
-            params.tma_down_weights_desc, params.tma_down_activations_desc,
-            sched,
-            get_tma_cache_hint(smem->routing.active_expert_count >
-                               params.l2_expert_capacity));
+        DownProjection<KernelTraits,
+                       Traits::DownGemm::MmaCore::kUseBlockscaled>::
+            run(params.expert_scales_down,
+                reinterpret_cast<Workspace*>(params.scratchpad), smem,
+                params.tma_down_weights_desc, params.tma_down_activations_desc,
+                sched,
+                get_tma_cache_hint(smem->routing.active_expert_count >
+                                   params.l2_expert_capacity));
     }
 
     // Pulls the TMA descriptors into the descriptor cache, so the first TMA of
@@ -531,6 +548,7 @@ struct CollectiveMainloopMoE {
     __device__ static void prefetch_tma_descriptors(Params const& params) {
         cute::prefetch_tma_descriptor(&params.tma_up_weights_desc);
         cute::prefetch_tma_descriptor(&params.tma_input_desc);
+        cute::prefetch_tma_descriptor(&params.tma_input_chunks_desc);
         cute::prefetch_tma_descriptor(&params.tma_down_weights_desc);
         cute::prefetch_tma_descriptor(&params.tma_down_activations_desc);
     }

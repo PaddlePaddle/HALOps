@@ -98,7 +98,7 @@ struct RouterProjectionBase {
             KERNEL_TIMER_END(smem->timer(), input_empty_span);
             smem->barriers.router_input_ready.arrive(k_iter_id,
                                                      kInputTileBytes);
-            load_input_tile<RouterGemm::kTileShapeN>(
+            load_input_tile_chunks<RouterGemm::kTileShapeN>(
                 tma_input_desc, k_iter_id, token_begin(),
                 smem->router.input.data[slot],
                 smem->barriers.router_input_ready.raw(slot));

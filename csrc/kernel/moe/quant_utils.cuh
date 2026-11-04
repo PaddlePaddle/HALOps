@@ -147,6 +147,90 @@ __device__ __forceinline__ float mxfp8_ue8m0_scale(float amax,
     return __uint_as_float((254u - biased) << 23);
 }
 
+// A full warp quantizes N values, grouped by QuantSpec::kBlockSize.
+// Each lane owns values[i] at column i * 32 + lane.
+template <typename QuantSpec, std::uint32_t N>
+struct GroupWiseQuantizer;
+
+template <std::uint32_t BlockSize, std::uint32_t N>
+struct GroupWiseQuantizer<QuantSpec<QuantMethod::kBlockwiseFP8, BlockSize>, N> {
+    using Quant = QuantSpec<QuantMethod::kBlockwiseFP8, BlockSize>;
+    using ElementType = typename Quant::ElementType;
+    using ScaleType = typename Quant::ScaleType;
+
+    static_assert(Quant::kBlockSize > 0u && Quant::kBlockSize % 32u == 0u,
+                  "each scale group must contain whole warps of values");
+    static_assert(N % Quant::kBlockSize == 0u,
+                  "N must contain whole scale groups");
+
+    static constexpr std::uint32_t kValuesPerThread = N / 32u;
+    static constexpr std::uint32_t kNumGroups = N / Quant::kBlockSize;
+
+    __device__ static __forceinline__ void run(
+        const float (&values)[kValuesPerThread],
+        ElementType* __restrict__ quantized_values,
+        ScaleType* __restrict__ quantized_scale) {
+        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
+        constexpr std::uint32_t kGroupValuesPerThread = Quant::kBlockSize / 32u;
+#pragma unroll
+        for (std::uint32_t group = 0; group < kNumGroups; ++group) {
+            const std::uint32_t begin = group * kGroupValuesPerThread;
+            float local_max = 0.0f;
+#pragma unroll
+            for (std::uint32_t i = 0; i < kGroupValuesPerThread; ++i) {
+                local_max = fmaxf(local_max, fabsf(values[begin + i]));
+            }
+            // Nonnegative finite floats order like their bit patterns.
+            float block_max = __uint_as_float(
+                __reduce_max_sync(0xffffffffu, __float_as_uint(local_max)));
+            // Tiny maxima would overflow the inverse scale.
+            block_max = fmaxf(block_max, 1e-10f);
+            constexpr float kFp8Max = 448.0f;
+            const float inv_scale = kFp8Max / block_max;
+#pragma unroll
+            for (std::uint32_t i = 0; i < kGroupValuesPerThread; ++i) {
+                quantized_values[(begin + i) * 32u + lane_idx] =
+                    static_cast<ElementType>(values[begin + i] * inv_scale);
+            }
+            if (lane_idx == 0u) {
+                quantized_scale[group] = block_max * (1.0f / kFp8Max);
+            }
+        }
+    }
+};
+
+template <std::uint32_t BlockSize, std::uint32_t N>
+struct GroupWiseQuantizer<QuantSpec<QuantMethod::kMXFP8, BlockSize>, N> {
+    using Quant = QuantSpec<QuantMethod::kMXFP8, BlockSize>;
+    using ElementType = typename Quant::ElementType;
+    using ScaleType = typename Quant::ScaleType;
+
+    static_assert(N % Quant::kBlockSize == 0u,
+                  "N must contain whole scale groups");
+
+    static constexpr std::uint32_t kValuesPerThread = N / 32u;
+    static constexpr std::uint32_t kNumGroups = N / Quant::kBlockSize;
+
+    __device__ static __forceinline__ void run(
+        const float (&values)[kValuesPerThread],
+        ElementType* __restrict__ quantized_values,
+        ScaleType* __restrict__ quantized_scale) {
+        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
+#pragma unroll
+        for (std::uint32_t i = 0; i < kNumGroups; ++i) {
+            const float amax = __uint_as_float(__reduce_max_sync(
+                0xffffffffu, __float_as_uint(fabsf(values[i]))));
+            std::uint32_t biased;
+            const float inv_scale = mxfp8_ue8m0_scale(amax, biased);
+            quantized_values[i * 32u + lane_idx] =
+                static_cast<ElementType>(values[i] * inv_scale);
+            if (lane_idx == 0u) {
+                quantized_scale[i] = static_cast<ScaleType>(biased);
+            }
+        }
+    }
+};
+
 // NumRows / NumCols are the tile's rows and K extent.  The scales land in
 // their per-slot SfAtom staging, ready for UTCCP.
 template <bool Staged, std::size_t NumRows, std::size_t NumCols,

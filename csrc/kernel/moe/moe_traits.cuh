@@ -141,6 +141,9 @@ struct LatentDownGemmTraits {
         Dims::KernelConfig::kNumLatentDownWeightSlots < kWeightRingSlots
             ? Dims::KernelConfig::kNumLatentDownWeightSlots
             : kWeightRingSlots;
+    static constexpr std::uint32_t kNumWeightScaleSlots = kNumWeightSlots;
+    static constexpr auto kWeightScaleShape =
+        WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
 };
 
 // Router Linear (logits = input x weight, bf16 in, fp32 accumulate, bf16 out).
@@ -268,6 +271,11 @@ struct UpGemmTraits {
         kNumWeightSlots >= 2u,
         "kNumWeightSlots must be >= 2 (the up-proj weight pipeline needs at "
         "least a ping-pong double buffer).");
+
+    // Blockwise up prefetches the full gate/up scale rows for each task.
+    static constexpr std::uint32_t kNumWeightScaleSlots = 2u;
+    static constexpr auto kWeightScaleShape =
+        cute::make_shape(cute::_2{}, cute::Int<kNumScaleBlocksK>{});
 };
 
 template <typename Dims>
@@ -315,6 +323,10 @@ struct DownGemmTraits {
 
     static constexpr std::uint32_t kNumWeightSlots =
         Dims::KernelConfig::kNumDownWeightSlots;
+    // Blockwise down loads the current M tile's full K scale table per task.
+    static constexpr std::uint32_t kNumWeightScaleSlots = 1u;
+    static constexpr auto kWeightScaleShape =
+        WeightQuant::template ScaleShape<kTileShapeM, kGemmK>();
 
     // Sub-accumulators per K step: one per activation quantization block.
     static constexpr std::uint32_t kNumSubBlocks =
@@ -392,6 +404,9 @@ struct SharedUpGemmTraits {
                   "the shared up's weight ring needs at least one slot");
     static_assert(kNumWeightSlots <= kTilesKPerCta,
                   "the weight ring must fit the block's K tiles");
+    static constexpr std::uint32_t kNumWeightScaleSlots = kNumWeightSlots;
+    static constexpr auto kWeightScaleShape =
+        WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
 };
 
 // The shared expert's down-projection: M hidden, N tokens, K intermediate.
@@ -443,6 +458,9 @@ struct SharedDownGemmTraits {
         Dims::KernelConfig::kNumSharedDownWeightSlots;
     static_assert(kNumWeightSlots >= 1u,
                   "the shared down's weight ring needs at least one slot");
+    static constexpr std::uint32_t kNumWeightScaleSlots = kNumWeightSlots;
+    static constexpr auto kWeightScaleShape =
+        WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
 };
 
 template <typename Dims>
@@ -497,8 +515,7 @@ struct MoEKernelTraits {
                   "the router weight ring needs at least one slot");
 
     static constexpr std::uint32_t kMinGrid =
-        RouterGemm::kNumCtas +
-        Select<kUseLatent, 0, LatentDownGemm::kNumCtas>::value;
+        RouterGemm::kNumCtas + (kUseLatent ? 0u : LatentDownGemm::kNumCtas);
     static constexpr std::uint32_t kMaxGrid = kSpecMaxGrid;
     static_assert(kMinGrid <= kMaxGrid,
                   "Grid bounds must be ordered kCtasPerExpert <= kMinGrid <= "
@@ -532,14 +549,13 @@ struct MoEKernelTraits {
         (DownGemm::kTileShapeM * DownGemm::kTileShapeK) /
         (UpGemm::kTileShapeM * UpGemm::kTileShapeK);
 
-    // The down projection's TMEM scale ring.  The issuer stages a step's
-    // SFA/SFB just before that step's MMA; a slot is reusable once the MMA
-    // that read it completed, which the accumulator ring already gates one
-    // lap deep -- so the scale ring matches it.
-    static constexpr std::uint32_t kDownScaleSlots = kNumAccSlots;
+    // The down scale ring follows the weight slots: each K tile's MMA
+    // completion releases its operands and their scale storage together.
+    static constexpr std::uint32_t kDownScaleSlots = DownGemm::kNumWeightSlots;
 
-    // SM100 TMEM allocation, shared by every phase of the block.  The
-    // blockscaled phases stage one SFA/SFB set beside their accumulator ring.
+    // SM100 TMEM allocation, shared by every phase of the block.
+    // Blockscaled up and down each use one fixed accumulator. Down keeps one
+    // SFA/SFB set per weight slot.
     static constexpr std::uint32_t kUpSfColumns =
         UpGemm::MmaCore::kUseBlockscaled
             ? UpGemm::ScaleTraits::kSfaTmemColumns +
@@ -551,9 +567,13 @@ struct MoEKernelTraits {
                   DownGemm::ScaleTraits::kSfbTmemColumns
             : 0u;
     static constexpr std::uint32_t kRingUpTmemColumns =
-        UpGemm::kAccColumns * kNumAccSlots + kUpSfColumns;
+        UpGemm::kAccColumns *
+            (UpGemm::MmaCore::kUseBlockscaled ? 1u : kNumAccSlots) +
+        kUpSfColumns;
     static constexpr std::uint32_t kRingDownTmemColumns =
-        DownGemm::kAccColumns * kNumAccSlots + kDownScaleSlots * kDownSfColumns;
+        DownGemm::kAccColumns *
+            (DownGemm::MmaCore::kUseBlockscaled ? 1u : kNumAccSlots) +
+        kDownScaleSlots * kDownSfColumns;
     static constexpr std::uint32_t kRingTmemColumns =
         kRingUpTmemColumns > kRingDownTmemColumns ? kRingUpTmemColumns
                                                   : kRingDownTmemColumns;
@@ -569,10 +589,14 @@ struct MoEKernelTraits {
                   SharedDownGemmTraits<Dims>::ScaleTraits::kSfbTmemColumns
             : 0u;
     static constexpr std::uint32_t kSharedUpTmemColumns =
-        kNumAccSlots * SharedUpGemmTraits<Dims>::kAccColumns +
+        (SharedUpGemmTraits<Dims>::MmaCore::kUseBlockscaled ? 1u
+                                                            : kNumAccSlots) *
+            SharedUpGemmTraits<Dims>::kAccColumns +
         kSharedUpSfColumns;
     static constexpr std::uint32_t kSharedDownTmemColumns =
-        SharedDownGemmTraits<Dims>::kNumTilesK *
+        (SharedDownGemmTraits<Dims>::MmaCore::kUseBlockscaled
+             ? 1u
+             : SharedDownGemmTraits<Dims>::kNumTilesK) *
             SharedDownGemmTraits<Dims>::kAccColumns +
         kSharedDownSfColumns;
     static constexpr std::uint32_t kTmemNeededColumns =

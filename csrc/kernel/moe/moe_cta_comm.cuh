@@ -82,9 +82,10 @@ struct MoECtaComm {
     // Shared expert blocks that have published their activation slice.
     std::uint32_t shared_up_out_done[2];
 
-    // Set once block 0's routing tables are in `router_tables`.  The router's
-    // own blocks build theirs; the others copy block 0's.
-    std::uint32_t router_tables_done[2];
+    // Block 0's routing tables travel as 32 slices, slice l being words
+    // l, l + 32, ... of `router_tables`; flag l is set once slice l is in.
+    static constexpr std::uint32_t kRouterTableSlices = 32u;
+    std::uint32_t router_tables_ready[2][kRouterTableSlices];
 
     // Claims this launch's parity for `blockIdx.x`, advancing that block's
     // private counter.
@@ -106,12 +107,29 @@ struct MoECtaComm {
         if (rank < kCtasPerExpert) {
             down_tasks_done[inactive][rank] = 0;
         }
+        if (rank < kRouterTableSlices) {
+            router_tables_ready[inactive][rank] = 0u;
+        }
         if (rank == 0u) {
             down_task_next[inactive] = 0u;
             router_tasks_done[inactive] = 0u;
             latent_tasks_done[inactive] = 0u;
             shared_up_out_done[inactive] = 0u;
-            router_tables_done[inactive] = 0u;
+        }
+    }
+
+    // Slice `slice` of block 0's routing tables is in (release), and its
+    // reader's wait (acquire).
+    __device__ __forceinline__ void publish_router_table_slice(
+        std::uint32_t parity, std::uint32_t slice) {
+        global_store_release_u32(&router_tables_ready[parity][slice], 1u);
+    }
+    __device__ __forceinline__ void wait_router_table_slice(
+        std::uint32_t parity, std::uint32_t slice) const {
+        // Polled at full rate: the latent blocks arrive after their
+        // projection, and a backoff would only delay seeing the tables.
+        while (global_load_acquire_u32(&router_tables_ready[parity][slice]) ==
+               0u) {
         }
     }
 
@@ -173,19 +191,6 @@ struct MoECtaComm {
         std::uint32_t parity, std::uint32_t num_tasks) const {
         while (global_load_acquire_u32(&latent_tasks_done[parity]) <
                num_tasks) {
-        }
-    }
-
-    // Block 0's routing tables are published, and their reader's wait.
-    __device__ __forceinline__ void publish_router_tables(
-        std::uint32_t parity) {
-        global_red_add_release_u32(&router_tables_done[parity], 1u);
-    }
-    __device__ __forceinline__ void wait_router_tables(
-        std::uint32_t parity) const {
-        // Polled at full rate: the latent blocks arrive after their projection,
-        // and a backoff would only delay seeing the flag.
-        while (global_load_acquire_u32(&router_tables_done[parity]) < 1u) {
         }
     }
 

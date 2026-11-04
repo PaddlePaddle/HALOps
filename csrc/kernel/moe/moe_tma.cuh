@@ -61,6 +61,41 @@ __device__ static __forceinline__ void tma_load_2d(
                                  static_cast<std::int32_t>(coord1));
 }
 
+// Issue one 3D TMA bulk-tensor load, tracked by an mbarrier.
+__device__ static __forceinline__ void tma_load_3d(
+    CUtensorMap const& tma_desc, std::uint32_t coord0, std::uint32_t coord1,
+    std::uint32_t coord2, void* dst_smem, std::uint64_t* bar_smem) {
+    cute::SM90_TMA_LOAD_3D::copy(
+        &tma_desc, bar_smem,
+        static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
+        dst_smem, static_cast<std::int32_t>(coord0),
+        static_cast<std::int32_t>(coord1), static_cast<std::int32_t>(coord2));
+}
+
+// The box of CreateTmaDescChunks3D's input view: one K tile of 8 rows by four
+// 128-B chunks (256 BF16 values).
+inline constexpr std::uint32_t kInputChunksBoxRows = 8u;
+inline constexpr std::uint32_t kInputChunksBoxChunks = 4u;
+
+// One BF16 input K tile in a single copy, through the CreateTmaDescChunks3D
+// view: its box lands chunk-major, as `dest` lays the tile out.  Each copy
+// costs the TMA unit a fixed time, so one per tile beats one per chunk.
+template <std::size_t NumRows, std::size_t NumSwizzleBoxesK,
+          std::size_t SwizzleBoxK>
+__device__ __forceinline__ void load_input_tile_chunks(
+    CUtensorMap const& tma_input_chunks_desc, std::uint32_t tile,
+    std::uint32_t token_start,
+    DataType::ElementA (&dest)[NumSwizzleBoxesK][NumRows][SwizzleBoxK],
+    std::uint64_t* bar_smem_ptr) {
+    static_assert(NumRows == kInputChunksBoxRows &&
+                      NumSwizzleBoxesK == kInputChunksBoxChunks &&
+                      SwizzleBoxK * sizeof(DataType::ElementA) == 128u,
+                  "the tile must be the descriptor's box");
+    tma_load_3d(tma_input_chunks_desc, /*coord0=*/0u, /*coord1=*/token_start,
+                /*coord2=*/tile * NumSwizzleBoxesK, &dest[0][0][0],
+                bar_smem_ptr);
+}
+
 // Issue the full per-block BF16 input TMA load: one 64-k SW128 box per
 // issue, box `kk` into `dest[kk]`.
 template <std::size_t NumRows, std::size_t NumSwizzleBoxesK,
@@ -125,6 +160,33 @@ inline CUtensorMap CreateTmaDesc2D(const char* debug_name, const T* global_ptr,
                 debug_name, ": CUresult=", static_cast<int>(res),
                 " (rows=", rows, ", cols=", cols, ", box=(", box_rows, ", ",
                 box_cols, "))");
+    return desc;
+}
+
+// A 3-D view of a row-major `[rows, cols]` BF16 tensor for
+// load_input_tile_chunks: (value in a 128-B chunk, row, chunk), SW128.
+inline CUtensorMap CreateTmaDescChunks3D(const char* debug_name,
+                                         const __nv_bfloat16* global_ptr,
+                                         std::uint32_t rows,
+                                         std::uint32_t cols) {
+    constexpr std::uint32_t kChunk = 128u / sizeof(__nv_bfloat16);
+    TORCH_CHECK(cols % kChunk == 0u, debug_name, ": cols=", cols,
+                " is not whole 128-B chunks");
+    CUtensorMap desc{};
+    uint64_t global_shape[3] = {kChunk, rows, cols / kChunk};
+    uint64_t global_strides[2] = {
+        static_cast<uint64_t>(cols) * sizeof(__nv_bfloat16), 128u};
+    uint32_t box_dim[3] = {kChunk, kInputChunksBoxRows, kInputChunksBoxChunks};
+    uint32_t element_strides[3] = {1u, 1u, 1u};
+    const CUresult res = cuTensorMapEncodeTiled(
+        &desc, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
+        const_cast<void*>(static_cast<const void*>(global_ptr)), global_shape,
+        global_strides, box_dim, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(res == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for ",
+                debug_name, ": CUresult=", static_cast<int>(res),
+                " (rows=", rows, ", cols=", cols, ")");
     return desc;
 }
 

@@ -129,7 +129,7 @@ struct LatentDownProjection {
 
             smem->barriers.latent_down_input_ready.arrive(local,
                                                           kInputTileBytes);
-            load_input_tile<kTileShapeN>(
+            load_input_tile_chunks<kTileShapeN>(
                 tma_input_desc, k_tile(local), token_begin(),
                 smem->latent_down.input.data[slot],
                 smem->barriers.latent_down_input_ready.raw(slot));
@@ -200,7 +200,6 @@ struct LatentDownProjection {
                                    SharedStorage* __restrict__ smem) {
         WarpRole::sync_calc_threads();
         if (threadIdx.x == 0u) {
-            __threadfence();
             workspace->cta_comm.publish_latent_tasks(smem->launch_parity, 1u);
         }
     }
@@ -223,15 +222,18 @@ struct LatentDownProjection {
     }
 
     // Reads partner shared memory: it runs between the two cluster barriers.
+    // A block that holds whole quantization blocks has no partner to read.
     __device__ static float cluster_token_max(SharedStorage* __restrict__ smem,
                                               std::uint32_t tok) {
         float amax = smem->latent_down.token_amax[tok];
+        if constexpr (LatentDownGemm::kClusterSize > 1u) {
 #pragma unroll
-        for (std::uint32_t rank = 0; rank < LatentDownGemm::kClusterSize;
-             ++rank) {
-            amax = fmaxf(amax, cluster_load_f32(cluster_map_shared_rank(
-                                   &smem->latent_down.token_amax[tok],
-                                   group_base_rank() + rank)));
+            for (std::uint32_t rank = 0; rank < LatentDownGemm::kClusterSize;
+                 ++rank) {
+                amax = fmaxf(amax, cluster_load_f32(cluster_map_shared_rank(
+                                       &smem->latent_down.token_amax[tok],
+                                       group_base_rank() + rank)));
+            }
         }
         return amax;
     }
@@ -245,7 +247,10 @@ struct LatentDownProjection {
     // The output quantized by the up phase's activation recipe: one fp32
     // scale per 128-row token block, or one UE8M0 byte per 32-row group.
     // Whole-block: the cluster barrier is CTA-collective, and two of them keep
-    // a partner out of this shared memory until every read is done.
+    // a partner out of this shared memory until every read is done.  When a
+    // block holds whole quantization blocks (the split-K tile), the scales
+    // are its own: split 0 quantizes with one CTA barrier, the other splits
+    // only publish.
     __device__ static void finish_quantized_output(
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         std::uint32_t batch_size) {
@@ -262,6 +267,12 @@ struct LatentDownProjection {
                       "an MXFP8 scale group must not straddle CTAs");
         static_assert(!kMx || Traits::UpGemm::kTileShapeK % kTileShapeM == 0u,
                       "an MXFP8 CTA's rows must sit inside one up K tile");
+        constexpr bool kLocalScale = LatentDownGemm::kClusterSize == 1u;
+        const bool owns_slice = split_idx() == 0u;
+        if (kLocalScale && !owns_slice) {
+            publish_all(workspace, smem);
+            return;
+        }
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         const std::uint32_t chunk_base = row_base() / kFp8ActChunkK;
@@ -305,9 +316,12 @@ struct LatentDownProjection {
             }
         }
 
-        cluster_arrive_and_wait();
+        if constexpr (kLocalScale) {
+            __syncthreads();
+        } else {
+            cluster_arrive_and_wait();
+        }
 
-        const bool owns_slice = split_idx() == 0u;
         const bool is_cell = owns_slice && threadIdx.x < kCells;
         const std::uint32_t cell_chunk = threadIdx.x / kTileShapeN;
         const std::uint32_t cell_tok = threadIdx.x % kTileShapeN;
@@ -353,7 +367,9 @@ struct LatentDownProjection {
             }
         }
 
-        cluster_arrive_and_wait();
+        if constexpr (!kLocalScale) {
+            cluster_arrive_and_wait();
+        }
 
         if (is_cell) {
             workspace->latent_down_out.store_cell(chunk_base + cell_chunk, tok,
@@ -405,7 +421,6 @@ struct LatentDownProjection {
                                        SharedStorage* __restrict__ smem) {
         __syncthreads();
         if (threadIdx.x == 0u) {
-            __threadfence();
             workspace->cta_comm.publish_latent_tasks(smem->launch_parity, 1u);
         }
     }
@@ -493,19 +508,27 @@ struct LatentDownProjection {
             // Every thread joins: the cluster barrier is block-collective.
             __syncthreads();
             cluster_arrive_and_wait();
-            if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
-                float acc[kTokenWindows][4] = {};
-                gather_split_share(smem, acc);
-                if (split_idx() == 0u) {
+            // Split 0 sums every share and writes the output; a partner's
+            // share is reusable once split 0 has read it.
+            if (split_idx() == 0u) {
+                if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
+                    float acc[kTokenWindows][4] = {};
+                    gather_split_share(smem, acc);
                     writeback(workspace, smem, acc);
+                    WarpRole::sync_calc_threads();
                 }
-                WarpRole::sync_calc_threads();
+                // Each thread's arrive releases its reads of the shares; the
+                // wait is deferred until the output is out.
+                cluster_arrive();
+            } else {
+                cluster_arrive();
+                cluster_wait();
             }
-            // The rendezvous region is reusable once every block has read it.
-            __syncthreads();
-            cluster_arrive_and_wait();
         }
         finish_quantized_output(workspace, smem, batch_size);
+        if constexpr (LatentDownGemm::kNumSplits > 1u) {
+            if (split_idx() == 0u) cluster_wait();
+        }
     }
 
     __device__ static void run_mma_k_loop(SharedStorage* __restrict__ smem,

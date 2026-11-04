@@ -127,7 +127,7 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
     static constexpr QuantConfig kQuantConfig = Config;
     struct KernelConfig {
         static constexpr std::uint32_t kBlockSize = 384;
-        static constexpr std::uint32_t kNumRouterInputSlots = 8;
+        static constexpr std::uint32_t kNumRouterInputSlots = 16;
         static constexpr std::uint32_t kNumLatentInputSlots = 8;
         static constexpr std::uint32_t kNumUpInputSlots = 8;
         // Router configs.
@@ -195,11 +195,6 @@ struct DataType {
     using ElementA = __nv_bfloat16;    // activations as they go into the GEMM
     using ElementQA = __nv_fp8_e4m3;   // activations after quantization
     using ElementOut = __nv_bfloat16;  // MoE output
-};
-
-template <bool kCondition, std::uint32_t kTrue, std::uint32_t kFalse>
-struct Select {
-    static constexpr std::uint32_t value = kCondition ? kTrue : kFalse;
 };
 
 // Width the experts reduce over (`up`) and produce (`down`).

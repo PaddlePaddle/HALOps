@@ -551,10 +551,13 @@ def test_moe_accuracy(num_tokens, top_k, activation):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 9, 16])
-def test_mxfp8_moe_accuracy(num_tokens):
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+def test_mxfp8_moe_accuracy(num_tokens, activation):
     """Every weight group runs as MXFP8."""
     top_k = 8
-    moe_params = MoEParams(use_latent=True, quant_mode="w8a8-mxfp8")
+    moe_params = MoEParams(
+        use_latent=True, activation=activation, quant_mode="w8a8-mxfp8"
+    )
     cos_routed, cos_shared = _run_and_compare(moe_params, num_tokens, top_k)
     print(
         f"\n[moe mxfp8] num_tokens={num_tokens} top_k={top_k}: "
@@ -565,10 +568,13 @@ def test_mxfp8_moe_accuracy(num_tokens):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 9, 16])
-def test_w4a8_mxfp4_moe_accuracy(num_tokens):
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+def test_w4a8_mxfp4_moe_accuracy(num_tokens, activation):
     """Only the routed experts' weights are MXFP4; latent and shared stay MXFP8."""
     top_k = 8
-    moe_params = MoEParams(use_latent=True, quant_mode="w4a8-mxfp4")
+    moe_params = MoEParams(
+        use_latent=True, activation=activation, quant_mode="w4a8-mxfp4"
+    )
     cos_routed, cos_shared = _run_and_compare(moe_params, num_tokens, top_k)
     print(
         f"\n[moe w4a8] num_tokens={num_tokens} top_k={top_k}: "
@@ -579,11 +585,15 @@ def test_w4a8_mxfp4_moe_accuracy(num_tokens):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
-def test_moe_cuda_graph_replay(num_tokens):
+@pytest.mark.parametrize("quant_mode", ["w8a8-blockwise", "w8a8-mxfp8", "w4a8-mxfp4"])
+@pytest.mark.parametrize("activation", ["silu", "situ"])
+def test_moe_cuda_graph_replay(num_tokens, quant_mode, activation):
     """CUDA graph capture + multi-replay must produce correct results."""
     top_k = 8
     dev = torch.device("cuda")
-    moe_params = MoEParams(use_latent=True)
+    moe_params = MoEParams(
+        use_latent=True, activation=activation, quant_mode=quant_mode
+    )
     moe_params.init_weights()
 
     input = torch.randn(
