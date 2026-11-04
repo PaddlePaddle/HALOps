@@ -104,7 +104,8 @@ void LowLatencyMmaGemm(const torch::Tensor& input, const torch::Tensor& weight,
                        const std::optional<torch::Tensor>& sfa2,
                        const std::optional<torch::Tensor>& sfb2,
                        const std::optional<torch::Tensor>& output2,
-                       const int sm_count, const bool use_pdl);
+                       const int sm_count, const bool use_pdl,
+                       const bool use_sigmoid);
 
 std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
                                           const std::string& mode,
@@ -218,7 +219,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("weight"), py::arg("sfa"), py::arg("sfb"), py::arg("output"),
           py::arg("input2"), py::arg("weight2"), py::arg("sfa2"),
           py::arg("sfb2"), py::arg("output2"), py::arg("sm_count"),
-          py::arg("use_pdl") = true);
+          py::arg("use_pdl") = true, py::arg("use_sigmoid") = false);
     m.def("group_wise_quant", &halops::GroupWiseQuant, py::arg("input"),
           py::arg("mode"), py::arg("use_swizzle") = true,
           py::arg("use_pdl") = true);

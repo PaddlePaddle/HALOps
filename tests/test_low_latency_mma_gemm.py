@@ -117,10 +117,11 @@ def tile_shape(block_n, warps_k):
     return 65 * block_n, 128 * warps_k * (2 if warps_k >= 8 else 6)
 
 
+@pytest.mark.parametrize("m", [8, 16])
 @pytest.mark.parametrize("block_n, warps_k", TILES)
-def test_tiles(block_n, warps_k):
+def test_tiles(block_n, warps_k, m):
     n, k = tile_shape(block_n, warps_k)
-    input_q, sfa, weight_q, sfb = make_operands(16, n, k)
+    input_q, sfa, weight_q, sfb = make_operands(m, n, k)
     output = run(input_q, weight_q, sfa, sfb, sm_count=TILE_SM_COUNT)
     check(output, reference(input_q, sfa, weight_q, sfb))
 
@@ -207,6 +208,13 @@ def test_concat_k(m, n, k1, k2, scale_pad, use_pdl):
     check(output, expected)
 
 
+@pytest.mark.parametrize("m", [6, 16])
+def test_sigmoid(m):
+    input_q, sfa, weight_q, sfb = make_operands(m, 2048, 1024)
+    output = run(input_q, weight_q, sfa, sfb, use_sigmoid=True)
+    assert torch.equal(output, torch.sigmoid(run(input_q, weight_q, sfa, sfb)))
+
+
 def gemm_args(input_q, sfa, weight_q, sfb, **kwargs):
     output = torch.empty(input_q.shape[0], weight_q.shape[0], dtype=torch.bfloat16)
     return dict(
@@ -254,6 +262,21 @@ def misaligned_weight():
 def weight2_without_input2_or_output2():
     input_q, sfa, weight_q, sfb = make_operands(8, 512, 2048)
     return gemm_args(input_q, sfa, weight_q, sfb, weight2=weight_q, sfb2=sfb)
+
+
+def sigmoid_with_weight2():
+    input_q, sfa, weight_q, sfb = make_operands(8, 512, 2048)
+    output2 = torch.empty(8, 512, dtype=torch.bfloat16)
+    return gemm_args(
+        input_q,
+        sfa,
+        weight_q,
+        sfb,
+        weight2=weight_q,
+        sfb2=sfb,
+        output2=output2,
+        use_sigmoid=True,
+    )
 
 
 def concat_k_k1_not_multiple_of_512():
@@ -308,6 +331,9 @@ def concat_k_k1_not_multiple_of_512():
             concat_k_k1_not_multiple_of_512,
             "K1 must be a multiple of 512",
             id="concat_k_k1_not_multiple_of_512",
+        ),
+        pytest.param(
+            sigmoid_with_weight2, "does not support", id="sigmoid_with_weight2"
         ),
     ],
 )
