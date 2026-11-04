@@ -23,6 +23,8 @@
 #include <cute/config.hpp>
 #include <cute/tensor.hpp>
 
+#include "common/pdl.cuh"
+
 namespace halops::mla {
 CUTE_DEVICE
 nv_bfloat162 fp8x2_to_bf16x2_with_scale(__nv_fp8x2_e4m3 data,
@@ -199,20 +201,6 @@ void bulk_wait_all() {
 CUTE_DEVICE
 void gmem_st_zero_relaxed(int* ptr) {
     asm volatile("st.global.s32 [%0], 0;" ::"l"(ptr) : "memory");
-}
-
-CUTE_DEVICE
-void pdl_wait() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-#endif
-}
-
-CUTE_DEVICE
-void pdl_trigger() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    asm volatile("griddepcontrol.launch_dependents;" :::);
-#endif
 }
 
 CUTE_DEVICE

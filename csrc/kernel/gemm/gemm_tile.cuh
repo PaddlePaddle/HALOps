@@ -15,17 +15,23 @@
 #pragma once
 
 #include <array>
+#include <bit>
 #include <cstdint>
 
+#include "common/mx_quant.cuh"
 #include "kernel/gemm/utils.cuh"
 
 namespace halops {
+
+inline constexpr int kSwapEpiChunk = 2 * kMatRows;
+inline constexpr int kSfbRowShiftAlign = 64;
 
 template <int BM, int BN, int BK, int PST, int EST, int CM = 1, int CN = 1,
           int OVLP = 0, int REG = 208, bool SWZ = false, bool FENCE = false,
           bool SWAP = false, bool FP4 = false, int SFVS = 16,
           bool ALPHA = false, bool BIAS = false,
-          KernelMode MODE = KernelMode::Dense>
+          KernelMode MODE = KernelMode::Dense,
+          EpilogueOp OP = EpilogueOp::Identity>
 struct GemmTile : GemmKernelConfig {
     static constexpr int KBlockM = BM;
     static constexpr int KBlockN = BN;
@@ -45,6 +51,8 @@ struct GemmTile : GemmKernelConfig {
     static constexpr bool AddBias = BIAS;
     static constexpr KernelMode KernelType = MODE;
     static constexpr bool IsPairUmma = (CM * CN) > 1;
+    static constexpr EpilogueOp KEpiOp = OP;
+    static constexpr bool KSwapSfbRun = SWAP;
 };
 
 struct TileSpec {
@@ -64,12 +72,24 @@ struct TileSpec {
 
     // Dispatch policy, not kernel parameters.
     bool dense_only = false;  // only tuned/allowed for the dense launcher
+    bool batch = false;       // a dense_only tile also tuned for batch
     bool searchable = true;   // may the cost model pick it?
+    int quant_stages = 0;
 
     constexpr bool pair() const { return cluster_m * cluster_n > 1; }
     // Activation-tile rows/cols; SwapAB swaps the two MMA dimensions.
     constexpr int act_m() const { return swap_ab ? block_n : block_m; }
     constexpr int act_n() const { return swap_ab ? block_m : block_n; }
+    constexpr bool quantizes() const {
+        return !bias &&
+               (swap_ab
+                    ? block_n % kSwapEpiChunk == 0
+                    : block_n % (2 * mxfp8::kGroup) == 0 &&
+                          std::has_single_bit(static_cast<unsigned>(block_n)));
+    }
+    constexpr int stages_for(EpilogueOp op) const {
+        return IsQuantOp(op) && quant_stages ? quant_stages : main_stages;
+    }
 
     friend constexpr bool operator==(const TileSpec&,
                                      const TileSpec&) = default;
@@ -118,13 +138,14 @@ struct MmaTraits<MmaKind::MXFP4> {
     static constexpr const char* kName = "w4a4-mxfp4";
 };
 
-template <MmaKind Kind, KernelMode Mode, TileSpec S>
+template <MmaKind Kind, KernelMode Mode, TileSpec S,
+          EpilogueOp Op = EpilogueOp::Identity>
 using MakeTile =
-    GemmTile<S.block_m, S.block_n, S.block_k, S.main_stages, S.epi_stages,
+    GemmTile<S.block_m, S.block_n, S.block_k, S.stages_for(Op), S.epi_stages,
              S.cluster_m, S.cluster_n, S.tmem_overlap, S.epi_regs, S.swizzle,
              S.skip_fence, S.swap_ab, MmaTraits<Kind>::kFp4,
              MmaTraits<Kind>::kSfVecSize, MmaTraits<Kind>::kHasAlpha, S.bias,
-             Mode>;
+             Mode, Op>;
 
 // Fp8
 constexpr TileSpec kFp8_128x256 = {.block_m = 128,
@@ -143,12 +164,14 @@ constexpr TileSpec kFp8_256x128_pair = {.block_m = 256,
                                         .block_k = 128,
                                         .main_stages = 8,
                                         .cluster_m = 2,
-                                        .dense_only = true};
+                                        .dense_only = true,
+                                        .batch = true};
 constexpr TileSpec kFp8_128x128 = {.block_m = 128,
                                    .block_n = 128,
                                    .block_k = 128,
                                    .main_stages = 6,
-                                   .dense_only = true};
+                                   .dense_only = true,
+                                   .batch = true};
 constexpr TileSpec kFp8_256x192_pair_reg160 = {.block_m = 256,
                                                .block_n = 192,
                                                .block_k = 128,
@@ -170,12 +193,15 @@ constexpr TileSpec kFp8_128x16x256_swap = {.block_m = 128,
                                            .epi_stages = 7,
                                            .swap_ab = true,
                                            .dense_only = true,
+                                           .batch = true,
                                            .searchable = false};
 constexpr TileSpec kFp8_128x64 = {.block_m = 128,
                                   .block_n = 64,
                                   .block_k = 128,
                                   .main_stages = 9,
-                                  .dense_only = true};
+                                  .dense_only = true,
+                                  .batch = true,
+                                  .quant_stages = 8};
 constexpr TileSpec kFp8_256x64_pair = {.block_m = 256,
                                        .block_n = 64,
                                        .block_k = 128,
@@ -203,6 +229,30 @@ constexpr TileSpec kFp8_256x224_pair_reg160_swizzle = {.block_m = 256,
                                                        .skip_fence = true,
                                                        .swizzle = true,
                                                        .dense_only = true};
+constexpr TileSpec kFp8_256x160_pair_swap = {.block_m = 256,
+                                             .block_n = 160,
+                                             .block_k = 128,
+                                             .main_stages = 7,
+                                             .cluster_m = 2,
+                                             .swap_ab = true,
+                                             .dense_only = true,
+                                             .batch = true};
+constexpr TileSpec kFp8_256x192_pair_swap = {.block_m = 256,
+                                             .block_n = 192,
+                                             .block_k = 128,
+                                             .main_stages = 6,
+                                             .cluster_m = 2,
+                                             .swap_ab = true,
+                                             .dense_only = true,
+                                             .batch = true};
+constexpr TileSpec kFp8_256x224_pair_swap = {.block_m = 256,
+                                             .block_n = 224,
+                                             .block_k = 128,
+                                             .main_stages = 6,
+                                             .cluster_m = 2,
+                                             .swap_ab = true,
+                                             .dense_only = true,
+                                             .batch = true};
 constexpr TileSpec kFp8_256x128_bias = {.block_m = 256,
                                         .block_n = 128,
                                         .block_k = 128,
@@ -288,7 +338,7 @@ constexpr TileSpec kFp4_256x256_pair_reg160 = {.block_m = 256,
                                                .dense_only = true};
 
 // Candidate tiles per MmaKind.
-inline constexpr std::array<TileSpec, 13> kFp8Tiles = {
+inline constexpr std::array<TileSpec, 16> kFp8Tiles = {
     kFp8_128x256,
     kFp8_256x256_pair,
     kFp8_256x128_pair,
@@ -302,6 +352,9 @@ inline constexpr std::array<TileSpec, 13> kFp8Tiles = {
     kFp8_256x224_pair_reg160,
     kFp8_256x224_pair_reg160_swizzle,
     kFp8_256x128_bias,
+    kFp8_256x160_pair_swap,
+    kFp8_256x192_pair_swap,
+    kFp8_256x224_pair_swap,
 };
 
 inline constexpr std::array<TileSpec, 10> kFp4Tiles = {

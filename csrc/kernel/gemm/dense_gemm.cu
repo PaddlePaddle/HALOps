@@ -25,7 +25,10 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                torch::Tensor& output, const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha,
                const int sm_count_arg, const std::string& mode,
-               const bool use_pdl) {
+               const bool use_pdl, const EpilogueOp epilogue,
+               const std::optional<torch::Tensor>& output_sf,
+               const double situ_beta,
+               const std::optional<double> situ_linear_beta) {
     const CudaDeviceGuard device_guard(input.device());
     TORCH_CHECK(
         mode == "w8a8-mxfp8" || mode == "w4a4-mxfp4" || mode == "w4a4-nvfp4",
@@ -39,16 +42,18 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
 
     const int m = input.size(0);
     const int n = weight.size(0);
-    TORCH_CHECK(output.size(0) == m && output.size(1) == n,
-                "output shape must be [M, N], got [", output.size(0), ", ",
-                output.size(1), "], expected [", m, ", ", n, "]");
+    const int out_n = epilogue == EpilogueOp::SituQuant ? n / 2 : n;
+    TORCH_CHECK(output.size(0) == m && output.size(1) == out_n,
+                "output shape must be [", m, ", ", out_n, "], got [",
+                output.size(0), ", ", output.size(1), "]");
     const int sm = sm_count_arg > 0 ? sm_count_arg : GetSmCount();
     const cudaStream_t stream = GetCurrentCUDAStream(input);
 
     const int m_sf = AlignSfM(m);
-    // still need to pass a rounded-up M to the kernel when using the bias path.
-    const bool bias_path = bias.has_value();
-    const int m_shape = (m < kSfAtomM || bias_path) ? m : m_sf;
+    // still need to pass a rounded-up M to the kernel when using the bias tile.
+    const bool bias_tile =
+        bias.has_value() && epilogue != EpilogueOp::SituQuant;
+    const int m_shape = (m < kSfAtomM || bias_tile) ? m : m_sf;
 
     GemmParams params;
     params.ptr_d = output.data_ptr();
@@ -57,6 +62,13 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.num_experts = 1;
     params.max_m_per_expert = m;
     params.use_pdl = use_pdl;
+    params.situ = {
+        .inv_beta = static_cast<float>(1.0 / situ_beta),
+        .gate_up_scale =
+            static_cast<float>(situ_beta * situ_linear_beta.value_or(1.0)),
+        .inv_linear_beta = situ_linear_beta
+                               ? static_cast<float>(1.0 / *situ_linear_beta)
+                               : 0.0f};
 
     if (mode == "w8a8-mxfp8") {
         const int k = weight.size(1);
@@ -81,18 +93,36 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
             "sfa must hold whole 128-row SfAtoms: expected at least ",
             int64_t(m_sf) * (k / 32), " elements (", m_sf, " x ", k / 32,
             ") for M=", m, ", got ", sfa.numel());
-        TORCH_CHECK(
-            !bias_path || m % 256 == 0,
-            "the bias epilogue has no per-row store predicate yet, so M "
-            "must be a multiple of 256 when bias is given, got ",
-            m);
+        TORCH_CHECK(!bias_tile || m % 256 == 0,
+                    "the bias tile has no per-row store predicate yet, so M "
+                    "must be a multiple of 256 when bias is given, got ",
+                    m);
         const GemmShape shape = {.m = m_shape,
                                  .n = n,
                                  .k = k,
                                  .m_grid = m_shape,
                                  .sm_count = sm,
-                                 .has_bias = bias_path};
-        LaunchCfg<KernelMode::Dense, MmaKind::MXFP8>(params, shape, stream);
+                                 .has_bias = bias_tile};
+        if (output_sf.has_value()) {
+            params.ptr_sfd = output_sf->data_ptr();
+        }
+        switch (epilogue) {
+            case EpilogueOp::Identity:
+                LaunchCfg<KernelMode::Dense, MmaKind::MXFP8>(params, shape,
+                                                             stream);
+                break;
+            case EpilogueOp::Sigmoid:
+                LaunchCfg<KernelMode::Dense, MmaKind::MXFP8,
+                          EpilogueOp::Sigmoid>(params, shape, stream);
+                break;
+            case EpilogueOp::SituQuant:
+                LaunchCfg<KernelMode::Dense, MmaKind::MXFP8,
+                          EpilogueOp::SituQuant>(params, shape, stream);
+                break;
+            default:
+                TORCH_CHECK(false, "Unsupported epilogue ",
+                            static_cast<int>(epilogue), " for ", mode);
+        }
     } else {
         const int k = weight.size(1) * 2;  // 2 FP4 per packed byte
         TORCH_CHECK(
@@ -138,10 +168,22 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                                  .m_grid = m_shape,
                                  .sm_count = sm,
                                  .has_bias = false};
-        if (mxfp4) {
-            LaunchCfg<KernelMode::Dense, MmaKind::MXFP4>(params, shape, stream);
-        } else {
-            LaunchCfg<KernelMode::Dense, MmaKind::NVFP4>(params, shape, stream);
+        switch (epilogue) {
+            case EpilogueOp::Identity:
+                mxfp4 ? LaunchCfg<KernelMode::Dense, MmaKind::MXFP4>(
+                            params, shape, stream)
+                      : LaunchCfg<KernelMode::Dense, MmaKind::NVFP4>(
+                            params, shape, stream);
+                break;
+            case EpilogueOp::Sigmoid:
+                mxfp4 ? LaunchCfg<KernelMode::Dense, MmaKind::MXFP4,
+                                  EpilogueOp::Sigmoid>(params, shape, stream)
+                      : LaunchCfg<KernelMode::Dense, MmaKind::NVFP4,
+                                  EpilogueOp::Sigmoid>(params, shape, stream);
+                break;
+            default:
+                TORCH_CHECK(false, "Unsupported epilogue ",
+                            static_cast<int>(epilogue), " for ", mode);
         }
     }
 }

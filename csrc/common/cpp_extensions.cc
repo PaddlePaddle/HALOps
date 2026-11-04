@@ -14,6 +14,8 @@
 
 #include <torch/extension.h>
 
+#include "kernel/gemm/epilogue_op.h"
+
 namespace halops {
 
 void WriteCacheKVEncoder(
@@ -72,7 +74,11 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const torch::Tensor& sfa, const torch::Tensor& sfb,
                torch::Tensor& output, const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha, const int sm_count,
-               const std::string& mode, const bool use_pdl);
+               const std::string& mode, const bool use_pdl,
+               const EpilogueOp epilogue,
+               const std::optional<torch::Tensor>& output_sf,
+               const double situ_beta,
+               const std::optional<double> situ_linear_beta);
 
 void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
                      const torch::Tensor& sfa, const torch::Tensor& sfb,
@@ -94,7 +100,9 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const torch::Tensor& sfa, const torch::Tensor& sfb,
                torch::Tensor& output, const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha, const int sm_count,
-               const std::string& mode);
+               const std::string& mode, const EpilogueOp epilogue,
+               const std::optional<torch::Tensor>& output_sf,
+               const std::optional<torch::Tensor>& gate, const bool use_pdl);
 
 void LowLatencyMmaGemm(const torch::Tensor& input, const torch::Tensor& weight,
                        const torch::Tensor& sfa, const torch::Tensor& sfb,
@@ -208,13 +216,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("encoder_attention", &halops::EncoderAttention);
     m.def("decoder_attention", &halops::DecoderAttention);
 
+    py::enum_<halops::EpilogueOp>(m, "EpilogueOp")
+        .value("Identity", halops::EpilogueOp::Identity)
+        .value("Quant", halops::EpilogueOp::Quant)
+        .value("GateMulQuant", halops::EpilogueOp::GateMulQuant)
+        .value("Sigmoid", halops::EpilogueOp::Sigmoid)
+        .value("SituQuant", halops::EpilogueOp::SituQuant);
     m.def("dense_gemm", &halops::DenseGemm, py::arg("input"), py::arg("weight"),
           py::arg("sfa"), py::arg("sfb"), py::arg("output"), py::arg("bias"),
           py::arg("alpha"), py::arg("sm_count"), py::arg("mode"),
-          py::arg("use_pdl") = true);
+          py::arg("use_pdl") = true,
+          py::arg("epilogue") = halops::EpilogueOp::Identity,
+          py::arg("output_sf") = py::none(), py::arg("situ_beta"),
+          py::arg("situ_linear_beta"));
     m.def("group_masked_gemm", &halops::GroupMaskedGemm);
     m.def("group_contiguous_gemm", &halops::GroupContiguousGemm);
-    m.def("batch_gemm", &halops::BatchGemm);
+    m.def("batch_gemm", &halops::BatchGemm, py::arg("input"), py::arg("weight"),
+          py::arg("sfa"), py::arg("sfb"), py::arg("output"), py::arg("bias"),
+          py::arg("alpha"), py::arg("sm_count"), py::arg("mode"),
+          py::arg("epilogue") = halops::EpilogueOp::Identity,
+          py::arg("output_sf") = py::none(), py::arg("gate") = py::none(),
+          py::arg("use_pdl") = true);
     m.def("low_latency_mma_gemm", &halops::LowLatencyMmaGemm, py::arg("input"),
           py::arg("weight"), py::arg("sfa"), py::arg("sfb"), py::arg("output"),
           py::arg("input2"), py::arg("weight2"), py::arg("sfa2"),

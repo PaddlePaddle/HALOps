@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <numeric>
 #include <span>
 #include <utility>
 
@@ -36,6 +37,7 @@ struct GemmShape {
     int m_grid;
     int sm_count;
     bool has_bias;
+    EpilogueOp op = EpilogueOp::Identity;
 };
 
 constexpr int CeilDiv(int a, int b) { return (a + b - 1) / b; }
@@ -55,13 +57,17 @@ constexpr const char* ModeName(KernelMode mode) {
 }
 
 constexpr bool TileAllowedFor(const TileSpec& t, KernelMode mode) {
-    return !t.dense_only || mode == KernelMode::Dense;
+    return !t.dense_only || mode == KernelMode::Dense ||
+           (t.batch && mode == KernelMode::Batch);
 }
 
 constexpr bool TileFitsShape(const TileSpec& t, const GemmShape& s,
                              KernelMode mode) {
     // A small tile only pays off when the grid would otherwise be too small.
-    if (t.swap_ab) {
+    if (IsQuantOp(s.op) && !t.quantizes()) {
+        return false;
+    }
+    if (t.swap_ab && !t.pair()) {
         if (s.m > 2 * t.act_m()) {
             return false;
         }
@@ -70,21 +76,19 @@ constexpr bool TileFitsShape(const TileSpec& t, const GemmShape& s,
     }
     // An activation N that is not 128-aligned overhangs N through the scale
     // run, so N only has to be aligned to the atomic 128 columns.
-    const bool n_ok = (t.act_n() % 128 != 0)
+    const bool n_ok = (t.act_n() > 128 && t.act_n() % 128 != 0)
                           ? (s.n % 128 == 0 && s.n >= 384)
                           : s.n % (t.act_n() * t.cluster_n) == 0;
     if (!n_ok || s.k % t.block_k != 0) {
         return false;
     }
-    // Dense may pad a short activation; every other mode wants whole tiles, and
-    // a pair tile always wants whole M tiles.
-    if (s.m % t.act_m() == 0) {
+    // Dense may pad a short activation; Batch runs a tile straddling two
+    // batches once per batch and drops the rows past the grid; the other
+    // modes want whole tiles.
+    if (s.m % t.act_m() == 0 || mode == KernelMode::Batch) {
         return true;
     }
-    if (t.pair()) {
-        return false;
-    }
-    return mode == KernelMode::Dense && s.m <= t.act_m();
+    return !t.pair() && mode == KernelMode::Dense && s.m <= t.act_m();
 }
 
 // Cost model
@@ -94,7 +98,10 @@ inline constexpr double kStage = 5.0e5;     // per K stage of pipeline fill
 inline constexpr double kPairFill = 5.5e6;  // a pair MMA's extra fill
 inline constexpr double kOverlap = 1.05;    // TMEM overlap costs a little
 inline constexpr double kActN224 = 1.01;    // 224-wide reads 3 atoms/2
+inline constexpr double kSwapPair = 1.03;   // SwapAB pair epilogue + SF run
 inline constexpr double kTieBand = 3e-3;
+inline constexpr double kQuantTail = 0.3;  // quant epilogue tail per tile MAC
+inline constexpr double kQuantRowShift = 1.01;  // 224 SwapAB quant SFB shift
 // Dense Fp8 prices an M below one legacy 128-row tile as 128 rows.
 inline constexpr int kMFloorFp8 = 128;
 }  // namespace cost
@@ -107,10 +114,6 @@ struct TileOverride {
 };
 
 inline constexpr TileOverride kDenseFp8Overrides[] = {
-    {[](const GemmShape& s) {
-         return s.m == 4096 && s.n == 4096 && s.k == 4096;
-     },
-     kFp8_256x192_pair_reg160},
     {[](const GemmShape& s) {
          return s.sm_count == 152 && s.m == 1024 && s.n == 4096 &&
                 s.k >= 1024 && s.k <= 2048;
@@ -126,6 +129,12 @@ inline constexpr TileOverride kDenseFp8Overrides[] = {
      kFp8_128x16x256_swap},
     {[](const GemmShape& s) { return s.m > 16 && s.m <= 64 && s.n >= 16384; },
      kFp8_128x64x256_swap},
+};
+
+// A 16-row swap tile reads one SfAtom column, so it serves a grid of at most
+// 16 rows.
+inline constexpr TileOverride kBatchFp8Overrides[] = {
+    {[](const GemmShape& s) { return s.m_grid <= 16; }, kFp8_128x16x256_swap},
 };
 
 inline constexpr TileOverride kDenseFp4Overrides[] = {
@@ -168,6 +177,9 @@ inline constexpr TileOverride kDenseFp4Overrides[] = {
 };
 
 inline std::span<const TileOverride> Overrides(MmaKind kind, KernelMode mode) {
+    if (mode == KernelMode::Batch && kind == MmaKind::MXFP8) {
+        return kBatchFp8Overrides;
+    }
     if (mode != KernelMode::Dense) {
         return {};
     }
@@ -181,6 +193,25 @@ inline std::span<const TileOverride> Overrides(MmaKind kind, KernelMode mode) {
             break;
     }
     return {};
+}
+
+// Activation tiles a launch runs: Batch runs a tile straddling two batches
+// once per batch.
+inline int ActTiles(const GemmShape& s, const TileSpec& t, KernelMode mode) {
+    const int act_m = t.act_m();
+    if (mode != KernelMode::Batch || s.m % act_m == 0) {
+        return CeilDiv(s.m_grid, act_m);
+    }
+    if (t.swap_ab && t.pair()) {
+        const int align = std::gcd(act_m, kSfAtomM);
+        return s.m_grid / s.m *
+               CeilDiv(s.m + align - std::gcd(s.m, align), act_m);
+    }
+    int tiles = 0;
+    for (int b = 0; b < s.m_grid / s.m; ++b) {
+        tiles += ((b + 1) * s.m - 1) / act_m - b * s.m / act_m + 1;
+    }
+    return tiles;
 }
 
 // PickByCostModel: the heuristic.
@@ -207,8 +238,7 @@ inline int PickByCostModel(const TileSpec* tiles, int count, MmaKind kind,
         if (units <= 0) {
             continue;
         }
-        const int grid_tiles =
-            CeilDiv(c.m_grid, t.act_m()) * CeilDiv(c.n, t.act_n());
+        const int grid_tiles = ActTiles(c, t, mode) * CeilDiv(c.n, t.act_n());
         const int waves = CeilDiv(grid_tiles, units);
         const double area = static_cast<double>(t.act_m() / ctas) * t.act_n();
         // A pair tile multicasts its weight, so only half comes from L2.
@@ -218,9 +248,16 @@ inline int PickByCostModel(const TileSpec* tiles, int count, MmaKind kind,
             static_cast<double>(c.k / t.block_k) * cost::kStage +
             (ctas == 2 ? cost::kPairFill : 0.0);
         const double pair_eff = (ctas == 2 && waves > 1) ? 0.95 : 1.0;
-        const double total = waves * tile_cost * pair_eff *
-                             (t.tmem_overlap ? cost::kOverlap : 1.0) *
-                             (t.act_n() == 224 ? cost::kActN224 : 1.0);
+        double total = waves * tile_cost * pair_eff *
+                       (t.tmem_overlap ? cost::kOverlap : 1.0) *
+                       (t.act_n() == 224 ? cost::kActN224 : 1.0) *
+                       (t.swap_ab && t.pair() ? cost::kSwapPair : 1.0);
+        if (IsQuantOp(s.op)) {
+            total += cost::kQuantTail * area * c.k;
+            if (t.swap_ab && t.pair() && t.act_m() % kSfbRowShiftAlign != 0) {
+                total *= cost::kQuantRowShift;
+            }
+        }
         const bool better =
             best < 0 || total < best_cost * (1.0 - cost::kTieBand) ||
             (total <= best_cost * (1.0 + cost::kTieBand) &&
@@ -267,26 +304,30 @@ inline int PickTile(const TileSpec* tiles, int count, MmaKind kind,
 // Dispatch
 using TileLauncher = void (*)(GemmParams&, const GemmShape&, cudaStream_t);
 
-template <MmaKind Kind, KernelMode Mode, std::size_t I>
+template <MmaKind Kind, KernelMode Mode, std::size_t I, EpilogueOp Op>
 void LaunchTile(GemmParams& params, const GemmShape& shape,
                 cudaStream_t stream) {
-    if constexpr (TileAllowedFor(CandidateTiles<Kind>::tiles[I], Mode)) {
+    constexpr TileSpec S = CandidateTiles<Kind>::tiles[I];
+    if constexpr (TileAllowedFor(S, Mode) &&
+                  (!IsQuantOp(Op) ||
+                   (Kind == MmaKind::MXFP8 && S.quantizes()))) {
         using T = MmaTraits<Kind>;
+        using TypeD = cute::conditional_t<IsQuantOp(Op), cutlass::float_e4m3_t,
+                                          typename T::Output>;
         gemm_impl<typename T::Operand, typename T::Operand, typename T::Output,
-                  typename T::Output, typename T::Scale, float,
-                  MakeTile<Kind, Mode, CandidateTiles<Kind>::tiles[I]>>(
+                  TypeD, typename T::Scale, float, MakeTile<Kind, Mode, S, Op>>(
             params, shape.sm_count, stream);
     }
 }
 
-template <MmaKind Kind, KernelMode Mode, std::size_t... I>
+template <MmaKind Kind, KernelMode Mode, EpilogueOp Op, std::size_t... I>
 constexpr std::array<TileLauncher, sizeof...(I)> MakeTileLaunchers(
     std::index_sequence<I...>) {
-    return {&LaunchTile<Kind, Mode, I>...};
+    return {&LaunchTile<Kind, Mode, I, Op>...};
 }
 
-template <MmaKind Kind, KernelMode Mode>
-inline constexpr auto kTileLaunchers = MakeTileLaunchers<Kind, Mode>(
+template <MmaKind Kind, KernelMode Mode, EpilogueOp Op>
+inline constexpr auto kTileLaunchers = MakeTileLaunchers<Kind, Mode, Op>(
     std::make_index_sequence<CandidateTiles<Kind>::tiles.size()>{});
 
 inline bool GemmTraceEnabled() {
@@ -294,9 +335,9 @@ inline bool GemmTraceEnabled() {
     return on;
 }
 
-template <KernelMode Mode, MmaKind Kind>
-void LaunchCfg(GemmParams& params, const GemmShape& shape,
-               cudaStream_t stream) {
+template <KernelMode Mode, MmaKind Kind, EpilogueOp Op = EpilogueOp::Identity>
+void LaunchCfg(GemmParams& params, GemmShape shape, cudaStream_t stream) {
+    shape.op = Op;
     constexpr auto& candidates = CandidateTiles<Kind>::tiles;
     const int pick =
         PickTile(candidates.data(), static_cast<int>(candidates.size()), Kind,
@@ -309,13 +350,15 @@ void LaunchCfg(GemmParams& params, const GemmShape& shape,
         const TileSpec& t = candidates[pick];
         std::fprintf(stderr,
                      "[gemm] mode=%s kind=%s m=%d n=%d k=%d grid=%d sm=%d "
-                     "bias=%d -> %dx%d/%d pair=%d swap=%d regs=%d cfg=%d\n",
+                     "bias=%d op=%d -> %dx%d/%d pair=%d swap=%d regs=%d "
+                     "cfg=%d\n",
                      ModeName(Mode), MmaTraits<Kind>::kName, shape.m, shape.n,
                      shape.k, shape.m_grid, shape.sm_count,
-                     shape.has_bias ? 1 : 0, t.block_m, t.block_n, t.block_k,
-                     t.pair() ? 1 : 0, t.swap_ab ? 1 : 0, t.epi_regs, pick);
+                     shape.has_bias ? 1 : 0, static_cast<int>(Op), t.block_m,
+                     t.block_n, t.block_k, t.pair() ? 1 : 0, t.swap_ab ? 1 : 0,
+                     t.epi_regs, pick);
     }
-    kTileLaunchers<Kind, Mode>[pick](params, shape, stream);
+    kTileLaunchers<Kind, Mode, Op>[pick](params, shape, stream);
 }
 
 }  // namespace halops

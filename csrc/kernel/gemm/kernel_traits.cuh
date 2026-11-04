@@ -13,6 +13,10 @@
 // limitations under the License.
 
 #pragma once
+
+#include <numeric>
+
+#include "common/mx_quant.cuh"
 #include "kernel/gemm/gemm_tile.cuh"
 #include "kernel/gemm/utils.cuh"
 
@@ -34,6 +38,9 @@ struct GemmParams {
     int *__restrict__ masked_m = nullptr;
     int *__restrict__ expert_ids = nullptr;
     bool use_pdl = false;
+    void *__restrict__ ptr_sfd = nullptr;
+    void const *__restrict__ ptr_gate = nullptr;
+    SituCoef situ;
 };
 
 template <class AccTensor, class SfaTensor, class SfbTensor>
@@ -85,12 +92,25 @@ struct GemmKernelTraits {
     // Narrow the A TMA box to the real M below KBlockM (the UMMA still reads
     // KBlockM rows; the epilogue drops D past M).
     static constexpr bool KNarrowA =
-        NarrowA_ && KDenseW8A8MXFP8 && !SwapAB && !IsPairUmma && !KIsFP4;
+        NarrowA_ &&
+        (KDenseW8A8MXFP8 || (KernelType == KernelMode::Batch && !AddBias)) &&
+        !SwapAB && !IsPairUmma && !KernelConfig_::KIsFP4 && KBlockK == 128;
     static constexpr bool KUsePdl = UsePdl_;
     static constexpr int KMmaK = KIsFP4 ? 64 : 32;
     static constexpr int kItersK = KBlockK / KMmaK;
-    // Epilogue warp groups split N: 1 for SwapAB (small N), 2 otherwise.
-    static constexpr int KEpilogueWarpGroupCount = SwapAB ? 1 : 2;
+    static constexpr EpilogueOp KEpiOp = KernelConfig_::KEpiOp;
+    static constexpr bool KQuantD = IsQuantOp(KEpiOp);
+    static constexpr bool KGateMul = KEpiOp == EpilogueOp::GateMulQuant;
+    static constexpr bool KGlu = KEpiOp == EpilogueOp::SituQuant;
+    static constexpr int KAccColsPerOut = KGlu ? 2 : 1;
+    static constexpr int KQuantAccCols = KAccColsPerOut * mxfp8::kGroup;
+    // Epilogue warp groups split N: 1 for bf16 SwapAB (small N) and for a
+    // quantized tile narrower than two quant groups, 2 otherwise.
+    static constexpr int KEpilogueWarpGroupCount =
+        (SwapAB && !KQuantD) ||
+                (KQuantD && !SwapAB && KBlockN < 2 * KQuantAccCols)
+            ? 1
+            : 2;
     static constexpr int KEpilogueWarpStartId = 0;
     static constexpr int KEpilogueWarpEndId = KEpilogueWarpGroupCount * 4 - 1;
     static constexpr int KLoadABWarpId = KEpilogueWarpEndId + 1;
@@ -126,31 +146,12 @@ struct GemmKernelTraits {
     static constexpr int KSubTilesPerWG = KEpiComputeN / KSubTileN;
     // Overlap sub-tiles sit at the boundary between adjacent stages.
     static constexpr int KOverlapSubCount = KTmemOverlapCols / KSubTileN;
-    static constexpr int KNonOverlapSubCount =
-        KSubTilesPerWG - KOverlapSubCount;
-
     // Overlap region fits one TMEM load (widths with a hardware op), so MMA can
     // resume right after T2R; other widths (e.g. 48) interleave per sub-tile.
     static constexpr bool KOverlapSingleLoad =
         (KTmemOverlapCols > 0) &&
         (KTmemOverlapCols == 16 || KTmemOverlapCols == 32 ||
          KTmemOverlapCols == 64 || KTmemOverlapCols == 128);
-
-    using CopyOpT2R_Overlap = cute::conditional_t<
-        KTmemOverlapCols == 16, cute::SM100_TMEM_LOAD_32dp32b16x,
-        cute::conditional_t<
-            KTmemOverlapCols == 32, cute::SM100_TMEM_LOAD_32dp32b32x,
-            cute::conditional_t<KTmemOverlapCols == 64,
-                                cute::SM100_TMEM_LOAD_32dp32b64x,
-                                cute::SM100_TMEM_LOAD_32dp32b128x>>>;
-
-    static constexpr int KOverlapLoadN =
-        KOverlapSingleLoad ? KTmemOverlapCols
-                           : (KTmemOverlapCols == 0 ? 16 : KSubTileN);
-    using OverlapLoadTile =
-        cute::Shape<cute::Int<KBlockM / KNumCTA>, cute::Int<KOverlapLoadN>>;
-
-    static constexpr int KWideTilesTotal = KBlockN / KOverlapLoadN;
 
     // The op width (`Nx` = columns per datapath) must equal KEpiComputeN: a
     // narrower op that fits moves only part of the tile. Widths with no atom
@@ -234,11 +235,13 @@ struct GemmKernelTraits {
         cute::size<1>(CtaShape_MNK{}) < Blk_MN{};
     static constexpr int IsCtaN64 = cute::size<1>(CtaShape_MNK{}) == 64;
     static constexpr bool IsSfbUnaligned =
-        !KIsFP4 && !SwapAB && KBlockN > 128 && KBlockN % 128 != 0;
+        !KIsFP4 && (!SwapAB || KernelConfig_::KSwapSfbRun) && KBlockN > 128 &&
+        KBlockN % 128 != 0;
     static_assert(!IsSfbUnaligned || KBlockN % 32 == 0,
                   "unaligned SFB tiles need KBlockN % 32 == 0");
     // Used when BLOCK_N=224.
-    static constexpr bool IsSfbRowShift = IsSfbUnaligned && KBlockN % 64 != 0;
+    static constexpr bool IsSfbRowShift =
+        IsSfbUnaligned && KBlockN % kSfbRowShiftAlign != 0;
     static constexpr int KSfbTransposeWarpId = KLoadCWarpId;
     static constexpr int KSfbTransposeWarps = KNumWarp - KSfbTransposeWarpId;
     static_assert(!IsSfbRowShift || (!AddBias && KSfbTransposeWarps >= 1),
@@ -406,6 +409,39 @@ struct GemmKernelTraits {
         alignas(8) typename cutlass::arch::ClusterTransactionBarrier::ValueType
             sf_full[KSfFullStages];
     };
+
+    static constexpr bool KActRowTma =
+        KernelType == KernelMode::Batch && SwapAB && IsPairUmma && !KIsFP4;
+    static constexpr int KActRowAlign = std::gcd(KBlockN, mxfp8::kAtomRows);
+
+    static constexpr int KCtaRows = KBlockM / KNumCTA;
+    static constexpr int KEpiChunk = !SwapAB ? KCtaRows
+                                     : KBlockN % (2 * kSwapEpiChunk) == 0
+                                         ? kSwapEpiChunk
+                                         : kMatRows;
+    static constexpr int KEpiRowBytes =
+        SwapAB ? KCtaRows * sizeof(TypeD) / KAccColsPerOut
+               : mxfp8::kGroup * sizeof(TypeD);
+    static constexpr int KSwapSfRowBytes = KCtaRows / mxfp8::kGroup;
+    static constexpr int KSwapAmaxBytes = cutlass::NumWarpsPerWarpGroup *
+                                          (KEpiChunk / kMatRows) * kQuad *
+                                          sizeof(uint32_t);
+    static constexpr int KEpiBufBytes =
+        KEpiChunk * KEpiRowBytes +
+        (SwapAB && KQuantD ? KEpiChunk * KSwapSfRowBytes : 0) +
+        (SwapAB && KGlu ? KSwapAmaxBytes : 0);
+    static constexpr int KSmemSwizzleAlign = 1024;
+    static constexpr int KEpiStageOffset =
+        cute::round_up((int)sizeof(SharedStorage), KSmemSwizzleAlign);
+    static constexpr int KEpiStageBytes =
+        KEpilogueWarpGroupCount * 2 * KEpiBufBytes;
+    static constexpr bool KEpiStageFits =
+        KEpiStageOffset + KEpiStageBytes <=
+        cutlass::arch::sm100_smem_capacity_bytes;
+    static constexpr bool KSwapStaged = SwapAB && KEpiStageFits;
+    static constexpr int KSmemBytes = KSwapStaged || KQuantD
+                                          ? KEpiStageOffset + KEpiStageBytes
+                                          : (int)sizeof(SharedStorage);
 
     static void print_args() {}
 };

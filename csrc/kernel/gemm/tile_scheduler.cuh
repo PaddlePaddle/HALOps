@@ -15,6 +15,8 @@
 #pragma once
 #include <cutlass/fast_math.h>
 
+#include <numeric>
+
 #include "kernel/gemm/kernel_traits.cuh"
 
 namespace halops {
@@ -43,6 +45,17 @@ struct TileScheduler {
     static constexpr bool SwapAB = KernelTraits::SwapAB;
     static constexpr bool UseTileSwizzle = KernelTraits::UseTileSwizzle;
     static constexpr bool KDenseW8A8MXFP8 = KernelTraits::KDenseW8A8MXFP8;
+    static constexpr bool IsBatch =
+        KernelTraits::KernelType == KernelMode::Batch;
+    static_assert(!IsBatch || !UseTileSwizzle,
+                  "Batch tiles straddling two batches need the compact order");
+    // Activation rows of one cluster tile; grouped modes stack experts on them.
+    static constexpr int kExpertTileSize =
+        SwapAB ? cute::size<1>(TileShape{}) : cute::size<0>(TileShape{});
+    static constexpr int kExpertClusterTiles =
+        SwapAB ? kClusterNTiles : kClusterMTiles;
+    static constexpr int kExpertClusterRows =
+        kExpertTileSize * kExpertClusterTiles;
 
     struct Params {
         int m;
@@ -62,6 +75,12 @@ struct TileScheduler {
 
         // Other compact state is derived on device (no D2H sync).
         bool use_compact_sched;
+        int batch_own_tiles;
+        cutlass::FastDivmod divmod_batch_period;
+        cutlass::FastDivmod divmod_slow_tiles;
+        cutlass::FastDivmod divmod_own_tiles;
+        int batch_valid_tiles;
+        float batch_per_tile;
     };
 
     static Params to_underlying_arguments(int m, int n, int num_experts = 0,
@@ -133,6 +152,32 @@ struct TileScheduler {
         if (S == 1) {
             use_compact_sched = true;
         }
+        int batch_period = 1;
+        int batch_own_tiles = 0;
+        if constexpr (KernelTraits::KActRowTma) {
+            constexpr int kAlign = KernelTraits::KActRowAlign;
+            batch_own_tiles =
+                (max_m_per_expert + kAlign -
+                 std::gcd(max_m_per_expert, kAlign) + kExpertClusterRows - 1) /
+                kExpertClusterRows;
+        }
+        int batch_valid_tiles = 0;
+        if constexpr (IsBatch) {
+            batch_period = kExpertClusterRows /
+                           std::gcd(max_m_per_expert, kExpertClusterRows);
+            const int e = num_experts;
+            const int before = batch_own_tiles > 0
+                                   ? e * batch_own_tiles
+                                   : e * max_m_per_expert / kExpertClusterRows +
+                                         e - e / batch_period;
+            batch_valid_tiles = before * (SwapAB ? expert_ctm : expert_ctn);
+        }
+        const float batch_per_tile =
+            IsBatch ? static_cast<float>(kExpertClusterRows * batch_period) /
+                          static_cast<float>(max_m_per_expert * batch_period +
+                                             kExpertClusterRows * batch_period -
+                                             kExpertClusterRows)
+                    : 0.f;
 
         return {m,
                 n,
@@ -148,7 +193,13 @@ struct TileScheduler {
                 divmod_ss,
                 divmod_blocks,
                 divmod_s,
-                use_compact_sched};
+                use_compact_sched,
+                batch_own_tiles,
+                cutlass::FastDivmod(batch_period),
+                cutlass::FastDivmod(SwapAB ? expert_ctm : expert_ctn),
+                cutlass::FastDivmod(batch_own_tiles > 0 ? batch_own_tiles : 1),
+                batch_valid_tiles,
+                batch_per_tile};
     }
 
     uint32_t tile_num_m_;
@@ -176,6 +227,13 @@ struct TileScheduler {
     int const* expert_ids_;
 
     bool use_compact_sched_;
+    uint32_t batch_own_tiles_;
+    cutlass::FastDivmod divmod_batch_period_;
+    cutlass::FastDivmod divmod_slow_tiles_;
+    cutlass::FastDivmod divmod_own_tiles_;
+    uint32_t batch_valid_tiles_;
+    float batch_per_tile_;
+    uint32_t act_row0_;
     uint32_t
         total_valid_tiles_;  // sum of valid cluster-tiles across all experts
     // tile ids only grow, so the expert cache is advanced by forward scan.
@@ -189,15 +247,48 @@ struct TileScheduler {
     uint32_t expert_idx_;
     bool is_valid_;
 
-    // Number of valid cluster-tiles of expert e given masked_m[e].
+    // Batch: the cluster tiles over the stacked rows that hold rows of batch e.
+    // A tile straddling two batches runs once per batch, each with its own
+    // weight; the epilogue stores only that batch's rows.
+    CUTLASS_DEVICE uint32_t batch_first_cluster_tile(uint32_t e) const {
+        if (batch_own_tiles_) return e * batch_own_tiles_;
+        return e * max_m_per_expert_ / kExpertClusterRows;
+    }
+    CUTLASS_DEVICE uint32_t batch_cluster_tiles(uint32_t e) const {
+        if (batch_own_tiles_) return batch_own_tiles_;
+        return ((e + 1) * max_m_per_expert_ - 1) / kExpertClusterRows -
+               batch_first_cluster_tile(e) + 1;
+    }
+
+    CUTLASS_DEVICE uint32_t batch_tiles_before(uint32_t e) const {
+        if (batch_own_tiles_) return e * batch_own_tiles_;
+        return batch_first_cluster_tile(e) + e -
+               divmod_batch_period_.div(static_cast<int>(e));
+    }
+
+    // Activation cluster tile of expert e's first tile.
+    CUTLASS_DEVICE uint32_t expert_first_cluster_tile(uint32_t e) const {
+        if constexpr (IsBatch) {
+            return batch_first_cluster_tile(e);
+        } else {
+            return e * (SwapAB ? expert_ctn_ : expert_ctm_);
+        }
+    }
+
+    CUTLASS_DEVICE uint32_t expert_slow_tiles() const {
+        return SwapAB ? expert_ctm_ : expert_ctn_;
+    }
+
+    // Number of valid cluster-tiles of expert e given masked_m[e] (Masked) or
+    // the rows of batch e (Batch).
     CUTLASS_DEVICE uint32_t expert_valid_tiles(uint32_t e) const {
-        constexpr int kExpertTileSize =
-            SwapAB ? cute::size<1>(TileShape{}) : cute::size<0>(TileShape{});
-        constexpr int kExpertClusterTiles =
-            SwapAB ? kClusterNTiles : kClusterMTiles;
-        int valid_m = __ldg(&masked_m_[e]);
-        int valid_ct = (valid_m + kExpertTileSize * kExpertClusterTiles - 1) /
-                       (kExpertTileSize * kExpertClusterTiles);
+        int valid_ct;
+        if constexpr (IsBatch) {
+            valid_ct = batch_cluster_tiles(e);
+        } else {
+            int valid_m = __ldg(&masked_m_[e]);
+            valid_ct = (valid_m + kExpertClusterRows - 1) / kExpertClusterRows;
+        }
         if constexpr (SwapAB) {
             return expert_ctm_ * valid_ct;
         } else {
@@ -218,7 +309,13 @@ struct TileScheduler {
           divmod_ss_(params.divmod_ss),
           divmod_blocks_(params.divmod_blocks),
           divmod_s_(params.divmod_s),
-          use_compact_sched_(params.use_compact_sched) {
+          use_compact_sched_(params.use_compact_sched),
+          batch_own_tiles_(params.batch_own_tiles),
+          divmod_batch_period_(params.divmod_batch_period),
+          divmod_slow_tiles_(params.divmod_slow_tiles),
+          divmod_own_tiles_(params.divmod_own_tiles),
+          batch_valid_tiles_(params.batch_valid_tiles),
+          batch_per_tile_(params.batch_per_tile) {
         tile_num_m_ = cute::ceil_div(params.m, cute::size<0>(TileShape{}));
         tile_num_n_ = cute::ceil_div(params.n, cute::size<1>(TileShape{}));
 
@@ -241,9 +338,15 @@ struct TileScheduler {
         cta_v_ = cute::get<0>(cta_coord_vmnk);
 
         if (use_compact_sched_) {
-            if constexpr (KernelTraits::KernelType == KernelMode::Contiguous ||
-                          KernelTraits::KernelType == KernelMode::Dense ||
-                          KernelTraits::KernelType == KernelMode::Batch) {
+            if constexpr (IsBatch) {
+                total_valid_tiles_ = batch_valid_tiles_;
+                cached_expert_ = 0;
+                cached_expert_start_ = 0;
+                cached_expert_end_ = expert_valid_tiles(0);
+            } else if constexpr (KernelTraits::KernelType ==
+                                     KernelMode::Contiguous ||
+                                 KernelTraits::KernelType ==
+                                     KernelMode::Dense) {
                 // No padding: every tile is valid.
                 total_valid_tiles_ = total_tiles_;
                 cached_expert_ = 0;
@@ -274,6 +377,10 @@ struct TileScheduler {
     CUTLASS_DEVICE uint32_t m_idx() const { return m_idx_; }
     CUTLASS_DEVICE uint32_t n_idx() const { return n_idx_; }
     CUTLASS_DEVICE uint32_t expert_idx() const { return expert_idx_; }
+    CUTLASS_DEVICE uint32_t act_row0() const { return act_row0_; }
+    CUTLASS_DEVICE uint32_t max_m_per_expert() const {
+        return max_m_per_expert_;
+    }
 
     CUTLASS_DEVICE void advance() {
         current_tile_id_ += cluster_num_;
@@ -289,6 +396,26 @@ struct TileScheduler {
                                                   uint32_t& expert) {
         if (tile_id >= cached_expert_start_ && tile_id < cached_expert_end_) {
             expert = cached_expert_;
+        } else if constexpr (IsBatch) {
+            const uint32_t c =
+                divmod_slow_tiles_.div(static_cast<int>(tile_id));
+            uint32_t lo;
+            if (batch_own_tiles_) {
+                lo = divmod_own_tiles_.div(static_cast<int>(c));
+            } else {
+                lo = min(static_cast<uint32_t>(static_cast<float>(c) *
+                                               batch_per_tile_) +
+                             1,
+                         num_experts_ - 1);
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < 3; ++i) {
+                    if (lo > 0 && batch_tiles_before(lo) > c) --lo;
+                }
+            }
+            expert = lo;
+            cached_expert_ = lo;
+            cached_expert_start_ = batch_tiles_before(lo) * expert_slow_tiles();
+            cached_expert_end_ = cached_expert_start_ + expert_valid_tiles(lo);
         } else {
             uint32_t start = cached_expert_start_;
             uint32_t e = cached_expert_;
@@ -322,11 +449,11 @@ struct TileScheduler {
             uint32_t local_cluster_m = r;
             uint32_t local_cluster_n = q;
             cluster_m = local_cluster_m;
-            cluster_n = expert * expert_ctn_ + local_cluster_n;
+            cluster_n = expert_first_cluster_tile(expert) + local_cluster_n;
         } else {
             uint32_t local_cluster_m = q;
             uint32_t local_cluster_n = r;
-            cluster_m = expert * expert_ctm_ + local_cluster_m;
+            cluster_m = expert_first_cluster_tile(expert) + local_cluster_m;
             cluster_n = local_cluster_n;
         }
         return true;
@@ -449,6 +576,18 @@ struct TileScheduler {
                 }
                 m_idx_ = m_idx;
                 n_idx_ = n_idx;
+                if constexpr (KernelTraits::KActRowTma) {
+                    constexpr uint32_t kRows = cute::size<1>(TileShape{});
+                    act_row0_ =
+                        batch_own_tiles_
+                            ? expert * max_m_per_expert_ /
+                                      KernelTraits::KActRowAlign *
+                                      KernelTraits::KActRowAlign +
+                                  (n_idx - batch_first_cluster_tile(expert) *
+                                               cluster_n_tiles_) *
+                                      kRows
+                            : n_idx * kRows;
+                }
                 if constexpr (KernelTraits::KernelType ==
                               KernelMode::Contiguous) {
                     if constexpr (SwapAB) {
@@ -459,17 +598,6 @@ struct TileScheduler {
                         uint32_t global_m_idx =
                             m_idx * cute::size<0>(TileShape{});
                         expert_idx_ = expert_ids_[global_m_idx];
-                    }
-                } else if constexpr (KernelTraits::KernelType ==
-                                     KernelMode::Batch) {
-                    if constexpr (SwapAB) {
-                        uint32_t global_m_idx =
-                            n_idx * cute::size<1>(TileShape{});
-                        expert_idx_ = global_m_idx / max_m_per_expert_;
-                    } else {
-                        uint32_t global_m_idx =
-                            m_idx * cute::size<0>(TileShape{});
-                        expert_idx_ = global_m_idx / max_m_per_expert_;
                     }
                 } else {
                     expert_idx_ = expert;
@@ -532,10 +660,6 @@ struct TileScheduler {
                                  KernelMode::Contiguous) {
                 uint32_t global_m_idx = m_idx * cute::size<0>(TileShape{});
                 expert_idx = expert_ids_[global_m_idx];
-            } else if constexpr (KernelTraits::KernelType ==
-                                 KernelMode::Batch) {
-                uint32_t global_m_idx = m_idx * cute::size<0>(TileShape{});
-                expert_idx = global_m_idx / max_m_per_expert_;
             }
 
             m_idx_ = m_idx;

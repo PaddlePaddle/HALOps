@@ -19,7 +19,7 @@ import re
 import pytest
 import torch
 
-from halops import batch_gemm
+from halops import EpilogueOp, batch_gemm
 from tests.utils.fp4_utils import MXFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE
 
 from tests.utils.gemm_utils import (
@@ -32,6 +32,8 @@ from tests.utils.gemm_utils import (
     per_token_cast_to_fp8,
     per_token_cast_to_mxfp4,
     reorder_sf_to_cutlass,
+    sfatom_offsets,
+    sfatom_rows,
     ue8m0_to_float32,
 )
 
@@ -244,6 +246,17 @@ def assert_close_per_batch(output, ref_out, tol, label):
         pytest.param(1, 256, 256, 128, False, id="single_batch"),
         # Boundary: larger K dimension.
         pytest.param(2, 128, 256, 512, False, id="larger_k"),
+        # M not a tile multiple: tiles straddle two batches.
+        pytest.param(8, 1, 1024, 256, False, id="m1_swapab"),
+        pytest.param(3, 100, 256, 256, False, id="m100_swapab"),
+        pytest.param(3, 200, 256, 128, False, id="m200"),
+        pytest.param(8, 1000, 1024, 256, False, id="m1000"),
+        pytest.param(2, 640, 256, 128, False, id="m640"),
+        pytest.param(2, 2176, 256, 128, False, id="m2176_pair"),
+        pytest.param(2, 640, 128, 128, True, id="m640_bias_pair"),
+        pytest.param(2, 1000, 256, 128, False, id="m1000_partial_pair"),
+        pytest.param(3, 300, 128, 128, True, id="m300_bias_partial_pair"),
+        pytest.param(2, 5, 256, 256, False, id="grid10_swap16"),
     ],
 )
 def test_batch_gemm_w8a8_mxfp8(B, M, N, K, add_bias):
@@ -349,6 +362,55 @@ def test_batch_gemm_w8a8_mxfp8_determinism():
     batch_gemm(*args, out1, None, None, -1, "w8a8-mxfp8")
     batch_gemm(*args, out2, None, None, -1, "w8a8-mxfp8")
     assert torch.equal(out1, out2), "W8A8-MXFP8 batch_gemm output is not deterministic"
+
+
+# =====================================================================
+# W8A8-MXFP8 with an e4m3 output (quantizing epilogue)
+# =====================================================================
+
+
+def ref_quant_e4m3(v):
+    g = v.float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
+    amax = g.abs().amax(-1).clamp_min(1e-10)
+    mant, exp = torch.frexp(amax)
+    e = (exp - 9 + (mant > 0.875).int() + 127).clamp(0, 254)
+    q = (g * torch.exp2(127 - e.float())[..., None]).flatten(-2)
+    return q.to(torch.float8_e4m3fn).view(torch.uint8), e.to(torch.uint8)
+
+
+@pytest.mark.parametrize("with_gate", [False, True], ids=["quant", "gate_mul"])
+@pytest.mark.parametrize(
+    "B, M, N, K",
+    [
+        pytest.param(4, 128, 256, 128, id="mid_m"),
+        pytest.param(2, 640, 256, 128, id="m640_pair"),
+        pytest.param(3, 200, 256, 128, id="m200_straddle"),
+        pytest.param(3, 100, 256, 256, id="m100_swapab"),
+        pytest.param(8, 1000, 1024, 256, id="m1000_pair_swapab"),
+        pytest.param(2, 5, 256, 256, id="grid10_swap16"),
+        pytest.param(8, 2000, 1024, 512, id="m2000"),
+    ],
+)
+def test_batch_gemm_w8a8_mxfp8_e4m3_out(B, M, N, K, with_gate):
+    inp = make_w8a8_mxfp8_inputs(B, M, N, K)
+    args = (inp["input_fp8"], inp["weight_fp8"], inp["sfa"], inp["sfb"])
+    y = torch.empty([B, M, N], dtype=torch.bfloat16)
+    batch_gemm(*args, y, None, None, -1, "w8a8-mxfp8")
+    gate = (torch.rand([B, M, N]) * 2 - 0.5).to(torch.bfloat16) if with_gate else None
+    ref_q, ref_sf = ref_quant_e4m3((y * gate if with_gate else y).view(B * M, N))
+
+    out = torch.empty([B, M, N], dtype=torch.float8_e4m3fn)
+    out_sf = torch.zeros([sfatom_rows(B * M) * N // FP8_BLOCK_SIZE], dtype=torch.uint8)
+    op = EpilogueOp.GateMulQuant if with_gate else EpilogueOp.Quant
+    batch_gemm(*args, out, None, None, -1, "w8a8-mxfp8", op, out_sf, gate)
+    assert torch.equal(out.view(torch.uint8).view(B * M, N), ref_q)
+    assert torch.equal(out_sf[sfatom_offsets(B * M, N // FP8_BLOCK_SIZE)], ref_sf)
+
+    out2 = torch.empty_like(out)
+    out_sf2 = torch.zeros_like(out_sf)
+    batch_gemm(*args, out2, None, None, -1, "w8a8-mxfp8", op, out_sf2, gate)
+    assert torch.equal(out.view(torch.uint8), out2.view(torch.uint8))
+    assert torch.equal(out_sf, out_sf2)
 
 
 # =====================================================================

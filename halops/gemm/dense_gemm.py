@@ -19,8 +19,26 @@ from typing import Optional
 import torch
 
 import halops.halops_kernel as halops_kernel
+from halops.halops_kernel import EpilogueOp
 
-__all__ = ["dense_gemm"]
+__all__ = ["dense_gemm", "interleave_gate_up"]
+
+_GLU_INTERLEAVE = 16
+
+
+def interleave_gate_up(t: torch.Tensor) -> torch.Tensor:
+    """Reorder ``[gate; up]`` rows for ``EpilogueOp.SituQuant``.
+
+    Args:
+        t: [2 * I, ...] weight, logical (unswizzled) weight scale or bias of a
+            gate/up projection, gate rows first.
+
+    Returns:
+        [2 * I, ...] tensor with gate and up rows interleaved in blocks of 16:
+        gate rows ``16i..16i+15``, then up rows ``16i..16i+15``.
+    """
+    gate, up = t.view(2, -1, _GLU_INTERLEAVE, *t.shape[1:]).unbind(0)
+    return torch.stack([gate, up], 1).flatten(0, 2)
 
 
 def dense_gemm(
@@ -34,6 +52,10 @@ def dense_gemm(
     sm_count: int = -1,
     mode: str = "w8a8-mxfp8",
     use_pdl: bool = True,
+    epilogue: EpilogueOp = EpilogueOp.Identity,
+    output_sf: Optional[torch.Tensor] = None,
+    situ_beta: float = 4.0,
+    situ_linear_beta: Optional[float] = 25.0,
 ) -> None:
     """Dense GEMM on Blackwell SM100 tensor cores.
 
@@ -68,6 +90,18 @@ def dense_gemm(
         mode: Quantization mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or
             ``"w4a4-nvfp4"``.
         use_pdl: Enable Programmatic Dependent Launch (on by default).
+        epilogue: ``EpilogueOp.Identity``, ``EpilogueOp.Sigmoid`` (bfloat16
+            ``sigmoid(input @ weight^T + bias)``) or ``EpilogueOp.SituQuant``
+            (``w8a8-mxfp8`` SiTU-GLU: with ``y = input @ weight^T + bias``
+            and the ``[gate; up]`` rows of weight, sfb and bias reordered by
+            ``interleave_gate_up``, output ``[M, N / 2]`` float8_e4m3fn is
+            ``situ_beta * tanh(gate / situ_beta) * sigmoid(gate) *
+            situ_linear_beta * tanh(up / situ_linear_beta)`` (``up`` as is
+            when ``situ_linear_beta`` is None) with UE8M0 scales per 32
+            columns in ``output_sf``).
+        output_sf: SfAtom scales of a quantized output.
+        situ_beta: SiTU gate softcap.
+        situ_linear_beta: SiTU up softcap, or None for none.
 
     Returns:
         None. The result is written in-place to output.
@@ -94,4 +128,8 @@ def dense_gemm(
         sm_count,
         mode,
         use_pdl,
+        epilogue,
+        output_sf,
+        situ_beta,
+        situ_linear_beta,
     )

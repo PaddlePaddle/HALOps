@@ -23,12 +23,11 @@
 #include <cstdlib>
 #include <string>
 
+#include "common/mx_quant.cuh"
+#include "common/pdl.cuh"
 #include "kernel/gemm/gemm_utils.h"
-#include "kernel/gemm/pdl.cuh"
 
 namespace halops {
-
-constexpr float FP8_E4M3_MAX = 448.0f;
 
 constexpr float FP4_E2M1_MAX = 6.0f;
 
@@ -86,7 +85,7 @@ __device__ __forceinline__ uint8_t quantize_to_fp4_code(float val) {
 // UE4M3 scale: for non-negative values the __nv_fp8_e4m3 bit pattern equals
 // UE4M3 (sign bit 0, bias 7).
 __device__ __forceinline__ uint8_t float32_to_ue4m3(float val) {
-    val = fmaxf(fminf(val, 448.0f), 0.0f);
+    val = fmaxf(fminf(val, mxfp8::kE4m3Max), 0.0f);
     __nv_fp8_e4m3 fp8_val(val);
     uint8_t bits;
     memcpy(&bits, &fp8_val, sizeof(uint8_t));
@@ -139,13 +138,13 @@ __global__ void group_wise_quant_kernel(
     constexpr int NUM_LOAD_VEC = GROUP_SIZE / Traits::elem_per_float4;
 
     const int num_k_tiles = kb_dim / 4;
-    const int total_groups = m * kb_dim;
+    const int total_groups = (USE_SWIZZLE ? AlignSfM(m) : m) * kb_dim;
 
     // The loop below holds the first global access, so a PDL launch resolves
     // the grid dependency here: the index math above overlaps with the tail of
     // the producing kernel.
     if constexpr (USE_PDL) {
-        PdlWaitForDependents();
+        pdl_wait();
     }
 
     for (int group_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -154,11 +153,34 @@ __global__ void group_wise_quant_kernel(
         const int kb = group_idx % kb_dim;
         const int k_start = kb * GROUP_SIZE;
 
+        int sf_offset;
+        if constexpr (USE_SWIZZLE) {
+            // Pad and swizzle into CUTLASS SfAtom layout.
+            const int n_tile = row / 128;
+            const int n_local = row % 128;
+            const int mn_i = n_local % 32;
+            const int mn_j = n_local / 32;
+            const int k_tile = kb / 4;
+            const int sf_l = kb % 4;
+
+            const int cutlass_byte = (n_tile * num_k_tiles + k_tile) * 512 +
+                                     mn_i * 16 + mn_j * 4 + sf_l;
+            const int n_phys = cutlass_byte / kb_dim;
+            const int kb_phys = cutlass_byte % kb_dim;
+            sf_offset = n_phys * kb_dim + kb_phys;
+        } else {
+            sf_offset = row * kb_dim + kb;
+        }
+        if (row >= m) {
+            reinterpret_cast<uint8_t*>(output_sf)[sf_offset] = 0;
+            continue;
+        }
+
         const float4* input_vec =
             reinterpret_cast<const float4*>(input + row * k + k_start);
 
         float vals[GROUP_SIZE];
-        float amax = 1e-10f;
+        float amax = mxfp8::kAmaxFloor;
 
 #pragma unroll
         for (int i = 0; i < NUM_LOAD_VEC; ++i) {
@@ -189,7 +211,7 @@ __global__ void group_wise_quant_kernel(
         } else if constexpr (MODE == QuantMode::W4A4MXFP4) {
             scale_byte = float32_to_ue8m0(amax / FP4_E2M1_MAX, inv_scale);
         } else {
-            scale_byte = float32_to_ue8m0(amax / FP8_E4M3_MAX, inv_scale);
+            scale_byte = float32_to_ue8m0(amax / mxfp8::kE4m3Max, inv_scale);
         }
 
         if constexpr (IsFp4(MODE)) {
@@ -216,7 +238,8 @@ __global__ void group_wise_quant_kernel(
 #pragma unroll
             for (int i = 0; i < GROUP_SIZE; ++i) {
                 float scaled = vals[i] * inv_scale;
-                scaled = fminf(fmaxf(scaled, -FP8_E4M3_MAX), FP8_E4M3_MAX);
+                scaled =
+                    fminf(fmaxf(scaled, -mxfp8::kE4m3Max), mxfp8::kE4m3Max);
                 fp8_vals[i] = __nv_fp8_e4m3(scaled);
             }
 
@@ -231,31 +254,13 @@ __global__ void group_wise_quant_kernel(
             }
         }
 
-        int sf_offset;
-        if constexpr (USE_SWIZZLE) {
-            // Pad and swizzle into CUTLASS SfAtom layout.
-            const int n_tile = row / 128;
-            const int n_local = row % 128;
-            const int mn_i = n_local % 32;
-            const int mn_j = n_local / 32;
-            const int k_tile = kb / 4;
-            const int sf_l = kb % 4;
-
-            const int cutlass_byte = (n_tile * num_k_tiles + k_tile) * 512 +
-                                     mn_i * 16 + mn_j * 4 + sf_l;
-            const int n_phys = cutlass_byte / kb_dim;
-            const int kb_phys = cutlass_byte % kb_dim;
-            sf_offset = n_phys * kb_dim + kb_phys;
-        } else {
-            sf_offset = row * kb_dim + kb;
-        }
         reinterpret_cast<uint8_t*>(output_sf)[sf_offset] = scale_byte;
     }
 
-    // Every store of this block is out: publish it and let a PDL-dependent
-    // grid (typically the GEMM consuming these buffers) start.
+    // Every store of this block is issued: let a PDL-dependent grid (typically
+    // the GEMM consuming these buffers) start; its pdl_wait sees the stores.
     if constexpr (USE_PDL) {
-        PdlTriggerAfterBlockWrites();
+        pdl_trigger();
     }
 }
 
@@ -363,9 +368,9 @@ std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
     }
 
     auto output_sf =
-        torch::zeros({m_sf, kb_dim}, input.options().dtype(torch::kByte));
+        torch::empty({m_sf, kb_dim}, input.options().dtype(torch::kByte));
 
-    const int total_groups = m * kb_dim;
+    const int total_groups = m_sf * kb_dim;
     const int block_dim = 128;
     const int grid_dim = max((total_groups + block_dim - 1) / block_dim, 1);
     void* quant_data;

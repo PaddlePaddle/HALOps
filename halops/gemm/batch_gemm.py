@@ -19,6 +19,7 @@ from typing import Optional
 import torch
 
 import halops.halops_kernel as halops_kernel
+from halops.halops_kernel import EpilogueOp
 
 __all__ = ["batch_gemm"]
 
@@ -33,6 +34,10 @@ def batch_gemm(
     alpha: Optional[torch.Tensor] = None,
     sm_count: int = -1,
     mode: str = "w8a8-mxfp8",
+    epilogue: EpilogueOp = EpilogueOp.Identity,
+    output_sf: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+    use_pdl: bool = True,
 ) -> None:
     """Batch GEMM on Blackwell SM100 tensor cores.
 
@@ -58,13 +63,20 @@ def batch_gemm(
             - ``w4a4-nvfp4``: UE4M3 encoding.
 
         sfb: [B, N, sf_k] scale factor for B, dtype uint8, same SfAtom layout as sfa.
-        output: [B, M, N] pre-allocated output tensor, dtype bfloat16. Written in-place.
+        output: [B, M, N] pre-allocated output tensor, dtype bfloat16, or
+            float8_e4m3fn (``w8a8-mxfp8``) for an MXFP8-quantized output.
         bias: Optional [B, N] bfloat16 bias vector. Only supported in w8a8-mxfp8 mode.
         alpha: Optional float32 per-batch scaling factor with shape [B], one
             value per batch item. Required for ``w4a4-nvfp4``; not accepted for
             ``w4a4-mxfp4``.
         sm_count: Number of SMs to use (-1 for all available).
         mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``.
+        epilogue: ``EpilogueOp.Identity``, ``EpilogueOp.Quant`` or
+            ``EpilogueOp.GateMulQuant`` (``w8a8-mxfp8``: float8_e4m3fn output,
+            the result (times ``gate``) quantized per 32 columns).
+        output_sf: UE8M0 SfAtom scales of a quantized output.
+        gate: [B, M, N] bfloat16 tensor of ``EpilogueOp.GateMulQuant``.
+        use_pdl: Enable Programmatic Dependent Launch (on by default).
 
     Returns:
         None. The result is written in-place to output.
@@ -83,5 +95,17 @@ def batch_gemm(
         >>> batch_gemm(x, w, sfa, sfb, out, mode="w8a8-mxfp8")
     """
     halops_kernel.batch_gemm(
-        input, weight, sfa, sfb, output, bias, alpha, sm_count, mode
+        input,
+        weight,
+        sfa,
+        sfb,
+        output,
+        bias,
+        alpha,
+        sm_count,
+        mode,
+        epilogue,
+        output_sf,
+        gate,
+        use_pdl,
     )

@@ -42,6 +42,29 @@ def float32_to_ue8m0(x):
     return biased_exp.to(torch.uint8)
 
 
+SF_ATOM_ROWS = 128
+SF_ATOM_COLS = 4
+SF_ATOM_COL_ROWS = 32
+
+
+def sfatom_rows(rows):
+    """Rows of a CUTLASS SfAtom scale tensor: ``rows`` padded to whole atoms."""
+    return -(-rows // SF_ATOM_ROWS) * SF_ATOM_ROWS
+
+
+def sfatom_offsets(rows, kb_dim):
+    """[rows, kb_dim] byte offsets of logical scales in the CUTLASS SfAtom layout."""
+    r = torch.arange(rows)[:, None]
+    kb = torch.arange(kb_dim)[None, :]
+    atom = SF_ATOM_ROWS * SF_ATOM_COLS
+    return (
+        ((r // SF_ATOM_ROWS) * (kb_dim // SF_ATOM_COLS) + kb // SF_ATOM_COLS) * atom
+        + (r % SF_ATOM_COL_ROWS) * SF_ATOM_COLS * SF_ATOM_COLS
+        + ((r % SF_ATOM_ROWS) // SF_ATOM_COL_ROWS) * SF_ATOM_COLS
+        + kb % SF_ATOM_COLS
+    )
+
+
 def ue8m0_to_float32(scale_ue8m0):
     """Decode UE8M0 (uint8) back to a float32 scale value: value = 2^(byte - 127)."""
     exp = scale_ue8m0.to(torch.float32) - 127.0
