@@ -138,7 +138,6 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr std::uint32_t kNumLatentDownWeightSlots = 8;
         static constexpr std::uint32_t kNumCtasForLatentDown = 64;
         static constexpr bool kLatentDownUseSplitK = true;
-        static constexpr bool kLatentQuantizeOutput = true;
         // SharedExpert configs.
         static constexpr std::uint32_t kNumCtasForShared = 16;
         static constexpr std::uint32_t kNumSharedUpWeightSlots = 4;

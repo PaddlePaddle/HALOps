@@ -49,30 +49,6 @@ struct RouterLogits {
     }
 };
 
-// The latent down-projection's output, as the up phase consumes it.
-template <typename Dims, bool IsQuantized>
-struct LatentDownOutput;
-
-template <typename Dims>
-struct LatentDownOutput<Dims, false> {
-    using LatentDownGemm = LatentDownGemmTraits<Dims>;
-    using Element = DataType::ElementA;
-
-    static constexpr std::uint32_t kNumRows = LatentDownGemm::kGemmN;
-    static constexpr std::uint32_t kNumCols = LatentDownGemm::kGemmM;
-
-    alignas(16) Element data[kNumRows][kNumCols];
-
-    __device__ __forceinline__ void store(std::uint32_t tok, std::uint32_t col,
-                                          Element value) {
-        data[tok][col] = value;
-    }
-
-    __host__ __device__ __forceinline__ Element* data_ptr() {
-        return &data[0][0];
-    }
-};
-
 // The scale image of the projection's output, in the up staging's layout: the
 // block-wise fp32 table, or one SfAtom slab per up K tile for MXFP8.  Either
 // is exactly one up staging tile's scales, so the phase boundary is one blob.
@@ -113,8 +89,10 @@ struct LatentScaleImage<Dims, true> {
     }
 };
 
+// The latent down-projection's output, as the up phase consumes it: the up
+// staging tile's own image, one blob of data plus one of scales.
 template <typename Dims>
-struct LatentDownOutput<Dims, true> {
+struct LatentDownOutput {
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
     using UpGemm = UpGemmTraits<Dims>;
     using Element = DataType::ElementQA;
@@ -306,8 +284,7 @@ struct MoEWorkspace {
 
     SharedUpOut shared_up_out;
 
-    using LatentOut =
-        LatentDownOutput<Dims, MoEKernelTraits<Dims>::kLatentQuantizeOutput>;
+    using LatentOut = LatentDownOutput<Dims>;
     LatentOut latent_down_out;
 
     RouterLogits<Dims> router_logits;

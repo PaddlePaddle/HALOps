@@ -435,7 +435,9 @@ struct UpProjection {
         const typename UpGemm::ElementScale* __restrict__ up_scale,
         std::uint32_t weight_row_base, std::uint32_t task_id,
         std::uint32_t expert_id, std::uint64_t weight_cache_hint) {
-#pragma unroll
+        // Rolled: unrolled, the K-iterations are kNumTilesK copies of the
+        // TMA issue, code a launch with a cold L2 fetches from DRAM.
+#pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < kNumTilesK; ++k_iter_id) {
             const std::uint32_t ring_iter_id = task_id * kNumTilesK + k_iter_id;
             wait_weight_empty(smem, ring_iter_id);
@@ -511,8 +513,11 @@ struct UpProjection {
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 1; k_iter_id <= kNumTilesK;
              ++k_iter_id) {
+            const auto dq_span =
+                KERNEL_TIMER_BEGIN(smem->timer(), "up_dequant", k_iter_id);
             dequant(smem, acc_gate_out, acc_up_out, cur_scale_slot,
                     task_id * kNumTilesK + k_iter_id, k_iter_id, tmem_base);
+            KERNEL_TIMER_END(smem->timer(), dq_span);
         }
 
         WarpRole::sync_calc_threads();
@@ -540,6 +545,8 @@ struct UpProjection {
                 &smem->routed_experts.quantized_input.data[s][0][0][0])),
             sB_layout);
         cute::Tensor tCrB = cta_mma.make_fragment_B(tCsB);
+        const auto stage_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "up_stage_scales");
         if constexpr (UpGemm::MmaCore::kUseBlockscaled) {
             // SFA rides the weight ring's slot, SFB the staging slot; both
             // are in SfAtom layout, UTCCP moves them into TMEM.
@@ -552,6 +559,11 @@ struct UpProjection {
                     sfa, sfb, tmem_addr(tmem_base, 0u, kUpSfaTmemOffset),
                     tmem_addr(tmem_base, 0u, kUpSfbTmemOffset));
             }
+        }
+        KERNEL_TIMER_END(smem->timer(), stage_span);
+        const auto issue_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "up_mma_issue");
+        if constexpr (UpGemm::MmaCore::kUseBlockscaled) {
             UpGemm::MmaCore::run(
                 tiled_mma, cta_mma,
                 reinterpret_cast<WeightElement*>(
@@ -570,6 +582,7 @@ struct UpProjection {
                 tCrB, tCt_gate,
                 tmem_addr(tmem_base, 0u, acc_slot * kAccColumns));
         }
+        KERNEL_TIMER_END(smem->timer(), issue_span);
     }
 
     __device__ static void dequant(SharedStorage* __restrict__ smem,

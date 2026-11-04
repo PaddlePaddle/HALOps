@@ -446,7 +446,8 @@ struct DownProjection {
         std::uint32_t base_m, std::uint64_t weight_cache_hint) {
         const std::uint32_t ring_iter_id = id_base + local_id;
 
-#pragma unroll
+        // Rolled, like the other down K loops (see run_mma_k_loop).
+#pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < kNumTilesK; ++k_iter_id) {
             const std::uint32_t slot = (local_id + k_iter_id) % kNumWeightSlots;
             wait_down_weight_empty(smem, id_base, ring_iter_id + k_iter_id,
@@ -495,7 +496,8 @@ struct DownProjection {
                                         Workspace::kUpOutReadyFull);
         KERNEL_TIMER_END(smem->timer(), up_out_span);
 
-#pragma unroll
+        // Rolled, like the other down K loops (see run_mma_k_loop).
+#pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < kNumTilesK; ++k_iter_id) {
             wait_activation_empty(smem, id_base + local_id + k_iter_id);
             prefetch_down_activation(smem, workspace, tma_down_activations_desc,
@@ -520,7 +522,10 @@ struct DownProjection {
                               cute::GenRowMajor{})));
         cute::Tensor tCt = cta_mma.make_fragment_C(tC_proxy);
 
-#pragma unroll
+        // Rolled: unrolled, each K step is its own copy of the scale staging
+        // and UMMA issue, with every slot's descriptors held in registers, and
+        // a launch with a cold L2 fetches all of that code from DRAM.
+#pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < kNumTilesK; ++k_iter_id) {
             const std::uint32_t step_id = ring_iter_id + k_iter_id;
             const std::uint32_t step_local = local_id + k_iter_id;
@@ -545,7 +550,10 @@ struct DownProjection {
                 KERNEL_TIMER_END(smem->timer(), act_span);
             }
             if constexpr (DownGemm::MmaCore::kUseBlockscaled) {
+                const auto stage_span =
+                    KERNEL_TIMER_BEGIN(smem->timer(), "down_stage_scales");
                 stage_down_scales(smem, step_local);
+                KERNEL_TIMER_END(smem->timer(), stage_span);
             }
             mma(smem, tiled_mma, cta_mma, sB_layout, tCt, acc_slot, w_slot,
                 step_local, tmem_base);
@@ -568,8 +576,11 @@ struct DownProjection {
 #pragma unroll(kDrainUnroll)
         for (std::uint32_t k_iter_id = 1; k_iter_id <= kNumTilesK;
              ++k_iter_id) {
+            const auto dq_span =
+                KERNEL_TIMER_BEGIN(smem->timer(), "down_dequant", k_iter_id);
             dequant(smem, ring_iter_id + k_iter_id, acc_out, m_tile_idx,
                     lane_base, k_iter_id, tmem_base);
+            KERNEL_TIMER_END(smem->timer(), dq_span);
         }
     }
 
@@ -591,6 +602,8 @@ struct DownProjection {
                                        .act_down_input[cur_w_slot][0])),
                               sB_layout);
         cute::Tensor tCrB = cta_mma.make_fragment_B(tCsB);
+        const auto issue_span =
+            KERNEL_TIMER_BEGIN(smem->timer(), "down_mma_issue");
         if constexpr (DownGemm::MmaCore::kUseBlockscaled) {
             // The issuer staged this step's scales one step ago; tcgen05 ops
             // from one warp are ordered, so the MMA reads them directly.
@@ -610,6 +623,7 @@ struct DownProjection {
                     &smem->routed_experts.w_down[cur_w_slot][0][0]),
                 tCrB, tCt, tmem_addr(tmem_base, 0u, acc * kAccColumns));
         }
+        KERNEL_TIMER_END(smem->timer(), issue_span);
     }
 
     // Issue the weight TMAs for one (expert, N-step): one TMA per M instruction

@@ -136,7 +136,6 @@ struct CollectiveMainloopMoE {
         std::uint32_t l2_expert_capacity;
         alignas(128) CUtensorMap tma_up_weights_desc;
         alignas(128) CUtensorMap tma_input_desc;
-        alignas(128) CUtensorMap tma_latent_out_desc;
         alignas(128) CUtensorMap tma_down_weights_desc;
         alignas(128) CUtensorMap tma_down_activations_desc;
         alignas(128) CUtensorMap tma_latent_down_weight_desc;
@@ -192,15 +191,6 @@ struct CollectiveMainloopMoE {
         params.tma_input_desc = CreateTmaDesc2D(
             "activations", args.input, args.num_tokens, Dims::kHiddenSize,
             /*box_rows=*/8u, /*box_cols=*/64u);
-        if constexpr (Traits::kUseLatent && !Traits::kLatentQuantizeOutput) {
-            params.tma_latent_out_desc = CreateTmaDesc2D(
-                "activations",
-                reinterpret_cast<Workspace*>(args.workspace)
-                    ->latent_down_out.data_ptr(),
-                Dims::kNumTokens, Dims::kLatentSize, /*box_rows=*/8u,
-                /*box_cols=*/64u);
-        }
-
         params.tma_up_weights_desc = CreateTmaDesc2D(
             "up-projection weights", args.expert_up_weights,
             /*rows=*/Dims::kNumExperts * 2u * Dims::kIntermediateSize,
@@ -465,130 +455,6 @@ struct CollectiveMainloopMoE {
         __syncwarp();
     }
 
-    // The up phase's staging loader: the activation through the input ring,
-    // one K tile per slot, in the order the quantize reads them.
-    __device__ static void run_load_up_input_k_loop(
-        CUtensorMap const& tma_desc, std::uint32_t num_tiles,
-        SharedStorage* __restrict__ smem) {
-        // This phase's own streaming tile, never the router's geometry.
-        constexpr std::uint32_t kBytes =
-            Traits::UpGemm::kTileShapeK * Dims::kNumTokens *
-            static_cast<std::uint32_t>(sizeof(DataType::ElementA));
-#pragma unroll 1
-        for (std::uint32_t tile = 0; tile < num_tiles; ++tile) {
-            const std::uint32_t slot = tile % Traits::kUpInputSlots;
-            if (tile >= Traits::kUpInputSlots) {
-                smem->barriers.up_input_slot_empty.wait(tile -
-                                                        Traits::kUpInputSlots);
-            }
-            smem->barriers.up_input_slot_ready.arrive(tile, kBytes);
-            load_input_tile<Dims::kNumTokens>(
-                tma_desc, tile, /*token_start=*/0u,
-                smem->routed_experts.input.data[slot],
-                smem->barriers.up_input_slot_ready.raw(slot));
-        }
-    }
-
-    // Calc warps: the whole activation in one pass, for the configs whose
-    // input ring holds the projection output outright.
-    __device__ void quantize_up_input_whole(SharedStorage* __restrict__ smem,
-                                            int batch_size) {
-        const auto quantize_span =
-            KERNEL_TIMER_BEGIN(smem->timer(), "up_quantize_input");
-        if constexpr (Traits::UpGemm::MmaCore::kUseBlockscaled) {
-            quantize_mxfp8_groupwise_1x32<
-                /*Staged=*/false, Dims::kNumTokens, Dims::kLatentSize,
-                Dims::kQuantConfig.kBlockSize, /*SwizzleBoxK=*/1u,
-                Traits::kQuantBlocksPerTile>(
-                reinterpret_cast<const DataType::ElementA*>(
-                    &smem->routed_experts.input.data[0][0][0]),
-                /*k_base=*/0u, &smem->routed_experts.quantized_input.data[0],
-                &smem->routed_experts.quantized_input.scale[0][0],
-                /*staging_slot_base=*/0u, /*src_block_base=*/0u, batch_size,
-                /*row_start=*/0u, WarpRole::get_calc_warp_idx(),
-                WarpRole::kCalcWarpCount);
-        } else {
-            quantize_fp8_groupwise_128<
-                /*Staged=*/false, Dims::kNumTokens, Dims::kLatentSize,
-                Traits::UpGemm::kGemmN, Dims::kQuantConfig.kBlockSize,
-                /*SwizzleBoxK=*/1u,
-                /*BlocksPerStage=*/Traits::kQuantBlocksPerTile>(
-                reinterpret_cast<const DataType::ElementA*>(
-                    &smem->routed_experts.input.data[0][0][0]),
-                /*k_base=*/0u, &smem->routed_experts.quantized_input.data[0],
-                &smem->routed_experts.quantized_input.scale[0][0],
-                /*staging_block_base=*/0u, /*scale_block_base=*/0u,
-                /*src_block_base=*/0u, batch_size,
-                /*row_start=*/0u, WarpRole::get_calc_warp_idx(),
-                WarpRole::kCalcWarpCount);
-        }
-        // One pass, every tile at once: the issuer's waits all pass straight
-        // through.
-        KERNEL_TIMER_END(smem->timer(), quantize_span);
-        WarpRole::sync_calc_threads();
-        if (WarpRole::get_calc_warp_idx() == 0u &&
-            WarpRole::get_lane_idx() == 0u) {
-            for (std::uint32_t tile = 0; tile < Traits::UpGemm::kNumTilesK;
-                 ++tile) {
-                smem->barriers.up_staging_ready.arrive(tile);
-            }
-        }
-    }
-
-    // Calc warps: quantize the up phase's bf16 activation out of the input
-    // ring, one K tile at a time, freeing each slot as it lands.
-    __device__ void quantize_up_input(std::uint32_t num_tiles,
-                                      SharedStorage* __restrict__ smem,
-                                      int batch_size) {
-        const auto quantize_span =
-            KERNEL_TIMER_BEGIN(smem->timer(), "up_quantize_input");
-        constexpr std::uint32_t kInputTileK = Traits::UpGemm::kTileShapeK;
-        constexpr std::uint32_t kBlocksPerTile =
-            kInputTileK / Dims::kQuantConfig.kBlockSize;
-        const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
-#pragma unroll 1
-        for (std::uint32_t tile = 0; tile < num_tiles; ++tile) {
-            const std::uint32_t slot = tile % Traits::kUpInputSlots;
-            smem->barriers.up_input_slot_ready.wait(tile);
-            if constexpr (Traits::UpGemm::MmaCore::kUseBlockscaled) {
-                quantize_mxfp8_groupwise_1x32<
-                    /*Staged=*/true, Dims::kNumTokens, kInputTileK,
-                    Dims::kQuantConfig.kBlockSize,
-                    SwizzleBoxK<DataType::ElementA>::value, kBlocksPerTile>(
-                    &smem->routed_experts.input.data[slot][0][0][0],
-                    tile * kInputTileK,
-                    &smem->routed_experts.quantized_input.data[0],
-                    &smem->routed_experts.quantized_input.scale[0][0], tile,
-                    tile * kBlocksPerTile, batch_size, /*row_start=*/0u,
-                    warp_idx, WarpRole::kCalcWarpCount);
-            } else {
-                quantize_fp8_groupwise_128<
-                    /*Staged=*/true, Dims::kNumTokens, kInputTileK,
-                    Traits::UpGemm::kGemmN, Dims::kQuantConfig.kBlockSize,
-                    SwizzleBoxK<DataType::ElementA>::value, kBlocksPerTile>(
-                    &smem->routed_experts.input.data[slot][0][0][0],
-                    tile * kInputTileK,
-                    &smem->routed_experts.quantized_input.data[0],
-                    &smem->routed_experts.quantized_input.scale[0][0],
-                    /*staging_slot_base=*/tile, tile * kBlocksPerTile,
-                    tile * kBlocksPerTile, batch_size,
-                    /*row_start=*/0u, warp_idx, WarpRole::kCalcWarpCount);
-            }
-            __syncwarp();
-            if (WarpRole::get_lane_idx() == 0u) {
-                smem->barriers.up_input_slot_empty.arrive(tile);
-            }
-            // This tile's fp8 staging is complete once every calc warp has
-            // stored: the issuer may consume it while the next one quantizes.
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            WarpRole::sync_calc_threads();
-            if (warp_idx == 0u && WarpRole::get_lane_idx() == 0u) {
-                smem->barriers.up_staging_ready.arrive(tile);
-            }
-        }
-        KERNEL_TIMER_END(smem->timer(), quantize_span);
-    }
-
     // The up entry's staging when the projection quantized its output: both
     // tensors are already the B operand's image, so this is one bulk copy each
     // and the issuer can read the staging as soon as it lands.
@@ -624,10 +490,6 @@ struct CollectiveMainloopMoE {
                            TaskScheduler<KernelTraits>& sched) {
         Workspace* __restrict__ workspace =
             reinterpret_cast<Workspace*>(params.scratchpad);
-        // The up phase's entry: the fp8 B operand.
-        constexpr bool kWholeLatentFits =
-            Dims::kLatentSize <=
-            Traits::kUpInputSlots * Traits::UpGemm::kTileShapeK;
         if (WarpRole::is_other_loader_thread()) {
             if constexpr (Traits::kUseLatent) {
                 const auto latent_span =
@@ -638,47 +500,9 @@ struct CollectiveMainloopMoE {
             }
             const auto activation_span =
                 KERNEL_TIMER_BEGIN(smem->timer(), "up_load_activation");
-            if constexpr (Traits::kLatentQuantizeOutput) {
-                load_quantized_activation(workspace, smem);
-            } else if constexpr (Traits::kUseLatent && kWholeLatentFits) {
-                // Only the launch's rows: the padding rows are zero-filled by
-                // the quantize, which never reads their source.
-                const std::uint32_t kBytes =
-                    params.num_tokens * Dims::kLatentSize *
-                    static_cast<std::uint32_t>(sizeof(DataType::ElementA));
-                smem->barriers.latent_copy_ready.arrive(0u, kBytes);
-                tma_load_1d(workspace->latent_down_out.data_ptr(), kBytes,
-                            reinterpret_cast<DataType::ElementA*>(
-                                &smem->routed_experts.input.data[0][0][0]),
-                            smem->barriers.latent_copy_ready.raw(0u));
-            } else if constexpr (Traits::kUseLatent) {
-                run_load_up_input_k_loop(params.tma_latent_out_desc,
-                                         Traits::UpGemm::kNumTilesK, smem);
-            } else {
-                run_load_up_input_k_loop(params.tma_input_desc,
-                                         Traits::UpGemm::kNumTilesK, smem);
-            }
+            load_quantized_activation(workspace, smem);
             KERNEL_TIMER_END(smem->timer(), activation_span);
         }
-        if constexpr (!Traits::kLatentQuantizeOutput) {
-            if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
-                if constexpr (Traits::kUseLatent && kWholeLatentFits) {
-                    smem->barriers.latent_copy_ready.wait(0u);
-                    quantize_up_input_whole(
-                        smem, static_cast<int>(params.num_tokens));
-                } else {
-                    quantize_up_input(Traits::UpGemm::kNumTilesK, smem,
-                                      static_cast<int>(params.num_tokens));
-                }
-                // The UMMA reads these stores through the async proxy.
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                WarpRole::sync_calc_threads();
-                if (WarpRole::get_lane_idx() == 0u) {
-                    smem->barriers.up_input_ready.arrive(0u);
-                }
-            }
-        }
-
         UpProjection<KernelTraits>::run(
             params.expert_scales_up, params.num_tokens, params.activation,
             GatedActParams{params.situ_beta, params.situ_linear_beta},
