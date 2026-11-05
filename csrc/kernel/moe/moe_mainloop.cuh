@@ -22,10 +22,10 @@
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_cta_comm.cuh"
 #include "kernel/moe/moe_mainloop_down.cuh"
-#include "kernel/moe/moe_mainloop_latent.cuh"
+#include "kernel/moe/moe_mainloop_latent_down.cuh"
+#include "kernel/moe/moe_mainloop_routed_up.cuh"
 #include "kernel/moe/moe_mainloop_router.cuh"
 #include "kernel/moe/moe_mainloop_shared.cuh"
-#include "kernel/moe/moe_mainloop_up.cuh"
 #include "kernel/moe/moe_scheduler.cuh"
 #include "kernel/moe/moe_shared_storage.cuh"
 #include "kernel/moe/moe_tma.cuh"
@@ -63,11 +63,12 @@ struct CollectiveMainloopMoE {
         std::uint32_t intermediate_size;
         const DataType::ElementA* input;
         const typename Traits::RouterGemm::MmaElement* router_weight;
-        const typename UpGemmTraits<Dims>::MmaElement* expert_up_weights;
-        const typename UpGemmTraits<Dims>::ElementScale*
+        const typename RoutedUpGemmTraits<Dims>::MmaElement* expert_up_weights;
+        const typename RoutedUpGemmTraits<Dims>::ElementScale*
             expert_up_weights_scale;
-        const typename DownGemmTraits<Dims>::MmaElement* expert_down_weights;
-        const typename DownGemmTraits<Dims>::ElementScale*
+        const typename RoutedDownGemmTraits<Dims>::MmaElement*
+            expert_down_weights;
+        const typename RoutedDownGemmTraits<Dims>::ElementScale*
             expert_down_weights_scale;
         const typename SharedUpGemmTraits<Dims>::MmaElement* shared_up_weight;
         const typename SharedUpGemmTraits<Dims>::ElementScale*
@@ -103,13 +104,13 @@ struct CollectiveMainloopMoE {
         const DataType::ElementA* __restrict__ input;
         const typename Traits::RouterGemm::
             MmaElement* __restrict__ router_weight;
-        const typename UpGemmTraits<
+        const typename RoutedUpGemmTraits<
             Dims>::MmaElement* __restrict__ expert_weights_up;
-        const typename UpGemmTraits<
+        const typename RoutedUpGemmTraits<
             Dims>::ElementScale* __restrict__ expert_scales_up;
-        const typename DownGemmTraits<
+        const typename RoutedDownGemmTraits<
             Dims>::MmaElement* __restrict__ expert_weights_down;
-        const typename DownGemmTraits<
+        const typename RoutedDownGemmTraits<
             Dims>::ElementScale* __restrict__ expert_scales_down;
         DataType::ElementOut* __restrict__ activations_out;
         const typename Traits::LatentDownGemm::
@@ -254,13 +255,23 @@ struct CollectiveMainloopMoE {
     // latent down-projection occupies.
     __device__ void run_shared(Params const& params,
                                SharedStorage* __restrict__ smem) {
-        SharedExpertProjection<Traits>::run(
-            params.tma_shared_up_desc, params.tma_shared_down_desc,
-            params.tma_input_desc, params.shared_up_scale,
-            params.shared_down_scale, params.shared_out,
-            reinterpret_cast<Workspace*>(params.scratchpad), smem,
-            static_cast<std::uint32_t>(params.num_tokens), params.activation,
-            params.situ_beta, params.situ_linear_beta);
+        using Shared = SharedUpProjectionBase<Traits>;
+        using Up = SharedUpProjection<Traits>;
+        using Down = SharedDownProjection<Traits>;
+
+        if (!Shared::is_shared_cta()) return;
+
+        auto* workspace = reinterpret_cast<Workspace*>(params.scratchpad);
+        const std::uint32_t batch_size =
+            static_cast<std::uint32_t>(params.num_tokens);
+        if (Shared::cta_idx() < Shared::kNumUpCtas) {
+            Up::run(params.tma_shared_up_desc, params.tma_input_desc,
+                    params.shared_up_scale, workspace, smem, batch_size,
+                    params.activation, params.situ_beta,
+                    params.situ_linear_beta);
+        }
+        Down::run(params.tma_shared_down_desc, params.shared_down_scale,
+                  params.shared_out, workspace, smem, batch_size);
     }
 
     // Phase 0c: the router Linear on this block's expert tiles, then this
@@ -367,6 +378,8 @@ struct CollectiveMainloopMoE {
                 }
                 __syncwarp();
             }
+            // The other calc warps read the swapped half too.
+            WarpRole::sync_calc_threads();
         }
     }
 
@@ -386,8 +399,6 @@ struct CollectiveMainloopMoE {
         if (!reads_published_tables) {
             if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
                 run_router_topk(params, workspace, smem, lane_idx);
-            }
-            if (WarpRole::get_calc_warp_idx() == 0u) {
                 // Every router block holds the whole selection by now (a
                 // coop pair has swapped halves), so it builds its own.
                 const auto tables_span =
@@ -396,7 +407,7 @@ struct CollectiveMainloopMoE {
                                              smem);
                 KERNEL_TIMER_END(smem->timer(), tables_span);
                 // Block 0 hands its finished tables to the other blocks.
-                if (blockIdx.x == 0u) {
+                if (blockIdx.x == 0u && WarpRole::get_calc_warp_idx() == 0u) {
                     publish_routing_tables(workspace, smem, lane_idx);
                 }
             }
@@ -482,19 +493,15 @@ struct CollectiveMainloopMoE {
                           kScaleBytes == Workspace::LatentOut::kScaleBytes,
                       "the projection's output must be exactly one up "
                       "staging tile.");
-        smem->barriers.latent_copy_ready.arrive(0u, kFp8Bytes + kScaleBytes);
+        smem->barriers.routed.up_input_ready.arrive(0u,
+                                                    kFp8Bytes + kScaleBytes);
         tma_load_1d(workspace->latent_down_out.data_ptr(), kFp8Bytes,
                     &smem->routed_experts.quantized_input.data[0][0][0][0],
-                    smem->barriers.latent_copy_ready.raw(0u));
+                    smem->barriers.routed.up_input_ready.raw(0u));
         tma_load_1d(workspace->latent_down_out.scale_ptr(), kScaleBytes,
                     &smem->routed_experts.quantized_input.scale[0][0],
-                    smem->barriers.latent_copy_ready.raw(0u));
-        smem->barriers.latent_copy_ready.wait(0u);
-        // Every K tile of the staging is complete at once.
-        for (std::uint32_t tile = 0; tile < Traits::UpGemm::kNumTilesK;
-             ++tile) {
-            smem->barriers.up_staging_ready.arrive(tile);
-        }
+                    smem->barriers.routed.up_input_ready.raw(0u));
+        smem->barriers.routed.up_input_ready.wait(0u);
     }
 
     // Phase 2: up-projection over this block's tasks, as enumerated by `sched`.
@@ -519,12 +526,12 @@ struct CollectiveMainloopMoE {
             load_quantized_activation(workspace, smem);
             KERNEL_TIMER_END(smem->timer(), activation_span);
         }
-        UpProjection<KernelTraits, Traits::UpGemm::MmaCore::kUseBlockscaled>::
-            run(params.expert_scales_up, params.num_tokens, params.activation,
-                params.situ_beta, params.situ_linear_beta, workspace, smem,
-                params.tma_up_weights_desc, sched,
-                get_tma_cache_hint(smem->routing.active_expert_count >
-                                   params.l2_expert_capacity));
+        RoutedUpProjection<KernelTraits>::run(
+            params.expert_scales_up, params.num_tokens, params.activation,
+            params.situ_beta, params.situ_linear_beta, workspace, smem,
+            params.tma_up_weights_desc, sched,
+            get_tma_cache_hint(smem->routing.active_expert_count >
+                               params.l2_expert_capacity));
     }
 
     // Phase 3: down-projection over this block's tasks, as enumerated by
@@ -532,14 +539,13 @@ struct CollectiveMainloopMoE {
     __device__ void run_down(Params const& params,
                              SharedStorage* __restrict__ smem,
                              TaskScheduler<KernelTraits>& sched) {
-        DownProjection<KernelTraits,
-                       Traits::DownGemm::MmaCore::kUseBlockscaled>::
-            run(params.expert_scales_down,
-                reinterpret_cast<Workspace*>(params.scratchpad), smem,
-                params.tma_down_weights_desc, params.tma_down_activations_desc,
-                sched,
-                get_tma_cache_hint(smem->routing.active_expert_count >
-                                   params.l2_expert_capacity));
+        RoutedDownProjection<KernelTraits>::run(
+            params.expert_scales_down,
+            reinterpret_cast<Workspace*>(params.scratchpad), smem,
+            params.tma_down_weights_desc, params.tma_down_activations_desc,
+            sched,
+            get_tma_cache_hint(smem->routing.active_expert_count >
+                               params.l2_expert_capacity));
     }
 
     // Pulls the TMA descriptors into the descriptor cache, so the first TMA of
@@ -553,7 +559,7 @@ struct CollectiveMainloopMoE {
         cute::prefetch_tma_descriptor(&params.tma_down_activations_desc);
     }
 
-    // Per-block setup: mbarrier and TMEM setup, the input-activation TMA and
+    // Per-block setup: mbarrier and TMEM setup, the descriptor prefetch and
     // the per-block launch parity.
     __device__ void initialize(Params const& params,
                                SharedStorage* __restrict__ smem) {
@@ -562,47 +568,43 @@ struct CollectiveMainloopMoE {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
 
-        if (WarpRole::is_tmem_warp(warp_idx)) {
-            // TMEM allocation issued by ONE fully-active warp.
-            tmem_alloc(Traits::kTmemColumns, &smem->tmem_ptr);
-        } else if (warp_idx == 1 && lane_idx == 0) {
-            smem->barriers.init_router_ring();
-            smem->barriers.init_latent_ring();
-            smem->barriers.init_expert_ring();
-            smem->barriers.init_shared_ring();
-            cutlass::arch::fence_barrier_init();
-        } else if (warp_idx == 2 && lane_idx == 0) {
-            // A warp with no other setup role; one thread covers the block.
-            prefetch_tma_descriptors(params);
-        } else if (warp_idx == 3 && lane_idx == 0) {
+        // The parity's workspace round trip is the longest step here, so its
+        // branch comes first.
+        if (warp_idx == 3 && lane_idx == 0) {
             // Per-CTA private launch counter.
             smem->launch_parity = workspace->cta_comm.claim_parity();
             // The down task queue starts empty.
             smem->down_tasks_claimed = 0u;
             smem->down_task_stores = 0u;
+        } else if (WarpRole::is_tmem_warp(warp_idx)) {
+            // TMEM allocation issued by ONE fully-active warp.
+            tmem_alloc(Traits::kTmemColumns, &smem->tmem_ptr);
+        } else if (warp_idx == 1 && lane_idx == 0) {
+            // Only this block's prologue role's barriers.
+            if (Router::is_router_cta()) {
+                smem->barriers.init_router_ring();
+            } else if (Latent::is_latent_cta()) {
+                smem->barriers.latent_down.init(
+                    static_cast<int>(WarpRole::kCalcWarpCount));
+            } else if (SharedUpProjectionBase<Traits>::is_shared_cta()) {
+                smem->barriers.init_shared_ring();
+            }
+            cutlass::arch::fence_barrier_init();
+        } else if (warp_idx == 2 && lane_idx == 0) {
+            prefetch_tma_descriptors(params);
+            // Every block runs the expert phases.
+            smem->barriers.routed.init();
+            cutlass::arch::fence_barrier_init();
         }
         __syncthreads();
 
-        if (warp_idx >= 4 && warp_idx < 8) {
-            // Reset the readiness state for the NEXT launch.
-            constexpr std::uint32_t kZeroThreads =
-                4u * WarpRole::kThreadsPerWarp;
-            // The ranks are the grid's zeroing threads in order, so the
-            // launch covers the rows as long as the smallest grid still
-            // reaches them.
-            static_assert(
-                Traits::kMinGrid * kZeroThreads >= Workspace::kMaxRoutedRows,
-                "the grid's zeroing threads must cover the per-row "
-                "up_out_ready words that reset_inactive zeroes by "
-                "`rank`.");
-
-            std::uint32_t launch_parity = smem->launch_parity;
-            std::uint32_t zero_tid =
-                threadIdx.x - 4u * WarpRole::kThreadsPerWarp;
-            // One pass may not reach every row: stride until the table is
-            // covered.
-            for (std::uint32_t rank = blockIdx.x * kZeroThreads + zero_tid;
-                 rank < Workspace::kMaxRoutedRows; rank += kZeroThreads) {
+        // Block 0 resets the readiness state for the NEXT launch, on the
+        // publish warp: it has no prologue role.
+        if (blockIdx.x == 0u && WarpRole::is_publish_warp(warp_idx)) {
+            const std::uint32_t launch_parity = smem->launch_parity;
+            for (std::uint32_t rank = lane_idx;
+                 rank < Workspace::kMaxRoutedRows;
+                 rank += WarpRole::kThreadsPerWarp) {
                 workspace->cta_comm.reset_inactive(launch_parity, rank);
             }
         }
@@ -631,53 +633,27 @@ struct CollectiveMainloopMoE {
         const std::uint32_t num_cells = batch_size * kDownOutputColsPerCta;
         const std::uint32_t top_k = params.top_k;
 
-        if constexpr (Traits::kCombineWaitPerToken) {
-            // A token's cells fill whole warps, so each wait is warp-uniform
-            // and every lane acquires the wait for itself.
-            static_assert(
-                kDownOutputColsPerCta % WarpRole::kThreadsPerWarp == 0u,
-                "a warp's combine cells must share one token");
-            __syncwarp();
-            for (std::uint32_t flat = first_cell; flat < num_cells;
-                 flat += cell_stride) {
-                const std::uint32_t tok = flat / kDownOutputColsPerCta;
-                const auto wait_span =
-                    KERNEL_TIMER_BEGIN(smem->timer(), "wait_down_out", tok);
-                workspace->cta_comm.wait_down_out_field(
-                    smem->launch_parity, m_block,
-                    tok * PackedTokenCounts<Dims>::kBits,
-                    PackedTokenCounts<Dims>::kMask, top_k);
-                KERNEL_TIMER_END(smem->timer(), wait_span);
-                const auto gather_span = KERNEL_TIMER_BEGIN(
-                    smem->timer(), "gather_and_combine", tok);
-                gather_cell(workspace, activations_out, tok,
-                            base_col + flat % kDownOutputColsPerCta, top_k);
-                KERNEL_TIMER_END(smem->timer(), gather_span);
-            }
-            return;
-        }
-
-        // Readiness wait: this block's m-block completes once every active
-        // expert's task of it has been published.
-        const auto m_block_wait =
-            KERNEL_TIMER_BEGIN(smem->timer(), "wait_down_out");
-        if (threadIdx.x == 0) {
-            workspace->cta_comm.wait_down_out(
-                smem->launch_parity, m_block,
-                smem->routing.active_expert_count);
-        }
-        __syncthreads();
-        KERNEL_TIMER_END(smem->timer(), m_block_wait);
-
-        const auto gather_span =
-            KERNEL_TIMER_BEGIN(smem->timer(), "gather_and_combine");
+        // A token's cells fill whole warps, so each wait is warp-uniform
+        // and every lane acquires the wait for itself.
+        static_assert(kDownOutputColsPerCta % WarpRole::kThreadsPerWarp == 0u,
+                      "a warp's combine cells must share one token");
+        __syncwarp();
         for (std::uint32_t flat = first_cell; flat < num_cells;
              flat += cell_stride) {
-            gather_cell(workspace, activations_out,
-                        flat / kDownOutputColsPerCta,
+            const std::uint32_t tok = flat / kDownOutputColsPerCta;
+            const auto wait_span =
+                KERNEL_TIMER_BEGIN(smem->timer(), "wait_down_out", tok);
+            workspace->cta_comm.wait_down_out_field(
+                smem->launch_parity, m_block,
+                tok * PackedTokenCounts<Dims>::kBits,
+                PackedTokenCounts<Dims>::kMask, top_k);
+            KERNEL_TIMER_END(smem->timer(), wait_span);
+            const auto gather_span =
+                KERNEL_TIMER_BEGIN(smem->timer(), "gather_and_combine", tok);
+            gather_cell(workspace, activations_out, tok,
                         base_col + flat % kDownOutputColsPerCta, top_k);
+            KERNEL_TIMER_END(smem->timer(), gather_span);
         }
-        KERNEL_TIMER_END(smem->timer(), gather_span);
     }
 
     // One output cell: sums token `tok`'s top_k combine slots at column `col`

@@ -61,8 +61,7 @@ struct LatentScaleImage<Dims, false> {
     // The block-wise image is fp32 by recipe; the MX one is a byte blob.
     using Element = float;
 
-    static constexpr std::uint32_t kNumBlocks =
-        LatentDownGemm::kGemmM / Dims::kQuantConfig.kBlockSize;
+    static constexpr std::uint32_t kNumBlocks = LatentDownGemm::kGemmM / 128u;
     static constexpr std::uint32_t kNumRows = LatentDownGemm::kGemmN;
 
     alignas(16) Element data[kNumBlocks][kNumRows];
@@ -74,7 +73,7 @@ struct LatentScaleImage<Dims, false> {
 
 template <typename Dims>
 struct LatentScaleImage<Dims, true> {
-    using UpGemm = UpGemmTraits<Dims>;
+    using UpGemm = RoutedUpGemmTraits<Dims>;
     using Element = std::uint8_t;
 
     // One 128-token SfAtom slab per up K tile holds that tile's 32-K groups.
@@ -94,9 +93,9 @@ struct LatentScaleImage<Dims, true> {
 template <typename Dims>
 struct LatentDownOutput {
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
-    using UpGemm = UpGemmTraits<Dims>;
     using Element = DataType::ElementQA;
-    using ScaleImage = LatentScaleImage<Dims, UpGemm::MmaCore::kUseBlockscaled>;
+    using ScaleImage =
+        LatentScaleImage<Dims, LatentDownGemm::kOutputUseBlockscaled>;
 
     static constexpr std::uint32_t kNumRows = LatentDownGemm::kGemmN;
     static constexpr std::uint32_t kNumCols = LatentDownGemm::kGemmM;
@@ -145,7 +144,7 @@ struct SharedUpOutput {
     using SharedUpGemm = SharedUpGemmTraits<Dims>;
     using SharedDownGemm = SharedDownGemmTraits<Dims>;
 
-    static constexpr std::uint32_t kQuantBlock = SharedUpGemm::kActQuantBlock;
+    static constexpr std::uint32_t kQuantBlock = SharedUpGemm::kTileShapeM / 2u;
 
     static constexpr std::uint32_t kNumRows = SharedUpGemm::kGemmN;
     static constexpr std::uint32_t kNumCols = SharedUpGemm::kGemmM / 2u;
@@ -204,7 +203,7 @@ struct RoutedUpOutput {
     using ElementType = DataType::ElementQA;
     // The block-wise image is fp32 by recipe; the MX one is a byte blob.
     using ScaleType = float;
-    using UpGemm = UpGemmTraits<Dims>;
+    using UpGemm = RoutedUpGemmTraits<Dims>;
 
     static constexpr std::uint32_t kNumRows = UpGemm::kGemmN * Dims::kMaxTopk;
     static constexpr std::uint32_t kNumCols = UpGemm::kGemmM / 2u;
@@ -251,7 +250,7 @@ struct RoutedUpOutput {
 template <typename Dims>
 struct RoutedDownOutput {
     using ElementType = DataType::ElementOut;
-    using DownGemm = DownGemmTraits<Dims>;
+    using DownGemm = RoutedDownGemmTraits<Dims>;
 
     static constexpr std::uint32_t kNumRows = DownGemm::kGemmN * Dims::kMaxTopk;
     static constexpr std::uint32_t kNumCols = DownGemm::kGemmM;
@@ -270,7 +269,7 @@ struct RoutedDownOutput {
 
 template <typename Dims>
 struct MoEWorkspace {
-    using DownGemm = DownGemmTraits<Dims>;
+    using DownGemm = RoutedDownGemmTraits<Dims>;
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
     using RoutedUpOut = RoutedUpOutput<Dims>;
     using RoutedDownOut = RoutedDownOutput<Dims>;

@@ -128,7 +128,6 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
     struct KernelConfig {
         static constexpr std::uint32_t kBlockSize = 384;
         static constexpr std::uint32_t kNumRouterInputSlots = 16;
-        static constexpr std::uint32_t kNumLatentInputSlots = 8;
         static constexpr std::uint32_t kNumUpInputSlots = 8;
         // Router configs.
         static constexpr std::uint32_t kNumRouterWeightSlots = 16;
@@ -149,7 +148,6 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr std::uint32_t kNumUpWeightSlots = 4;
         static constexpr std::uint32_t kNumDownWeightSlots = 4;
         static constexpr std::uint32_t kNumAccSlots = 4;
-        static constexpr bool kCombineWaitPerToken = true;
     };
 };
 

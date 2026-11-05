@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cutlass/array.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -40,26 +41,19 @@ __device__ static inline float warp_reduce_max_float(float value) {
 #endif
 }
 
-// Reinterprets the bit-pattern of `x` to type `To`
-template <typename To, typename From>
-__device__ static __forceinline__ To bit_cast(From x) {
-    static_assert(sizeof(To) == sizeof(From), "Types of different size");
-    To y;
-    memcpy(&y, &x, sizeof(From));
-    return y;
-}
-
 // Sets NaNs (positive or negative, any payload) to 0.0 (bit-pattern all
 // 0). Values other than NaN remain unchanged.
 __device__ static __forceinline__ __nv_bfloat162
 mask_nans_to_zero(__nv_bfloat162 xs) {
-    return bit_cast<__nv_bfloat162>(bit_cast<uint32_t>(xs) &
-                                    __heq2_mask(xs, xs));
+    return cutlass::platform::bit_cast<__nv_bfloat162>(
+        cutlass::platform::bit_cast<uint32_t>(xs) & __heq2_mask(xs, xs));
 }
 
-// Per-128-K-block bf16 → fp8 quantization for one row.
+// Loads one row's 8-B chunk (4 consecutive bf16) and widens it to fp32 with
+// NaNs masked to 0, so they cannot poison the 128-K block's amax or the fp8
+// conversion in store_quantized_pair.
 __device__ __forceinline__ float4
-moe_load_quantize_pair(const DataType::ElementA* __restrict__ bf16_4) {
+load_quantize_pair(const DataType::ElementA* __restrict__ bf16_4) {
     const __nv_bfloat162 bf_01 =
         mask_nans_to_zero(*reinterpret_cast<const __nv_bfloat162*>(bf16_4));
     const __nv_bfloat162 bf_23 =
@@ -69,11 +63,13 @@ moe_load_quantize_pair(const DataType::ElementA* __restrict__ bf16_4) {
     return make_float4(f01.x, f01.y, f23.x, f23.y);
 }
 
+// Scales the loaded pair by its 128-K block's amax, writes the fp8 e4m3 bytes
+// into the staging slot, and has lane 0 record the block's scale.
 // `row` is the staging row (the CTA's own row window), `chunk_at` the first
 // 16-B chunk of this pair inside the slot, and `global_row` the row it belongs
 // to in the source tensor (which decides whether it is padding).
 template <std::size_t Fp8NumChunks, std::size_t Fp8Rows, std::size_t Fp8KInner>
-__device__ __forceinline__ void moe_store_quantized_pair(
+__device__ __forceinline__ void store_quantized_pair(
     float4 v, std::uint32_t row, std::uint32_t chunk_at,
     std::uint32_t global_row,
     DataType::ElementQA (&fp8_act)[Fp8NumChunks][Fp8Rows][Fp8KInner],
@@ -108,27 +104,6 @@ __device__ __forceinline__ void moe_store_quantized_pair(
     if (lane == 0u) {
         *quantized_input_scale_for_step = blk_max * kFp8MaxInv;
     }
-}
-
-template <std::size_t NumRows, std::size_t ChunksPerSlot,
-          std::size_t Fp8NumChunks, std::size_t Fp8Rows, std::size_t Fp8KInner>
-__device__ __forceinline__ void moe_streaming_quantize_k128(
-    const DataType::ElementA* __restrict__ bf16_4, std::uint32_t row,
-    std::uint32_t chunk_at, std::uint32_t global_row,
-    std::uint32_t actual_num_rows,
-    DataType::ElementQA (&fp8_act)[Fp8NumChunks][Fp8Rows][Fp8KInner],
-    float* __restrict__ quantized_input_scale_for_step) {
-    static_assert(NumRows <= 16u, "Streaming quantize supports BS<=16");
-    static_assert(Fp8NumChunks == ChunksPerSlot,
-                  "fp8_act must hold the slot as its 16-K chunks");
-    static_assert(Fp8Rows == NumRows || Fp8Rows == NumRows + 1u,
-                  "fp8_act must carry the block's rows, padded or not; "
-                  "only the first ones are written");
-    static_assert(Fp8KInner == 16, "fp8_act inner dim must be 16");
-
-    moe_store_quantized_pair(moe_load_quantize_pair(bf16_4), row, chunk_at,
-                             global_row, fp8_act, actual_num_rows,
-                             quantized_input_scale_for_step);
 }
 
 // One 32-K group's UE8M0 scale: the exponent field is
@@ -166,11 +141,13 @@ struct GroupWiseQuantizer<QuantSpec<QuantMethod::kBlockwiseFP8, BlockSize>, N> {
     static constexpr std::uint32_t kValuesPerThread = N / 32u;
     static constexpr std::uint32_t kNumGroups = N / Quant::kBlockSize;
 
-    __device__ static __forceinline__ void run(
-        const float (&values)[kValuesPerThread],
-        ElementType* __restrict__ quantized_values,
-        ScaleType* __restrict__ quantized_scale) {
-        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
+    // The warp's inputs, and one block scale per group.
+    using Values = cutlass::Array<float, kValuesPerThread>;
+    using ScaleArray = cutlass::Array<ScaleType, kNumGroups>;
+
+    __device__ static __forceinline__ void quantize(
+        const Values& values, ElementType (&quantized_values)[kValuesPerThread],
+        ScaleArray& quantized_scale) {
         constexpr std::uint32_t kGroupValuesPerThread = Quant::kBlockSize / 32u;
 #pragma unroll
         for (std::uint32_t group = 0; group < kNumGroups; ++group) {
@@ -189,12 +166,10 @@ struct GroupWiseQuantizer<QuantSpec<QuantMethod::kBlockwiseFP8, BlockSize>, N> {
             const float inv_scale = kFp8Max / block_max;
 #pragma unroll
             for (std::uint32_t i = 0; i < kGroupValuesPerThread; ++i) {
-                quantized_values[(begin + i) * 32u + lane_idx] =
+                quantized_values[begin + i] =
                     static_cast<ElementType>(values[begin + i] * inv_scale);
             }
-            if (lane_idx == 0u) {
-                quantized_scale[group] = block_max * (1.0f / kFp8Max);
-            }
+            quantized_scale[group] = block_max * (1.0f / kFp8Max);
         }
     }
 };
@@ -211,23 +186,45 @@ struct GroupWiseQuantizer<QuantSpec<QuantMethod::kMXFP8, BlockSize>, N> {
     static constexpr std::uint32_t kValuesPerThread = N / 32u;
     static constexpr std::uint32_t kNumGroups = N / Quant::kBlockSize;
 
-    __device__ static __forceinline__ void run(
-        const float (&values)[kValuesPerThread],
-        ElementType* __restrict__ quantized_values,
-        ScaleType* __restrict__ quantized_scale) {
-        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
+    // The warp's inputs, and one block scale per group.  The scales stay a
+    // plain array: an Array<uint8_t, N> would pack four per word.
+    using Values = cutlass::Array<float, kValuesPerThread>;
+    using ScaleArray = ScaleType[kNumGroups];
+
+    __device__ static __forceinline__ void quantize(
+        const Values& values, ElementType (&quantized_values)[kValuesPerThread],
+        ScaleArray& quantized_scale) {
 #pragma unroll
         for (std::uint32_t i = 0; i < kNumGroups; ++i) {
             const float amax = __uint_as_float(__reduce_max_sync(
                 0xffffffffu, __float_as_uint(fabsf(values[i]))));
             std::uint32_t biased;
             const float inv_scale = mxfp8_ue8m0_scale(amax, biased);
-            quantized_values[i * 32u + lane_idx] =
+            quantized_values[i] =
                 static_cast<ElementType>(values[i] * inv_scale);
-            if (lane_idx == 0u) {
-                quantized_scale[i] = static_cast<ScaleType>(biased);
-            }
+            quantized_scale[i] = static_cast<ScaleType>(biased);
         }
+    }
+};
+
+// Where a tile's rows and quantization blocks sit: the first staging slot it
+// fills, its first block in the source and the scale table, and its row window
+// in the source activation.  A row of the window is padding once it reaches
+// `actual_num_rows`.
+struct QuantizeTile {
+    std::uint32_t staging_slot_base;
+    std::uint32_t block_base;
+    std::uint32_t row_start;
+    std::uint32_t actual_num_rows;
+
+    __host__ __device__ QuantizeTile(std::uint32_t staging_slot_base_in,
+                                     std::uint32_t block_base_in,
+                                     std::uint32_t row_start_in,
+                                     std::uint32_t actual_num_rows_in) {
+        staging_slot_base = staging_slot_base_in;
+        block_base = block_base_in;
+        row_start = row_start_in;
+        actual_num_rows = actual_num_rows_in;
     }
 };
 
@@ -241,13 +238,10 @@ __device__ inline void quantize_mxfp8_groupwise_1x32(
     DataType::ElementQA (*__restrict__ quantized_data)[QuantBlock *
                                                        BlocksPerStage / 16u]
                                                       [NumRows + 1u][16u],
-    std::uint8_t* __restrict__ quantized_scale, std::uint32_t staging_slot_base,
-    std::uint32_t src_block_base, std::uint32_t actual_num_rows,
-    std::uint32_t row_start, std::uint32_t warp_idx,
-    std::uint32_t num_quant_warps) {
+    std::uint8_t* __restrict__ quantized_scale, const QuantizeTile& tile,
+    std::uint32_t warp_idx, std::uint32_t num_quant_warps) {
     static constexpr std::uint32_t NumQuantBlocks =
         Staged ? BlocksPerStage : (NumCols / QuantBlock);
-    static_assert(NumRows <= 16u, "MXFP8 quantize supports BS<=16");
     static_assert(NumCols % QuantBlock == 0u,
                   "the tile must span whole quantization blocks");
     static_assert(NumQuantBlocks % BlocksPerStage == 0u,
@@ -265,12 +259,14 @@ __device__ inline void quantize_mxfp8_groupwise_1x32(
     for (std::uint32_t i = warp_idx; i < NumRows * NumQuantBlocks;
          i += num_quant_warps) {
         const std::uint32_t row = i / NumQuantBlocks;
-        const std::uint32_t global_row = row_start + row;
+        const std::uint32_t global_row = tile.row_start + row;
         const std::uint32_t blk = i % NumQuantBlocks;
-        const std::uint32_t slot = staging_slot_base + blk / BlocksPerStage;
+        const std::uint32_t slot =
+            tile.staging_slot_base + blk / BlocksPerStage;
         const std::uint32_t chunk_at = (blk % BlocksPerStage) * kChunksPerBlock;
-        const std::uint32_t k = (src_block_base + blk) * QuantBlock + col;
-        const std::uint32_t src_row = global_row < actual_num_rows ? row : 0u;
+        const std::uint32_t k = (tile.block_base + blk) * QuantBlock + col;
+        const std::uint32_t src_row =
+            global_row < tile.actual_num_rows ? row : 0u;
         const DataType::ElementA* bf16_4;
         if constexpr (Staged) {
             const std::uint32_t rel = k - k_base;
@@ -279,9 +275,10 @@ __device__ inline void quantize_mxfp8_groupwise_1x32(
                      src_row * SwizzleBoxK + (chunk ^ (src_row % 8u)) * 8u +
                      rel % 8u;
         } else {
-            bf16_4 =
-                data +
-                (global_row < actual_num_rows ? global_row : 0u) * NumCols + k;
+            bf16_4 = data +
+                     (global_row < tile.actual_num_rows ? global_row : 0u) *
+                         NumCols +
+                     k;
         }
 
         const std::uint32_t kc = chunk_at + col / 16u;
@@ -293,7 +290,7 @@ __device__ inline void quantize_mxfp8_groupwise_1x32(
         std::uint8_t* const scale =
             quantized_scale + slot * kSfAtomBytes +
             sf_atom_offset(row, (blk % BlocksPerStage) * kSubBlocks + sub);
-        if (global_row >= actual_num_rows) {
+        if (global_row >= tile.actual_num_rows) {
             // One word per lane zeroes the padded row; the neutral exponent
             // never contributes.
             *reinterpret_cast<std::uint32_t*>(
@@ -302,7 +299,7 @@ __device__ inline void quantize_mxfp8_groupwise_1x32(
             continue;
         }
 
-        const float4 v = moe_load_quantize_pair(bf16_4);
+        const float4 v = load_quantize_pair(bf16_4);
         float local_max =
             fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
         local_max =
@@ -339,12 +336,11 @@ __device__ inline void quantize_fp8_groupwise_128(
     DataType::ElementQA (*__restrict__ quantized_data)[QuantBlock *
                                                        BlocksPerStage / 16u]
                                                       [NumRows + 1u][16u],
-    float* __restrict__ quantized_scale, std::uint32_t staging_slot_base,
-    std::uint32_t scale_block_base, std::uint32_t src_block_base,
-    std::uint32_t actual_num_rows, std::uint32_t row_start,
+    float* __restrict__ quantized_scale, const QuantizeTile& tile,
     std::uint32_t warp_idx, std::uint32_t num_quant_warps) {
     static constexpr std::uint32_t NumQuantBlocks =
         Staged ? BlocksPerStage : (NumCols / QuantBlock);
+    static_assert(NumRows <= 16u, "FP8 quantize supports BS<=16");
     static_assert(NumCols % QuantBlock == 0u,
                   "the tile must span whole quantization blocks");
     static_assert(NumQuantBlocks % BlocksPerStage == 0u,
@@ -357,16 +353,18 @@ __device__ inline void quantize_fp8_groupwise_128(
          i += num_quant_warps) {
         // The window's row, and the row it holds in the source tensor.
         const std::uint32_t row = i / NumQuantBlocks;
-        const std::uint32_t global_row = row_start + row;
+        const std::uint32_t global_row = tile.row_start + row;
         const std::uint32_t blk = i % NumQuantBlocks;
-        const std::uint32_t slot = staging_slot_base + blk / BlocksPerStage;
+        const std::uint32_t slot =
+            tile.staging_slot_base + blk / BlocksPerStage;
         const std::uint32_t chunk_at = (blk % BlocksPerStage) * kChunksPerBlock;
-        const std::uint32_t sblk = scale_block_base + blk;
-        const std::uint32_t k = (src_block_base + blk) * QuantBlock + col;
+        const std::uint32_t sblk = tile.block_base + blk;
+        const std::uint32_t k = (tile.block_base + blk) * QuantBlock + col;
         // A padded row re-reads the ring's first row: the store zeroes it
         // anyway, and an unconditional read is what lets several pairs' loads
         // overlap.
-        const std::uint32_t src_row = global_row < actual_num_rows ? row : 0u;
+        const std::uint32_t src_row =
+            global_row < tile.actual_num_rows ? row : 0u;
         const DataType::ElementA* bf16_4;
         if constexpr (Staged) {
             // The box's 16-B chunk index is XOR-ed with the row.
@@ -378,14 +376,15 @@ __device__ inline void quantize_fp8_groupwise_128(
         } else {
             // A row-major source is the whole tensor, so it is addressed by the
             // row in the source tensor.
-            bf16_4 =
-                data +
-                (global_row < actual_num_rows ? global_row : 0u) * NumCols + k;
+            bf16_4 = data +
+                     (global_row < tile.actual_num_rows ? global_row : 0u) *
+                         NumCols +
+                     k;
         }
-        moe_streaming_quantize_k128<NumRows, QuantBlock / 16u * BlocksPerStage>(
-            bf16_4, row, chunk_at, global_row, actual_num_rows,
-            quantized_data[slot],
-            &quantized_scale[sblk * ScaleCols + global_row]);
+        store_quantized_pair(load_quantize_pair(bf16_4), row, chunk_at,
+                             global_row, quantized_data[slot],
+                             tile.actual_num_rows,
+                             &quantized_scale[sblk * ScaleCols + global_row]);
     }
 }
 

@@ -354,16 +354,12 @@ __device__ static __forceinline__ float key_score(uint32_t key) {
     return __uint_as_float((key & 0x80000000u) ? (key & 0x7FFFFFFFu) : ~key);
 }
 
-// Selection on fp32 scores; `renormalize` divides by the selected sum.  Each
-// round takes the best remaining (score, then lowest expert): every lane's own
-// best, one redux over them, and the lowest lane of a tie, since lane l owns
-// experts [l * N, (l + 1) * N).  The scores are sums of sigmoid or softmax
-// scores, or -FLT_MAX for a non-finite logit, so never NaN, -0 or denormal:
-// their keys order exactly as they compare.  There is no per-lane sort, which
-// keeps the code a launch with cold instruction caches fetches before it can
-// route small.
+// topk_weights_from_scores_fp32 without a per-lane sort: each round takes
+// the best remaining (score, then lowest expert): every lane's own best, one
+// redux over them, and the lowest lane of a tie, since lane l owns experts
+// [l * N, (l + 1) * N).
 template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
-__device__ static void topk_weights_from_scores_fp32(
+__device__ static void topk_weights_from_scores_fp32_scan(
     uint32_t token, uint32_t top_k, bool renormalize,
     const float (&scores)[kExpertsPerThread], uint16_t* topk_ids,
     float* topk_weights) {
@@ -422,6 +418,85 @@ __device__ static void topk_weights_from_scores_fp32(
         inv = (sum > 0.0f) ? (1.0f / sum) : 1.0f;
     }
     if (lane_idx < top_k) {
+        topk_weights[token * kMaxTopk + lane_idx] = my_score * inv;
+    }
+}
+
+// Selection on fp32 scores; `renormalize` divides by the selected sum.  Each
+// lane sorts its keys once, so a round is one redux over the lane heads: the
+// best (score, then lowest expert) is the top head of the lowest lane that has
+// it, since lane l owns experts [l * N, (l + 1) * N).  The winner shifts its
+// list.  A rank's expert is found from its key in its lane at the end, which
+// needs a lane's keys to differ: a warp where a lane repeats a key runs the
+// scan above instead.  The scores are sums of sigmoid or softmax scores, or
+// -FLT_MAX for a non-finite logit, so never NaN, -0 or denormal: their keys
+// order exactly as they compare.
+template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
+__device__ static void topk_weights_from_scores_fp32(
+    uint32_t token, uint32_t top_k, bool renormalize,
+    const float (&scores)[kExpertsPerThread], uint16_t* topk_ids,
+    float* topk_weights) {
+    // A lane wins at most top_k rounds, so kKeep heads suffice.
+    constexpr uint32_t kKeep =
+        kExpertsPerThread < kMaxTopk ? kExpertsPerThread : kMaxTopk;
+    const uint32_t lane_idx = WarpRole::get_lane_idx();
+    uint32_t key[kExpertsPerThread];
+    uint32_t head[kExpertsPerThread];
+#pragma unroll
+    for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
+        key[i] = score_key(scores[i]);
+        head[i] = key[i];
+    }
+    sort_descending<kExpertsPerThread>(head);
+    bool repeated = false;
+#pragma unroll
+    for (uint32_t i = 0; i + 1u < kExpertsPerThread; ++i) {
+        repeated |= head[i] == head[i + 1u];
+    }
+    if (__any_sync(FULL_MASK, repeated)) {
+        topk_weights_from_scores_fp32_scan<kExpertsPerThread, kMaxTopk>(
+            token, top_k, renormalize, scores, topk_ids, topk_weights);
+        return;
+    }
+
+    // Lane k keeps rank k's key and lane.
+    uint32_t lanes_below;
+    asm("mov.u32 %0, %%lanemask_lt;" : "=r"(lanes_below));
+    uint32_t my_key = 0u;
+    uint32_t my_lane = 0u;
+#pragma unroll 1
+    for (uint32_t k = 0; k < top_k; k++) {
+        const uint32_t top = __reduce_max_sync(FULL_MASK, head[0]);
+        const bool tied = head[0] == top;
+        const uint32_t ties = __ballot_sync(FULL_MASK, tied);
+        // The lowest tied lane wins: no find-first-set on the round's chain.
+        const bool won = tied && (ties & lanes_below) == 0u;
+        if (lane_idx == k) {
+            my_key = top;
+            my_lane = __ffs(ties) - 1u;
+        }
+#pragma unroll
+        for (uint32_t i = 0; i + 1u < kKeep; ++i) {
+            head[i] = won ? head[i + 1u] : head[i];
+        }
+        head[kKeep - 1u] = won ? 0u : head[kKeep - 1u];
+    }
+
+    // Rank k's expert: the one slot of its key in its lane.
+    uint32_t at = 0u;
+#pragma unroll
+    for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
+        at = __shfl_sync(FULL_MASK, key[i], my_lane) == my_key ? i : at;
+    }
+    const float my_score = lane_idx < top_k ? key_score(my_key) : 0.0f;
+    float inv = 1.0f;
+    if (renormalize) {
+        const float sum = sum_over_ranks<kMaxTopk>(my_score, top_k);
+        inv = (sum > 0.0f) ? (1.0f / sum) : 1.0f;
+    }
+    if (lane_idx < top_k) {
+        topk_ids[token * kMaxTopk + lane_idx] =
+            static_cast<uint16_t>(my_lane * kExpertsPerThread + at);
         topk_weights[token * kMaxTopk + lane_idx] = my_score * inv;
     }
 }

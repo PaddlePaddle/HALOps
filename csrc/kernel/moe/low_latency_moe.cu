@@ -52,17 +52,18 @@ template <typename MoEDims>
 void CheckRouterShape(const torch::Tensor& router_weight) {
     using RouterGemm = moe::RouterGemmTraits<MoEDims>;
     constexpr std::uint32_t kNumBoxKs =
-        RouterGemm::kNumTilesK * RouterGemm::kNumSwizzleBoxKs;
+        RouterGemm::kNumTilesK * RouterGemm::MmaCore::kNumSwizzleBoxKs;
     constexpr std::uint32_t kPackedTiles =
         RouterGemm::kNumRouterGates * RouterGemm::kNumTilesM;
-    TORCH_CHECK(
-        router_weight.dim() == 4 && router_weight.size(0) == kPackedTiles &&
-            router_weight.size(1) == kNumBoxKs &&
-            router_weight.size(2) == RouterGemm::kTileShapeM &&
-            router_weight.size(3) == RouterGemm::kSwizzleBoxK,
-        "moe: router_weight must be the packed [", kPackedTiles, ", ",
-        kNumBoxKs, ", ", RouterGemm::kTileShapeM, ", ",
-        RouterGemm::kSwizzleBoxK, "] layout (see prepare_router_weight).");
+    TORCH_CHECK(router_weight.dim() == 4 &&
+                    router_weight.size(0) == kPackedTiles &&
+                    router_weight.size(1) == kNumBoxKs &&
+                    router_weight.size(2) == RouterGemm::kTileShapeM &&
+                    router_weight.size(3) == RouterGemm::MmaCore::kSwizzleBoxK,
+                "moe: router_weight must be the packed [", kPackedTiles, ", ",
+                kNumBoxKs, ", ", RouterGemm::kTileShapeM, ", ",
+                RouterGemm::MmaCore::kSwizzleBoxK,
+                "] layout (see prepare_router_weight).");
     // Each tile is one bulk copy, which needs a 16-B aligned source.
     TORCH_CHECK(
         reinterpret_cast<std::uintptr_t>(router_weight.const_data_ptr()) %
@@ -320,16 +321,16 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
         static_cast<const DataType::ElementA*>(router_weight.const_data_ptr());
 
     args.expert_up_weights =
-        static_cast<const moe::UpGemmTraits<MoEDims>::MmaElement*>(
+        static_cast<const moe::RoutedUpGemmTraits<MoEDims>::MmaElement*>(
             expert_up_weights.const_data_ptr());
     args.expert_up_weights_scale =
-        static_cast<const moe::UpGemmTraits<MoEDims>::ElementScale*>(
+        static_cast<const moe::RoutedUpGemmTraits<MoEDims>::ElementScale*>(
             expert_up_weights_scale.const_data_ptr());
     args.expert_down_weights =
-        static_cast<const moe::DownGemmTraits<MoEDims>::MmaElement*>(
+        static_cast<const moe::RoutedDownGemmTraits<MoEDims>::MmaElement*>(
             expert_down_weights.const_data_ptr());
     args.expert_down_weights_scale =
-        static_cast<const moe::DownGemmTraits<MoEDims>::ElementScale*>(
+        static_cast<const moe::RoutedDownGemmTraits<MoEDims>::ElementScale*>(
             expert_down_weights_scale.const_data_ptr());
 
     args.shared_up_weight =

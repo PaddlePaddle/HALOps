@@ -65,9 +65,9 @@ struct MoECtaComm {
     std::uint32_t up_out_ready[2][kMaxRoutedRows];
 
     // Dynamic down schedule, both double-buffered by launch parity: the next
-    // unclaimed (expert, m-block) task, and per output m-block the number
-    // of its tasks finished so far. An m-block is complete once that count
-    // reaches the launch's active expert count (the expert dimension length).
+    // unclaimed (expert, m-block) task, and per output m-block one packed word
+    // of per-token counts. A token of the m-block is complete once its field
+    // reaches top_k.
     std::uint32_t down_task_next[2];
     std::uint64_t down_tasks_done[2][kCtasPerExpert];
 
@@ -220,19 +220,9 @@ struct MoECtaComm {
         global_red_add_u64(&down_tasks_done[parity][m_block], count);
     }
 
-    // Waits until all `num_tasks` tasks of `m_block` are published.
+    // Waits until the count packed at `shift` reaches `need`.
     // Polled at full rate on purpose: the satisfying value is what gates this
     // block's writeback, so any backoff here is added straight to the tail.
-    __device__ __forceinline__ void wait_down_out(
-        std::uint32_t parity, std::uint32_t m_block,
-        std::uint32_t num_tasks) const {
-        while (global_load_acquire_u64(&down_tasks_done[parity][m_block]) <
-               num_tasks) {
-        }
-    }
-
-    // Per-token form: waits until the count packed at `shift` reaches `need`.
-    // Polled at full rate, like `wait_down_out`.
     __device__ __forceinline__ void wait_down_out_field(
         std::uint32_t parity, std::uint32_t m_block, std::uint32_t shift,
         std::uint64_t mask, std::uint64_t need) const {

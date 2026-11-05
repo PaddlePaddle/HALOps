@@ -31,14 +31,13 @@
 
 namespace halops::moe {
 
-// K width of one SW128 operand box.
+// K-major SW128 tile: 128 B of K per swizzle box.
 template <typename T>
 struct SwizzleBoxK {
     static constexpr std::uint32_t value = 1024u / cute::sizeof_bits_v<T>;
 };
 
-// The SM100 UMMA instruction for an operand pair.  `Method` separates the
-// blockscaled MXFP8 recipe from the plain fp8 one, which share element types.
+// The SM100 UMMA instruction for an operand pair.
 template <class ElementA, class ElementB, class ElementAcc, class AtomShape,
           cute::UMMA::Major MajorA = cute::UMMA::Major::K,
           cute::UMMA::Major MajorB = cute::UMMA::Major::K,
@@ -70,10 +69,7 @@ struct UmmaAtom<cute::float_e4m3_t, cute::float_e4m3_t, ElementAcc, AtomShape,
 };
 
 // Blockscaled w4a8: 4-bit weights paired with fp8 activations, UE8M0 factors
-// per 32-K group from TMEM.  Same instruction as MXFP8 (mxf8f6f4 takes any
-// pair of operands at most 8 bits wide), but its format field is keyed off the
-// *unpacked*-in-SMEM E2M1 marker: plain `float_e2m1_t` encodes the standalone
-// MXF4 format instead (cute/arch/mma_sm100_desc.hpp).
+// per 32-K group from TMEM.
 template <class ElementAcc, class AtomShape, cute::UMMA::Major MajorA,
           cute::UMMA::Major MajorB>
 struct UmmaAtom<cutlass::float_e2m1_t, __nv_fp8_e4m3, ElementAcc, AtomShape,
@@ -108,9 +104,6 @@ struct UmmaAtom<__nv_bfloat16, __nv_bfloat16, ElementAcc, AtomShape, MajorA,
     : UmmaAtom<cute::bfloat16_t, cute::bfloat16_t, ElementAcc, AtomShape,
                MajorA, MajorB, QuantMethod::kNone> {};
 
-// MXFP8 scale-factor staging for the blockscaled instruction: one tile's
-// UE8M0 scales are packed into CUTLASS's SfAtom SMEM layout, copied to TMEM
-// with UTCCP, and read by the MMA per 32-K group.
 template <class TiledMma, class TileShape, bool Blockscaled>
 struct UmmaScaleTraits {
     static constexpr std::uint32_t kNumSF = 0u;
@@ -183,45 +176,38 @@ struct UmmaScaleTraits<TiledMma, TileShape, true> {
         copy_sfb_to_tmem(sfb, sfb_addr);
     }
 
-    // One operand's half of the pair, for the paths that stage each from the
-    // warp that loads it.
+    // UTCCP one operand's scales into their TMEM staging.  SFA and SFB differ
+    // only in their SfAtom layout and the fragment type they stage into.
+    template <class SfLayout, class TmemSf>
+    __device__ static void copy_sf_to_tmem(std::uint8_t* __restrict__ sf,
+                                           TmemSf tmem_sf) {
+        using UtccpOp = cute::SM100_UTCCP_4x32dp128bit_1cta;
+        auto sf_compact = cute::make_tensor(
+            cute::make_smem_ptr(reinterpret_cast<cute::float_ue8m0_t*>(sf)),
+            cute::filter_zeros(SfLayout{}));
+        auto tmem_sf_compact = cute::make_tensor(
+            tmem_sf.data(), cute::filter_zeros(tmem_sf.layout()));
+        auto copy_sf = cute::make_utccp_copy(UtccpOp{}, tmem_sf_compact);
+        auto thr_sf = copy_sf.get_slice(0);
+        auto s_sf = cute::get_utccp_smem_desc_tensor<UtccpOp>(
+            thr_sf.partition_S(sf_compact));
+        cute::copy(copy_sf, s_sf, thr_sf.partition_D(tmem_sf_compact));
+    }
+
     __device__ static void copy_sfa_to_tmem(std::uint8_t* __restrict__ sfa,
                                             std::uint32_t sfa_addr) {
-        using UtccpOp = cute::SM100_UTCCP_4x32dp128bit_1cta;
-        auto sfa_compact = cute::make_tensor(
-            cute::make_smem_ptr(reinterpret_cast<cute::float_ue8m0_t*>(sfa)),
-            cute::filter_zeros(SfaAtomLayout{}));
-        TmemSfa tmem_sfa = make_tmem_sfa(sfa_addr);
-        auto tmem_sfa_compact = cute::make_tensor(
-            tmem_sfa.data(), cute::filter_zeros(tmem_sfa.layout()));
-        auto copy_sfa = cute::make_utccp_copy(UtccpOp{}, tmem_sfa_compact);
-        auto thr_sfa = copy_sfa.get_slice(0);
-        auto s_sfa = cute::get_utccp_smem_desc_tensor<UtccpOp>(
-            thr_sfa.partition_S(sfa_compact));
-        cute::copy(copy_sfa, s_sfa, thr_sfa.partition_D(tmem_sfa_compact));
+        copy_sf_to_tmem<SfaAtomLayout>(sfa, make_tmem_sfa(sfa_addr));
     }
 
     __device__ static void copy_sfb_to_tmem(std::uint8_t* __restrict__ sfb,
                                             std::uint32_t sfb_addr) {
-        using UtccpOp = cute::SM100_UTCCP_4x32dp128bit_1cta;
-        auto sfb_compact = cute::make_tensor(
-            cute::make_smem_ptr(reinterpret_cast<cute::float_ue8m0_t*>(sfb)),
-            cute::filter_zeros(SfbAtomLayout{}));
-        TmemSfb tmem_sfb = make_tmem_sfb(sfb_addr);
-        auto tmem_sfb_compact = cute::make_tensor(
-            tmem_sfb.data(), cute::filter_zeros(tmem_sfb.layout()));
-        auto copy_sfb = cute::make_utccp_copy(UtccpOp{}, tmem_sfb_compact);
-        auto thr_sfb = copy_sfb.get_slice(0);
-        auto s_sfb = cute::get_utccp_smem_desc_tensor<UtccpOp>(
-            thr_sfb.partition_S(sfb_compact));
-        cute::copy(copy_sfb, s_sfb, thr_sfb.partition_D(tmem_sfb_compact));
+        copy_sf_to_tmem<SfbAtomLayout>(sfb, make_tmem_sfb(sfb_addr));
     }
 };
 
 // One SM100 MMA kind: instruction M is 128 (64 for a shorter tile), N is 8,
-// and K is 256 bits of the operand type; the caller's tile may repeat it.
-// MXFP8 uses the blockscaled instruction, which applies UE8M0 scale factors
-// per 32-element group from TMEM.
+// and K is 256 bits of the operand type. MXFP8/MXFP4 uses the blockscaled
+// instruction, which applies UE8M0 scale factors from TMEM.
 template <class QuantA, class QuantB, class ElementAcc, class TileShape,
           cute::UMMA::Major MajorA = cute::UMMA::Major::K,
           cute::UMMA::Major MajorB = cute::UMMA::Major::K>
@@ -243,9 +229,6 @@ struct UmmaCore {
 
     static constexpr bool kUseBlockscaled = kBlockscaledA;
 
-    // A sub-byte (4-bit) operand is staged one value per byte: the gmem tensor
-    // is packed and the TMA's 16U4_ALIGN16B expansion fills the gap.  So every
-    // SMEM/LBO/SBO quantity below is byte-sized for both fp8 and fp4.
     static constexpr std::uint32_t kElementABits =
         cute::sizeof_bits_v<ElementA>;
     static constexpr std::uint32_t kElementBBits =
@@ -255,17 +238,20 @@ struct UmmaCore {
     static constexpr std::uint32_t kMmaBits =
         kElementABits > kElementBBits ? kElementABits : kElementBBits;
 
+    // The A operand's SMEM element.
+    using SmemElementA =
+        std::conditional_t<(kElementABits < 8u), std::uint8_t, ElementA>;
+
     static constexpr std::uint32_t kTileShapeM = cute::get<0>(TileShape{});
     static constexpr std::uint32_t kTileShapeN = cute::get<1>(TileShape{});
     static constexpr std::uint32_t kTileShapeK = cute::get<2>(TileShape{});
+    static constexpr std::uint32_t kNumQuantBlocksB =
+        QuantB::kMethod == QuantMethod::kNone
+            ? 1u
+            : kTileShapeK / QuantB::kBlockSize;
 
-    // 256 bits of the widest operand per issue: 32 elements for fp8/fp4 mixed
-    // (mxf8f6f4), 16 for bf16.  The blockscaled instruction has no 64-row form,
-    // so its tile M is whole 128-row atoms.
     static constexpr std::uint32_t kAtomShapeM =
         kUseBlockscaled ? 128u : (kTileShapeM <= 64u ? 64u : 128u);
-    static_assert(!kUseBlockscaled || kTileShapeM % 128u == 0u,
-                  "a blockscaled tile's M must be whole 128-row atoms");
     static constexpr std::uint32_t kAtomShapeN = kTileShapeN;
     static constexpr std::uint32_t kAtomShapeK = 256u / kMmaBits;
     using AtomShape =
@@ -280,34 +266,25 @@ struct UmmaCore {
                   "the tile's K must be a whole number of instructions");
 
     static constexpr std::uint32_t kNumAtomMs = kTileShapeM / kAtomShapeM;
+    static constexpr std::uint32_t kNumAtomKs = kTileShapeK / kAtomShapeK;
 
     using AtomOp = typename UmmaAtom<ElementA, ElementB, ElementAcc, AtomShape,
                                      MajorA, MajorB, QuantA::kMethod>::type;
     using TiledMma = decltype(cute::make_tiled_mma(AtomOp{}));
     using ScaleTraits = UmmaScaleTraits<TiledMma, TileShape, kUseBlockscaled>;
 
-    static constexpr std::uint32_t kNumAtomKs = kTileShapeK / kAtomShapeK;
-
-    // K width of one SW128 A-operand box (128 B); a wider tile repeats it.
-    static constexpr std::uint32_t kSwizzleBoxK = 1024u / kSmemABits;
+    static constexpr std::uint32_t kSwizzleBoxK =
+        SwizzleBoxK<SmemElementA>::value;
     static_assert(kTileShapeK % kSwizzleBoxK == 0u,
                   "the tile's K must be a whole number of SW128 boxes");
     static constexpr std::uint32_t kNumSwizzleBoxKs =
         kTileShapeK / kSwizzleBoxK;
 
-    // The A operand's SMEM element: one byte per value, whatever the weight's
-    // packed width is.
-    using SmemElementA =
-        std::conditional_t<(kElementABits < 8u), std::uint8_t, ElementA>;
-
-    // Bytes of one tile's A operand in SMEM.  A 4-bit weight lands expanded
-    // to one byte per value (16 values per 16 B: 8 B of nibbles, then 8 B the
-    // copy leaves as is), so its SW128 image is laid out like the fp8 one.
+    // Bytes of one tile's A operand in SMEM.
     static constexpr std::uint32_t kWeightTileElems = kTileShapeM * kTileShapeK;
     static constexpr std::uint32_t kWeightTileBytes =
         kWeightTileElems * (kSmemABits / 8u);
-    // What the copy credits the mbarrier with: the gmem bytes it reads, so a
-    // 4-bit weight (two values per byte) counts half its SMEM footprint.
+    // Bytes of one tile's A operand for TMA.
     static constexpr std::uint32_t kWeightTileTxBytes =
         kWeightTileElems * kElementABits / 8u;
 
@@ -350,8 +327,11 @@ struct UmmaCore {
         constexpr std::uint32_t kAtomOperandElems = kAtomShapeM * kTileShapeK;
         cute::for_each(cute::make_seq<int(kNumAtomMs)>{}, [&](auto m_block) {
             constexpr std::uint32_t m = decltype(m_block)::value;
+            // CUDA and CUTLASS bf16 share storage but use distinct types.
             auto tCsA = cute::make_tensor(
-                cute::make_smem_ptr(sA + m * kAtomOperandElems),
+                cute::make_smem_ptr(
+                    reinterpret_cast<typename TiledMma::ValTypeA*>(
+                        sA + m * kAtomOperandElems)),
                 WeightTileLayout{});
             cute::Tensor tCrA = cta_mma.make_fragment_A(tCsA);
             cute::for_each(cute::make_seq<int(kNumAtomKs)>{}, [&](auto kb) {
@@ -369,9 +349,8 @@ struct UmmaCore {
         });
     }
 
-    // The blockscaled tile's gemm.  `sfa_addr`/`sfb_addr` are the TMEM
-    // staging of this tile's UE8M0 scale factors, one 32-K group per K mode;
-    // the instruction applies them, so the accumulator needs no sub-blocks.
+    // The blockscaled tile's gemm. `sfa_addr`/`sfb_addr` are the TMEM
+    // staging of this tile's UE8M0 scale factors, one 32-K group per K mode.
     template <class CtaMma, class TensorB, class TensorC>
     __device__ static void run(TiledMma& tiled_mma, CtaMma& cta_mma,
                                SmemElementA* sA, TensorB const& tCrB,
@@ -380,14 +359,10 @@ struct UmmaCore {
                                bool accumulate = false) {
         static_assert(kUseBlockscaled,
                       "the scale-factor run overload is the MXFP8 one");
-        // An SF address's top two bits are its scale-factor ID, which the
-        // instruction descriptor carries.  The staging sits at lane 0, ID 0,
-        // so only the column field is set; saying so lets each K mode's ID
-        // fold into a constant descriptor instead of being rebuilt per MMA.
+
         sfa_addr &= 0xFFFFu;
         sfb_addr &= 0xFFFFu;
-        // Each M atom is its own instruction with its own SFA slab, so both
-        // the A tile and the accumulator step atom by atom.
+
         constexpr std::uint32_t kAtomOperandElems = kAtomShapeM * kTileShapeK;
         const auto tCrSFB = ScaleTraits::make_tmem_sfb(sfb_addr);
         cute::for_each(cute::make_seq<int(kNumAtomMs)>{}, [&](auto m_block) {
@@ -416,7 +391,6 @@ struct UmmaCore {
 
 // The warp-level `mma.sync` core, the unquantized walk: m16n8k16, bf16 in,
 // fp32 accumulated in registers, operands loaded from SMEM with `ldmatrix`.
-// Every quantized group takes the UMMA cores above.
 template <class TileShape>
 struct HmmaCore {
     using Element = __nv_bfloat16;
@@ -435,6 +409,7 @@ struct HmmaCore {
     static_assert(kTileShapeM % kAtomShapeM == 0u,
                   "the tile's M must be a whole number of instructions");
     static constexpr std::uint32_t kNumAtomMs = kTileShapeM / kAtomShapeM;
+
     // Values of the m16n8 C fragment one lane holds.
     static constexpr std::uint32_t kAtomElemsC = 4u;
     static_assert(kTileShapeN == kAtomShapeN,
@@ -445,7 +420,6 @@ struct HmmaCore {
 
     using TiledMma = decltype(cute::make_tiled_mma(AtomOp{}));
 
-    // A is a K-major SW128 tile: 128 B of K per swizzle box.
     static constexpr std::uint32_t kSwizzleBoxK = SwizzleBoxK<Element>::value;
     static_assert(kTileShapeK % kSwizzleBoxK == 0u,
                   "the tile's K must be a whole number of SW128 boxes");
