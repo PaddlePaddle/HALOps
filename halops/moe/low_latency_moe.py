@@ -26,8 +26,8 @@ from halops.moe.low_latency_moe_utils import (
     _check_workspace,
     _interleave_up_for_pair_layout,
     _pack_router_weight,
-    _prepare_latent_down_weight,
     _prepare_shared_expert_up_weight,
+    _prepare_up_scale,
     _router_gates,
 )
 
@@ -148,6 +148,7 @@ def low_latency_moe(
     activation: str = "silu",
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
+    quant_mode: str = "w8a8-blockwise",
     *,
     fc2_weight: torch.Tensor,
     fc2_scale: torch.Tensor,
@@ -162,12 +163,14 @@ def low_latency_moe(
     up/down projections and the shared expert for 1..16 tokens, writing
     ``shared_out`` and ``out`` in place.  The shipped schedule is
     fixed to E=512 experts, hidden size 4096, intermediate size 512 and
-    latent size 2048, with block-wise FP8 weights (128x128 blocks).
+    latent size 2048.  Every weight group runs block-wise FP8 (128x128
+    blocks) or MXFP8 (1x32 UE8M0 groups); the "w4a8-mxfp4" recipe packs only
+    the routed experts' weights to MXFP4 and keeps the activations fp8.
 
-    Weights are block-wise quantized by the caller; the router, up-projection
-    and latent-down operands must first be packed with
-    ``transform_weights_for_moe``.  This build runs the latent stage, so
-    ``latent_down_weight`` and ``latent_down_weight_scale`` are required.
+    Weights are quantized by the caller (``group_wise_quant`` for MX
+    recipes); the router and up-projection operands are then packed with
+    ``transform_weights_for_moe``.  The down-projection and latent-down
+    weights are quantized directly in the kernel layout and passed as-is.
 
     The fused tail always runs as the kernel's last phase (the same single
     launch)::
@@ -185,27 +188,34 @@ def low_latency_moe(
         input: [T, 4096] bfloat16 activations, 1 <= T <= 16.
         router_weight: Packed router weight (bfloat16) from
             ``transform_weights_for_moe``.
-        expert_up_weights: [512, 1024, 2048] float8_e4m3fn fused gate/up
-            weights, in the pair layout returned by
-            ``transform_weights_for_moe``.
+        expert_up_weights: Fused gate/up weights in the pair layout returned
+            by ``transform_weights_for_moe``, shape [512, 1024, 2048]; under
+            "w4a8-mxfp4" uint8 of shape [512, 1024, 1024] (two 4-bit values per
+            byte, low nibble first, as ``group_wise_quant(mode="w4a4-mxfp4")``
+            packs them).
         expert_up_weights_scale: [512, 8, 16] float32 block scales of
-            ``expert_up_weights``.
-        expert_down_weights: [512, 2048, 512] float8_e4m3fn down weights.
+            ``expert_up_weights``; under the MX recipes uint8 UE8M0 scales.
+        expert_down_weights: [512, 2048, 512] float8_e4m3fn down weights;
+            under "w4a8-mxfp4" uint8 of shape [512, 2048, 256], packed the same
+            way.
         expert_down_weights_scale: [512, 16, 4] float32 block scales of
-            ``expert_down_weights``.
+            ``expert_down_weights``; uint8 under the MX recipes.
         shared_up_weight: [1024, 4096] float8_e4m3fn shared-expert gate/up
             weights, pair layout.
         shared_up_weight_scale: [8, 32] float32 block scales of
-            ``shared_up_weight``.
+            ``shared_up_weight`` ("w8a8-blockwise"), or [1024, 128] uint8 in the
+            CUTLASS SfAtom layout under the MX recipes, following the *packed*
+            pair row order returned by ``transform_weights_for_moe``.
         shared_down_weight: [4096, 512] float8_e4m3fn shared-expert down
             weights.
         shared_down_weight_scale: [32, 4] float32 block scales of
-            ``shared_down_weight``.
+            ``shared_down_weight``, or [4096, 16] uint8 in the SfAtom layout
+            under the MX recipes.
         latent_down_weight: [2048, 4096] float8_e4m3fn latent
-            down-projection weight, transposed by
-            ``transform_weights_for_moe``.
+            down-projection weight in the kernel layout.
         latent_down_weight_scale: [16, 32] float32 block scales of
-            ``latent_down_weight``.
+            ``latent_down_weight``, or [2048, 128] uint8 in the SfAtom layout
+            under the MX recipes.
         workspace: Workspace from ``get_workspace_for_moe`` whose schedule
             width matches the token count (``T > 8`` needs the wide one).
         shared_out: [T, 4096] bfloat16 output of the shared expert (this rank's
@@ -219,6 +229,9 @@ def low_latency_moe(
         situ_beta: SiTU gate soft cap; <= 0 disables it.  Must be finite.
         situ_linear_beta: SiTU up soft cap; <= 0 disables it.  Must be
             finite.
+        quant_mode: Quantization recipe: "w8a8-blockwise" (every group
+            block-wise), "w8a8-mxfp8" (every group MXFP8) or "w4a8-mxfp4"
+            (routed experts MXFP4, latent and shared MXFP8).
         fc2_weight: [H, L] float8_e4m3fn, replicated on every rank.
         fc2_scale: [H/128, L/128] float32 block scales, powers of two.
         norm_weight: [L] bfloat16 RMSNorm weight.
@@ -259,6 +272,7 @@ def low_latency_moe(
         grid_cap,
         scoring_func,
         activation,
+        quant_mode,
         renormalize,
         situ_beta,
         situ_linear_beta,
@@ -283,26 +297,27 @@ def transform_weights_for_moe(
     router_weight: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]],
     expert_up_weights: Optional[torch.Tensor],
     shared_up_weight: Optional[torch.Tensor],
-    latent_down_weight: Optional[torch.Tensor] = None,
     num_tokens: int = 1,
     num_router_gates: int = 2,
+    expert_up_weights_scale: Optional[torch.Tensor] = None,
+    shared_up_weight_scale: Optional[torch.Tensor] = None,
 ) -> dict:
-    """Pack the router, up-projection and latent-down weights for ``low_latency_moe``.
+    """Pack the router and up-projection weights for ``low_latency_moe``.
 
-    The down-projection weights and all block scales already follow torch's
-    ``[out, in]`` layout and are passed to ``low_latency_moe`` as-is.  This repacks the
-    operands the kernel reads differently:
+    The down-projection and latent-down weights, and the scales, already follow
+    the layout the kernel reads and are passed to ``low_latency_moe`` as-is.
+    This repacks the operands whose layout differs:
 
     * ``router_weight`` -- the router's SW128 swizzle, one packed blob per
       gate.
     * ``expert_up_weights`` / ``shared_up_weight`` -- the gate/up pair
-      layout (pack after quantizing: the scales stay on the raw layout).
-    * ``latent_down_weight`` -- transposed to ``[latent, hidden]``.
+      layout.
 
-    ``num_tokens`` selects the router schedule and must match the ``low_latency_moe``
-    call.  Every operand is optional: only the ones that are given are packed (and
-    returned), e.g. to pack the experts as soon as they are loaded and the router once
-    per schedule.
+    Only the layout changes: quantize every weight first, then convert it
+    here.  ``num_tokens`` selects the router schedule and must match the
+    ``low_latency_moe`` call.  Every operand is optional: only the ones that
+    are given are packed (and returned), e.g. to pack the experts as soon as
+    they are loaded and the router once per schedule.
 
     Args:
         router_weight: Router weight ``[K, E]`` bfloat16, ``[G, K, E]`` or a
@@ -312,16 +327,26 @@ def transform_weights_for_moe(
             [0, N) are gate and [N, 2N) up.  None to skip.
         shared_up_weight: [2N, H] float8_e4m3fn shared-expert weights, same
             gate/up split.  None to skip.
-        latent_down_weight: Optional [H, L] float8_e4m3fn latent
-            down-projection weight.
         num_tokens: Token count of the ``low_latency_moe`` call, which picks the router
             tile M.
         num_router_gates: Gates to merge; this build requires 2.
+        expert_up_weights_scale: Scales of ``expert_up_weights``: [E, 2N, K/32]
+            uint8 for "w8a8-mxfp8", or [E, 2N/128, K/128] float32 for
+            "w8a8-blockwise".  None to skip.
+        shared_up_weight_scale: Scales of ``shared_up_weight``: [2N, H/32]
+            uint8 for "w8a8-mxfp8", or [2N/128, H/128] float32 for
+            "w8a8-blockwise".  None to skip.
+
+    Note:
+        The up-projection's gate/up pairing reorders weight rows, so the
+        MXFP8 SfAtom tables passed in are moved onto the packed rows too.
+        Block-wise f32 tables are addressed by raw row and come back
+        unchanged.
 
     Returns:
         A dict with the keys ``"router_weight"``, ``"expert_up_weights"``,
-        ``"shared_up_weight"`` and ``"latent_down_weight"`` of the operands
-        that were given.
+        ``"shared_up_weight"``, ``"expert_up_weights_scale"`` and
+        ``"shared_up_weight_scale"`` of the operands that were given.
     """
     packed = {}
     if router_weight is not None:
@@ -332,6 +357,8 @@ def transform_weights_for_moe(
         packed["expert_up_weights"] = _interleave_up_for_pair_layout(expert_up_weights)
     if shared_up_weight is not None:
         packed["shared_up_weight"] = _prepare_shared_expert_up_weight(shared_up_weight)
-    if latent_down_weight is not None:
-        packed["latent_down_weight"] = _prepare_latent_down_weight(latent_down_weight)
+    if expert_up_weights_scale is not None:
+        packed["expert_up_weights_scale"] = _prepare_up_scale(expert_up_weights_scale)
+    if shared_up_weight_scale is not None:
+        packed["shared_up_weight_scale"] = _prepare_up_scale(shared_up_weight_scale)
     return packed

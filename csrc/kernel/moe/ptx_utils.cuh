@@ -38,10 +38,20 @@ __device__ static inline void cp_async_wait_group() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
 }
 
+// The halves of the cluster barrier, CTA-collective: the arrive releases the
+// thread's earlier accesses, the wait acquires its partners'.
+__device__ static __forceinline__ void cluster_arrive() {
+    asm volatile("barrier.cluster.arrive.aligned;" ::: "memory");
+}
+
+__device__ static __forceinline__ void cluster_wait() {
+    asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+}
+
 // Cluster-wide barrier: CTA-collective, release-arrive and acquire-wait.
 __device__ static __forceinline__ void cluster_arrive_and_wait() {
-    asm volatile("barrier.cluster.arrive.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+    cluster_arrive();
+    cluster_wait();
 }
 
 // The shared-memory address `ptr` has in cluster block `rank`.
@@ -97,16 +107,23 @@ __device__ static __forceinline__ std::uint64_t global_load_acquire_u64(
     return v;
 }
 
-__device__ static __forceinline__ void global_red_add_u64(std::uint64_t* addr,
-                                                          std::uint64_t val) {
-    asm volatile("red.global.add.u64 [%0], %1;" ::"l"(addr), "l"(val)
-                 : "memory");
-}
-
-// Device-scope release store of a 32-bit word (st.release.gpu).
+// Device-scope release store of a 32-bit word (st.release.gpu): the
+// thread's earlier writes are visible to whoever acquires the new value.
 __device__ static __forceinline__ void global_store_release_u32(uint32_t* addr,
                                                                 uint32_t v) {
     asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(addr), "r"(v)
+                 : "memory");
+}
+
+// After acquiring data another block wrote with ordinary stores, orders it
+// before this thread's next TMA (async-proxy) reads of global memory.
+__device__ static __forceinline__ void fence_proxy_async_global() {
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+}
+
+__device__ static __forceinline__ void global_red_add_u64(std::uint64_t* addr,
+                                                          std::uint64_t val) {
+    asm volatile("red.global.add.u64 [%0], %1;" ::"l"(addr), "l"(val)
                  : "memory");
 }
 
@@ -148,13 +165,6 @@ __device__ static __forceinline__ void shared_red_add_release_u32(
     asm volatile(
         "red.release.cta.shared::cta.add.u32 [%0], %1;" ::"r"(smem_addr), "r"(v)
         : "memory");
-}
-
-// Device-scope relaxed ADD-reduction into a 32-bit word.
-__device__ static __forceinline__ void global_red_add_u32(uint32_t* addr,
-                                                          uint32_t v) {
-    asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;" ::"l"(addr), "r"(v)
-                 : "memory");
 }
 
 // Device-scope release ADD-reduction into a 32-bit word.

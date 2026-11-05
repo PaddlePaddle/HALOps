@@ -99,12 +99,17 @@ struct TailPhase {
             WarpRole::sync_calc_threads();
             __threadfence();
         }
+#if defined(HALOPS_KERNEL_TIMER_ENABLED)
+        const auto timer = smem->timer();
+#else
+        const int timer = 0;  // the probes expand to nothing
+#endif
         ::halops::moe::tail::eb5_tail_group_body<
             Geometry::kWorld, Dims::kLatentSize, Dims::kHiddenSize,
             Geometry::kMaxM, Geometry>(
             tail, blockIdx.x, threadIdx.x,
             reinterpret_cast<std::uint8_t*>(&smem->routed_experts),
-            CalcWarpSync{}, smem->tail_parity);
+            CalcWarpSync{}, smem->tail_parity, timer);
         WarpRole::sync_calc_threads();
         if (blockIdx.x == 0 && threadIdx.x == 0) {
             __threadfence();
