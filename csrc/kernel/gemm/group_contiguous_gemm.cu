@@ -22,8 +22,9 @@
 namespace halops {
 
 void GroupContiguousGemm(const torch::Tensor& input,
-                         const torch::Tensor& weight, const torch::Tensor& sfa,
-                         const torch::Tensor& sfb,
+                         const torch::Tensor& weight,
+                         const std::optional<torch::Tensor>& sfa,
+                         const std::optional<torch::Tensor>& sfb,
                          const torch::Tensor& expert_ids, torch::Tensor& output,
                          const std::optional<torch::Tensor>& bias,
                          const std::optional<torch::Tensor>& alpha,
@@ -102,6 +103,10 @@ void GroupContiguousGemm(const torch::Tensor& input,
                           KernelConfig>(params, sm, stream);
             });
     } else if (mode == "w8a8-mxfp8") {
+        TORCH_CHECK(sfa.has_value() && sfb.has_value(),
+                    "w8a8-mxfp8 contiguous grouped GEMM requires sfa/sfb "
+                    "scale factors (only mode='bf16' accepts sfa=None, "
+                    "sfb=None)");
         const int k = weight.size(2);
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),
@@ -109,8 +114,8 @@ void GroupContiguousGemm(const torch::Tensor& input,
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();
-        params.ptr_sfa = sfa.data_ptr();
-        params.ptr_sfb = sfb.data_ptr();
+        params.ptr_sfa = sfa->data_ptr();
+        params.ptr_sfb = sfb->data_ptr();
         if (bias.has_value()) {
             params.ptr_c = bias->data_ptr();
         }
@@ -125,6 +130,9 @@ void GroupContiguousGemm(const torch::Tensor& input,
              .has_bias = bias.has_value()},
             stream);
     } else {
+        TORCH_CHECK(sfa.has_value() && sfb.has_value(),
+                    "W4A4 contiguous grouped GEMM requires sfa/sfb scale "
+                    "factors (only mode='bf16' accepts sfa=None, sfb=None)");
         const int k = weight.size(2) * 2;  // 2 FP4 per packed byte
         TORCH_CHECK(
             input.size(1) == weight.size(2),
@@ -133,18 +141,18 @@ void GroupContiguousGemm(const torch::Tensor& input,
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();
-        params.ptr_sfa = sfa.data_ptr();
-        params.ptr_sfb = sfb.data_ptr();
+        params.ptr_sfa = sfa->data_ptr();
+        params.ptr_sfb = sfb->data_ptr();
         TORCH_CHECK(!bias.has_value(), "W4A4 mode does not support bias yet.");
 
         const bool mxfp4 = mode == "w4a4-mxfp4";
         const int sf_k = k / (mxfp4 ? 32 : 16);
-        TORCH_CHECK(sfa.size(-1) == sf_k && sfb.size(-1) == sf_k,
+        TORCH_CHECK(sfa->size(-1) == sf_k && sfb->size(-1) == sf_k,
                     "W4A4 scale-factor shape does not match mode ",
                     mxfp4 ? "'w4a4-mxfp4' (UE8M0 per 32)"
                           : "'w4a4-nvfp4' (UE4M3 per 16)",
-                    " requires SF K = ", sf_k, ", got sfa K=", sfa.size(-1),
-                    " and sfb K=", sfb.size(-1), ".");
+                    " requires SF K = ", sf_k, ", got sfa K=", sfa->size(-1),
+                    " and sfb K=", sfb->size(-1), ".");
 
         TORCH_CHECK(!mxfp4 || !alpha.has_value(),
                     "'w4a4-mxfp4' does not take alpha; the per-expert scaling "
