@@ -15,7 +15,6 @@
 #include <optional>
 #include <string>
 
-#include "kernel/gemm/bf16_cfgs.h"
 #include "kernel/gemm/gemm_dispatch.cuh"
 #include "kernel/gemm/gemm_utils.h"
 
@@ -65,13 +64,8 @@ void GroupContiguousGemm(const torch::Tensor& input,
     params.num_experts = num_experts;
 
     if (mode == "bf16") {
-        using TypeA = cutlass::bfloat16_t;
-        using TypeB = cutlass::bfloat16_t;
-        using TypeC = cutlass::bfloat16_t;
-        using TypeD = cutlass::bfloat16_t;
-        using TypeSF = cutlass::float_ue8m0_t;  // placeholder, unused
-        using TypeAccumulate = float;
-
+        // Native BF16: sfa/sfb/bias/alpha are ignored; dispatch and launch
+        // live in gemm_dispatch.cuh (bf16::LaunchContiguous).
         const int k = weight.size(2);
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),
@@ -88,20 +82,7 @@ void GroupContiguousGemm(const torch::Tensor& input,
         params.ptr_sfa = nullptr;
         params.ptr_sfb = nullptr;
         params.ptr_alpha = nullptr;
-
-        const int cfg = bf16_dispatch::SelectBF16ContiguousCfg(m, n, k, sm);
-        TORCH_CHECK(cfg >= 0, "bf16 contiguous GEMM: unsupported shape M=", m,
-                    " N=", n, " K=", k);
-        bf16_dispatch::CheckBF16CfgShape(
-            "bf16 contiguous GEMM", bf16_dispatch::kBF16ContiguousCfgs[cfg], m,
-            n, k);
-        bf16_dispatch::DispatchBF16SmallCfg<
-            bf16_dispatch::BF16ContiguousTiles,
-            bf16_dispatch::kBF16ContiguousCount>(
-            cfg, "bf16 contiguous", [&]<class KernelConfig>() {
-                gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                          KernelConfig>(params, sm, stream);
-            });
+        bf16::LaunchContiguous(params, sm, stream);
     } else if (mode == "w8a8-mxfp8") {
         TORCH_CHECK(sfa.has_value() && sfb.has_value(),
                     "w8a8-mxfp8 contiguous grouped GEMM requires sfa/sfb "
