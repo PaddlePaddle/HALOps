@@ -15,7 +15,6 @@
 #include <optional>
 #include <string>
 
-#include "kernel/gemm/bf16_cfgs.h"
 #include "kernel/gemm/gemm_dispatch.cuh"
 #include "kernel/gemm/gemm_utils.h"
 
@@ -76,13 +75,8 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.use_pdl = true;
 
     if (mode == "bf16") {
-        using TypeA = cutlass::bfloat16_t;
-        using TypeB = cutlass::bfloat16_t;
-        using TypeC = cutlass::bfloat16_t;
-        using TypeD = cutlass::bfloat16_t;
-        using TypeSF = cutlass::float_ue8m0_t;  // placeholder, unused
-        using TypeAccumulate = float;
-
+        // Native BF16: sfa/sfb/bias/alpha are ignored; dispatch and launch
+        // live in gemm_dispatch.cuh (bf16::LaunchMasked).
         const int k = weight.size(2);
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),
@@ -99,21 +93,7 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
         params.ptr_sfa = nullptr;
         params.ptr_sfb = nullptr;
         params.ptr_alpha = nullptr;
-
-        const int cfg = bf16_dispatch::SelectBF16MaskedCfg(
-            num_experts, max_m_per_expert, n, k, sm);
-        TORCH_CHECK(cfg >= 0,
-                    "bf16 masked GEMM: unsupported shape E=", num_experts,
-                    " max_m_per_expert=", max_m_per_expert, " N=", n, " K=", k);
-        bf16_dispatch::CheckBF16CfgShape("bf16 masked GEMM",
-                                         bf16_dispatch::kBF16MaskedCfgs[cfg],
-                                         max_m_per_expert, n, k);
-        bf16_dispatch::DispatchBF16SmallCfg<bf16_dispatch::BF16MaskedTiles,
-                                            bf16_dispatch::kBF16MaskedCount>(
-            cfg, "bf16 masked", [&]<class KernelConfig>() {
-                gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                          KernelConfig>(params, sm, stream);
-            });
+        bf16::LaunchMasked(params, sm, stream);
     } else if (mode == "w8a8-mxfp8") {
         TORCH_CHECK(sfa.has_value() && sfb.has_value(),
                     "w8a8-mxfp8 masked grouped GEMM requires sfa/sfb scale "
@@ -140,6 +120,9 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
              .has_bias = bias.has_value()},
             stream);
     } else if (mode == "w4a8-mxfp4") {
+        TORCH_CHECK(sfa.has_value() && sfb.has_value(),
+                    "w4a8-mxfp4 grouped GEMM requires sfa/sfb scale factors "
+                    "(only mode='bf16' accepts sfa=None, sfb=None)");
         const int k = weight.size(2) * 2;  // 2 FP4 per packed byte
         TORCH_CHECK(input.size(1) == k,
                     "W4A8 input K (unpacked fp8) must match unpacked weight K, "
@@ -148,16 +131,16 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();
-        params.ptr_sfa = sfa.data_ptr();
-        params.ptr_sfb = sfb.data_ptr();
+        params.ptr_sfa = sfa->data_ptr();
+        params.ptr_sfb = sfb->data_ptr();
         TORCH_CHECK(!bias.has_value(), "W4A8 mode does not support bias yet.");
         TORCH_CHECK(
             !alpha.has_value(),
             "W4A8 mode does not take alpha; scales are per-group UE8M0.");
         const int sf_k = k / 32;  // UE8M0 group-32 scale on both A and B
-        TORCH_CHECK(sfa.size(-1) == sf_k && sfb.size(-1) == sf_k,
+        TORCH_CHECK(sfa->size(-1) == sf_k && sfb->size(-1) == sf_k,
                     "W4A8 'w4a8-mxfp4' (UE8M0 per 32) requires SF K = ", sf_k,
-                    ", got sfa K=", sfa.size(-1), " and sfb K=", sfb.size(-1),
+                    ", got sfa K=", sfa->size(-1), " and sfb K=", sfb->size(-1),
                     ".");
         LaunchCfg<KernelMode::Masked, MmaKind::MXFP8FP4>(params,
                                                          {.m = max_m_per_expert,

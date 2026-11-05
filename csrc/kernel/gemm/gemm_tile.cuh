@@ -100,10 +100,12 @@ struct TileSpec {
     bool bias = false;        // AddBias
 
     // Dispatch policy, not kernel parameters.
-    bool dense_only = false;  // only tuned/allowed for the dense launcher
-    bool batch = false;       // a dense_only tile also tuned for batch
-    bool searchable = true;   // may the cost model pick it?
+    bool dense_only = false;   // only tuned/allowed for the dense launcher
+    bool batch = false;        // a dense_only tile also tuned for batch
+    bool searchable = true;    // may the cost model pick it?
     int quant_stages = 0;
+    int epi_warp_groups = 0;   // KEpilogueWarpGroupsOverride; 0 = auto
+    bool force_ntail = false;  // KForceEpiNPredicate (predicated N-tail store)
 
     constexpr bool pair() const { return cluster_m * cluster_n > 1; }
     // Activation-tile rows/cols; SwapAB swaps the two MMA dimensions.
@@ -187,6 +189,21 @@ struct MmaTraits<MmaKind::MXFP8FP4> {
     static constexpr const char* kName = "w4a8-mxfp4";
 };
 
+template <>
+struct MmaTraits<MmaKind::BF16> {
+    using Operand = cutlass::bfloat16_t;
+    using OperandA = Operand;
+    using OperandB = Operand;
+    using Output = cutlass::bfloat16_t;
+    // Placeholder only: BF16 has no scale factors and never dereferences
+    // the SF pointer.
+    using Scale = cutlass::float_ue8m0_t;
+    static constexpr bool kFp4 = false;
+    static constexpr int kSfVecSize = 16;
+    static constexpr bool kHasAlpha = false;
+    static constexpr const char* kName = "bf16";
+};
+
 template <MmaKind Kind, KernelMode Mode, TileSpec S,
           EpilogueOp Op = EpilogueOp::Identity>
 using MakeTile =
@@ -194,7 +211,8 @@ using MakeTile =
              S.cluster_m, S.cluster_n, S.tmem_overlap, S.epi_regs, S.swizzle,
              S.skip_fence, S.swap_ab, MmaTraits<Kind>::kFp4,
              MmaTraits<Kind>::kSfVecSize, MmaTraits<Kind>::kHasAlpha, S.bias,
-             Mode, Op>;
+             Mode, Op, S.epi_warp_groups, S.force_ntail,
+             Kind == MmaKind::BF16>;
 
 // Fp8
 constexpr TileSpec kFp8_128x256 = {.block_m = 128,
@@ -460,214 +478,270 @@ struct CandidateTiles<MmaKind::MXFP8FP4> {
 };
 
 // ===========================================================================
-// BF16 (kind::f16) configs — no block-scale, no alpha. KBlockK=64 gives the
-// same per-stage A/B smem as FP8@KBlockK=128 and there is no SFA/SFB smem, so
-// stage counts can mirror the FP8 configs (< 228 KB). The tail three template
-// parameters are BF16-relevant: EWGO (KEpilogueWarpGroupsOverride, 1 for the
-// 2SM "2x2" TMEM layout and narrow tiles), NTAIL (KForceEpiNPredicate, the
-// predicated store for N % KBlockN != 0), BF16 (KIsBF16).
+// BF16 tiles — no block-scale, no alpha. KBlockK=64 gives the same per-stage
+// A/B smem as FP8@KBlockK=128 and there is no SFA/SFB smem, so stage counts
+// can mirror the FP8 configs. epi_warp_groups=1 marks the 1-epilogue-warp-
+// group layouts (narrow tiles, 2SM "2x2" TMEM layout); force_ntail marks the
+// predicated N-tail store (N only has to divide 64, or 32 for non-power-of-2
+// widths). dense_only stays false on every BF16 tile: each mode picks from
+// its own table below, so the flag is never consulted.
+//
+// Dense table. Order defines the id the dense selector returns
+// (SelectBF16Cfg in gemm_dispatch.cuh); keep the two in sync.
 // ---------------------------------------------------------------------------
-// Dense (Naive)
-using GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA =
-    GemmTile<256, 256, 64, 6, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x256x64_1CTA =
-    GemmTile<128, 256, 64, 4, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x128x64_1CTA =
-    GemmTile<128, 128, 64, 4, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x32x64_1CTA =
-    GemmTile<128, 32, 64, 10, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x64x64_2x2CTA =
-    GemmTile<128, 64, 64, 8, 2, 2, 2, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 1, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x64x64_2x2CTA_P16 =
-    GemmTile<128, 64, 64, 16, 2, 2, 2, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 1, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x64x64_2x2CTA_P18 =
-    GemmTile<128, 64, 64, 18, 2, 2, 2, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 1, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x64x64_2CTA_P18 =
-    GemmTile<128, 64, 64, 18, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 1, false, true>;
-using GemmKernelConfigBF16NaiveNoBias64x96x64_1CTA_P11 =
-    GemmTile<64, 96, 64, 11, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 1, false, true>;
-using GemmKernelConfigBF16NaiveNoBias64x224x64_1CTA_P6 =
-    GemmTile<64, 224, 64, 6, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 1, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x64x64_2x1CTA =
-    GemmTile<128, 64, 64, 8, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 1, false, true>;
-using GemmKernelConfigBF16NaiveNoBias64x64x64_1CTA =
-    GemmTile<64, 64, 64, 10, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias64x128x64_1CTA =
-    GemmTile<64, 128, 64, 8, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias64x32x64_1WG_P14_1CTA =
-    GemmTile<64, 32, 64, 14, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 1, false, true>;
-using GemmKernelConfigBF16NaiveNoBias64x32x64_1WG_P18_1CTA =
-    GemmTile<64, 32, 64, 18, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 1, false, true>;
-using GemmKernelConfigBF16NaiveNoBias64x32x64_1WG_1CTA =
-    GemmTile<64, 32, 64, 10, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 1, false, true>;
-using GemmKernelConfigBF16NaiveNoBias64x64x64_1WG_1CTA =
-    GemmTile<64, 64, 64, 10, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 1, false, true>;
-using GemmKernelConfigBF16NaiveNoBias64x64x64_P12_1CTA =
-    GemmTile<64, 64, 64, 12, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias64x64x64_P14_1CTA =
-    GemmTile<64, 64, 64, 14, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias64x64x64_1WG_P14_1CTA =
-    GemmTile<64, 64, 64, 14, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 1, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x32x64_P4_1CTA =
-    GemmTile<128, 32, 64, 4, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x32x64_P6_1CTA =
-    GemmTile<128, 32, 64, 6, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x32x32_1CTA =
-    GemmTile<128, 32, 32, 16, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x64x64_1CTA =
-    GemmTile<128, 64, 64, 8, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA =
-    GemmTile<256, 128, 64, 8, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_Ntail =
-    GemmTile<256, 128, 64, 8, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, true, true>;
-using GemmKernelConfigBF16NaiveNoBias256x64x64_2CTA =
-    GemmTile<256, 64, 64, 10, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA_P7 =
-    GemmTile<256, 256, 64, 7, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_P9 =
-    GemmTile<256, 128, 64, 9, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_P9_Ntail =
-    GemmTile<256, 128, 64, 9, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, true, true>;
-using GemmKernelConfigBF16NaiveNoBias256x192x64_2CTA =
-    GemmTile<256, 192, 64, 8, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x64x64_SwapAB_1CTA =
-    GemmTile<128, 64, 64, 8, 2, 1, 1, 0, 208, false, false, true, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x32x64_SwapAB_1CTA =
-    GemmTile<128, 32, 64, 8, 2, 1, 1, 0, 208, false, false, true, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias256x64x64_SwapAB_2CTA =
-    GemmTile<256, 64, 64, 9, 2, 2, 1, 0, 208, false, false, true, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
-using GemmKernelConfigBF16NaiveNoBias128x64x128_SwapAB_1CTA =
-    GemmTile<128, 64, 128, 4, 2, 1, 1, 0, 208, false, false, true, false, 16,
-             false, false, KernelMode::Dense, EpilogueOp::Identity, 0, false, true>;
+constexpr TileSpec kBF16_256x256_pair = {.block_m = 256,
+                                         .block_n = 256,
+                                         .block_k = 64,
+                                         .main_stages = 6,
+                                         .cluster_m = 2};
+constexpr TileSpec kBF16_256x256_pair_p7 = {.block_m = 256,
+                                            .block_n = 256,
+                                            .block_k = 64,
+                                            .main_stages = 7,
+                                            .cluster_m = 2};
+constexpr TileSpec kBF16_256x128_pair = {.block_m = 256,
+                                         .block_n = 128,
+                                         .block_k = 64,
+                                         .main_stages = 8,
+                                         .cluster_m = 2};
+constexpr TileSpec kBF16_256x128_pair_ntail = {.block_m = 256,
+                                               .block_n = 128,
+                                               .block_k = 64,
+                                               .main_stages = 8,
+                                               .cluster_m = 2,
+                                               .force_ntail = true};
+constexpr TileSpec kBF16_256x128_pair_p9 = {.block_m = 256,
+                                            .block_n = 128,
+                                            .block_k = 64,
+                                            .main_stages = 9,
+                                            .cluster_m = 2};
+constexpr TileSpec kBF16_256x128_pair_p9_ntail = {.block_m = 256,
+                                                  .block_n = 128,
+                                                  .block_k = 64,
+                                                  .main_stages = 9,
+                                                  .cluster_m = 2,
+                                                  .force_ntail = true};
+constexpr TileSpec kBF16_256x192_pair = {.block_m = 256,
+                                         .block_n = 192,
+                                         .block_k = 64,
+                                         .main_stages = 8,
+                                         .cluster_m = 2};
+constexpr TileSpec kBF16_256x64_pair = {.block_m = 256,
+                                        .block_n = 64,
+                                        .block_k = 64,
+                                        .main_stages = 10,
+                                        .cluster_m = 2};
+constexpr TileSpec kBF16_128x256 = {
+    .block_m = 128, .block_n = 256, .block_k = 64, .main_stages = 4};
+constexpr TileSpec kBF16_128x128 = {
+    .block_m = 128, .block_n = 128, .block_k = 64, .main_stages = 4};
+constexpr TileSpec kBF16_128x64 = {
+    .block_m = 128, .block_n = 64, .block_k = 64, .main_stages = 8};
+constexpr TileSpec kBF16_128x32 = {
+    .block_m = 128, .block_n = 32, .block_k = 64, .main_stages = 10};
+constexpr TileSpec kBF16_128x64_pair_p18 = {.block_m = 128,
+                                            .block_n = 64,
+                                            .block_k = 64,
+                                            .main_stages = 18,
+                                            .cluster_m = 2,
+                                            .epi_warp_groups = 1};
+constexpr TileSpec kBF16_64x128 = {
+    .block_m = 64, .block_n = 128, .block_k = 64, .main_stages = 8};
+constexpr TileSpec kBF16_64x96_p11 = {.block_m = 64,
+                                      .block_n = 96,
+                                      .block_k = 64,
+                                      .main_stages = 11,
+                                      .epi_warp_groups = 1};
+constexpr TileSpec kBF16_64x224 = {.block_m = 64,
+                                   .block_n = 224,
+                                   .block_k = 64,
+                                   .main_stages = 6,
+                                   .epi_warp_groups = 1};
+constexpr TileSpec kBF16_64x64 = {
+    .block_m = 64, .block_n = 64, .block_k = 64, .main_stages = 10};
+constexpr TileSpec kBF16_64x64_1wg = {.block_m = 64,
+                                      .block_n = 64,
+                                      .block_k = 64,
+                                      .main_stages = 10,
+                                      .epi_warp_groups = 1};
+constexpr TileSpec kBF16_64x64_1wg_p14 = {.block_m = 64,
+                                          .block_n = 64,
+                                          .block_k = 64,
+                                          .main_stages = 14,
+                                          .epi_warp_groups = 1};
+constexpr TileSpec kBF16_64x32_1wg = {.block_m = 64,
+                                      .block_n = 32,
+                                      .block_k = 64,
+                                      .main_stages = 10,
+                                      .epi_warp_groups = 1};
+constexpr TileSpec kBF16_64x32_1wg_p18 = {.block_m = 64,
+                                          .block_n = 32,
+                                          .block_k = 64,
+                                          .main_stages = 18,
+                                          .epi_warp_groups = 1};
+constexpr TileSpec kBF16_128x64_swap = {.block_m = 128,
+                                        .block_n = 64,
+                                        .block_k = 64,
+                                        .main_stages = 8,
+                                        .swap_ab = true};
+constexpr TileSpec kBF16_128x32_swap = {.block_m = 128,
+                                        .block_n = 32,
+                                        .block_k = 64,
+                                        .main_stages = 8,
+                                        .swap_ab = true};
+constexpr TileSpec kBF16_256x64_swap_pair = {.block_m = 256,
+                                             .block_n = 64,
+                                             .block_k = 64,
+                                             .main_stages = 9,
+                                             .cluster_m = 2,
+                                             .swap_ab = true};
+constexpr TileSpec kBF16_128x64x128_swap = {.block_m = 128,
+                                            .block_n = 64,
+                                            .block_k = 128,
+                                            .main_stages = 4,
+                                            .swap_ab = true};
 
-// Batch
-using GemmKernelConfigBF16BatchNoBias256x256x64_2CTA =
-    GemmTile<256, 256, 64, 6, 2, 2, 1, 16, 208, false, false, false, false, 16,
-             false, false, KernelMode::Batch, EpilogueOp::Identity, 0, false, true>;
+inline constexpr std::array<TileSpec, 25> kBF16DenseTiles = {
+    kBF16_256x256_pair,    kBF16_256x256_pair_p7,
+    kBF16_256x128_pair,    kBF16_256x128_pair_ntail,
+    kBF16_256x128_pair_p9, kBF16_256x128_pair_p9_ntail,
+    kBF16_256x192_pair,    kBF16_256x64_pair,
+    kBF16_128x256,         kBF16_128x128,
+    kBF16_128x64,          kBF16_128x32,
+    kBF16_128x64_pair_p18, kBF16_64x128,
+    kBF16_64x96_p11,       kBF16_64x224,
+    kBF16_64x64,           kBF16_64x64_1wg,
+    kBF16_64x64_1wg_p14,   kBF16_64x32_1wg,
+    kBF16_64x32_1wg_p18,   kBF16_128x64_swap,
+    kBF16_128x32_swap,     kBF16_256x64_swap_pair,
+    kBF16_128x64x128_swap,
+};
 
-using GemmKernelConfigBF16BatchNoBias128x256x64_1CTA =
-    GemmTile<128, 256, 64, 4, 2, 1, 1, 16, 208, false, false, false, false, 16,
-             false, false, KernelMode::Batch, EpilogueOp::Identity, 0, false, true>;
+// Grouped/batch tiles: deeper / TMEM-overlapped variants of the dense shapes.
+constexpr TileSpec kBF16_128x256_ovlp16 = {.block_m = 128,
+                                           .block_n = 256,
+                                           .block_k = 64,
+                                           .main_stages = 4,
+                                           .tmem_overlap = 16};
+constexpr TileSpec kBF16_128x128_p6 = {
+    .block_m = 128, .block_n = 128, .block_k = 64, .main_stages = 6};
+constexpr TileSpec kBF16_128x64_ovlp16 = {.block_m = 128,
+                                          .block_n = 64,
+                                          .block_k = 64,
+                                          .main_stages = 8,
+                                          .tmem_overlap = 16};
 
-using GemmKernelConfigBF16BatchNoBias128x64x64_SwapAB_1CTA =
-    GemmTile<128, 64, 64, 8, 2, 1, 1, 0, 208, false, false, true, false, 16,
-             false, false, KernelMode::Batch, EpilogueOp::Identity, 0, false, true>;
+// Order defines the id the per-mode selectors return (gemm_dispatch.cuh).
+inline constexpr std::array<TileSpec, 6> kBF16ContiguousTiles = {
+    kBF16_256x256_pair_p7,  // 0
+    kBF16_256x128_pair_p9,  // 1
+    kBF16_128x256_ovlp16,   // 2
+    kBF16_128x128_p6,       // 3
+    kBF16_128x64_ovlp16,    // 4
+    kBF16_128x64_swap,      // 5
+};
 
-// Group contiguous
-using GemmKernelConfigBF16ContiguousNoBias256x256x64_2CTA =
-    GemmTile<256, 256, 64, 7, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Contiguous, EpilogueOp::Identity, 0, false, true>;
+inline constexpr std::array<TileSpec, 6> kBF16MaskedTiles = {
+    kBF16_128x256_ovlp16,   // 0
+    kBF16_128x64_swap,      // 1
+    kBF16_128x128_p6,       // 2
+    kBF16_128x64_ovlp16,    // 3
+    kBF16_256x256_pair_p7,  // 4
+    kBF16_256x128_pair_p9,  // 5
+};
 
-using GemmKernelConfigBF16ContiguousNoBias256x128x64_2CTA =
-    GemmTile<256, 128, 64, 9, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Contiguous, EpilogueOp::Identity, 0, false, true>;
+inline constexpr std::array<TileSpec, 3> kBF16BatchTiles = {
+    kBF16_256x256_pair,    // 0
+    kBF16_128x256_ovlp16,  // 1
+    kBF16_128x64_swap,     // 2
+};
 
-using GemmKernelConfigBF16ContiguousNoBias128x256x64_1CTA =
-    GemmTile<128, 256, 64, 4, 2, 1, 1, 16, 208, false, false, false, false, 16,
-             false, false, KernelMode::Contiguous, EpilogueOp::Identity, 0, false, true>;
+// ---------------------------------------------------------------------------
+// Field-lock asserts: guard the designated-initializer tables above against
+// drift. These tables replaced hand-written GemmTile structs; the locks pin
+// every kernel-facing constant a table entry must produce.
+// ---------------------------------------------------------------------------
+template <MmaKind Kind, KernelMode Mode, TileSpec S, int BM, int BN, int BK,
+          int ST, int CM = 1, int CN = 1, int OVLP = 0, int EWGO = 0,
+          bool SWAP = false, bool NTAIL = false>
+constexpr bool BF16TileLocks() {
+    using C = MakeTile<Kind, Mode, S>;
+    return C::KBlockM == BM && C::KBlockN == BN && C::KBlockK == BK &&
+           C::KPrologueStages == ST && C::KClusterM == CM &&
+           C::KClusterN == CN && C::KTmemOverlapCols == OVLP &&
+           C::KNumRegsEpilogue == 208 &&
+           C::KEpilogueWarpGroupsOverride == EWGO && C::SwapAB == SWAP &&
+           C::KForceEpiNPredicate == NTAIL && C::KIsBF16 && !C::KIsFP4 &&
+           !C::HasAlpha && !C::AddBias && !C::UseTileSwizzle &&
+           !C::SkipTmemFence;
+}
 
-using GemmKernelConfigBF16ContiguousNoBias128x128x64_1CTA =
-    GemmTile<128, 128, 64, 6, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Contiguous, EpilogueOp::Identity, 0, false, true>;
-
-using GemmKernelConfigBF16ContiguousNoBias128x64x64_1CTA =
-    GemmTile<128, 64, 64, 8, 2, 1, 1, 16, 208, false, false, false, false, 16,
-             false, false, KernelMode::Contiguous, EpilogueOp::Identity, 0, false, true>;
-
-using GemmKernelConfigBF16ContiguousNoBias128x64x64_SwapAB_1CTA =
-    GemmTile<128, 64, 64, 8, 2, 1, 1, 0, 208, false, false, true, false, 16,
-             false, false, KernelMode::Contiguous, EpilogueOp::Identity, 0, false, true>;
-
-// Group masked
-using GemmKernelConfigBF16MaskedNoBias128x256x64_1CTA =
-    GemmTile<128, 256, 64, 4, 2, 1, 1, 16, 208, false, false, false, false, 16,
-             false, false, KernelMode::Masked, EpilogueOp::Identity, 0, false, true>;
-
-using GemmKernelConfigBF16MaskedNoBias128x64x64_SwapAB_1CTA =
-    GemmTile<128, 64, 64, 8, 2, 1, 1, 0, 208, false, false, true, false, 16,
-             false, false, KernelMode::Masked, EpilogueOp::Identity, 0, false, true>;
-
-using GemmKernelConfigBF16MaskedNoBias128x128x64_1CTA =
-    GemmTile<128, 128, 64, 6, 2, 1, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Masked, EpilogueOp::Identity, 0, false, true>;
-
-using GemmKernelConfigBF16MaskedNoBias128x64x64_1CTA =
-    GemmTile<128, 64, 64, 8, 2, 1, 1, 16, 208, false, false, false, false, 16,
-             false, false, KernelMode::Masked, EpilogueOp::Identity, 0, false, true>;
-
-using GemmKernelConfigBF16MaskedNoBias256x256x64_2CTA =
-    GemmTile<256, 256, 64, 7, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Masked, EpilogueOp::Identity, 0, false, true>;
-
-using GemmKernelConfigBF16MaskedNoBias256x128x64_2CTA =
-    GemmTile<256, 128, 64, 9, 2, 2, 1, 0, 208, false, false, false, false, 16,
-             false, false, KernelMode::Masked, EpilogueOp::Identity, 0, false, true>;
-
-// Field-lock asserts: guard against positional-argument drift in the
-// 21-parameter alias lists above (migration from hand-written structs).
-static_assert(GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA::KBlockM == 256 &&
-              GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA::KBlockN == 256 &&
-              GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA::KBlockK == 64 &&
-              GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA::KPrologueStages ==
-                  6 &&
-              GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA::IsPairUmma &&
-              GemmKernelConfigBF16NaiveNoBias256x256x64_2CTA::KIsBF16);
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense,
+                            kBF16_256x256_pair, 256, 256, 64, 6, 2>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense,
+                            kBF16_256x256_pair_p7, 256, 256, 64, 7, 2>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense,
+                            kBF16_256x128_pair, 256, 128, 64, 8, 2>());
 static_assert(
-    GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_Ntail::KForceEpiNPredicate &&
-    GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_Ntail::KPrologueStages ==
-        8 &&
-    GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_P9_Ntail::KPrologueStages ==
-        9 &&
-    GemmKernelConfigBF16NaiveNoBias256x128x64_2CTA_P9_Ntail::
-        KForceEpiNPredicate);
+    BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_256x128_pair_ntail,
+                  256, 128, 64, 8, 2, 1, 0, 0, false, true>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense,
+                            kBF16_256x128_pair_p9, 256, 128, 64, 9, 2>());
 static_assert(
-    GemmKernelConfigBF16NaiveNoBias128x64x64_2x2CTA_P18::
-            KEpilogueWarpGroupsOverride == 1 &&
-    GemmKernelConfigBF16NaiveNoBias128x64x64_2x2CTA_P18::KPrologueStages ==
-        18 &&
-    GemmKernelConfigBF16NaiveNoBias128x64x64_2x2CTA_P18::KClusterN == 2);
-static_assert(GemmKernelConfigBF16NaiveNoBias128x32x32_1CTA::KBlockK == 32 &&
-              GemmKernelConfigBF16NaiveNoBias128x64x128_SwapAB_1CTA::KBlockK ==
-                  128 &&
-              GemmKernelConfigBF16NaiveNoBias128x64x128_SwapAB_1CTA::SwapAB);
+    BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_256x128_pair_p9_ntail,
+                  256, 128, 64, 9, 2, 1, 0, 0, false, true>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense,
+                            kBF16_256x192_pair, 256, 192, 64, 8, 2>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_256x64_pair,
+                            256, 64, 64, 10, 2>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_128x256,
+                            128, 256, 64, 4>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_128x128,
+                            128, 128, 64, 4>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_128x64, 128,
+                            64, 64, 8>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_128x32, 128,
+                            32, 64, 10>());
 static_assert(
-    GemmKernelConfigBF16ContiguousNoBias128x256x64_1CTA::KTmemOverlapCols ==
-        16 &&
-    GemmKernelConfigBF16MaskedNoBias256x128x64_2CTA::KPrologueStages == 9 &&
-    GemmKernelConfigBF16BatchNoBias128x64x64_SwapAB_1CTA::SwapAB);
+    BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_128x64_pair_p18, 128,
+                  64, 64, 18, 2, 1, 0, 1>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_64x128, 64,
+                            128, 64, 8>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_64x96_p11,
+                            64, 96, 64, 11, 1, 1, 0, 1>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_64x224, 64,
+                            224, 64, 6, 1, 1, 0, 1>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_64x64, 64,
+                            64, 64, 10>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_64x64_1wg,
+                            64, 64, 64, 10, 1, 1, 0, 1>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense,
+                            kBF16_64x64_1wg_p14, 64, 64, 64, 14, 1, 1, 0, 1>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_64x32_1wg,
+                            64, 32, 64, 10, 1, 1, 0, 1>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense,
+                            kBF16_64x32_1wg_p18, 64, 32, 64, 18, 1, 1, 0, 1>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_128x64_swap,
+                            128, 64, 64, 8, 1, 1, 0, 0, true>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_128x32_swap,
+                            128, 32, 64, 8, 1, 1, 0, 0, true>());
+static_assert(
+    BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_256x64_swap_pair, 256,
+                  64, 64, 9, 2, 1, 0, 0, true>());
+static_assert(
+    BF16TileLocks<MmaKind::BF16, KernelMode::Dense, kBF16_128x64x128_swap, 128,
+                  64, 128, 4, 1, 1, 0, 0, true>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Contiguous,
+                            kBF16_128x256_ovlp16, 128, 256, 64, 4, 1, 1, 16>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Contiguous,
+                            kBF16_128x128_p6, 128, 128, 64, 6>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Masked,
+                            kBF16_128x64_ovlp16, 128, 64, 64, 8, 1, 1, 16>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Masked,
+                            kBF16_256x128_pair_p9, 256, 128, 64, 9, 2>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Batch,
+                            kBF16_256x256_pair, 256, 256, 64, 6, 2>());
+static_assert(BF16TileLocks<MmaKind::BF16, KernelMode::Batch, kBF16_128x64_swap,
+                            128, 64, 64, 8, 1, 1, 0, 0, true>());
 
 }  // namespace halops
