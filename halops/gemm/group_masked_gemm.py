@@ -99,11 +99,6 @@ def group_masked_gemm(
         ...     max_m_per_expert=max_m_per_expert, mode="w8a8-mxfp8",
         ... )
     """
-    if sfa is None:
-        sfa = torch.empty(0, dtype=torch.uint8, device=input.device)
-    if sfb is None:
-        sfb = torch.empty(0, dtype=torch.uint8, device=input.device)
-
     halops_kernel.group_masked_gemm(
         input,
         weight,

@@ -22,7 +22,8 @@
 namespace halops {
 
 void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
-               const torch::Tensor& sfa, const torch::Tensor& sfb,
+               const std::optional<torch::Tensor>& sfa,
+               const std::optional<torch::Tensor>& sfb,
                torch::Tensor& output, const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha,
                const int sm_count_arg, const std::string& mode,
@@ -277,6 +278,9 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                       KernelConfig>(params, sm, stream);
         });
     } else if (mode == "w8a8-mxfp8") {
+        TORCH_CHECK(sfa.has_value() && sfb.has_value(),
+                    "w8a8-mxfp8 dense GEMM requires sfa/sfb scale factors "
+                    "(only mode='bf16' accepts sfa=None, sfb=None)");
         const int k = weight.size(1);
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),
@@ -284,21 +288,21 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();
-        params.ptr_sfa = sfa.data_ptr();
+        params.ptr_sfa = sfa->data_ptr();
         // sfb is the quantizer's uint8 SfAtom weight scale, used as-is: a
         // 224-wide tile reads it as a run of atoms plus a 32-row rewrite.
-        TORCH_CHECK(sfb.scalar_type() == torch::kUInt8,
+        TORCH_CHECK(sfb->scalar_type() == torch::kUInt8,
                     "sfb must be the uint8 SfAtom weight scale that "
                     "group_wise_quant returns");
-        params.ptr_sfb = sfb.data_ptr();
+        params.ptr_sfb = sfb->data_ptr();
         if (bias.has_value()) {
             params.ptr_c = bias->data_ptr();
         }
         TORCH_CHECK(
-            sfa.is_contiguous() && sfa.numel() >= int64_t(m_sf) * (k / 32),
+            sfa->is_contiguous() && sfa->numel() >= int64_t(m_sf) * (k / 32),
             "sfa must hold whole 128-row SfAtoms: expected at least ",
             int64_t(m_sf) * (k / 32), " elements (", m_sf, " x ", k / 32,
-            ") for M=", m, ", got ", sfa.numel());
+            ") for M=", m, ", got ", sfa->numel());
         TORCH_CHECK(!bias_tile || m % 256 == 0,
                     "the bias tile has no per-row store predicate yet, so M "
                     "must be a multiple of 256 when bias is given, got ",
@@ -330,6 +334,9 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                             static_cast<int>(epilogue), " for ", mode);
         }
     } else {
+        TORCH_CHECK(sfa.has_value() && sfb.has_value(),
+                    "W4A4 dense GEMM requires sfa/sfb scale factors "
+                    "(only mode='bf16' accepts sfa=None, sfb=None)");
         const int k = weight.size(1) * 2;  // 2 FP4 per packed byte
         TORCH_CHECK(
             input.size(1) == weight.size(1),
@@ -338,8 +345,8 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();
-        params.ptr_sfa = sfa.data_ptr();
-        params.ptr_sfb = sfb.data_ptr();
+        params.ptr_sfa = sfa->data_ptr();
+        params.ptr_sfb = sfb->data_ptr();
         TORCH_CHECK(!bias.has_value(), "W4A4 mode does not support bias yet.");
 
         const bool mxfp4 = mode == "w4a4-mxfp4";
@@ -349,16 +356,17 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
         params.ptr_alpha =
             alpha.has_value() ? alpha->data_ptr<float>() : nullptr;
         const int sf_k = k / (mxfp4 ? 32 : 16);
-        TORCH_CHECK(sfa.size(-1) == sf_k && sfb.size(-1) == sf_k,
+        TORCH_CHECK(sfa->size(-1) == sf_k && sfb->size(-1) == sf_k,
                     "W4A4 scale-factor shape does not match mode ",
                     mxfp4 ? "'w4a4-mxfp4' (UE8M0 per 32)"
                           : "'w4a4-nvfp4' (UE4M3 per 16)",
-                    " requires SF K = ", sf_k, ", got sfa K=", sfa.size(-1),
-                    " and sfb K=", sfb.size(-1), ".");
-        TORCH_CHECK(sfa.is_contiguous() && sfa.numel() >= int64_t(m_sf) * sf_k,
-                    "sfa must hold whole 128-row SfAtoms: expected at least ",
-                    int64_t(m_sf) * sf_k, " elements (", m_sf, " x ", sf_k,
-                    ") for M=", m, ", got ", sfa.numel());
+                    " requires SF K = ", sf_k, ", got sfa K=", sfa->size(-1),
+                    " and sfb K=", sfb->size(-1), ".");
+        TORCH_CHECK(
+            sfa->is_contiguous() && sfa->numel() >= int64_t(m_sf) * sf_k,
+            "sfa must hold whole 128-row SfAtoms: expected at least ",
+            int64_t(m_sf) * sf_k, " elements (", m_sf, " x ", sf_k,
+            ") for M=", m, ", got ", sfa->numel());
         TORCH_CHECK(!mxfp4 || !alpha.has_value(),
                     "'w4a4-mxfp4' does not take alpha; the per-batch scaling "
                     "factor is only used by 'w4a4-nvfp4'.");

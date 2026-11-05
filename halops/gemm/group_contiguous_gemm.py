@@ -96,11 +96,6 @@ def group_contiguous_gemm(
         >>> out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
         >>> group_contiguous_gemm(x, w, sfa, sfb, expert_ids, out, mode="w8a8-mxfp8")
     """
-    if sfa is None:
-        sfa = torch.empty(0, dtype=torch.uint8, device=input.device)
-    if sfb is None:
-        sfb = torch.empty(0, dtype=torch.uint8, device=input.device)
-
     halops_kernel.group_contiguous_gemm(
         input,
         weight,

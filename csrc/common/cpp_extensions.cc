@@ -71,7 +71,8 @@ void DecoderAttention(
     const int mtp_steps, const std::string& cache_quant_type_str);
 
 void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
-               const torch::Tensor& sfa, const torch::Tensor& sfb,
+               const std::optional<torch::Tensor>& sfa,
+               const std::optional<torch::Tensor>& sfb,
                torch::Tensor& output, const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha, const int sm_count,
                const std::string& mode, const bool use_pdl,
@@ -80,24 +81,26 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const double situ_beta,
                const std::optional<double> situ_linear_beta);
 
-void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
-                     const torch::Tensor& sfa, const torch::Tensor& sfb,
-                     const torch::Tensor& masked_m, torch::Tensor& output,
-                     const std::optional<torch::Tensor>& bias,
-                     const std::optional<torch::Tensor>& alpha,
-                     const int max_m_per_expert, const int sm_count,
-                     const std::string& mode);
+void GroupMaskedGemm(
+    const torch::Tensor& input, const torch::Tensor& weight,
+    const std::optional<torch::Tensor>& sfa,
+    const std::optional<torch::Tensor>& sfb, const torch::Tensor& masked_m,
+    torch::Tensor& output, const std::optional<torch::Tensor>& bias,
+    const std::optional<torch::Tensor>& alpha, const int max_m_per_expert,
+    const int sm_count, const std::string& mode);
 
 void GroupContiguousGemm(const torch::Tensor& input,
-                         const torch::Tensor& weight, const torch::Tensor& sfa,
-                         const torch::Tensor& sfb,
+                         const torch::Tensor& weight,
+                         const std::optional<torch::Tensor>& sfa,
+                         const std::optional<torch::Tensor>& sfb,
                          const torch::Tensor& expert_ids, torch::Tensor& output,
                          const std::optional<torch::Tensor>& bias,
                          const std::optional<torch::Tensor>& alpha,
                          const int sm_count, const std::string& mode);
 
 void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
-               const torch::Tensor& sfa, const torch::Tensor& sfb,
+               const std::optional<torch::Tensor>& sfa,
+               const std::optional<torch::Tensor>& sfb,
                torch::Tensor& output, const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha, const int sm_count,
                const std::string& mode, const EpilogueOp epilogue,
