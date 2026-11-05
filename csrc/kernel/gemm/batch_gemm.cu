@@ -15,7 +15,6 @@
 #include <optional>
 #include <string>
 
-#include "kernel/gemm/bf16_cfgs.h"
 #include "kernel/gemm/gemm_dispatch.cuh"
 #include "kernel/gemm/gemm_utils.h"
 
@@ -23,8 +22,8 @@ namespace halops {
 
 void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const std::optional<torch::Tensor>& sfa,
-               const std::optional<torch::Tensor>& sfb,
-               torch::Tensor& output, const std::optional<torch::Tensor>& bias,
+               const std::optional<torch::Tensor>& sfb, torch::Tensor& output,
+               const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha, const int sm_count,
                const std::string& mode, const EpilogueOp epilogue,
                const std::optional<torch::Tensor>& output_sf,
@@ -70,13 +69,8 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.use_pdl = use_pdl;
 
     if (mode == "bf16") {
-        using TypeA = cutlass::bfloat16_t;
-        using TypeB = cutlass::bfloat16_t;
-        using TypeC = cutlass::bfloat16_t;
-        using TypeD = cutlass::bfloat16_t;
-        using TypeSF = cutlass::float_ue8m0_t;  // placeholder, unused
-        using TypeAccumulate = float;
-
+        // Native BF16: sfa/sfb/bias/alpha are ignored; dispatch and launch
+        // live in gemm_dispatch.cuh (bf16::LaunchBatch).
         const int k = weight.size(2);
         TORCH_CHECK(input.size(2) == k,
                     "input K must match weight K, got input K=", input.size(2),
@@ -96,20 +90,7 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
         params.ptr_sfa = nullptr;
         params.ptr_sfb = nullptr;
         params.ptr_alpha = nullptr;
-
-        const int cfg = bf16_dispatch::SelectBF16BatchCfg(m, n, k);
-        TORCH_CHECK(cfg >= 0, "bf16 batch GEMM: unsupported shape B=", batches,
-                    " M=", m, " N=", n, " K=", k,
-                    ". Need one of: (M%256==0 && N%256==0), "
-                    "(M%128==0 && N%256==0), or (M%64==0 && N%128==0).");
-        bf16_dispatch::CheckBF16CfgShape(
-            "bf16 batch GEMM", bf16_dispatch::kBF16BatchCfgs[cfg], m, n, k);
-        bf16_dispatch::DispatchBF16SmallCfg<bf16_dispatch::BF16BatchTiles,
-                                            bf16_dispatch::kBF16BatchCount>(
-            cfg, "bf16 batch", [&]<class KernelConfig>() {
-                gemm_impl<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
-                          KernelConfig>(params, sm, stream);
-            });
+        bf16::LaunchBatch(params, sm, stream);
     } else if (mode == "w8a8-mxfp8") {
         TORCH_CHECK(sfa.has_value() && sfb.has_value(),
                     "w8a8-mxfp8 batch GEMM requires sfa/sfb scale factors "
