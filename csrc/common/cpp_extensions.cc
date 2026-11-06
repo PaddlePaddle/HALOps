@@ -196,48 +196,44 @@ void LowLatencyMoE(const torch::Tensor& input,
 torch::Tensor GetWorkspace(const torch::Tensor& input);
 
 int64_t GetWorkspaceSize(const std::optional<torch::Tensor>& input);
-pybind11::dict GetKernelTimer();
 
 int64_t RouterTileM(int64_t num_tokens);
 
 }  // namespace halops
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    //     m.def("write_cache_kv_encoder", &halops::WriteCacheKVEncoder);
-    //     m.def("write_cache_kv_decoder", &halops::WriteCacheKVDecoder);
-    //     m.def("get_qk_token", &halops::GetQKToken);
-    //     m.def("encoder_attention", &halops::EncoderAttention);
-    //     m.def("decoder_attention", &halops::DecoderAttention);
+    m.def("write_cache_kv_encoder", &halops::WriteCacheKVEncoder);
+    m.def("write_cache_kv_decoder", &halops::WriteCacheKVDecoder);
+    m.def("get_qk_token", &halops::GetQKToken);
+    m.def("encoder_attention", &halops::EncoderAttention);
+    m.def("decoder_attention", &halops::DecoderAttention);
 
-    //     m.def("dense_gemm", &halops::DenseGemm, py::arg("input"),
-    //     py::arg("weight"),
-    //           py::arg("sfa"), py::arg("sfb"), py::arg("output"),
-    //           py::arg("bias"), py::arg("alpha"), py::arg("sm_count"),
-    //           py::arg("mode"), py::arg("use_pdl") = true);
-    //     m.def("group_masked_gemm", &halops::GroupMaskedGemm);
-    //     m.def("group_contiguous_gemm", &halops::GroupContiguousGemm);
-    //     m.def("batch_gemm", &halops::BatchGemm);
-    //     m.def("low_latency_mma_gemm", &halops::LowLatencyMmaGemm,
-    //     py::arg("input"),
-    //           py::arg("weight"), py::arg("sfa"), py::arg("sfb"),
-    //           py::arg("output"), py::arg("input2"), py::arg("weight2"),
-    //           py::arg("sfa2"), py::arg("sfb2"), py::arg("output2"),
-    //           py::arg("sm_count"), py::arg("use_pdl") = true);
+    m.def("dense_gemm", &halops::DenseGemm, py::arg("input"), py::arg("weight"),
+          py::arg("sfa"), py::arg("sfb"), py::arg("output"), py::arg("bias"),
+          py::arg("alpha"), py::arg("sm_count"), py::arg("mode"),
+          py::arg("use_pdl") = true);
+    m.def("group_masked_gemm", &halops::GroupMaskedGemm);
+    m.def("group_contiguous_gemm", &halops::GroupContiguousGemm);
+    m.def("batch_gemm", &halops::BatchGemm);
+    m.def("low_latency_mma_gemm", &halops::LowLatencyMmaGemm, py::arg("input"),
+          py::arg("weight"), py::arg("sfa"), py::arg("sfb"), py::arg("output"),
+          py::arg("input2"), py::arg("weight2"), py::arg("sfa2"),
+          py::arg("sfb2"), py::arg("output2"), py::arg("sm_count"),
+          py::arg("use_pdl") = true);
     m.def("group_wise_quant", &halops::GroupWiseQuant, py::arg("input"),
           py::arg("mode"), py::arg("use_swizzle") = true,
           py::arg("use_pdl") = true);
-    //     m.def("prefill_permute_to_masked_gemm",
-    //           &halops::PrefillPermuteToMaskedGemm);
-    //     m.def("fused_swiglu_quant", &halops::FusedSwigluQuant);
+    m.def("prefill_permute_to_masked_gemm",
+          &halops::PrefillPermuteToMaskedGemm);
+    m.def("fused_swiglu_quant", &halops::FusedSwigluQuant);
 
-    //     m.def("mla_workspace_bytes", &halops::MlaWorkspaceBytes);
-    //     m.def("mla_attention_plan", &halops::MlaAttentionPlan);
-    //     m.def("mla_attention", &halops::MlaAttention);
-    //     m.def("combine_with_rope_quant", &halops::CombineWithRopeQuant);
-    //     m.def("mla_output_proj", &halops::MlaOutputProj);
+    m.def("mla_workspace_bytes", &halops::MlaWorkspaceBytes);
+    m.def("mla_attention_plan", &halops::MlaAttentionPlan);
+    m.def("mla_attention", &halops::MlaAttention);
+    m.def("combine_with_rope_quant", &halops::CombineWithRopeQuant);
+    m.def("mla_output_proj", &halops::MlaOutputProj);
 
     m.def("low_latency_moe", &halops::LowLatencyMoE);
-    m.def("moe_get_kernel_timer", &halops::GetKernelTimer);
     m.def("moe_get_workspace", &halops::GetWorkspace, py::arg("input"));
     m.def("moe_get_workspace_size", &halops::GetWorkspaceSize,
           py::arg("input") = py::none());

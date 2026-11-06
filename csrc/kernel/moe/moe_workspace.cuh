@@ -49,16 +49,14 @@ struct RouterLogits {
     }
 };
 
-// The scale image of the projection's output, in the up staging's layout: the
-// block-wise fp32 table, or one SfAtom slab per up K tile for MXFP8.  Either
-// is exactly one up staging tile's scales, so the phase boundary is one blob.
+// Latent output scales in routed-up staging layout: FP32 blocks or MXFP8
+// SfAtoms.
 template <typename Dims, bool IsMx>
 struct LatentScaleImage;
 
 template <typename Dims>
 struct LatentScaleImage<Dims, false> {
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
-    // The block-wise image is fp32 by recipe; the MX one is a byte blob.
     using Element = float;
 
     static constexpr std::uint32_t kNumBlocks = LatentDownGemm::kGemmM / 128u;
@@ -88,8 +86,7 @@ struct LatentScaleImage<Dims, true> {
     }
 };
 
-// The latent down-projection's output, as the up phase consumes it: the up
-// staging tile's own image, one blob of data plus one of scales.
+// Latent output data and scales in routed-up staging layout.
 template <typename Dims>
 struct LatentDownOutput {
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
@@ -100,8 +97,7 @@ struct LatentDownOutput {
     static constexpr std::uint32_t kNumRows = LatentDownGemm::kGemmN;
     static constexpr std::uint32_t kNumCols = LatentDownGemm::kGemmM;
 
-    static constexpr std::uint32_t kLboChunk =
-        MoEKernelTraits<Dims>::kLboChunkK;
+    static constexpr std::uint32_t kLboChunk = LboChunkK<Element>::value;
     static constexpr std::uint32_t kNumChunks = kNumCols / kLboChunk;
 
     alignas(16) Element data[kNumChunks][kNumRows + 1u][kLboChunk];
@@ -139,7 +135,6 @@ struct LatentDownOutput {
 template <typename Dims>
 struct SharedUpOutput {
     using ElementType = DataType::ElementQA;
-    // The block-wise image is fp32 by recipe; the MX one is a byte blob.
     using ScaleType = float;
     using SharedUpGemm = SharedUpGemmTraits<Dims>;
     using SharedDownGemm = SharedDownGemmTraits<Dims>;
@@ -149,13 +144,11 @@ struct SharedUpOutput {
     static constexpr std::uint32_t kNumRows = SharedUpGemm::kGemmN;
     static constexpr std::uint32_t kNumCols = SharedUpGemm::kGemmM / 2u;
 
-    static constexpr std::uint32_t kLboChunk = kFp8ActChunkK;
+    static constexpr std::uint32_t kLboChunk = LboChunkK<ElementType>::value;
     static constexpr std::uint32_t kNumChunks = kNumCols / kLboChunk;
     static constexpr std::uint32_t kNumScaleCols = kNumCols / kQuantBlock;
 
-    // The blockscaled down reads one SfAtom slab per K tile.  Both scale
-    // images live in one union sized to the larger, so the workspace size is
-    // the same for every recipe (host sizing reads only the default Dims).
+    // The union keeps workspace sizing identical across quantization recipes.
     static constexpr std::uint32_t kDownTilesK = SharedDownGemm::kNumTilesK;
     static constexpr std::uint32_t kSfAtomBytes =
         128u * (SharedDownGemm::kTileShapeK / 32u);
@@ -180,8 +173,7 @@ struct SharedUpOutput {
         return scale.blockwise[block];
     }
 
-    // One down K tile's UE8M0 scales, in the SfAtom layout the down's SFB
-    // staging expects.
+    // UE8M0 scale slab for one down-input K tile.
     __device__ __forceinline__ std::uint8_t* sf_slab(std::uint32_t tile) {
         return scale.mxfp8[tile];
     }
@@ -201,7 +193,6 @@ struct SharedUpOutput {
 template <typename Dims>
 struct RoutedUpOutput {
     using ElementType = DataType::ElementQA;
-    // The block-wise image is fp32 by recipe; the MX one is a byte blob.
     using ScaleType = float;
     using UpGemm = RoutedUpGemmTraits<Dims>;
 
@@ -210,13 +201,12 @@ struct RoutedUpOutput {
 
     static constexpr std::uint32_t kQuantBlock = UpGemm::kTileShapeM / 2u;
     static constexpr std::uint32_t kNumScaleCols = kNumCols / kQuantBlock;
-    // The MX recipe stores one UE8M0 byte per row and 32 features; the
-    // blockscaled down repacks them into its SfAtom slab on the way in.
+    // MX uses one UE8M0 byte per row and 32 features, repacked into SfAtoms
+    // during down loading.
     static constexpr std::uint32_t kNumMxScaleCols = kNumCols / 32u;
 
     alignas(16) ElementType data[(kNumRows + 8u) * kNumCols];
-    // Both scale images share one union so the workspace size is the same for
-    // every recipe (host sizing reads only the default Dims).
+    // The union keeps workspace sizing identical across quantization recipes.
     union alignas(16) ScaleImage {
         ScaleType blockwise[kNumRows * kNumScaleCols];
         std::uint8_t mxfp8[kNumRows * kNumMxScaleCols];

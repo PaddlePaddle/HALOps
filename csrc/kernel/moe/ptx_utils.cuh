@@ -38,8 +38,7 @@ __device__ static inline void cp_async_wait_group() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
 }
 
-// The halves of the cluster barrier, CTA-collective: the arrive releases the
-// thread's earlier accesses, the wait acquires its partners'.
+// CTA-collective cluster barrier: release on arrive, acquire on wait.
 __device__ static __forceinline__ void cluster_arrive() {
     asm volatile("barrier.cluster.arrive.aligned;" ::: "memory");
 }
@@ -107,16 +106,14 @@ __device__ static __forceinline__ std::uint64_t global_load_acquire_u64(
     return v;
 }
 
-// Device-scope release store of a 32-bit word (st.release.gpu): the
-// thread's earlier writes are visible to whoever acquires the new value.
+// Device-scope release store of a 32-bit word.
 __device__ static __forceinline__ void global_store_release_u32(uint32_t* addr,
                                                                 uint32_t v) {
     asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(addr), "r"(v)
                  : "memory");
 }
 
-// After acquiring data another block wrote with ordinary stores, orders it
-// before this thread's next TMA (async-proxy) reads of global memory.
+// Order acquired cross-CTA stores before async-proxy global reads.
 __device__ static __forceinline__ void fence_proxy_async_global() {
     asm volatile("fence.proxy.async.global;" ::: "memory");
 }

@@ -25,10 +25,8 @@
 
 namespace halops::moe {
 
-// Builds the routing tables from topk_ids on the calc warps; every calc thread
-// calls it, and it returns with the tables complete.  Thread t takes slot t
-// and experts 2t and 2t + 1, so the experts ascend with the threads.  Token
-// t's picks sit at slots t * kMaxTopk + k, which are also their combine slots.
+// All calc threads build routing tables. Experts are ordered by ID; combine
+// slots use token * kMaxTopk + rank.
 template <typename Dims>
 __device__ void prepare_routing_tables(
     std::uint32_t batch_size, std::uint32_t top_k,
@@ -66,9 +64,8 @@ __device__ void prepare_routing_tables(
     }
     WarpRole::sync_calc_threads();
 
-    // The thread's experts' row counts and which of them are active, then one
-    // scan of both over the calc threads: rows in the high half, experts in
-    // the low one.
+    // Scan packed counts across calc threads: rows in the high half, active
+    // experts in the low half.
     const uint2 masks = *own_masks;
     const std::uint32_t own =
         ((__popc(masks.x) + __popc(masks.y)) << 16) |
@@ -76,7 +73,7 @@ __device__ void prepare_routing_tables(
     std::uint32_t scan = own;
 #pragma unroll
     for (std::uint32_t off = 1u; off < 32u; off *= 2u) {
-        const std::uint32_t t = __shfl_up_sync(FULL_MASK, scan, off);
+        const std::uint32_t t = __shfl_up_sync(0xFFFFFFFFu, scan, off);
         if (lane >= off) scan += t;
     }
     if (lane == 31u) scratch.warp_counts[warp] = scan;

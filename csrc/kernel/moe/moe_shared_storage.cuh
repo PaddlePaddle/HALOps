@@ -22,7 +22,6 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/tensor.hpp>
 
-#include "common/device_timer.hpp"
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/ptx_utils.cuh"
@@ -381,16 +380,14 @@ struct RoutingSmem {
 
     std::uint8_t expert_position[Dims::kNumExperts];
 
-    // Every expert's routed tokens, one bit per token; the tables keep the
-    // active experts' copies.
+    // Token masks for all experts; routing tables retain active experts only.
     alignas(16) std::uint32_t expert_token_mask[Dims::kNumExperts];
 
     // Each calc warp's row and active-expert counts, for the block scan.
     std::uint32_t warp_counts[WarpRole::kCalcWarpCount];
 };
 
-// A ring of streamed bf16 activation tiles: B operand and quantize source.
-// A ring of streamed bf16 activation tiles: B operand and quantize source.
+// BF16 activation ring for quantization and MMA input.
 template <std::uint32_t NumSlots, std::uint32_t TileShapeN,
           std::uint32_t TileShapeK>
 struct ActivationSmem {
@@ -437,7 +434,6 @@ struct WeightScaleStorage<GemmTraits, false> {
 template <typename GemmTraits>
 struct WeightScaleStorage<GemmTraits, true> {
     static constexpr std::uint32_t kNumSlots = GemmTraits::kNumWeightSlots;
-    // One SfAtom slab per slot, as the UTCCP staging consumes it.
     static constexpr std::uint32_t kScaleCols =
         GemmTraits::MmaCore::ScaleTraits::kSfaSmemBytes;
     alignas(128) std::uint8_t scale[kNumSlots][kScaleCols];
@@ -492,13 +488,12 @@ struct QuantizedActivationSmem {
     using ElementScale = typename Quant::ScaleType;
 
     static constexpr std::uint32_t kNumSlots = NumSlots;
-    static constexpr std::uint32_t kLboChunkK = kFp8ActChunkK;
+    static constexpr std::uint32_t kLboChunkK = LboChunkK<ElementType>::value;
     static constexpr std::uint32_t kNumLboChunksK = TileShapeK / kLboChunkK;
     static_assert(TileShapeK % kLboChunkK == 0u,
                   "a tile must be whole 16-B chunks");
 
-    // MXFP8 scales are staged per slot in their SfAtom layout; the other
-    // recipes keep one scale per (block, row).
+    // MXFP8 uses per-slot SfAtoms; blockwise uses per-block, per-row scales.
     static constexpr std::uint32_t kSfAtomBytes =
         128u * (TileShapeK / Quant::kBlockSize);
     using ScaleArray =
@@ -550,11 +545,14 @@ struct LatentDownSmem {
     // MX stages SfAtoms here; blockwise reads scales directly from gmem.
     WeightScaleStorage<GemmTraits> w_latent_down_scale;
 
+    // BF16 staging follows the quantized output's chunk boundaries.
+    static constexpr std::uint32_t kOutChunkK =
+        LboChunkK<typename GemmTraits::OutputQuant::ElementType>::value;
     static constexpr std::uint32_t kNumOutChunks =
-        GemmTraits::kTileShapeM / kFp8ActChunkK;
+        GemmTraits::kTileShapeM / kOutChunkK;
     static constexpr std::uint32_t kNumOutRows = GemmTraits::kTileShapeN;
-    alignas(16)
-        DataType::ElementA act_out[kNumOutChunks][kNumOutRows][kFp8ActChunkK];
+    alignas(
+        16) DataType::ElementA act_out[kNumOutChunks][kNumOutRows][kOutChunkK];
     alignas(16) float token_amax[kNumOutRows];
 
     static constexpr std::uint32_t kNumOutGroups =
@@ -668,25 +666,6 @@ struct MoESharedStorage {
     uint16_t down_grid_task[kMaxDownTasks + 1];
     uint32_t down_tasks_claimed;
     uint32_t down_task_stores;
-
-#if defined(HALOPS_KERNEL_TIMER_ENABLED)
-    // Per-warp slot write-cursors for the device event timer, zeroed in the
-    // kernel prologue (before any probe) and published by its __syncthreads.
-    // One entry per warp; the block must not exceed kTimerWarps warps.
-    uint32_t timer_next[halops::kTimerWarps];
-    static_assert(Dims::KernelConfig::kBlockSize / 32u <= halops::kTimerWarps,
-                  "block has more warps than the timer's per-warp cursors");
-    // The per-CTA record pool pointer (null = timer off), parked here by the
-    // prologue so any phase can mint a writer via `timer()`
-    // without threading it through its call chain.
-    std::uint64_t* timer_base;
-
-    __device__ __forceinline__ halops::DeviceTimer timer() {
-        return halops::DeviceTimer::make(
-            timer_base, timer_next, static_cast<int>(blockIdx.x),
-            static_cast<int>(WarpRole::get_warp_idx()));
-    }
-#endif
 };
 
 // Dynamic shared memory required by fused_moe_kernel<Dims>.
@@ -696,7 +675,7 @@ __device__ __host__ constexpr size_t get_moe_smem_size() {
     // The two weight rings are one union view, so they must start together.
     static_assert(offsetof(RoutedSmem, w_up) == offsetof(RoutedSmem, w_down),
                   "the two weight rings must share one region.");
-    // H100/H200's per-block opt-in budget is 228 KB; 224 leaves driver margin.
+    // Reserve shared-memory headroom for the driver.
     static_assert(
         sizeof(MoESharedStorage<Dims>) <= 224 * 1024,
         "MoESharedStorage layout exceeds the 224 KB per-block SHM budget.");

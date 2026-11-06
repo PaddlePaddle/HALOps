@@ -31,8 +31,7 @@
 
 namespace halops::moe {
 
-// L2 eviction hint for the streamed TMA loads: a working set that fits in L2
-// is worth keeping, otherwise evict first.
+// Retain weight working sets that fit in L2; otherwise evict first.
 __device__ __forceinline__ constexpr std::uint64_t get_tma_cache_hint(
     bool evict_first) {
     return static_cast<std::uint64_t>(
@@ -40,8 +39,7 @@ __device__ __forceinline__ constexpr std::uint64_t get_tma_cache_hint(
                     : cute::TMA::CacheHintSm90::EVICT_NORMAL);
 }
 
-// Issue one 1-D bulk copy (a contiguous byte range, no tensor map), tracked
-// by an mbarrier.
+// Issue an mbarrier-tracked contiguous bulk copy.
 __device__ static __forceinline__ void tma_load_1d(const void* src_gmem,
                                                    std::uint32_t bytes,
                                                    void* dst_smem,
@@ -72,14 +70,11 @@ __device__ static __forceinline__ void tma_load_3d(
         static_cast<std::int32_t>(coord1), static_cast<std::int32_t>(coord2));
 }
 
-// The box of CreateTmaDescChunks3D's input view: one K tile of 8 rows by four
-// 128-B chunks (256 BF16 values).
+// Input tile box: eight rows and four 128-byte chunks.
 inline constexpr std::uint32_t kInputChunksBoxRows = 8u;
 inline constexpr std::uint32_t kInputChunksBoxChunks = 4u;
 
-// One BF16 input K tile in a single copy, through the CreateTmaDescChunks3D
-// view: its box lands chunk-major, as `dest` lays the tile out.  Each copy
-// costs the TMA unit a fixed time, so one per tile beats one per chunk.
+// Load one BF16 K tile in chunk-major order with a single TMA copy.
 template <std::size_t NumRows, std::size_t NumSwizzleBoxesK,
           std::size_t SwizzleBoxK>
 __device__ __forceinline__ void load_input_tile_chunks(
@@ -96,8 +91,7 @@ __device__ __forceinline__ void load_input_tile_chunks(
                 bar_smem_ptr);
 }
 
-// Issue the full per-block BF16 input TMA load: one 64-k SW128 box per
-// issue, box `kk` into `dest[kk]`.
+// Load input as SW128 boxes, placing box kk in dest[kk].
 template <std::size_t NumRows, std::size_t NumSwizzleBoxesK,
           std::size_t SwizzleBoxK>
 __device__ __forceinline__ void load_input_tile(
@@ -122,12 +116,8 @@ __device__ __forceinline__ void load_input_tile(
     }
 }
 
-// Create a 2-D TMA descriptor for a dense row-major `[rows, cols]` tensor of
-// `T`; the box is the per-copy tile.  A 4-bit `T` is packed two values per
-// byte, low nibble first, and `cols` and the box still count values: the copy
-// spreads each 16 values over 16 B of SMEM (8 B of nibbles, 8 B untouched),
-// the one-byte-per-value image the f8f6f4 UMMA reads.  Its box is 128 values
-// wide, and the mbarrier is credited with the packed gmem bytes.
+// Create a row-major TMA descriptor. FP4 dimensions count values; TMA expands
+// packed nibbles to SMEM bytes, while barriers count packed GMEM bytes.
 template <typename T>
 inline CUtensorMap CreateTmaDesc2D(const char* debug_name, const T* global_ptr,
                                    std::uint32_t rows, std::uint32_t cols,
@@ -163,8 +153,7 @@ inline CUtensorMap CreateTmaDesc2D(const char* debug_name, const T* global_ptr,
     return desc;
 }
 
-// A 3-D view of a row-major `[rows, cols]` BF16 tensor for
-// load_input_tile_chunks: (value in a 128-B chunk, row, chunk), SW128.
+// SW128 view of BF16 input: (value within 128-byte chunk, row, chunk).
 inline CUtensorMap CreateTmaDescChunks3D(const char* debug_name,
                                          const __nv_bfloat16* global_ptr,
                                          std::uint32_t rows,

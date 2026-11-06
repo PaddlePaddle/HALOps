@@ -22,8 +22,6 @@
 #include <cstdint>
 #include <cute/tensor.hpp>
 
-#define FULL_MASK 0xFFFFFFFFU
-
 namespace halops::moe {
 
 enum class MmaKind : uint32_t {
@@ -38,9 +36,8 @@ enum class QuantMethod : uint32_t {
     kNone = 3,
 };
 
-// One operand's quantization scheme: scale method, group width, element and
-// scale types.  `BlockSize` is the scale group (or block) width; MXFP8 and
-// MXFP4 have a fixed 32-element group, so their specialization ignores it.
+// Operand quantization types and group width. MXFP8/MXFP4 use fixed 32-element
+// groups.
 template <QuantMethod Method,
           std::uint32_t BlockSize =
               (Method == QuantMethod::kBlockwiseFP8 ? 128u : 32u)>
@@ -88,8 +85,7 @@ struct QuantSpec<QuantMethod::kMXFP4, BlockSize> {
     static constexpr QuantMethod kMethod = QuantMethod::kMXFP4;
     static constexpr std::uint32_t kBlockSize = 32u;
 
-    // A 4-bit weight occupies one SMEM byte per value (the TMA's
-    // 16U4_ALIGN16B expansion); its scale is an E8M0 byte.
+    // TMA expands each FP4 weight into one SMEM byte; scales use E8M0.
     using ElementType = cutlass::float_e2m1_t;
     using ScaleType = std::uint8_t;  // one UE8M0 byte per 32-K group
 
@@ -178,16 +174,11 @@ enum class ScoringFunc : uint32_t {
     kSoftmax = 1,
 };
 
-// Expert activation of the up-projection epilogue: how the gate and up halves
-// of the expert's fc1 output are combined before re-quantization.
+// Gated activation applied before output quantization.
 enum class Activation : uint32_t {
     kSilu = 0,  // silu(gate) * up -- unbounded
     kSitu = 1,  // SiTU-GLU -- output bounded by beta * linear_beta
 };
-
-// The MMA's B operand walks K in 16-B chunks, its descriptor's leading byte
-// offset.
-inline constexpr std::uint32_t kFp8ActChunkK = 16u;
 
 struct DataType {
     using ElementA = __nv_bfloat16;    // activations as they go into the GEMM
@@ -202,8 +193,7 @@ struct MoEInputSize {
         Dims::kUseLatent ? Dims::kLatentSize : Dims::kHiddenSize;
 };
 
-// Byte offset of one 32-K scale in a 128x4 SfAtom: four K groups share a
-// 32-bit word of 128 rows.
+// Byte offset of a scale in a 128-row, four-group SfAtom.
 __host__ __device__ static constexpr std::uint32_t sf_atom_offset(
     std::uint32_t mn, std::uint32_t k) {
     return (mn % 32u) * 16u + ((mn / 32u) % 4u) * 4u + (k % 4u) +

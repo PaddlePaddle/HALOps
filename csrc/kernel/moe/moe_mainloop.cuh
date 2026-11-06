@@ -21,8 +21,8 @@
 
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_cta_comm.cuh"
-#include "kernel/moe/moe_mainloop_down.cuh"
 #include "kernel/moe/moe_mainloop_latent_down.cuh"
+#include "kernel/moe/moe_mainloop_routed_down.cuh"
 #include "kernel/moe/moe_mainloop_routed_up.cuh"
 #include "kernel/moe/moe_mainloop_router.cuh"
 #include "kernel/moe/moe_mainloop_shared.cuh"
@@ -44,7 +44,7 @@ struct CollectiveMainloopMoE {
     using Router = RouterProjection<KernelTraits, Traits::RouterGemm::kUseUmma>;
     using Latent = LatentDownProjection<KernelTraits>;
 
-    // The routing tables as the 4-B words they travel between blocks in.
+    // Routing tables are copied as 4-byte words.
     static constexpr std::uint32_t kRoutingTableWords =
         static_cast<std::uint32_t>(sizeof(MoERoutingTables<Dims>) /
                                    sizeof(std::uint32_t));
@@ -54,8 +54,7 @@ struct CollectiveMainloopMoE {
                       WarpRole::kThreadsPerWarp,
                   "one table slice per lane of the copying warp");
 
-    // Host-side launch arguments: one member per runtime tensor plus the launch
-    // scalars.
+    // Runtime tensors and launch scalars.
     struct Arguments {
         std::uint32_t num_tokens;
         std::uint32_t hidden_size;
@@ -83,9 +82,6 @@ struct CollectiveMainloopMoE {
         DataType::ElementOut* routed_out;
         DataType::ElementOut* shared_out;
         void* workspace;
-        // Device event timer: the per-CTA record pool (null = off) and
-        // whether the per-block detail probes should fire.
-        std::uint64_t* timer_events;
         std::uint32_t top_k;
         ScoringFunc scoring_func;
         bool renormalize;
@@ -127,19 +123,17 @@ struct CollectiveMainloopMoE {
             Dims>::ElementScale* __restrict__ shared_down_scale;
         DataType::ElementOut* __restrict__ shared_out;
         void* __restrict__ scratchpad;
-        std::uint64_t* timer_events;
         std::uint32_t top_k;
         ScoringFunc scoring_func;
         bool renormalize;
         Activation activation;
         float situ_beta;
         float situ_linear_beta;
-        // How many experts' weights fit in L2: the eviction hint flips to
-        // evict-first above it.
+        // Evict weights first when their working set exceeds L2 capacity.
         std::uint32_t l2_expert_capacity;
         alignas(128) CUtensorMap tma_up_weights_desc;
         alignas(128) CUtensorMap tma_input_desc;
-        // The same input, one box per K tile, for the router and latent.
+        // Router and latent input share the K-tile descriptor.
         alignas(128) CUtensorMap tma_input_chunks_desc;
         alignas(128) CUtensorMap tma_down_weights_desc;
         alignas(128) CUtensorMap tma_down_activations_desc;
@@ -170,7 +164,6 @@ struct CollectiveMainloopMoE {
         params.shared_down_scale = args.shared_down_weight_scale;
         params.shared_out = args.shared_out;
         params.scratchpad = args.workspace;
-        params.timer_events = args.timer_events;
         params.top_k = args.top_k;
         params.scoring_func = args.scoring_func;
         params.renormalize = args.renormalize;
@@ -238,8 +231,7 @@ struct CollectiveMainloopMoE {
         return params;
     }
 
-    // Phase 0a: the latent down-projection, on the blocks the router leaves
-    // idle.
+    // Run latent projection on its assigned CTAs.
     __device__ void run_latent_down(Params const& params,
                                     SharedStorage* __restrict__ smem) {
         if constexpr (Traits::kUseLatent) {
@@ -251,8 +243,7 @@ struct CollectiveMainloopMoE {
         }
     }
 
-    // Phase 0b: the shared expert, on the blocks neither the router nor the
-    // latent down-projection occupies.
+    // Run the shared expert on its assigned CTAs.
     __device__ void run_shared(Params const& params,
                                SharedStorage* __restrict__ smem) {
         using Shared = SharedUpProjectionBase<Traits>;
@@ -274,30 +265,24 @@ struct CollectiveMainloopMoE {
                   params.shared_out, workspace, smem, batch_size);
     }
 
-    // Phase 0c: the router Linear on this block's expert tiles, then this
-    // block's routing tables into shared memory.
+    // Compute router logits and build routing tables.
     __device__ static void run_router_topk(Params const& params,
                                            Workspace* __restrict__ workspace,
                                            SharedStorage* __restrict__ smem,
                                            std::uint32_t lane_idx) {
         constexpr std::uint32_t kExpertsPerThread = Dims::kNumExperts / 32u;
 
-        // One warp per token, unless the launch has more tokens than the calc
-        // warps have: then a cluster pair splits them, one token each.
+        // Use one warp per token; cluster pairs divide wider token batches.
         const bool coop_topk = Traits::kClusterSize >= 2u &&
                                params.num_tokens > WarpRole::kCalcWarpCount;
         if (threadIdx.x == 0u) {
             // One task per router CTA, whatever its M tile or K slice.
-            const auto logits_span =
-                KERNEL_TIMER_BEGIN(smem->timer(), "router_wait_logits");
             workspace->cta_comm.wait_router_tasks(smem->launch_parity,
                                                   Traits::RouterGemm::kNumCtas);
-            KERNEL_TIMER_END(smem->timer(), logits_span);
         }
         WarpRole::sync_calc_threads();
         const std::uint32_t calc_warp_idx = WarpRole::get_calc_warp_idx();
-        // The coop cluster's blocks take one token half each, one
-        // warp per token; a single-block selection walks them all.
+        // Cluster pairs select one token half per CTA.
         constexpr std::uint32_t kTokensPerCta = (Dims::kNumTokens + 1u) / 2u;
         static_assert(kTokensPerCta <= WarpRole::kCalcWarpCount,
                       "one warp per token must cover a split block");
@@ -307,12 +292,9 @@ struct CollectiveMainloopMoE {
             // One warp per token, and this block runs only its half.
             const std::uint32_t tok = tok_base + calc_warp_idx;
             if (calc_warp_idx < kTokensPerCta && tok < params.num_tokens) {
-                const auto topk_span =
-                    KERNEL_TIMER_BEGIN(smem->timer(), "topk_one_token");
                 topk_one_token<Dims, kExpertsPerThread>(
                     tok, params.top_k, params.scoring_func, params.renormalize,
                     workspace, smem);
-                KERNEL_TIMER_END(smem->timer(), topk_span);
             }
         } else {
             constexpr std::uint32_t kTokensPerWarp =
@@ -324,34 +306,25 @@ struct CollectiveMainloopMoE {
                 const std::uint32_t tok =
                     calc_warp_idx + g * WarpRole::kCalcWarpCount;
                 if (tok >= params.num_tokens) break;
-                const auto topk_span =
-                    KERNEL_TIMER_BEGIN(smem->timer(), "topk_one_token");
                 topk_one_token<Dims, kExpertsPerThread>(
                     tok, params.top_k, params.scoring_func, params.renormalize,
                     workspace, smem);
-                KERNEL_TIMER_END(smem->timer(), topk_span);
             }
         }
         WarpRole::sync_calc_threads();
         if (coop_topk) {
-            // My half of the selection is in my own scratch; the pair
-            // swaps the other half through the cluster's shared
-            // memory, so both blocks end up with the whole table.
+            // Exchange token halves through cluster shared memory.
             if (calc_warp_idx == 0u) {
                 using Coop = decltype(smem->barriers.router_coop);
                 const std::uint32_t peer_rank =
                     (blockIdx.x % Traits::kClusterSize) ^ 1u;
                 if (lane_idx == 0u) {
-                    const auto coop_span = KERNEL_TIMER_BEGIN(
-                        smem->timer(), "router_coop_exchange");
                     smem->barriers.router_coop.arrive();
                     Coop::arrive_remote(
                         smem->barriers.router_coop.partner(peer_rank));
-                    KERNEL_TIMER_END(smem->timer(), coop_span);
                 }
                 smem->barriers.router_coop.wait();
-                // The partner's half as 16-B words, its ids and then its
-                // weights: one word per lane, so the copy is one round trip.
+                // Copy the partner IDs and weights as 16-byte words.
                 constexpr std::uint32_t kPairs = kTokensPerCta * Dims::kMaxTopk;
                 static_assert(
                     kPairs * sizeof(std::uint16_t) % sizeof(uint4) == 0u,
@@ -392,20 +365,16 @@ struct CollectiveMainloopMoE {
                         workspace, smem, params.scoring_func);
         }
 
-        // Only the router's own blocks run the selection and build the routing
-        // tables; every other block copies the tables block 0 publishes.
+        // Router CTAs build their tables; other CTAs copy the tables published
+        // by CTA 0.
         const bool reads_published_tables = !Router::is_router_cta();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         if (!reads_published_tables) {
             if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
                 run_router_topk(params, workspace, smem, lane_idx);
-                // Every router block holds the whole selection by now (a
-                // coop pair has swapped halves), so it builds its own.
-                const auto tables_span =
-                    KERNEL_TIMER_BEGIN(smem->timer(), "prepare_routing_tables");
+                // Each router CTA has the complete selection.
                 prepare_routing_tables<Dims>(params.num_tokens, params.top_k,
                                              smem);
-                KERNEL_TIMER_END(smem->timer(), tables_span);
                 // Block 0 hands its finished tables to the other blocks.
                 if (blockIdx.x == 0u && WarpRole::get_calc_warp_idx() == 0u) {
                     publish_routing_tables(workspace, smem, lane_idx);
@@ -413,18 +382,12 @@ struct CollectiveMainloopMoE {
             }
         } else if (WarpRole::is_calc_warp(WarpRole::get_warp_idx()) &&
                    WarpRole::get_calc_warp_idx() == 0u) {
-            // After the projection: one warp copies block 0's tables, and it
-            // does not contend with the projection's own warps.
-            const auto load_span =
-                KERNEL_TIMER_BEGIN(smem->timer(), "load_routing_tables");
+            // Copy routing tables after the latent projection finishes.
             load_routing_tables(workspace, smem, lane_idx);
-            KERNEL_TIMER_END(smem->timer(), load_span);
         }
     }
 
-    // Block 0's calc warp 0: its tables into the workspace.  Lane l copies
-    // slice l (words l, l + 32, ...) and release-sets that slice's flag, so
-    // the lanes publish in parallel and a reader lane waits only for its own.
+    // CTA 0 publishes routing tables in lane-strided word slices.
     __device__ static __forceinline__ void publish_routing_tables(
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         std::uint32_t lane_idx) {
@@ -452,8 +415,7 @@ struct CollectiveMainloopMoE {
                                                        lane_idx);
     }
 
-    // A non-router block's calc warp 0: block 0's tables into its own.  Lane
-    // l waits for slice l, then loads it, every load before any store.
+    // Each lane acquires and copies its routing-table slice before storing it.
     __device__ static __forceinline__ void load_routing_tables(
         Workspace const* __restrict__ workspace,
         SharedStorage* __restrict__ smem, std::uint32_t lane_idx) {
@@ -479,9 +441,7 @@ struct CollectiveMainloopMoE {
         __syncwarp();
     }
 
-    // The up entry's staging when the projection quantized its output: both
-    // tensors are already the B operand's image, so this is one bulk copy each
-    // and the issuer can read the staging as soon as it lands.
+    // Copy quantized latent output and scales into routed-up staging.
     __device__ static void load_quantized_activation(
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem) {
         using Quantized = decltype(smem->routed_experts.quantized_input);
@@ -512,19 +472,12 @@ struct CollectiveMainloopMoE {
             reinterpret_cast<Workspace*>(params.scratchpad);
         if (WarpRole::is_other_loader_thread()) {
             if constexpr (Traits::kUseLatent) {
-                const auto latent_span =
-                    KERNEL_TIMER_BEGIN(smem->timer(), "up_wait_latent");
                 workspace->cta_comm.wait_latent_tasks(
                     smem->launch_parity, Traits::LatentDownGemm::kNumCtas);
-                // The output was stored by other blocks; the copy below reads
-                // it through TMA.
+                // Order cross-CTA stores before TMA reads.
                 fence_proxy_async_global();
-                KERNEL_TIMER_END(smem->timer(), latent_span);
             }
-            const auto activation_span =
-                KERNEL_TIMER_BEGIN(smem->timer(), "up_load_activation");
             load_quantized_activation(workspace, smem);
-            KERNEL_TIMER_END(smem->timer(), activation_span);
         }
         RoutedUpProjection<KernelTraits>::run(
             params.expert_scales_up, params.num_tokens, params.activation,
@@ -534,8 +487,7 @@ struct CollectiveMainloopMoE {
                                params.l2_expert_capacity));
     }
 
-    // Phase 3: down-projection over this block's tasks, as enumerated by
-    // `sched`.
+    // Run scheduled down-projection tasks.
     __device__ void run_down(Params const& params,
                              SharedStorage* __restrict__ smem,
                              TaskScheduler<KernelTraits>& sched) {
@@ -548,9 +500,7 @@ struct CollectiveMainloopMoE {
                                params.l2_expert_capacity));
     }
 
-    // Pulls the TMA descriptors into the descriptor cache, so the first TMA of
-    // each phase does not wait on a fetch of its descriptor from the kernel
-    // parameters.
+    // Prefetch the TMA descriptors.
     __device__ static void prefetch_tma_descriptors(Params const& params) {
         cute::prefetch_tma_descriptor(&params.tma_up_weights_desc);
         cute::prefetch_tma_descriptor(&params.tma_input_desc);
@@ -559,8 +509,7 @@ struct CollectiveMainloopMoE {
         cute::prefetch_tma_descriptor(&params.tma_down_activations_desc);
     }
 
-    // Per-block setup: mbarrier and TMEM setup, the descriptor prefetch and
-    // the per-block launch parity.
+    // Initialize barriers, TMEM, descriptor cache and launch parity.
     __device__ void initialize(Params const& params,
                                SharedStorage* __restrict__ smem) {
         Workspace* __restrict__ workspace =
@@ -568,8 +517,6 @@ struct CollectiveMainloopMoE {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
 
-        // The parity's workspace round trip is the longest step here, so its
-        // branch comes first.
         if (warp_idx == 3 && lane_idx == 0) {
             // Per-CTA private launch counter.
             smem->launch_parity = workspace->cta_comm.claim_parity();
@@ -598,8 +545,7 @@ struct CollectiveMainloopMoE {
         }
         __syncthreads();
 
-        // Block 0 resets the readiness state for the NEXT launch, on the
-        // publish warp: it has no prologue role.
+        // CTA 0 clears the next launch's readiness state.
         if (blockIdx.x == 0u && WarpRole::is_publish_warp(warp_idx)) {
             const std::uint32_t launch_parity = smem->launch_parity;
             for (std::uint32_t rank = lane_idx;
@@ -610,8 +556,7 @@ struct CollectiveMainloopMoE {
         }
     }
 
-    // Phase 4: waits for an m-block to be complete and reduces its per-group
-    // partials into the output tensor.
+    // Wait for completed m-blocks and combine their partial outputs.
     __device__ void combine(Params const& params,
                             SharedStorage* __restrict__ smem,
                             CtaGroup<Traits::kCtasPerExpert> const& cta_group) {
@@ -622,8 +567,7 @@ struct CollectiveMainloopMoE {
         const std::uint32_t batch_size = params.num_tokens;
         constexpr std::uint32_t kDownOutputColsPerCta =
             Traits::DownGemm::MmaCore::kTileShapeM;
-        // The block combines m-block `cta_idx_in_group`, whose cells the
-        // num_groups blocks holding that index split by `group_idx`.
+        // Groups partition the cells of m-block cta_idx_in_group.
         if (!cta_group.in_whole_group()) return;
         const std::uint32_t m_block = cta_group.cta_idx_in_group;
         const std::uint32_t base_col = m_block * kDownOutputColsPerCta;
@@ -633,38 +577,28 @@ struct CollectiveMainloopMoE {
         const std::uint32_t num_cells = batch_size * kDownOutputColsPerCta;
         const std::uint32_t top_k = params.top_k;
 
-        // A token's cells fill whole warps, so each wait is warp-uniform
-        // and every lane acquires the wait for itself.
+        // Waits are warp-uniform; every lane acquires output readiness.
         static_assert(kDownOutputColsPerCta % WarpRole::kThreadsPerWarp == 0u,
                       "a warp's combine cells must share one token");
         __syncwarp();
         for (std::uint32_t flat = first_cell; flat < num_cells;
              flat += cell_stride) {
             const std::uint32_t tok = flat / kDownOutputColsPerCta;
-            const auto wait_span =
-                KERNEL_TIMER_BEGIN(smem->timer(), "wait_down_out", tok);
             workspace->cta_comm.wait_down_out_field(
                 smem->launch_parity, m_block,
                 tok * PackedTokenCounts<Dims>::kBits,
                 PackedTokenCounts<Dims>::kMask, top_k);
-            KERNEL_TIMER_END(smem->timer(), wait_span);
-            const auto gather_span =
-                KERNEL_TIMER_BEGIN(smem->timer(), "gather_and_combine", tok);
             gather_cell(workspace, activations_out, tok,
                         base_col + flat % kDownOutputColsPerCta, top_k);
-            KERNEL_TIMER_END(smem->timer(), gather_span);
         }
     }
 
-    // One output cell: sums token `tok`'s top_k combine slots at column `col`
-    // (slot = token*kMaxTopk + k, written by the block that ran the token's
-    // k-th expert), in fixed k order and accumulating in FP32.
+    // Sum a token's top-k output slots in rank order using FP32.
     __device__ static __forceinline__ void gather_cell(
         Workspace* __restrict__ workspace,
         DataType::ElementOut* __restrict__ activations_out, std::uint32_t tok,
         std::uint32_t col, std::uint32_t top_k) {
-        // Token `tok`'s top-k slot run, at this thread's column.  Consecutive
-        // threads walk consecutive `col`, so each k-step is a coalesced load.
+        // Consecutive lanes load consecutive output columns.
         DataType::ElementOut slot_v[Dims::kMaxTopk];
 #pragma unroll
         for (std::uint32_t k = 0; k < Dims::kMaxTopk; ++k) {

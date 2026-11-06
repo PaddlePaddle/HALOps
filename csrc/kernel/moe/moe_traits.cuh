@@ -61,8 +61,7 @@ struct GemmTileShape {
                     cute::Int<kTileShapeK>>;
 };
 
-// Latent down-projection: M = latent size, N = tokens, K = hidden, fp8 in
-// and out, fp32 accumulate.
+// Latent projection: M = latent width, N = tokens, K = hidden width.
 template <typename Dims>
 struct LatentDownGemmTraits {
     static constexpr std::uint32_t kGemmM = Dims::kLatentSize;
@@ -273,8 +272,7 @@ struct RoutedDownGemmTraits {
         WeightQuant::template ScaleShape<kTileShapeM, kGemmK>();
 };
 
-// The shared expert's up-projection: one expert every token goes through, in
-// the hidden space.
+// Shared-expert up projection over all tokens.
 template <typename Dims>
 struct SharedUpGemmTraits {
     static constexpr std::uint32_t kGemmM = Dims::kIntermediateSize * 2u;
@@ -389,8 +387,7 @@ constexpr std::uint32_t get_gemm_tmem_columns() {
                 GemmTraits::ScaleTraits::kSfbTmemColumns);
 }
 
-// The column count is a template parameter so the bound can be checked at
-// compile time; a function parameter is not a constant expression.
+// Round TMEM columns to an allocation size and check the limit.
 template <std::uint32_t kNeededColumns>
 constexpr std::uint32_t get_tmem_columns() {
     static_assert(kNeededColumns <= 512u,
@@ -411,9 +408,10 @@ struct MoEKernelTraits {
     using DownGemm = RoutedDownGemmTraits<Dims>;
     using RouterGemm = RouterGemmTraits<Dims>;
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
+    using SharedUpGemm = SharedUpGemmTraits<Dims>;
+    using SharedDownGemm = SharedDownGemmTraits<Dims>;
 
-    // The projection's fp8 output, and its scale image, are the up phase's B
-    // operand, so the two recipes must be the same one.
+    // Latent output and routed-up input must use the same quantization recipe.
     static_assert(std::is_same_v<typename LatentDownGemm::OutputQuant,
                                  typename UpGemm::InputQuant>,
                   "the latent output recipe must be the up's input recipe");
@@ -438,23 +436,14 @@ struct MoEKernelTraits {
                   "the projection's groups must be whole blocks");
 
     static constexpr std::uint32_t kMinGrid =
-        RouterGemm::kNumCtas + (kUseLatent ? 0u : LatentDownGemm::kNumCtas);
+        RouterGemm::kNumCtas + (kUseLatent ? 0u : LatentDownGemm::kNumCtas) +
+        cute::max(SharedUpGemm::kNumCtas, SharedDownGemm::kNumCtas);
     static constexpr std::uint32_t kMaxGrid = kSpecMaxGrid;
     static_assert(kMinGrid <= kMaxGrid,
                   "Grid bounds must be ordered kCtasPerExpert <= kMinGrid <= "
                   "kMaxGrid.");
 
-    static_assert(Dims::KernelConfig::kNumAccSlots >= 2u,
-                  "kNumAccSlots must be >= 2 so the dequant warpgroup can lag "
-                  "the MMA by one K-iteration.");
-
-    // K per 16-B chunk, the granularity the MMA's SMEM descriptor walks.
-    static constexpr std::uint32_t kLboChunkK = kFp8ActChunkK;
-    static constexpr std::uint32_t kFp8ActChunksPerBlock =
-        Dims::kQuantConfig.kBlockSize / kLboChunkK;
-
-    // Gate/up pair layout: the Python repack interleaves gate and up in
-    // groups of kPairLayoutGranularity rows.
+    // Gate/up rows are interleaved in groups of kPairLayoutGranularity.
     static constexpr std::uint32_t kPairLayoutGranularity = 8u;
     static_assert(UpGemm::kTileShapeM % (2u * kPairLayoutGranularity) == 0u,
                   "The pair-layout interleave period must divide the A tile's "

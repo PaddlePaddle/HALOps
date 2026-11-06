@@ -88,7 +88,7 @@ __device__ static void warp_softmax_inplace(float (&logits)[Count]) {
         local_sum += logits[i];
     }
     for (int off = 16; off >= 1; off /= 2)
-        local_sum += __shfl_xor_sync(FULL_MASK, local_sum, off, 32);
+        local_sum += __shfl_xor_sync(0xFFFFFFFFu, local_sum, off, 32);
 
     float inv_sum = 1.0f / local_sum;
 #pragma unroll
@@ -103,9 +103,9 @@ __device__ static __forceinline__ void warp_argmax_expert(
     uint32_t& warp_expert) {
     const uint32_t bits = __float_as_uint(my_score);
     const uint32_t moe = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-    const uint32_t best = __reduce_max_sync(FULL_MASK, moe);
+    const uint32_t best = __reduce_max_sync(0xFFFFFFFFu, moe);
     warp_expert =
-        __reduce_min_sync(FULL_MASK, (moe == best) ? my_expert : 0xFFFFFFFFu);
+        __reduce_min_sync(0xFFFFFFFFu, (moe == best) ? my_expert : 0xFFFFFFFFu);
     const uint32_t best_bits =
         (best & 0x80000000u) ? (best & 0x7FFFFFFFu) : ~best;
     warp_score = __uint_as_float(best_bits);
@@ -126,12 +126,12 @@ __device__ static void fp32_candidates(
     }
 }
 
-// Packs one bf16 logit pattern into a packed score (see packed_candidates).
+// Pack a BF16 logit into an ordered score.
 __device__ static __forceinline__ uint32_t pack_logit_bits(uint32_t bits,
                                                            uint32_t expert_id) {
     // NaN/Inf -> the lowest finite score.
     if ((bits & 0x7F80u) == 0x7F80u) bits = 0xFF7Fu;
-    // -0.0 -> +0.0: equal as floats, so they must not order here either.
+    // Normalize signed zero before ordering.
     if ((bits & 0x7FFFu) == 0u) bits = 0u;
     const uint32_t moe = (bits & 0x8000u) ? (bits ^ 0xFFFFu) : (bits | 0x8000u);
     return (moe << 16) | (expert_id ^ 0xFFFFu);
@@ -235,12 +235,11 @@ __device__ static void sort_descending(uint32_t (&keys)[N]) {
     }
 }
 
-// Picks the highest remaining packed score (score, then inverted expert id),
-// then shifts the winner's list and refills its tail with 0.
+// Select the highest packed score and remove it from the winner's list.
 template <uint32_t N, uint32_t kKeep>
 __device__ static __forceinline__ void select_next_packed_score(
     uint32_t (&best)[N], uint32_t& selected_packed_score) {
-    selected_packed_score = __reduce_max_sync(FULL_MASK, best[0]);
+    selected_packed_score = __reduce_max_sync(0xFFFFFFFFu, best[0]);
     const bool won = best[0] == selected_packed_score;
 #pragma unroll
     for (uint32_t i = 0; i + 1u < kKeep; i++)
@@ -257,7 +256,7 @@ __device__ static __forceinline__ void unpack_packed_score(
     expert_id = (packed_score ^ 0xFFFFu) & 0xFFFFu;
 }
 
-// Slow path: softmax + renormalize=False; weights are row probabilities.
+// Unnormalized softmax weights use full-row probabilities.
 template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
 __device__ static void topk_weights_from_softmax_probs(
     uint32_t token, uint32_t top_k, float (&scores)[kExpertsPerThread],
@@ -278,21 +277,21 @@ __device__ static void topk_weights_from_softmax_probs(
     }
 }
 
-// Sums `v` over lanes [0, top_k) in rank order, like a serial loop.
+// Sum lanes [0, top_k) in rank order.
 template <uint32_t kMaxTopk>
 __device__ static __forceinline__ float sum_over_ranks(float v,
                                                        uint32_t top_k) {
     float sum = 0.0f;
 #pragma unroll
     for (uint32_t k = 0; k < kMaxTopk; k++) {
-        const float rank_v = __shfl_sync(FULL_MASK, v, k);
+        const float rank_v = __shfl_sync(0xFFFFFFFFu, v, k);
         if (k < top_k) sum += rank_v;
     }
     return sum;
 }
 
-// Fast path: softmax + renormalize=True, or sigmoid (either setting).
-// Selection runs on packed scores; lane k keeps the rank-k winner.
+// Select packed scores for renormalized softmax or sigmoid. Lane k holds rank
+// k.
 template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
 __device__ static void topk_weights_from_logits(
     uint32_t token, uint32_t top_k, ScoringFunc scoring_func, bool renormalize,
@@ -354,10 +353,7 @@ __device__ static __forceinline__ float key_score(uint32_t key) {
     return __uint_as_float((key & 0x80000000u) ? (key & 0x7FFFFFFFu) : ~key);
 }
 
-// topk_weights_from_scores_fp32 without a per-lane sort: each round takes
-// the best remaining (score, then lowest expert): every lane's own best, one
-// redux over them, and the lowest lane of a tie, since lane l owns experts
-// [l * N, (l + 1) * N).
+// Scan each lane's remaining scores; ties select the lowest expert ID.
 template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
 __device__ static void topk_weights_from_scores_fp32_scan(
     uint32_t token, uint32_t top_k, bool renormalize,
@@ -394,12 +390,11 @@ __device__ static void topk_weights_from_scores_fp32_scan(
                 at[i] = right ? at[i + w] : at[i];
             }
         }
-        const uint32_t top = __reduce_max_sync(FULL_MASK, best[0]);
+        const uint32_t top = __reduce_max_sync(0xFFFFFFFFu, best[0]);
         const uint32_t winner =
-            __ffs(__ballot_sync(FULL_MASK, best[0] == top)) - 1u;
+            __ffs(__ballot_sync(0xFFFFFFFFu, best[0] == top)) - 1u;
         if (lane_idx == k) my_score = key_score(top);
-        // The winner records its expert and retires it: no broadcast, and
-        // no branch for the warp to reconverge from.
+        // The winning lane records and removes its expert.
         const bool won = lane_idx == winner;
         if (won) {
             ids[k] =
@@ -422,15 +417,8 @@ __device__ static void topk_weights_from_scores_fp32_scan(
     }
 }
 
-// Selection on fp32 scores; `renormalize` divides by the selected sum.  Each
-// lane sorts its keys once, so a round is one redux over the lane heads: the
-// best (score, then lowest expert) is the top head of the lowest lane that has
-// it, since lane l owns experts [l * N, (l + 1) * N).  The winner shifts its
-// list.  A rank's expert is found from its key in its lane at the end, which
-// needs a lane's keys to differ: a warp where a lane repeats a key runs the
-// scan above instead.  The scores are sums of sigmoid or softmax scores, or
-// -FLT_MAX for a non-finite logit, so never NaN, -0 or denormal: their keys
-// order exactly as they compare.
+// Select sorted FP32 scores, breaking ties by expert ID. Repeated lane-local
+// keys use the scan variant; renormalization uses the selected sum.
 template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
 __device__ static void topk_weights_from_scores_fp32(
     uint32_t token, uint32_t top_k, bool renormalize,
@@ -453,7 +441,7 @@ __device__ static void topk_weights_from_scores_fp32(
     for (uint32_t i = 0; i + 1u < kExpertsPerThread; ++i) {
         repeated |= head[i] == head[i + 1u];
     }
-    if (__any_sync(FULL_MASK, repeated)) {
+    if (__any_sync(0xFFFFFFFFu, repeated)) {
         topk_weights_from_scores_fp32_scan<kExpertsPerThread, kMaxTopk>(
             token, top_k, renormalize, scores, topk_ids, topk_weights);
         return;
@@ -466,10 +454,10 @@ __device__ static void topk_weights_from_scores_fp32(
     uint32_t my_lane = 0u;
 #pragma unroll 1
     for (uint32_t k = 0; k < top_k; k++) {
-        const uint32_t top = __reduce_max_sync(FULL_MASK, head[0]);
+        const uint32_t top = __reduce_max_sync(0xFFFFFFFFu, head[0]);
         const bool tied = head[0] == top;
-        const uint32_t ties = __ballot_sync(FULL_MASK, tied);
-        // The lowest tied lane wins: no find-first-set on the round's chain.
+        const uint32_t ties = __ballot_sync(0xFFFFFFFFu, tied);
+        // The lowest tied lane wins.
         const bool won = tied && (ties & lanes_below) == 0u;
         if (lane_idx == k) {
             my_key = top;
@@ -486,7 +474,7 @@ __device__ static void topk_weights_from_scores_fp32(
     uint32_t at = 0u;
 #pragma unroll
     for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
-        at = __shfl_sync(FULL_MASK, key[i], my_lane) == my_key ? i : at;
+        at = __shfl_sync(0xFFFFFFFFu, key[i], my_lane) == my_key ? i : at;
     }
     const float my_score = lane_idx < top_k ? key_score(my_key) : 0.0f;
     float inv = 1.0f;

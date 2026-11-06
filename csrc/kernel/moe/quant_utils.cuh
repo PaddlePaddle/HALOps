@@ -41,17 +41,14 @@ __device__ static inline float warp_reduce_max_float(float value) {
 #endif
 }
 
-// Sets NaNs (positive or negative, any payload) to 0.0 (bit-pattern all
-// 0). Values other than NaN remain unchanged.
+// Map all NaN bit patterns to zero.
 __device__ static __forceinline__ __nv_bfloat162
 mask_nans_to_zero(__nv_bfloat162 xs) {
     return cutlass::platform::bit_cast<__nv_bfloat162>(
         cutlass::platform::bit_cast<uint32_t>(xs) & __heq2_mask(xs, xs));
 }
 
-// Loads one row's 8-B chunk (4 consecutive bf16) and widens it to fp32 with
-// NaNs masked to 0, so they cannot poison the 128-K block's amax or the fp8
-// conversion in store_quantized_pair.
+// Load four BF16 values as FP32 and map NaNs to zero.
 __device__ __forceinline__ float4
 load_quantize_pair(const DataType::ElementA* __restrict__ bf16_4) {
     const __nv_bfloat162 bf_01 =
@@ -63,11 +60,8 @@ load_quantize_pair(const DataType::ElementA* __restrict__ bf16_4) {
     return make_float4(f01.x, f01.y, f23.x, f23.y);
 }
 
-// Scales the loaded pair by its 128-K block's amax, writes the fp8 e4m3 bytes
-// into the staging slot, and has lane 0 record the block's scale.
-// `row` is the staging row (the CTA's own row window), `chunk_at` the first
-// 16-B chunk of this pair inside the slot, and `global_row` the row it belongs
-// to in the source tensor (which decides whether it is padding).
+// Scale and store an FP8 pair; lane 0 records its scale. row is local to
+// staging, while global_row determines source padding.
 template <std::size_t Fp8NumChunks, std::size_t Fp8Rows, std::size_t Fp8KInner>
 __device__ __forceinline__ void store_quantized_pair(
     float4 v, std::uint32_t row, std::uint32_t chunk_at,
@@ -82,8 +76,7 @@ __device__ __forceinline__ void store_quantized_pair(
     const std::uint32_t kc = chunk_at + col / 16u;
     const std::uint32_t ki = col % 16u;
     if (global_row >= actual_num_rows) {
-        // One word per lane zeroes the padded slot's 128 B row, so the UMMA's
-        // B operand sees no stray fp8 NaN bit patterns.
+        // Zero padded rows before UMMA reads them.
         *reinterpret_cast<std::uint32_t*>(&fp8_act[kc][row][ki]) = 0u;
         if (lane == 0u) *quantized_input_scale_for_step = 1.0f;
         return;
@@ -91,8 +84,7 @@ __device__ __forceinline__ void store_quantized_pair(
     const float local_max =
         fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
     float blk_max = warp_reduce_max_float(local_max);
-    // Tiny maxima would overflow the inverse scale; the eps matches vLLM's
-    // group-quant clamp.
+    // Clamp tiny maxima to keep the inverse scale finite.
     blk_max = fmaxf(blk_max, 1e-10f);
     const float blk_inv_scale = kFp8Max / blk_max;
 
@@ -106,9 +98,7 @@ __device__ __forceinline__ void store_quantized_pair(
     }
 }
 
-// One 32-K group's UE8M0 scale: the exponent field is
-// ceil(log2(amax / 448)) + 127, one when the mantissa is non-zero, and `inv`
-// is the reciprocal of the power of two it encodes.
+// Encode ceil(log2(amax / 448)) + 127 as UE8M0 and return its inverse scale.
 __device__ __forceinline__ float mxfp8_ue8m0_scale(float amax,
                                                    std::uint32_t& biased) {
     constexpr float kFp8MaxInv = 1.0f / 448.0f;
@@ -186,8 +176,7 @@ struct GroupWiseQuantizer<QuantSpec<QuantMethod::kMXFP8, BlockSize>, N> {
     static constexpr std::uint32_t kValuesPerThread = N / 32u;
     static constexpr std::uint32_t kNumGroups = N / Quant::kBlockSize;
 
-    // The warp's inputs, and one block scale per group.  The scales stay a
-    // plain array: an Array<uint8_t, N> would pack four per word.
+    // Use a plain scale array to preserve byte-addressable UE8M0 entries.
     using Values = cutlass::Array<float, kValuesPerThread>;
     using ScaleArray = ScaleType[kNumGroups];
 
@@ -207,10 +196,8 @@ struct GroupWiseQuantizer<QuantSpec<QuantMethod::kMXFP8, BlockSize>, N> {
     }
 };
 
-// Where a tile's rows and quantization blocks sit: the first staging slot it
-// fills, its first block in the source and the scale table, and its row window
-// in the source activation.  A row of the window is padding once it reaches
-// `actual_num_rows`.
+// Staging slot, source block and row window for a quantized tile. Rows beyond
+// actual_num_rows are padding.
 struct QuantizeTile {
     std::uint32_t staging_slot_base;
     std::uint32_t block_base;
@@ -228,8 +215,7 @@ struct QuantizeTile {
     }
 };
 
-// NumRows / NumCols are the tile's rows and K extent.  The scales land in
-// their per-slot SfAtom staging, ready for UTCCP.
+// Quantize a NumRows x NumCols tile into per-slot SfAtoms.
 template <bool Staged, std::size_t NumRows, std::size_t NumCols,
           std::size_t QuantBlock, std::size_t SwizzleBoxK,
           std::size_t BlocksPerStage>
@@ -283,16 +269,14 @@ __device__ inline void quantize_mxfp8_groupwise_1x32(
 
         const std::uint32_t kc = chunk_at + col / 16u;
         const std::uint32_t ki = col % 16u;
-        // One staging slot holds `BlocksPerStage` quantization blocks; the
-        // SfAtom staging is sized per slot, not per the whole source row.
+        // Each slot stages BlocksPerStage quantization blocks.
         constexpr std::uint32_t kSfAtomBytes =
             128u * (QuantBlock * BlocksPerStage / 32u);
         std::uint8_t* const scale =
             quantized_scale + slot * kSfAtomBytes +
             sf_atom_offset(row, (blk % BlocksPerStage) * kSubBlocks + sub);
         if (global_row >= tile.actual_num_rows) {
-            // One word per lane zeroes the padded row; the neutral exponent
-            // never contributes.
+            // Zero padded data and store neutral scale exponents.
             *reinterpret_cast<std::uint32_t*>(
                 &quantized_data[slot][kc][row][ki]) = 0u;
             if (leader) *scale = 127u;
@@ -326,8 +310,7 @@ __device__ inline void quantize_mxfp8_groupwise_1x32(
     }
 }
 
-// NumRows / NumCols are the tile's rows and K extent; ScaleCols is the scale
-// table's row stride (the whole activation's row count).
+// Quantize a NumRows x NumCols tile; ScaleCols is the scale-table row stride.
 template <bool Staged, std::size_t NumRows, std::size_t NumCols,
           std::size_t ScaleCols, std::size_t QuantBlock,
           std::size_t SwizzleBoxK, std::size_t BlocksPerStage>
@@ -360,9 +343,7 @@ __device__ inline void quantize_fp8_groupwise_128(
         const std::uint32_t chunk_at = (blk % BlocksPerStage) * kChunksPerBlock;
         const std::uint32_t sblk = tile.block_base + blk;
         const std::uint32_t k = (tile.block_base + blk) * QuantBlock + col;
-        // A padded row re-reads the ring's first row: the store zeroes it
-        // anyway, and an unconditional read is what lets several pairs' loads
-        // overlap.
+        // Padding rows read the first valid row and are zeroed on store.
         const std::uint32_t src_row =
             global_row < tile.actual_num_rows ? row : 0u;
         const DataType::ElementA* bf16_4;
@@ -374,8 +355,7 @@ __device__ inline void quantize_fp8_groupwise_128(
                      src_row * SwizzleBoxK + (chunk ^ (src_row % 8u)) * 8u +
                      rel % 8u;
         } else {
-            // A row-major source is the whole tensor, so it is addressed by the
-            // row in the source tensor.
+            // Row-major input uses the global source-row index.
             bf16_4 = data +
                      (global_row < tile.actual_num_rows ? global_row : 0u) *
                          NumCols +

@@ -21,11 +21,8 @@
 
 namespace halops::moe {
 
-// This single struct is both the gmem storage and the publish/wait behaviour.
-// Every handoff between the blocks of a launch is double-buffered by launch
-// parity: a launch publishes into the parity-selected half while phase 1
-// refills the other half for the next launch, so no consumer observes a
-// leftover from the previous launch.
+// Global handoff state, double-buffered by launch parity to separate
+// consecutive launches.
 template <typename Dims>
 struct PackedTokenCounts {
     using Word = std::uint64_t;
@@ -38,8 +35,7 @@ struct PackedTokenCounts {
     static_assert(Dims::kMaxTopk <= kMask,
                   "a token's count reaches top_k, which must fit its field");
 
-    // The increment one finished task adds to a packed word, for the tokens in
-    // `token_mask`.
+    // Packed completion increment for tokens selected by token_mask.
     __device__ __forceinline__ static Word increment(std::uint32_t token_mask) {
         Word inc = 0u;
 #pragma unroll
@@ -56,47 +52,36 @@ struct MoECtaComm {
     // Per-block launch counter; its parity selects the double-buffer half.
     std::uint32_t launch_flip[kSpecMaxGrid];
 
-    // Per-row up→down readiness bitmask (one bit per up-block), double-buffered
-    // by launch parity. Bit b is set (release) once up has written this row's
-    // up-block b into `routed_up_out.data` + `routed_up_out.scale`. A row is
-    // fully published when all kUpOutScaleCols bits are set.
+    // Per-row readiness bits, double-buffered by launch parity. Each up block
+    // release-sets its bit after storing data and scales.
     static constexpr std::uint32_t kUpOutReadyFull =
         (kUpOutScaleCols >= 32u) ? 0xFFFFFFFFu : ((1u << kUpOutScaleCols) - 1u);
     std::uint32_t up_out_ready[2][kMaxRoutedRows];
 
-    // Dynamic down schedule, both double-buffered by launch parity: the next
-    // unclaimed (expert, m-block) task, and per output m-block one packed word
-    // of per-token counts. A token of the m-block is complete once its field
-    // reaches top_k.
+    // Parity-buffered down-task cursor and packed per-token completion counts.
+    // Each token completes after top_k tasks.
     std::uint32_t down_task_next[2];
     std::uint64_t down_tasks_done[2][kCtasPerExpert];
 
-    // Router tasks (one M tile each) whose logits are published,
-    // double-buffered by launch parity; the logits are complete once it
-    // reaches the task count.
+    // Published router-task count, double-buffered by launch parity.
     std::uint32_t router_tasks_done[2];
-    // Latent down-projection tasks whose fp8 output is published,
-    // double-buffered by launch parity; the output is complete once it reaches
-    // the task count.
+    // Published latent-task count, double-buffered by launch parity.
     std::uint32_t latent_tasks_done[2];
     // Shared expert blocks that have published their activation slice.
     std::uint32_t shared_up_out_done[2];
 
-    // Block 0's routing tables travel as 32 slices, slice l being words
-    // l, l + 32, ... of `router_tables`; flag l is set once slice l is in.
+    // Routing tables are published in 32 lane-strided word slices.
     static constexpr std::uint32_t kRouterTableSlices = 32u;
     std::uint32_t router_tables_ready[2][kRouterTableSlices];
 
-    // Claims this launch's parity for `blockIdx.x`, advancing that block's
-    // private counter.
+    // Advance this CTA's launch counter and return its parity.
     __device__ __forceinline__ std::uint32_t claim_parity() {
         const std::uint32_t flip = launch_flip[blockIdx.x];
         launch_flip[blockIdx.x] = flip + 1u;
         return flip & 1u;
     }
 
-    // Zero-refills the readiness state the NEXT launch will use (its parity is
-    // the currently-inactive one).
+    // Clear readiness state for the next launch in the inactive buffer.
     __device__ __forceinline__ void reset_inactive(std::uint32_t parity,
                                                    std::uint32_t rank) {
         const std::uint32_t inactive = parity ^ 1u;
@@ -118,16 +103,13 @@ struct MoECtaComm {
         }
     }
 
-    // Slice `slice` of block 0's routing tables is in (release), and its
-    // reader's wait (acquire).
+    // Publish a routing-table slice with release ordering; readers acquire it.
     __device__ __forceinline__ void publish_router_table_slice(
         std::uint32_t parity, std::uint32_t slice) {
         global_store_release_u32(&router_tables_ready[parity][slice], 1u);
     }
     __device__ __forceinline__ void wait_router_table_slice(
         std::uint32_t parity, std::uint32_t slice) const {
-        // Polled at full rate: the latent blocks arrive after their
-        // projection, and a backoff would only delay seeing the tables.
         while (global_load_acquire_u32(&router_tables_ready[parity][slice]) ==
                0u) {
         }
@@ -145,9 +127,7 @@ struct MoECtaComm {
         }
     }
 
-    // Per-expert up→down readiness wait (acquire), the counterpart to
-    // publish_up_out: spins until every routed row [expert_start,
-    // +routed_count) of this expert has the requested up-block bits.
+    // Acquire the requested up-block bits for every routed row of this expert.
     __device__ __forceinline__ void wait_up_out(std::uint32_t parity,
                                                 std::uint32_t expert_start,
                                                 std::uint32_t routed_count,
@@ -160,8 +140,7 @@ struct MoECtaComm {
         }
     }
 
-    // `num_tiles` router tasks published.  The caller has joined the
-    // writers of their logits.
+    // Publish router tasks after their logit writers have joined.
     __device__ __forceinline__ void publish_router_tasks(
         std::uint32_t parity, std::uint32_t num_tiles) {
         global_red_add_release_u32(&router_tasks_done[parity], num_tiles);
@@ -202,17 +181,14 @@ struct MoECtaComm {
         }
     }
 
-    // Claims the next down task of the grid-wide dynamic schedule (relaxed:
-    // it only distributes work).  Returns values past the task count once the
-    // schedule is exhausted.
+    // Atomically claim a down task. Values beyond the task count end the
+    // schedule.
     __device__ __forceinline__ std::uint32_t claim_down_task(
         std::uint32_t parity) {
         return atomicAdd(&down_task_next[parity], 1u);
     }
 
-    // One finished task of `m_block`, adding `count` to its completion word.
-    // The caller has joined every thread's output stores; the fence makes
-    // them device-visible before the count.
+    // Publish a completed task after its output writers have joined.
     __device__ __forceinline__ void publish_down_task(std::uint32_t parity,
                                                       std::uint32_t m_block,
                                                       std::uint64_t count) {
@@ -220,9 +196,7 @@ struct MoECtaComm {
         global_red_add_u64(&down_tasks_done[parity][m_block], count);
     }
 
-    // Waits until the count packed at `shift` reaches `need`.
-    // Polled at full rate on purpose: the satisfying value is what gates this
-    // block's writeback, so any backoff here is added straight to the tail.
+    // Wait until the packed count at shift reaches need.
     __device__ __forceinline__ void wait_down_out_field(
         std::uint32_t parity, std::uint32_t m_block, std::uint32_t shift,
         std::uint64_t mask, std::uint64_t need) const {

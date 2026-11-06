@@ -70,8 +70,7 @@ struct RoutedUpProjectionBase
         return true;
     }
 
-    // Load one (expert, K-tile)'s weight tile into its ring slot. The caller
-    // arms the barrier with the total weight and scale transaction bytes.
+    // Load a weight tile after arming the barrier for weight and scale bytes.
     __device__ static void load_weight_tile(
         SharedStorage* __restrict__ smem,
         const CUtensorMap& tma_up_weights_desc, std::uint32_t ring_iter_id,
@@ -94,9 +93,6 @@ struct RoutedUpProjectionBase
         float situ_linear_beta, Accumulator& acc_gate, Accumulator& acc_up) {
         [[maybe_unused]] const std::uint32_t expert_id =
             smem->routing.active_experts[e];
-
-        const auto act_span = KERNEL_TIMER_BEGIN(
-            smem->timer(), "up_combine_gated_activation", expert_id);
         const auto& routing = smem->routing;
         const std::uint32_t token_mask =
             routing.token_mask(e) & ((1u << batch_size) - 1u);
@@ -115,11 +111,7 @@ struct RoutedUpProjectionBase
         Base::combine_gated_activation(nullptr, smem->routed_experts.act_up_out,
                                        acc_gate, acc_up, activation, situ_beta,
                                        situ_linear_beta, &weights, token_mask);
-        KERNEL_TIMER_END(smem->timer(), act_span);
         WarpRole::sync_calc_threads();
-
-        const auto publish_span = KERNEL_TIMER_BEGIN(
-            smem->timer(), "up_quantize_publish_rows", expert_id);
 
         constexpr std::uint32_t kTokensPerWarp =
             UpGemm::kTileShapeN / WarpRole::kCalcWarpCount;
@@ -129,7 +121,6 @@ struct RoutedUpProjectionBase
                 workspace, smem, e, batch_size, base_feature, m_block_idx,
                 WarpRole::get_warp_idx() + g * WarpRole::kCalcWarpCount);
         }
-        KERNEL_TIMER_END(smem->timer(), publish_span);
         WarpRole::sync_calc_threads();
     }
 
@@ -168,12 +159,9 @@ struct RoutedUpProjectionBase
                 scale[i] = scales[i];
             }
         }
-        // Both quantized data and scales are stored before publishing
-        // readiness.
+        // Store quantized data and scales before publishing readiness.
         workspace->cta_comm.publish_up_out(smem->launch_parity, dest_row,
                                            m_block_idx, lane_idx);
-        KERNEL_TIMER_MARK(smem->timer(), "up_handoff_publish",
-                          smem->routing.active_experts[e]);
     }
 };
 
@@ -220,9 +208,6 @@ struct RoutedUpProjection<KernelTraits, true>
                 smem->routing.active_experts[task.local_expert_idx];
             const std::uint32_t task_id = task.task_id;
 
-            const auto task_span =
-                KERNEL_TIMER_BEGIN(smem->timer(), "up_expert_task", expert_id);
-
             if (WarpRole::is_weight_loader_thread()) {
                 run_load_k_loop(smem, tma_up_weights_desc, expert_scales_up,
                                 weight_row_base, task_id, expert_id,
@@ -234,32 +219,22 @@ struct RoutedUpProjection<KernelTraits, true>
                 Accumulator acc_up_out;
                 load_accumulators(smem, acc_gate_out, acc_up_out, tmem_base,
                                   task_id);
-
-                const auto epilogue_span =
-                    KERNEL_TIMER_BEGIN(smem->timer(), "up_epilogue", expert_id);
                 Base::epilogue(workspace, smem, task.local_expert_idx,
                                batch_size, base_feature, m_block, activation,
                                situ_beta, situ_linear_beta, acc_gate_out,
                                acc_up_out);
-                KERNEL_TIMER_END(smem->timer(), epilogue_span);
             }
-            KERNEL_TIMER_END(smem->timer(), task_span);
         }
 
-        // Drain the aliased weight storage and the fixed TMEM accumulator
-        // before their respective producers enter the down phase.
+        // Drain aliased weights and the accumulator before entering down.
         if (sched.next_task_id() > 0u) {
             if (WarpRole::is_weight_loader_thread()) {
                 const std::uint32_t last_tile =
                     sched.next_task_id() * Base::kNumTilesK - 1u;
-                KERNEL_TIMER_SCOPE(smem->timer(), "up_wait_weight_empty",
-                                   last_tile);
                 smem->barriers.routed.up_weight_empty.wait(last_tile);
                 // Order completed SMEM reads before down's TMA writes.
                 asm volatile("fence.proxy.async;" ::: "memory");
             } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
-                KERNEL_TIMER_SCOPE(smem->timer(), "up_wait_accumulator_empty",
-                                   sched.next_task_id() - 1u);
                 smem->barriers.routed.accumulator_empty.wait(
                     sched.next_task_id() - 1u);
             }
@@ -272,10 +247,7 @@ struct RoutedUpProjection<KernelTraits, true>
                                              Accumulator& acc_up_out,
                                              std::uint32_t tmem_base,
                                              std::uint32_t task_id) {
-        const auto acc_ready_span = KERNEL_TIMER_BEGIN(
-            smem->timer(), "up_wait_accumulator_ready", task_id);
         smem->barriers.routed.accumulator_ready.wait(task_id);
-        KERNEL_TIMER_END(smem->timer(), acc_ready_span);
 
         Base::load_accumulators(tmem_base, acc_gate_out, acc_up_out);
         cutlass::arch::fence_view_async_tmem_load();
@@ -293,13 +265,9 @@ struct RoutedUpProjection<KernelTraits, true>
         typename UpGemm::TiledMma tiled_mma{};
         auto cta_mma = tiled_mma.get_slice(cute::_0{});
         auto tCt = Base::make_accumulator_fragment(cta_mma);
-
-        const auto acc_empty_span = KERNEL_TIMER_BEGIN(
-            smem->timer(), "up_wait_accumulator_empty", task_id);
         if (task_id > 0u) {
             smem->barriers.routed.accumulator_empty.wait(task_id - 1u);
         }
-        KERNEL_TIMER_END(smem->timer(), acc_empty_span);
 
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kNumTilesK;
@@ -308,10 +276,7 @@ struct RoutedUpProjection<KernelTraits, true>
                 task_id * Base::kNumTilesK + k_iter_id;
             const std::uint32_t weight_slot =
                 ring_iter_id % Base::kNumWeightSlots;
-            const auto mma_ready_span = KERNEL_TIMER_BEGIN(
-                smem->timer(), "up_wait_mma_ready", ring_iter_id);
             smem->barriers.routed.wait_up_mma_ready(ring_iter_id);
-            KERNEL_TIMER_END(smem->timer(), mma_ready_span);
             Base::mma(
                 tiled_mma, cta_mma, tCt,
                 reinterpret_cast<typename Base::WeightElement*>(
@@ -335,7 +300,6 @@ struct RoutedUpProjection<KernelTraits, true>
         if (arm_id < Base::kNumWeightSlots) {
             return;
         }
-        KERNEL_TIMER_SCOPE(smem->timer(), "up_wait_weight_empty", arm_id);
         smem->barriers.routed.up_weight_empty.wait(arm_id -
                                                    Base::kNumWeightSlots);
     }
@@ -439,8 +403,6 @@ struct RoutedUpProjection<KernelTraits, false>
             const std::uint32_t cur_scale_slot = task_id % kScaleSlots;
 
             const bool has_next_e = (task.next_expert_idx != kNoExpert);
-            const auto task_span =
-                KERNEL_TIMER_BEGIN(smem->timer(), "up_expert_task", expert_id);
 
             if (WarpRole::is_weight_loader_thread()) {
                 run_load_k_loop(smem, tma_up_weights_desc, weight_row_base,
@@ -453,21 +415,16 @@ struct RoutedUpProjection<KernelTraits, false>
                 run_dequant_k_loop(smem, acc_gate_out, acc_up_out,
                                    cur_scale_slot, tmem_base, task_id,
                                    expert_id);
-
-                const auto epilogue_span =
-                    KERNEL_TIMER_BEGIN(smem->timer(), "up_epilogue", expert_id);
                 Base::epilogue(workspace, smem, task.local_expert_idx,
                                batch_size, base_feature, m_block, activation,
                                situ_beta, situ_linear_beta, acc_gate_out,
                                acc_up_out);
-                KERNEL_TIMER_END(smem->timer(), epilogue_span);
             } else if (WarpRole::is_other_loader_warp(warp_idx) && has_next_e) {
                 const std::uint32_t next_expert_id =
                     smem->routing.active_experts[task.next_expert_idx];
                 load_up_weight_scale(expert_scales_up, next_expert_id,
                                      base_feature, task_id + 1u, smem);
             }
-            KERNEL_TIMER_END(smem->timer(), task_span);
         }
     }
 
@@ -477,7 +434,6 @@ struct RoutedUpProjection<KernelTraits, false>
         if (arm_id < Base::kNumWeightSlots) {
             return;
         }
-        KERNEL_TIMER_SCOPE(smem->timer(), "up_wait_weight_empty", arm_id);
         smem->barriers.routed.accumulator_ready.wait(arm_id -
                                                      Base::kNumWeightSlots);
     }
@@ -488,8 +444,6 @@ struct RoutedUpProjection<KernelTraits, false>
         const CUtensorMap& tma_up_weights_desc, std::uint32_t weight_row_base,
         std::uint32_t task_id, std::uint32_t expert_id,
         std::uint64_t weight_cache_hint) {
-        // Rolled: unrolled, the K-iterations are kNumTilesK copies of the
-        // TMA issue, code a launch with a cold L2 fetches from DRAM.
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kNumTilesK;
              ++k_iter_id) {
@@ -513,10 +467,7 @@ struct RoutedUpProjection<KernelTraits, false>
                                               std::uint32_t tmem_base,
                                               std::uint32_t task_id,
                                               std::uint32_t expert_id) {
-        const auto scale_span = KERNEL_TIMER_BEGIN(
-            smem->timer(), "up_wait_weight_scale_ready", expert_id);
         smem->barriers.routed.wait_weight_scale_ready(task_id, cur_scale_slot);
-        KERNEL_TIMER_END(smem->timer(), scale_span);
 
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 1; k_iter_id <= Base::kNumTilesK;
@@ -549,10 +500,7 @@ struct RoutedUpProjection<KernelTraits, false>
             const std::uint32_t weight_slot =
                 ring_iter_id % Base::kNumWeightSlots;
             // Each K tile needs its own accumulator for software scaling.
-            const auto mma_ready_span = KERNEL_TIMER_BEGIN(
-                smem->timer(), "up_wait_mma_ready", ring_iter_id);
             smem->barriers.routed.wait_up_mma_ready(ring_iter_id);
-            KERNEL_TIMER_END(smem->timer(), mma_ready_span);
             Base::mma(
                 tiled_mma, cta_mma, tCt,
                 reinterpret_cast<typename Base::WeightElement*>(
@@ -581,10 +529,7 @@ struct RoutedUpProjection<KernelTraits, false>
                                    std::uint32_t ring_iter_id, std::uint32_t s,
                                    std::uint32_t tmem_base) {
         // Dequant reads tile ring_iter_id - 1, one iteration behind the UMMA.
-        const auto acc_ready_span = KERNEL_TIMER_BEGIN(
-            smem->timer(), "up_wait_accumulator_ready", ring_iter_id);
         smem->barriers.routed.accumulator_ready.wait(ring_iter_id - 1u);
-        KERNEL_TIMER_END(smem->timer(), acc_ready_span);
 
         const std::uint32_t prev_slot = (ring_iter_id - 1u) % kNumAccSlots;
 
@@ -592,8 +537,7 @@ struct RoutedUpProjection<KernelTraits, false>
 #pragma unroll
         for (std::uint32_t sub = 0; sub < UpGemm::MmaCore::kNumQuantBlocksB;
              ++sub) {
-            // Each sub-accumulator is one activation quant block; kblk is its
-            // global index into both scale tables.
+            // kblk indexes this activation block in both scale tables.
             const std::uint32_t kblk =
                 (s - 1u) * UpGemm::MmaCore::kNumQuantBlocksB + sub;
             const std::uint32_t acc_col =
@@ -638,13 +582,9 @@ struct RoutedUpProjection<KernelTraits, false>
         SharedStorage* __restrict__ smem) {
         const std::uint32_t slot = task_id % kScaleSlots;
         if (task_id >= kScaleSlots) {
-            KERNEL_TIMER_SCOPE(smem->timer(), "up_wait_weight_scale_empty",
-                               expert_id);
             smem->barriers.routed.wait_weight_scale_empty(task_id - kScaleSlots,
                                                           slot);
         }
-
-        KERNEL_TIMER_SCOPE(smem->timer(), "up_load_weight_scale", expert_id);
         load_up_weight_scale_per_expert_async(
             expert_scales_up, expert_id, base_row_up,
             smem->routed_experts.w_up_scale[slot]);

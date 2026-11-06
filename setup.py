@@ -47,14 +47,7 @@ if not os.path.exists(os.path.join(CUTLASS_DIR, "include")):
         cwd=PROJECT_DIR,
     )
 
-# The device event timer is a build-time switch: its probes cost a
-# `%globaltimer` read plus a store, so production builds leave them out.
-timer_flags = []
-if os.environ.get("ENABLE_KERNEL_TIMER", "") not in ("", "0"):
-    timer_flags.append("-DENABLE_KERNEL_TIMER=1")
-
 gencode_flags = [
-    *timer_flags,
     f"-I{PROJECT_DIR}",
     f"-I{PROJECT_DIR}/csrc",
     f"-I{CUTLASS_DIR}/include",
@@ -83,35 +76,27 @@ setup(
     ext_modules=[
         CUDAExtension(
             name="halops.halops_kernel",
-            # TEMP: only the gemm + moe kernels are under work; the excluded
-            # modules' bindings are commented out in cpp_extensions.cc too.
             sources=[
-                # "csrc/kernel/attention/encoder_attention.cu",
-                # "csrc/kernel/attention/cachekv.cu",
-                # "csrc/kernel/attention/decoder_attention.cu",
-                # "csrc/kernel/gemm/dense_gemm.cu",
-                # "csrc/kernel/gemm/group_masked_gemm.cu",
-                # "csrc/kernel/gemm/group_contiguous_gemm.cu",
-                # "csrc/kernel/gemm/batch_gemm.cu",
+                "csrc/kernel/attention/encoder_attention.cu",
+                "csrc/kernel/attention/cachekv.cu",
+                "csrc/kernel/attention/decoder_attention.cu",
+                "csrc/kernel/gemm/dense_gemm.cu",
+                "csrc/kernel/gemm/group_masked_gemm.cu",
+                "csrc/kernel/gemm/group_contiguous_gemm.cu",
+                "csrc/kernel/gemm/batch_gemm.cu",
                 "csrc/kernel/gemm/group_wise_quant.cu",
-                # "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
-                # "csrc/kernel/gemm/fused_swiglu_quant.cu",
-                # "csrc/kernel/gemm/low_latency_mma_gemm.cu",
-                # "csrc/kernel/mla/mla_plan.cu",
-                # "csrc/kernel/mla/mla_attention.cu",
-                # "csrc/kernel/mla/mla_prequant_x.cu",
-                # "csrc/kernel/mla/mla_output_proj.cu",
-                # "csrc/kernel/mla/combine_with_rope_quant.cu",
+                "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+                "csrc/kernel/gemm/fused_swiglu_quant.cu",
+                "csrc/kernel/gemm/low_latency_mma_gemm.cu",
+                "csrc/kernel/mla/mla_plan.cu",
+                "csrc/kernel/mla/mla_attention.cu",
+                "csrc/kernel/mla/mla_prequant_x.cu",
+                "csrc/kernel/mla/mla_output_proj.cu",
+                "csrc/kernel/mla/combine_with_rope_quant.cu",
                 "csrc/kernel/moe/low_latency_moe.cu",
-                "csrc/common/kernel_timer_host.cu",
                 "csrc/common/cpp_extensions.cc",
             ],
-            # `cpp_extensions.cc` binds the timer export too, so the define has
-            # to reach the C++ compiler as well as nvcc.
-            extra_compile_args={
-                "nvcc": gencode_flags,
-                "cxx": timer_flags,
-            },
+            extra_compile_args={"nvcc": gencode_flags},
             libraries=["cuda"],
         ),
     ],

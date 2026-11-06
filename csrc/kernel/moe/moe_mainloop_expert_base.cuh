@@ -120,7 +120,8 @@ struct UpProjectionBase {
         UpGemm::kTileShapeM / 16u == WarpRole::kCalcWarpCount;
 
     static constexpr std::uint64_t kBLbo =
-        (UpGemm::kTileShapeN + 1u) * std::uint64_t{kFp8ActChunkK};
+        (UpGemm::kTileShapeN + 1u) *
+        std::uint64_t{LboChunkK<ActElement>::value};
     static constexpr std::uint32_t kBKStride = 2u * kBLbo;
     using SBLayout = decltype(cute::make_layout(
         cute::make_shape(
@@ -311,8 +312,8 @@ struct UpProjectionBase {
         }
     }
 
-    // Split zero's calc warps call after join_up_split_k. Without split-K,
-    // partial may be null; null weights apply a unit weight to every token.
+    // Split 0 calls after reduction. Null partials mean no split-K; null
+    // weights mean unit weights.
     __device__ static void combine_gated_activation(
         const float (*partial)[kOutputFeatureBlock][UpGemm::kTileShapeN],
         float (*act)[UpGemm::kTileShapeN + 1u], const Accumulator& gate,
@@ -381,8 +382,8 @@ struct UpProjectionBase {
     }
 };
 
-// Shared down-projection computation; callers select buffers, layouts and
-// accumulator/scale slots, and synchronize their producers and consumers.
+// Down-projection computation; callers manage layouts, slots and
+// synchronization.
 template <typename KernelTraits, typename GemmTraits>
 struct DownProjectionBase {
     using Traits = KernelTraits;

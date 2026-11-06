@@ -68,79 +68,43 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
 
     const std::uint32_t warp_idx = WarpRole::get_warp_idx();
 
-    // Device event timer: park the per-CTA record pool in SMEM and zero the
-    // per-warp write cursors before any probe.
-#if defined(HALOPS_KERNEL_TIMER_ENABLED)
-    if (threadIdx.x < halops::kTimerWarps) {
-        smem->timer_next[threadIdx.x] = 0u;
-    }
-    if (threadIdx.x == 0u) {
-        smem->timer_base = mainloop_params.timer_events;
-    }
-    __syncthreads();
-#endif
-
-    KERNEL_TIMER_CALIBRATE(smem->timer());
-    const auto kernel_span =
-        KERNEL_TIMER_BEGIN(smem->timer(), "fused_moe_kernel");
-
     using Workspace = MoEWorkspace<Dims>;
     Workspace* __restrict__ workspace =
         reinterpret_cast<Workspace*>(mainloop_params.scratchpad);
 
     // Initialize the launcher-thread states and publish to all warps.
-    const auto init_span = KERNEL_TIMER_BEGIN(smem->timer(), "initialize");
     collective_mainloop.initialize(mainloop_params, smem);
-    KERNEL_TIMER_END(smem->timer(), init_span);
 
-    // Phase 1: prologue, including routing + latent_down + shared_expert,
-    // overlapped on different CTAs.
-    const auto prologue_span =
-        KERNEL_TIMER_BEGIN(smem->timer(), "prologue_phase");
+    // Run routing, latent projection and the shared expert on separate CTAs.
     collective_mainloop.run_latent_down(mainloop_params, smem);
     collective_mainloop.run_shared(mainloop_params, smem);
     collective_mainloop.run_router(mainloop_params, smem);
-    // Phase boundary: publishes the routing tables and orders the router's
-    // SMEM traffic before the next phase's TMA writes into those bytes.
+    // Publish routing tables and order SMEM reads before reusing storage.
     __syncthreads();
     if (WarpRole::is_weight_loader_thread()) {
         CollectiveMainloop::Router::release_weight_smem();
     }
-    KERNEL_TIMER_END(smem->timer(), prologue_span);
 
-    // Scheduler per thread drives both projections; `begin_phase` opens
-    // the task sequence of the projection about to run.
+    // Each thread follows the same projection task sequence.
     TaskScheduler<Traits> sched(smem, workspace);
 
-    // Phase 2: up-projection — expert groups in parallel. The scheduler maps
-    // this block to (expert group, feature block) statically.
+    // Run up-projection tasks assigned to this expert group and feature block.
     sched.begin_phase(BlockPhase::kUp, smem->routing.active_expert_count);
-    const auto up_span = KERNEL_TIMER_BEGIN(smem->timer(), "routed_up_phase",
-                                            smem->routing.active_expert_count);
     if (sched.is_active()) {
         collective_mainloop.run_up(mainloop_params, smem, sched);
     }
-    KERNEL_TIMER_END(smem->timer(), up_span);
 
-    // Phase 3: down-projection over (expert, m-block) tasks, each published
-    // to its m-block's completion count.
+    // Run down-projection tasks and publish their completion counts.
     sched.begin_phase(BlockPhase::kDown, smem->routing.active_expert_count);
-    const auto down_span = KERNEL_TIMER_BEGIN(
-        smem->timer(), "routed_down_phase", smem->routing.active_expert_count);
     collective_mainloop.run_down(mainloop_params, smem, sched);
-    KERNEL_TIMER_END(smem->timer(), down_span);
 
     // Phase 4: gather and combine each token's top_k combine slots.
-    const auto combine_span =
-        KERNEL_TIMER_BEGIN(smem->timer(), "combine_phase");
     collective_mainloop.combine(mainloop_params, smem, sched.cta_group());
-    KERNEL_TIMER_END(smem->timer(), combine_span);
 
     __syncthreads();
     if (WarpRole::is_tmem_warp(warp_idx)) {
         tmem_free(smem->tmem_ptr, MoEKernelTraits<Dims>::kTmemColumns);
     }
-    KERNEL_TIMER_END(smem->timer(), kernel_span);
 }
 
 template <typename MoEDims>
