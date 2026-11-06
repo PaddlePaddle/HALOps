@@ -71,6 +71,17 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr std::uint32_t kNumDownWeightSlots = 4;
         static constexpr std::uint32_t kNumAccSlots = 4;
         static constexpr bool kCombineWaitPerToken = true;
+        // Tail configs
+        static constexpr int kTailWorld = 4;
+        static constexpr int kTailTpg = 2;
+        static constexpr int kTailGsize = 32;
+        static constexpr int kTailThreads = 256;
+        static constexpr int kTailStage = 1;
+        static constexpr int kTailBlkB = 4;
+        static constexpr int kTailWStagePad = 64;
+        static constexpr int kTailXPad = 8;
+        static constexpr int kTailMaxStageSmemBytes = 160 * 1024;
+        static constexpr std::uint32_t kTailPrefetchChunk = 16384;
     };
 };
 
@@ -93,6 +104,8 @@ struct Dims_BS16_E512_N512_K2048_SM100
         static constexpr bool kLatentDownUseSplitK = true;
         // SharedExpert configs.
         static constexpr bool kSharedUseSplitK = true;
+        // Tail configs
+        static constexpr int kTailTpg = 4;
     };
 };
 

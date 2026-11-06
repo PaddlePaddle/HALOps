@@ -572,6 +572,7 @@ struct MoESharedStorage {
         "barrier parity is per slot");
 
     uint32_t launch_parity;
+    uint32_t tail_parity;
 
     static constexpr uint32_t kMaxDownTasks =
         MoERoutingTables<Dims>::kMaxActiveExperts *

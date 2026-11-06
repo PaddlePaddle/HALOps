@@ -228,4 +228,112 @@ __device__ static __forceinline__ void tmem_ld_16x256b1x(std::uint32_t addr,
     for (int i = 0; i < 4; ++i) d[i] = __int_as_float(v[i]);
 }
 
+template <typename V>
+__device__ static __forceinline__ void ld_global_16B(V& x, const void* addr,
+                                                     std::int64_t vec_offset) {
+    static_assert(alignof(V) == 16 && sizeof(V) == 16);
+    addr = static_cast<const std::uint8_t*>(addr) + vec_offset * sizeof(V);
+    uint4 val;
+    asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                 : "l"(addr));
+    x = *reinterpret_cast<const V*>(&val);
+}
+
+template <typename V>
+__device__ static __forceinline__ void st_global_16B(const V& x, void* addr,
+                                                     std::int64_t vec_offset) {
+    static_assert(alignof(V) == 16 && sizeof(V) == 16);
+    const uint4 val = *reinterpret_cast<const uint4*>(&x);
+    addr = static_cast<std::uint8_t*>(addr) + vec_offset * sizeof(V);
+    asm volatile("st.global.v4.b32 [%4], {%0, %1, %2, %3};"
+                 :
+                 : "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w), "l"(addr));
+}
+
+template <typename V>
+__device__ static __forceinline__ void ld_relaxed_16B(V& x, const void* addr,
+                                                      std::int64_t vec_offset) {
+    static_assert(alignof(V) == 16 && sizeof(V) == 16);
+    addr = static_cast<const std::uint8_t*>(addr) + vec_offset * sizeof(V);
+    uint4 val;
+    asm volatile("ld.relaxed.sys.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                 : "l"(addr));
+    x = *reinterpret_cast<const V*>(&val);
+}
+
+template <typename V>
+__device__ static __forceinline__ void st_multimem_16B(
+    const V& x, void* mc_addr, std::int64_t vec_offset) {
+    static_assert(alignof(V) == 16 && sizeof(V) == 16);
+    const auto val = *reinterpret_cast<const float4*>(&x);
+    mc_addr = static_cast<std::uint8_t*>(mc_addr) + vec_offset * 16;
+    asm volatile("multimem.st.weak.v4.f32 [%4], {%0, %1, %2, %3};"
+                 :
+                 : "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w),
+                   "l"(mc_addr));
+}
+
+__device__ static __forceinline__ void prefetch_l2_bulk(const void* ptr,
+                                                        std::uint32_t bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(ptr),
+                 "r"(bytes)
+                 : "memory");
+}
+
+__device__ static __forceinline__ void mma_f16_m16n8k16(
+    float4& d, std::uint32_t a0, std::uint32_t a1, std::uint32_t a2,
+    std::uint32_t a3, std::uint32_t b0, std::uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
+        : "+f"(d.x), "+f"(d.y), "+f"(d.z), "+f"(d.w)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ static __forceinline__ void e4m3x4_to_f16x2x2(std::uint32_t w,
+                                                         std::uint32_t& lo,
+                                                         std::uint32_t& hi) {
+    asm("{\n\t.reg .b16 l, h;\n\tmov.b32 {l, h}, %2;\n\t"
+        "cvt.rn.f16x2.e4m3x2 %0, l;\n\tcvt.rn.f16x2.e4m3x2 %1, h;\n\t}"
+        : "=r"(lo), "=r"(hi)
+        : "r"(w));
+}
+
+__device__ static __forceinline__ std::uint32_t smem_u32(const void* p) {
+    return static_cast<std::uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__device__ static __forceinline__ void mbar_init_1(std::uint64_t* bar) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_u32(bar))
+                 : "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
+__device__ static __forceinline__ void mbar_expect_tx(std::uint64_t* bar,
+                                                      std::uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(
+                     smem_u32(bar)),
+                 "r"(bytes)
+                 : "memory");
+}
+
+__device__ static __forceinline__ void bulk_g2s(void* dst, const void* src,
+                                                std::uint32_t bytes,
+                                                std::uint64_t* bar) {
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
+        "[%0], [%1], %2, [%3];" ::"r"(smem_u32(dst)),
+        "l"(src), "r"(bytes), "r"(smem_u32(bar))
+        : "memory");
+}
+
+__device__ static __forceinline__ void mbar_wait_phase0(std::uint64_t* bar) {
+    asm volatile(
+        "{\n.reg .pred p;\nWAIT_%=:\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], 0;\n"
+        "@!p bra WAIT_%=;\n}" ::"r"(smem_u32(bar))
+        : "memory");
+}
+
 }  // namespace halops::moe

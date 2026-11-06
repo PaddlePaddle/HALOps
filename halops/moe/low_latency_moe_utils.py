@@ -28,6 +28,13 @@ _PAIR_GRAN = 8
 # K width of one router SW128 box.
 _ROUTER_SWIZZLE_K = 64
 
+# Token capacity of the narrow schedule; larger token counts run the wide one.
+_NARROW_TOKENS = 8
+_MAX_TOKENS = 16
+
+# Alignment of the tail mailbox inside the workspace's symmetric region.
+_TAIL_ALIGN = 4096
+
 
 def _interleave_up_for_pair_layout(w_fp8: torch.Tensor) -> torch.Tensor:
     """Repack ``[E, 2N, K]`` up/gate weights into the gran-8 pair layout."""
@@ -147,3 +154,16 @@ def _router_gates(
             f"expected {num_router_gates} router weights to merge, got " f"{len(gates)}"
         )
     return gates
+
+
+def _check_workspace(workspace, num_tokens: int) -> None:
+    """Check that ``workspace`` is the one bound to the schedule that ``num_tokens`` runs."""
+    if not 1 <= num_tokens <= _MAX_TOKENS:
+        raise ValueError(f"num_tokens must be in [1, {_MAX_TOKENS}], got {num_tokens}")
+    wide = num_tokens > _NARROW_TOKENS
+    if workspace.wide != wide:
+        raise ValueError(
+            f"the workspace is bound to the {'wide' if workspace.wide else 'narrow'} "
+            f"schedule but T={num_tokens} runs the {'wide' if wide else 'narrow'} one: "
+            f"allocate it from an input with T {'>' if wide else '<='} {_NARROW_TOKENS}."
+        )
