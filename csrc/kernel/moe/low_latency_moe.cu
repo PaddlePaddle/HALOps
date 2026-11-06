@@ -75,6 +75,19 @@ void CheckSharedExpertShape(const torch::Tensor& shared_up_weight,
 }
 
 template <typename MoEDims>
+void CheckRoutingVectors(const std::optional<torch::Tensor>& correction_bias,
+                         const std::optional<torch::Tensor>& per_expert_scale) {
+    for (const auto* v : {&correction_bias, &per_expert_scale}) {
+        if (!v->has_value()) continue;
+        TORCH_CHECK((*v)->scalar_type() == at::kFloat && (*v)->dim() == 1 &&
+                        (*v)->size(0) == MoEDims::kNumExperts &&
+                        (*v)->is_cuda() && (*v)->is_contiguous(),
+                    "correction_bias and per_expert_scale must be contiguous "
+                    "float32 CUDA tensors of shape [num_experts], or None.");
+    }
+}
+
+template <typename MoEDims>
 void CheckTailFc2Shape(const torch::Tensor& tail_fc2_weight,
                        const torch::Tensor& tail_fc2_scale) {
     using WeightQuant = typename moe::TailGeometryT<MoEDims>::WeightQuant;
@@ -179,6 +192,8 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
              const torch::Tensor& tail_fc2_weight,
              const torch::Tensor& tail_fc2_scale,
              const torch::Tensor& tail_norm_weight,
+             const std::optional<torch::Tensor>& correction_bias,
+             const std::optional<torch::Tensor>& per_expert_scale,
              const torch::Tensor& tail_epochs,
              const torch::Tensor& tail_uc_bases, const torch::Tensor& workspace,
              const torch::Tensor& tail_out, int64_t top_k, int64_t scoring_func,
@@ -202,6 +217,7 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
     }
     CheckSharedExpertShape<MoEDims>(shared_up_weight, shared_down_weight);
     CheckTailFc2Shape<MoEDims>(tail_fc2_weight, tail_fc2_scale);
+    CheckRoutingVectors<MoEDims>(correction_bias, per_expert_scale);
 
     using Traits = moe::MoEKernelTraits<MoEDims>;
     using Mainloop = moe::CollectiveMainloopMoE<Traits>;
@@ -217,6 +233,10 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
     args.top_k = static_cast<uint32_t>(top_k);
     args.scoring_func = static_cast<ScoringFunc>(scoring_func);
     args.renormalize = renormalize;
+    args.correction_bias =
+        correction_bias ? correction_bias->const_data_ptr<float>() : nullptr;
+    args.per_expert_scale =
+        per_expert_scale ? per_expert_scale->const_data_ptr<float>() : nullptr;
     args.activation = static_cast<Activation>(activation);
     args.situ_beta = static_cast<float>(situ_beta);
     args.situ_linear_beta = static_cast<float>(situ_linear_beta);
@@ -349,10 +369,13 @@ void LowLatencyMoE(
     const torch::Tensor& latent_down_weight,
     const torch::Tensor& latent_down_weight_scale,
     const torch::Tensor& tail_fc2_weight, const torch::Tensor& tail_fc2_scale,
-    const torch::Tensor& tail_norm_weight, const torch::Tensor& tail_epochs,
-    const torch::Tensor& tail_uc_bases, const torch::Tensor& workspace,
-    const torch::Tensor& tail_out, int64_t top_k, int64_t num_router_gates,
-    int64_t tail_rank, int64_t tail_mc_base, int64_t tail_grid_cap,
+    const torch::Tensor& tail_norm_weight,
+    const std::optional<torch::Tensor>& correction_bias,
+    const std::optional<torch::Tensor>& per_expert_scale,
+    const torch::Tensor& tail_epochs, const torch::Tensor& tail_uc_bases,
+    const torch::Tensor& workspace, const torch::Tensor& tail_out,
+    int64_t top_k, int64_t num_router_gates, int64_t tail_rank,
+    int64_t tail_mc_base, int64_t tail_grid_cap,
     const std::string& scoring_func, const std::string& activation,
     bool renormalize, double situ_beta, double situ_linear_beta,
     double tail_eps, const std::string& quant_mode, bool use_pdl) {
@@ -391,10 +414,10 @@ void LowLatencyMoE(
             shared_up_weight_scale, shared_down_weight,
             shared_down_weight_scale, latent_down_weight,
             latent_down_weight_scale, tail_fc2_weight, tail_fc2_scale,
-            tail_norm_weight, tail_epochs, tail_uc_bases, workspace, tail_out,
-            top_k, scoring_type, activation_type, tail_rank, tail_mc_base,
-            tail_grid_cap, renormalize, situ_beta, situ_linear_beta, tail_eps,
-            use_pdl);
+            tail_norm_weight, correction_bias, per_expert_scale, tail_epochs,
+            tail_uc_bases, workspace, tail_out, top_k, scoring_type,
+            activation_type, tail_rank, tail_mc_base, tail_grid_cap,
+            renormalize, situ_beta, situ_linear_beta, tail_eps, use_pdl);
     };
 
     constexpr auto kBWFP8 = moe::QuantMethod::kBlockwiseFP8;

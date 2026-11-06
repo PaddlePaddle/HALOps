@@ -142,6 +142,8 @@ def low_latency_moe(
     latent_up_weight: torch.Tensor,
     latent_up_weight_scale: torch.Tensor,
     norm_weight: torch.Tensor,
+    correction_bias: Optional[torch.Tensor],
+    per_expert_scale: Optional[torch.Tensor],
     out: torch.Tensor,
     workspace: MoEWorkspace,
     top_k: int,
@@ -152,7 +154,7 @@ def low_latency_moe(
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
     eps: float = 1e-6,
-    quant_mode: str = "w8a8-blockwise",
+    quant_mode: str = "w4a8-mxfp4",
     grid_cap: int = 0,
     use_pdl: bool = True,
 ) -> None:
@@ -234,6 +236,13 @@ def low_latency_moe(
             plain row-major as from ``group_wise_quant(use_swizzle=False)``,
             not the SfAtom layout) for "w8a8-mxfp8" and "w4a8-mxfp4".
         norm_weight (Tensor): [2048] bfloat16 RMSNorm weight.
+        correction_bias (Tensor or None): [512] float32 CUDA router bias
+            (``e_score_correction_bias``). It is added to each expert's score
+            only to choose the top-k; the weights and their renormalization
+            use the bias-free scores. None: no bias.
+        per_expert_scale (Tensor or None): [512] float32 CUDA routed scaling,
+            multiplied into each selected weight after renormalization. None:
+            no scaling.
         out (Tensor): [T, 4096] bfloat16 output, identical across ranks.
         workspace (MoEWorkspace): Scratchpad and tail communication state
             from ``get_workspace_for_moe``, matching the token schedule.
@@ -254,7 +263,7 @@ def low_latency_moe(
         quant_mode (str, optional): Quantization recipe: "w8a8-blockwise"
             (every group block-wise), "w8a8-mxfp8" (every group MXFP8) or
             "w4a8-mxfp4" (routed experts MXFP4, latent and shared MXFP8).
-            Default: "w8a8-blockwise".
+            Default: "w4a8-mxfp4".
         grid_cap (int, optional): Maximum resident CTAs; 0 uses the device
             limit. Keep this fixed for each workspace. Default: 0.
         use_pdl (bool, optional): Launch with Programmatic Dependent Launch, so
@@ -282,6 +291,8 @@ def low_latency_moe(
         latent_up_weight,
         latent_up_weight_scale,
         norm_weight,
+        correction_bias,
+        per_expert_scale,
         workspace.epochs,
         workspace.uc_bases,
         workspace.buffer,

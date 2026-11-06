@@ -147,7 +147,6 @@ struct Mxfp8 {
         xb[4] = xhi.x, xb[5] = xhi.y, xb[6] = xhi.z, xb[7] = xhi.w;
     }
 
-    // UE8M0 byte `g` of a row's scale vector as 2^(byte - 127).
     __device__ static float scale_of(const uint4 (&v)[kSfVec], int g) {
         const uint32_t* u = reinterpret_cast<const uint32_t*>(v);
         return __uint_as_float(((u[g >> 2] >> ((g & 3) * 8)) & 0xffu) << 23);

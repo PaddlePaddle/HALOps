@@ -78,6 +78,7 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     if (threadIdx.x == 0) {
         smem->tail_parity = __ldcg(mainloop_params.tail_epochs) & 1u;
     }
+    pdl_wait();
 
     // Run routing, latent projection and the shared expert on separate CTAs.
     collective_mainloop.run_latent_down(mainloop_params, smem);
@@ -106,11 +107,10 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     // Phase 4: gather and combine each token's top_k combine slots.
     collective_mainloop.combine(mainloop_params, smem, sched.cta_group());
 
-    pdl_trigger();
-
     // Phase 5: the latent moe tail.
     collective_mainloop.run_tail(mainloop_params, smem, sched.cta_group());
 
+    pdl_trigger();
     __syncthreads();
     if (WarpRole::is_tmem_warp(warp_idx)) {
         tmem_free(smem->tmem_ptr, MoEKernelTraits<Dims>::kTmemColumns);
@@ -137,22 +137,9 @@ cudaError_t LaunchMoEKernel(
         if (attribute != cudaSuccess) return attribute;
     }
     constexpr std::uint32_t kClusterSize = Traits::kClusterSize;
-    cudaLaunchAttribute attrs[2];
-    attrs[0].id = cudaLaunchAttributeClusterDimension;
-    attrs[0].val.clusterDim.x = kClusterSize;
-    attrs[0].val.clusterDim.y = 1;
-    attrs[0].val.clusterDim.z = 1;
-    unsigned int num_attrs = 1;
-    if (use_pdl) attrs[num_attrs++] = PdlLaunchAttribute();
-    cudaLaunchConfig_t config{};
-    config.gridDim = dim3(grid_size, 1, 1);
-    config.blockDim = dim3(Traits::kThreads, 1, 1);
-    config.dynamicSmemBytes = smem_size;
-    config.stream = stream;
-    config.attrs = attrs;
-    config.numAttrs = num_attrs;
-    const cudaError_t launch_status =
-        cudaLaunchKernelEx(&config, kernel_ptr, params);
+    const cudaError_t launch_status = LaunchClusterKernelWithPdl(
+        kernel_ptr, dim3(grid_size, 1, 1), dim3(Traits::kThreads, 1, 1),
+        dim3(kClusterSize, 1, 1), smem_size, stream, use_pdl, params);
     if (launch_status != cudaSuccess) return launch_status;
     return cudaGetLastError();
 }

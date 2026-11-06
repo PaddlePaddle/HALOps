@@ -41,22 +41,42 @@ inline cudaLaunchAttribute PdlLaunchAttribute() {
 }
 
 template <typename KernelT, typename... Args>
+inline cudaError_t LaunchClusterKernelWithPdl(KernelT kernel, dim3 grid_dim,
+                                              dim3 block_dim, dim3 cluster_dim,
+                                              std::size_t smem_bytes,
+                                              cudaStream_t stream, bool use_pdl,
+                                              Args&&... args) {
+    const bool clustered = cluster_dim.x * cluster_dim.y * cluster_dim.z > 1;
+    if (!use_pdl && !clustered) {
+        kernel<<<grid_dim, block_dim, smem_bytes, stream>>>(args...);
+        return cudaGetLastError();
+    }
+    cudaLaunchAttribute attrs[2];
+    unsigned int num_attrs = 0;
+    if (clustered) {
+        attrs[num_attrs].id = cudaLaunchAttributeClusterDimension;
+        attrs[num_attrs].val.clusterDim.x = cluster_dim.x;
+        attrs[num_attrs].val.clusterDim.y = cluster_dim.y;
+        attrs[num_attrs].val.clusterDim.z = cluster_dim.z;
+        ++num_attrs;
+    }
+    if (use_pdl) attrs[num_attrs++] = PdlLaunchAttribute();
+    cudaLaunchConfig_t config{};
+    config.gridDim = grid_dim;
+    config.blockDim = block_dim;
+    config.dynamicSmemBytes = smem_bytes;
+    config.stream = stream;
+    config.attrs = attrs;
+    config.numAttrs = num_attrs;
+    return cudaLaunchKernelEx(&config, kernel, args...);
+}
+
+template <typename KernelT, typename... Args>
 inline void LaunchKernelWithPdl(KernelT kernel, dim3 grid_dim, dim3 block_dim,
                                 std::size_t smem_bytes, cudaStream_t stream,
                                 bool use_pdl, Args&&... args) {
-    if (use_pdl) {
-        cudaLaunchAttribute attr = PdlLaunchAttribute();
-        cudaLaunchConfig_t config{};
-        config.gridDim = grid_dim;
-        config.blockDim = block_dim;
-        config.dynamicSmemBytes = smem_bytes;
-        config.stream = stream;
-        config.attrs = &attr;
-        config.numAttrs = 1;
-        cudaLaunchKernelEx(&config, kernel, args...);
-        return;
-    }
-    kernel<<<grid_dim, block_dim, smem_bytes, stream>>>(args...);
+    LaunchClusterKernelWithPdl(kernel, grid_dim, block_dim, dim3(1, 1, 1),
+                               smem_bytes, stream, use_pdl, args...);
 }
 
 }  // namespace halops
