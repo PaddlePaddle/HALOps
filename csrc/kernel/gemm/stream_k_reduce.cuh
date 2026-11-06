@@ -18,18 +18,13 @@
 
 #include <cstdint>
 
-// Reduction pass for tail-only stream-K (see tile_scheduler.h).
+// Reduction pass for tail-only stream-K (see tile_scheduler.cuh).
 //
-// The first `tail_base` cluster-tiles are data-parallel and written straight
-// to D. Each of the remaining `rem` tiles is split into `splits` K-chunks, each
-// writing a raw fp32 partial to its own workspace slot:
-//
-//   partial[ ((t * splits + s) * num_cta + v) ][ cta_m ][ block_n ]
-//
-// (v = CTA index inside the cluster). This kernel sums the `splits` partials of
-// each tail tile and casts to TypeD in place in D; cost scales with
-// rem*splits only. A shared fp32 buffer with atomicAdd is slower (address
-// contention serializes the epilogue stores).
+// The first `tail_base` cluster-tiles are written straight to D; the remaining
+// `rem` tiles are split into `splits` K-chunks, each depositing an fp32 partial
+// to partial[((t * splits + s) * num_cta + v)][cta_m][block_n]. This kernel
+// sums the per-tile partials into D. Cost scales with rem*splits only; a shared
+// buffer with atomicAdd serializes on the address.
 template <typename TypeD, int CtaM, int BlockN, int NumCta>
 __global__ void stream_k_reduce_kernel(TypeD* __restrict__ ptr_d,
                                        float const* __restrict__ ptr_partial,
@@ -41,9 +36,9 @@ __global__ void stream_k_reduce_kernel(TypeD* __restrict__ ptr_d,
         return;
     }
 
-    // Unflatten: [t][v][cta_m][block_n], 4 columns per thread (scalar is
-    // issue-bound). BlockN % 4 == 0 and slots are CtaM*BlockN floats, so the
-    // float4 loads and 4x TypeD store are naturally aligned.
+    // Unflatten: [t][v][cta_m][block_n], 4 columns per thread (scalar stores
+    // are issue-bound). Slots are CtaM*BlockN floats, so float4 loads and the
+    // 4x TypeD store stay aligned.
     constexpr int kVec = 4;
     constexpr int kColVecs = BlockN / kVec;
     const int col = static_cast<int>(idx % kColVecs) * kVec;
@@ -53,7 +48,6 @@ __global__ void stream_k_reduce_kernel(TypeD* __restrict__ ptr_d,
     const int v = static_cast<int>(rest % NumCta);
     const int t = static_cast<int>(rest / NumCta);
 
-    // Sum the `splits` partials of these elements.
     float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
     const int64_t slot_stride = static_cast<int64_t>(CtaM) * BlockN;
     const int64_t within = static_cast<int64_t>(row) * BlockN + col;
@@ -68,8 +62,7 @@ __global__ void stream_k_reduce_kernel(TypeD* __restrict__ ptr_d,
         acc.w += p.w;
     }
 
-    // Map the tail work id to cluster coords as the scheduler's linear path
-    // does.
+    // Map the tail work id to cluster coords (scheduler's linear path).
     const int base_tile = tail_base + t;
     int cluster_m, cluster_n;
     if (m_fast) {

@@ -14,11 +14,10 @@
 # limitations under the License.
 """
 
-# Native BF16 (mode="bf16") accuracy tests for the batch / grouped-masked /
-# grouped-contiguous GEMM entry points. These share the self-developed
-# CollectiveMainloop path with W8A8/W4A4 but take the compile-time KIsBF16
-# branch (no scale factors, no alpha). Golden reference is a plain fp32 matmul
-# rounded to bf16, so tolerances are much tighter than the quantized paths.
+# Native BF16 accuracy tests for the batch / grouped entry points. They take
+# the KIsBF16 branch (no scale factors, no alpha) of the shared mainloop. The
+# golden reference is an fp32 matmul rounded to bf16, so tolerances are tighter
+# than for the quantized paths.
 
 import numpy as np
 import torch
@@ -29,9 +28,9 @@ torch.manual_seed(2026)
 torch.cuda.manual_seed_all(2026)
 torch.set_default_device("cuda")
 
-# bf16 output is rounded once by the kernel and once by the reference; a couple
-# of ulps of slack is enough. This is far tighter than fp8 (atol 2e-3 rtol 2e-2)
-# in relative terms because there is no dequantization error.
+# Output is rounded once by the kernel and once by the reference; a couple of
+# ulps suffice. There is no dequantization error, so this is far tighter than
+# fp8 in relative terms.
 RTOL = 1e-2
 ATOL = 1e-2
 

@@ -85,8 +85,8 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
 
     bool is_load_ab_warp = (warp_idx == KernelTraits::KLoadABWarpId);
 
-    // Prefetch TMA descriptors: AB warp handles A, B (+ SFA, SFB for
-    // block-scaled modes). BF16 has no scale-factor descriptors.
+    // Prefetch TMA descriptors: the AB warp handles A and B (plus SFA/SFB for
+    // block-scaled modes).
     if (is_load_ab_warp && lane_predicate) {
         cute::prefetch_tma_descriptor(
             mainloop_params.tma_load_A.get_tma_descriptor());
@@ -199,12 +199,10 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
     BiasPipeline bias_pipeline(shared_storage.bias_pipeline,
                                bias_pipeline_params);
 
-    // TMEM allocation, issued right before the barrier that waits on it
-    // (hoisting it earlier hides nothing).
+    // TMEM allocation, issued right before the barrier that waits on it.
     TmemAllocator tmem_allocator{};
     if (warp_idx == KernelTraits::KMmaWarpId) {
-        // Right-sized (KTmemColumns, see kernel_traits.cuh), not the full 512
-        // columns; shrinks the TMEM footprint, MMA geometry unchanged.
+        // Right-sized (KTmemColumns), not the full 512 columns.
         tmem_allocator.allocate(KernelTraits::KTmemColumns,
                                 &shared_storage.tmem_base_ptr);
     }
@@ -230,16 +228,14 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
     }
     TmemStorage tmem_storage = main_loop.init_tmem_tensors();
 
-    // The load warp never touches TMEM, so it skips set_tmem_offsets and with
-    // it the first tmem_base_ptr read (where tcgen05.alloc latency surfaces),
-    // reaching its first TMA issue earlier.
+    // The load warp skips set_tmem_offsets and the first tmem_base_ptr read
+    // (where alloc latency surfaces).
     if (!is_load_ab_warp) {
         main_loop.set_tmem_offsets(tmem_storage, shared_storage.tmem_base_ptr);
     }
 
     if (is_load_ab_warp) {
-        // Prologue warps need few registers — release to pool for epilogue
-        // warps.
+        // Prologue warps release registers to the pool.
         if constexpr (KernelTraits::KRedistributeRegs) {
             cutlass::arch::warpgroup_reg_dealloc<KernelTraits::KNumRegsOther>();
         }
@@ -263,16 +259,15 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
         if constexpr (KernelTraits::KRedistributeRegs) {
             cutlass::arch::warpgroup_reg_dealloc<KernelTraits::KNumRegsOther>();
         }
-        // Guarded so the rewriter (which static_asserts IsSfbRowShift) is not
-        // instantiated by every other config.
+        // Guarded so the rewriter (static_asserts IsSfbRowShift) is not
+        // instantiated elsewhere.
         if constexpr (KernelTraits::IsSfbRowShift) {
             main_loop.sfb_shift_rows(
                 mainloop_params, shared_storage, scheduler,
                 warp_idx - KernelTraits::KSfbTransposeWarpId);
         }
     } else if (warp_idx <= KernelTraits::KEpilogueWarpEndId) {
-        // Epilogue warps need the most registers for TMEM->reg->smem
-        // conversion.
+        // Epilogue warps need the most registers.
         if constexpr (KernelTraits::KRedistributeRegs) {
             cutlass::arch::warpgroup_reg_alloc<
                 KernelTraits::KNumRegsEpilogue>();
@@ -302,7 +297,7 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
         __syncthreads();
     }
 
-    // Then deallocate TMEM (must match the allocated column count).
+    // Deallocate TMEM (must match the allocated column count).
     if (warp_idx == KernelTraits::KMmaWarpId) {
         tmem_allocator.release_allocation_lock();
         tmem_allocator.free(shared_storage.tmem_base_ptr,
@@ -447,15 +442,15 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
                         "gemm_impl requires M to be divisible by KBlockM=",
                         KernelTraits::KBlockM, ", got ", params.m);
             if constexpr (KernelTraits::IsSfbUnaligned) {
-                // Unpacked 224-pair tiles load a run of whole 128-row SF
-                // atoms, which requires n to tile cleanly at 128.
+                // Unpacked 224-pair tiles load whole 128-row SF atoms, so n
+                // must tile at 128.
                 TORCH_CHECK(params.n % 128 == 0 && params.n >= 384,
                             "gemm_impl requires N to be a multiple of 128 and "
                             ">= 384 for KBlockN=",
                             KernelTraits::KBlockN, ", got ", params.n);
             } else if constexpr (KernelTraits::KEpiNeedsNPredicate) {
                 // Non-power-of-2 KBlockN (96/112/224) need not divide n; the
-                // epilogue predicates the overhang per KSubTileN sub-tile.
+                // overhang is predicated per sub-tile.
                 TORCH_CHECK(params.n % KernelTraits::KSubTileN == 0,
                             "gemm_impl with KBlockN=", KernelTraits::KBlockN,
                             " predicates the N overhang per ",
@@ -480,8 +475,7 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
     }
 }
 
-// Kernel pointer in, not a traits type: the caller picks between the
-// data-parallel and the stream-K instantiation of gemm_kernel.
+// Kernel-pointer launch: the caller picks data-parallel or stream-K.
 template <typename KernelTraits, typename MainloopParams,
           typename EpilogueParams, typename SchedulerParams>
 void LaunchGemmKernel(void const* kernel_ptr, dim3 dim_grid, dim3 dim_cluster,
@@ -521,8 +515,7 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
     static constexpr int KCTAsPerCluster = cute::size(ClusterShape_MNK{});
     // Same SM-count resolution as the dispatch-site tile heuristics.
     const int raw_sm_count = ResolveSmCount(sm_count);
-    // Round down to a multiple of KCTAsPerCluster so every cluster is fully
-    // occupied.
+    // Round down to a multiple of KCTAsPerCluster.
     const int runtime_sm_count =
         (raw_sm_count / KCTAsPerCluster) * KCTAsPerCluster;
     int M = params.m;
@@ -558,9 +551,8 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
     cute::Layout layout_C = cute::make_layout(
         cute::make_shape(M, N), cute::make_stride(N, cute::Int<1>{}));
 
-    // The scale tensors always cover whole 128-row SfAtom atoms even when the
-    // activation is only M rows. (BF16 passes null SF pointers; these layouts
-    // are then unused bookkeeping.)
+    // Scale tensors cover whole 128-row SfAtom atoms even for M < 128 rows
+    // (unused for BF16).
     const int M_sf = AlignSfM(M);
     typename KernelTraits::LayoutSFA layout_SFA =
         SwapAB ? KernelTraits::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
@@ -603,8 +595,8 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
                       cutlass::arch::sm100_smem_capacity_bytes,
                   "SMEM usage exceeded capacity");
 
-    // Tail-only stream-K fp32 workspace, allocated only if the scheduler split
-    // a tail: rem * splits * KNumCTA per-CTA slots of CtaShape_M x KBlockN.
+    // Stream-K fp32 workspace, allocated only when a tail was split:
+    // rem * splits * KNumCTA slots of CtaShape_M x KBlockN.
     static constexpr int KPartM = KernelTraits::KBlockM / KernelTraits::KNumCTA;
     static constexpr int KPartN = KernelTraits::KBlockN;
     at::Tensor streamk_ws;
@@ -631,10 +623,9 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
              params.situ, params.gate_ld,
              streamk_active ? streamk_ws.data_ptr<float>() : nullptr});
 
-    // Two instantiations, picked by pointer: data-parallel (unchanged codegen,
-    // used whenever nothing is split) and fused stream-K. The `if constexpr`
-    // keeps traits without KSupportsStreamK (all but BF16 dense no-bias
-    // no-alpha) from instantiating a dead stream-K copy.
+    // Two instantiations picked by pointer: data-parallel and fused
+    // stream-K; `if constexpr` keeps other traits from instantiating a dead
+    // stream-K copy.
     auto* kernel_ptr_dp = &gemm_kernel<KernelTraits, MainloopParams,
                                        EpilogueParams, SchedulerParams, false>;
     void const* kernel_ptr = (void const*)kernel_ptr_dp;
@@ -663,8 +654,7 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
     }
 
     if (streamk_active) {
-        // Reduce tail fp32 partials into D (whole tiles were already stored
-        // to D by the main launch).
+        // Reduce tail partials into D; whole tiles were already stored.
         launch_stream_k_reduce<TypeD, KPartM, KPartN, KernelTraits::KNumCTA>(
             static_cast<TypeD*>(params.ptr_d), streamk_ws.data_ptr<float>(),
             scheduler_params.streamk_tail_base, scheduler_params.streamk_rem,

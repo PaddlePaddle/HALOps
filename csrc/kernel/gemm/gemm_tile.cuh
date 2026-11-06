@@ -26,8 +26,7 @@ namespace halops {
 inline constexpr int kSwapEpiChunk = 2 * kMatRows;
 inline constexpr int kSfbRowShiftAlign = 64;
 
-// ---------------------------------------------------------------------------
-// Dense GEMM tile parameters; this is the only tile definition in the tree.
+// Dense GEMM tile parameters.
 //
 //   BM, BN, BK    KBlockM/N/K; for SwapAB, BM is the weight's M and BN the
 //                 activation extent.
@@ -46,9 +45,7 @@ inline constexpr int kSfbRowShiftAlign = 64;
 //   NTAIL         KForceEpiNPredicate (predicated store on power-of-2 N).
 //   BF16          KIsBF16 (native BF16 GEMM, no scale factors).
 //   ATOM          CTAs per MMA atom: 0 = auto (CM*CN > 1 ? 2 : 1), 1 = 1SM,
-//                 2 = 2x1SM. Decoupled from the cluster shape so a 1SM atom
-//                 can still sit in a multi-CTA cluster and share loads.
-// ---------------------------------------------------------------------------
+//                 2 = 2x1SM.
 template <int BM, int BN, int BK, int PST, int EST, int CM = 1, int CN = 1,
           int OVLP = 0, int REG = 208, bool SWZ = false, bool FENCE = false,
           bool SWAP = false, bool FP4 = false, int SFVS = 16,
