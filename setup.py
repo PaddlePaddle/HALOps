@@ -92,6 +92,7 @@ setup(
                 "csrc/kernel/mla/mla_prequant_x.cu",
                 "csrc/kernel/mla/mla_output_proj.cu",
                 "csrc/kernel/mla/combine_with_rope_quant.cu",
+                "csrc/kernel/indexer/indexer_prepare.cu",
                 "csrc/common/cpp_extensions.cc",
             ],
             extra_compile_args={"nvcc": gencode_flags},
