@@ -69,6 +69,16 @@ def _pow2_block_quant(w):
     return q.reshape(r, c).contiguous(), s.reshape(r // 128, c // 128).contiguous()
 
 
+def _mxfp8_quant(w):
+    """[rows, cols] -> (fp8 e4m3, uint8 UE8M0 scales [rows, cols/32]): one scale per row per 32 columns."""
+    r, c = w.shape
+    blocks = w.float().reshape(r, c // 32, 32)
+    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    exp = torch.ceil(torch.log2(amax / _FP8_MAX)).clamp(-126, 127)
+    q = (blocks / torch.exp2(exp)).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+    return q.reshape(r, c).contiguous(), (exp + 127).squeeze(-1).to(torch.uint8)
+
+
 def _quant_fp8_group_wise(x, group_size=128):
     """Per-token-dynamic quant over the last dim; `x` is [..., K], bf16 or fp32."""
     x_float = x.float()
@@ -290,13 +300,32 @@ class MoEParams:
         return self
 
     def init_tail_weights(self, *, seed: int = 1, device=None):
-        """The fused tail's operands: fc2 (e4m3, power-of-two 128x128 scales) and the RMSNorm weight."""
+        """The fused tail's operands: fc2 and the RMSNorm weight.
+
+        fc2 follows the latent recipe: e4m3 with power-of-two 128x128 scales for
+        "w8a8-blockwise", e4m3 with a UE8M0 scale per row per 32 columns for the MX
+        recipes. ``fc2_dequant`` is the fp32 weight the kernel should reproduce.
+        """
         dev = torch.device(device or "cuda")
         g = torch.Generator(device=dev).manual_seed(seed)
         h, z = self.hidden_size, self.latent_size
-        self.fc2_weight, self.fc2_scale = _pow2_block_quant(
-            torch.randn(h, z, device=dev, generator=g) * 0.05
-        )
+        w = torch.randn(h, z, device=dev, generator=g) * 0.05
+        if self.quant_mode == "w8a8-blockwise":
+            self.fc2_weight, self.fc2_scale = _pow2_block_quant(w)
+            self.fc2_dequant = (
+                self.fc2_weight.float()
+                * self.fc2_scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
+            )
+        else:
+            # Rows and column groups of different magnitude, so every scale matters.
+            w = w * torch.exp2(torch.randint(-1, 2, (h, 1), device=dev, generator=g))
+            w = w * torch.exp2(
+                torch.randint(-1, 2, (1, z // 32), device=dev, generator=g)
+            ).repeat_interleave(32, 1)
+            self.fc2_weight, self.fc2_scale = _mxfp8_quant(w)
+            self.fc2_dequant = self.fc2_weight.float() * torch.exp2(
+                self.fc2_scale.float() - 127
+            ).repeat_interleave(32, 1)
         self.norm_weight = (
             1.0 + 0.1 * torch.randn(z, device=dev, generator=g)
         ).bfloat16()
@@ -483,9 +512,7 @@ class MoERef:
         routed = torch.stack([t.float() for t in routed_outs]).sum(0).bfloat16().float()
         rms = torch.rsqrt(routed.pow(2).mean(-1, keepdim=True) + p.eps)
         normed = (routed * rms * p.norm_weight.float()).bfloat16().float()
-        fc2 = p.fc2_weight.float() * p.fc2_scale.repeat_interleave(
-            128, 0
-        ).repeat_interleave(128, 1)
+        fc2 = p.fc2_dequant
         return normed @ fc2.t() + torch.stack([t.float() for t in shared_outs]).sum(0)
 
     def __call__(self, input, top_k):

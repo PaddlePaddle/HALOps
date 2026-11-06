@@ -74,6 +74,39 @@ void CheckSharedExpertShape(const torch::Tensor& shared_up_weight,
                 "shared_down_weight must be [H, N].");
 }
 
+template <typename MoEDims>
+void CheckTailFc2Shape(const torch::Tensor& tail_fc2_weight,
+                       const torch::Tensor& tail_fc2_scale) {
+    using WeightQuant = typename moe::TailGeometryT<MoEDims>::WeightQuant;
+    TORCH_CHECK(tail_fc2_weight.scalar_type() == at::kFloat8_e4m3fn &&
+                    tail_fc2_weight.dim() == 2 &&
+                    tail_fc2_weight.size(0) == MoEDims::kHiddenSize &&
+                    tail_fc2_weight.size(1) == MoEDims::kLatentSize &&
+                    tail_fc2_weight.is_contiguous(),
+                "fc2_weight must be a contiguous [H, L] float8_e4m3fn.");
+    if constexpr (moe::TailGeometryT<MoEDims>::kMxfp8) {
+        TORCH_CHECK(tail_fc2_scale.scalar_type() == at::kByte &&
+                        tail_fc2_scale.dim() == 2 &&
+                        tail_fc2_scale.size(0) == MoEDims::kHiddenSize &&
+                        tail_fc2_scale.size(1) ==
+                            MoEDims::kLatentSize / WeightQuant::kBlockSize &&
+                        tail_fc2_scale.is_contiguous(),
+                    "this quant_mode takes a contiguous uint8 (UE8M0) "
+                    "fc2_scale of shape [H, L/32].");
+    } else {
+        constexpr std::int64_t kBlock = WeightQuant::kBlockSize;
+        TORCH_CHECK(
+            tail_fc2_scale.scalar_type() == at::kFloat &&
+                tail_fc2_scale.dim() == 2 &&
+                tail_fc2_scale.size(0) == MoEDims::kHiddenSize / kBlock &&
+                tail_fc2_scale.size(1) == MoEDims::kLatentSize / kBlock &&
+                tail_fc2_scale.is_contiguous(),
+            "this quant_mode takes a contiguous float32 fc2_scale of shape "
+            "[H/",
+            kBlock, ", L/", kBlock, "].");
+    }
+}
+
 // All CTAs must remain resident for the kernel lifetime.
 template <typename MoEDims>
 uint32_t CalculateGridSize(int device, cudaStream_t stream,
@@ -168,6 +201,7 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
         CheckLatentDownShape<MoEDims>(latent_down_weight);
     }
     CheckSharedExpertShape<MoEDims>(shared_up_weight, shared_down_weight);
+    CheckTailFc2Shape<MoEDims>(tail_fc2_weight, tail_fc2_scale);
 
     using Traits = moe::MoEKernelTraits<MoEDims>;
     using Mainloop = moe::CollectiveMainloopMoE<Traits>;

@@ -224,8 +224,14 @@ def low_latency_moe(
             "w8a8-blockwise", or shape [2048, 128] and dtype uint8 in the
             CUTLASS SfAtom layout (from ``group_wise_quant(use_swizzle=True)``)
             for "w8a8-mxfp8".
-        latent_up_weight (Tensor): [4096, 2048] float8_e4m3fn latent up weight.
-        latent_up_weight_scale (Tensor): [32, 16] float32 block scales, powers of two.
+        latent_up_weight (Tensor): [4096, 2048] float8_e4m3fn latent up weight
+            (the tail's fc2).
+        latent_up_weight_scale (Tensor): Scales of ``latent_up_weight``,
+            following the latent recipe of ``quant_mode``: shape [32, 16] and
+            dtype float32 (powers of two) for "w8a8-blockwise"; shape
+            [4096, 64] and dtype uint8 (UE8M0, one per row per 32 columns,
+            plain row-major as from ``group_wise_quant(use_swizzle=False)``,
+            not the SfAtom layout) for "w8a8-mxfp8" and "w4a8-mxfp4".
         norm_weight (Tensor): [2048] bfloat16 RMSNorm weight.
         out (Tensor): [T, 4096] bfloat16 output, identical across ranks.
         workspace (MoEWorkspace): Scratchpad and tail communication state
