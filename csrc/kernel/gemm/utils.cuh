@@ -70,16 +70,14 @@ struct GemmKernelConfig {
     static constexpr int KSfVecSize = 16;
     static constexpr int KNumRegsEpilogue = 208;
     static constexpr bool SkipTmemFence = false;
-    // Number of epilogue warp groups; 0 = auto (SwapAB ? 1 : 2).
-    // KEpiComputeN = KBlockN / count must be >= 32 when CtaM == 64, so narrow
-    // tiles (e.g. 64x32) need 1. Also drops the inter-warp-group barrier.
+    // Epilogue warp groups; 0 = auto (SwapAB ? 1 : 2). KEpiComputeN must be
+    // >= 32 when CtaM == 64, so narrow tiles (e.g. 64x32) need 1.
     static constexpr int KEpilogueWarpGroupsOverride = 0;
-    // Force KEpiNeedsNPredicate even for power-of-two KBlockN, so a wide tile
-    // can serve N % KBlockN != 0 (e.g. N=1600 on a 128-wide tile).
+    // Force N predication even for power-of-two KBlockN (e.g. N=1600 on a
+    // 128-wide tile).
     static constexpr bool KForceEpiNPredicate = false;
 };
 
-// BF16 tile definitions live in gemm_tile.cuh alongside the W8A8/W4A4 ones.
 static constexpr int get_num_warps(int load_c_warp_id, bool add_bias) {
     int last_warp = add_bias ? load_c_warp_id : (load_c_warp_id - 1);
     return ((last_warp + 4) / 4) * 4;
