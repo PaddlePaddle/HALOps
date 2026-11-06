@@ -189,6 +189,13 @@ struct SharedUpOutput {
     }
 };
 
+template <typename Dims>
+struct SharedDownOutput {
+    using ElementType = DataType::ElementOut;
+
+    alignas(16) ElementType data[Dims::kNumTokens * Dims::kHiddenSize];
+};
+
 // The up projection's output: the gated activation in expert-sorted rows.
 template <typename Dims>
 struct RoutedUpOutput {
@@ -272,6 +279,7 @@ struct MoEWorkspace {
     static constexpr uint32_t kSpecMaxGrid = moe::kSpecMaxGrid;
 
     SharedUpOut shared_up_out;
+    SharedDownOutput<Dims> shared_down_out;
 
     using LatentOut = LatentDownOutput<Dims>;
     LatentOut latent_down_out;

@@ -17,6 +17,7 @@
 #include <torch/extension.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -75,7 +76,8 @@ void CheckSharedExpertShape(const torch::Tensor& shared_up_weight,
 
 // All CTAs must remain resident for the kernel lifetime.
 template <typename MoEDims>
-uint32_t CalculateGridSize(int device, cudaStream_t stream) {
+uint32_t CalculateGridSize(int device, cudaStream_t stream,
+                           std::uint32_t grid_cap = 0u) {
     using Traits = moe::MoEKernelTraits<MoEDims>;
     using Mainloop = moe::CollectiveMainloopMoE<Traits>;
 
@@ -84,6 +86,7 @@ uint32_t CalculateGridSize(int device, cudaStream_t stream) {
 
     uint32_t grid_size =
         std::min(static_cast<std::uint32_t>(sm_count), Traits::kMaxGrid);
+    if (grid_cap != 0u) grid_size = std::min(grid_size, grid_cap);
     constexpr std::uint32_t kClusterSize = Traits::kClusterSize;
     if constexpr (kClusterSize > 1u) {
         // Limit the grid to clusters that can be resident together.
@@ -140,10 +143,15 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
              const torch::Tensor& shared_down_weight_scale,
              const torch::Tensor& latent_down_weight,
              const torch::Tensor& latent_down_weight_scale,
-             const torch::Tensor& workspace, const torch::Tensor& routed_out,
-             const torch::Tensor& shared_out, int64_t top_k,
-             int64_t scoring_func, bool renormalize, int64_t activation,
-             double situ_beta, double situ_linear_beta) {
+             const torch::Tensor& tail_fc2_weight,
+             const torch::Tensor& tail_fc2_scale,
+             const torch::Tensor& tail_norm_weight,
+             const torch::Tensor& tail_epochs,
+             const torch::Tensor& tail_uc_bases, const torch::Tensor& workspace,
+             const torch::Tensor& tail_out, int64_t top_k, int64_t scoring_func,
+             int64_t activation, int64_t tail_rank, int64_t tail_mc_base,
+             int64_t tail_grid_cap, bool renormalize, double situ_beta,
+             double situ_linear_beta, double tail_eps) {
     const uint32_t num_tokens = static_cast<uint32_t>(input.size(0));
     TORCH_CHECK(num_tokens >= 1 && num_tokens <= MoEDims::kNumTokens,
                 "token count M=", num_tokens,
@@ -163,6 +171,7 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
 
     using Traits = moe::MoEKernelTraits<MoEDims>;
     using Mainloop = moe::CollectiveMainloopMoE<Traits>;
+    using TailGeometry = moe::TailGeometryT<MoEDims>;
 
     typename Mainloop::Arguments args{};
     args.num_tokens = num_tokens;
@@ -221,9 +230,7 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
                                   latent_down_weight_scale.const_data_ptr())
                             : nullptr;
 
-    args.routed_out = static_cast<DataType::ElementOut*>(routed_out.data_ptr());
     args.workspace = static_cast<char*>(workspace.data_ptr());
-    args.shared_out = static_cast<DataType::ElementOut*>(shared_out.data_ptr());
 
     const int device = input.get_device();
     int l2_cached_bytes = 0;
@@ -232,8 +239,30 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
         l2_cached_bytes > 0 ? static_cast<uint32_t>(l2_cached_bytes) : 0u;
 
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device).stream();
-    const uint32_t grid_size = CalculateGridSize<MoEDims>(device, stream);
+    const std::uint32_t grid_cap = static_cast<std::uint32_t>(tail_grid_cap);
+    const int64_t* uc_bases = tail_uc_bases.const_data_ptr<int64_t>();
+    for (int r = 0; r < MoEDims::KernelConfig::kTailWorld; ++r) {
+        args.tail_uc_base[r] = reinterpret_cast<std::uint8_t*>(uc_bases[r]);
+    }
+    args.tail_mc_base = reinterpret_cast<std::uint8_t*>(
+        static_cast<std::uintptr_t>(tail_mc_base));
+    args.tail_epochs = static_cast<std::uint32_t*>(tail_epochs.data_ptr());
+    args.tail_fc2_w8 = static_cast<const typename TailGeometry::ElementWeight*>(
+        tail_fc2_weight.const_data_ptr());
+    args.tail_fc2_scale =
+        static_cast<const typename TailGeometry::ElementScale*>(
+            tail_fc2_scale.const_data_ptr());
+    args.tail_norm_weight = static_cast<const DataType::ElementA*>(
+        tail_norm_weight.const_data_ptr());
+    args.tail_out = static_cast<DataType::ElementOut*>(tail_out.data_ptr());
+    args.tail_eps = static_cast<float>(tail_eps);
+    args.tail_rank = static_cast<std::uint32_t>(tail_rank);
 
+    const uint32_t grid_size =
+        CalculateGridSize<MoEDims>(device, stream, grid_cap);
+    TORCH_CHECK(grid_size >= TailGeometry::kNumCtas,
+                "The shared expert and tail need at least ",
+                TailGeometry::kNumCtas, " resident CTAs; got ", grid_size, ".");
     const cudaError_t launch_status =
         moe::LaunchMoEKernel<MoEDims>(args, grid_size, stream);
     TORCH_CHECK(launch_status == cudaSuccess,
@@ -273,31 +302,26 @@ int64_t GetWorkspaceSize(const std::optional<torch::Tensor>& input) {
     return input->size(0) <= 8 ? kBs8Bytes : kBs16Bytes;
 }
 
-torch::Tensor GetWorkspace(const torch::Tensor& input) {
-    return torch::zeros(
-        {GetWorkspaceSize(input)},
-        torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
-}
-
-void LowLatencyMoE(const torch::Tensor& input,
-                   const torch::Tensor& router_weight,
-                   const torch::Tensor& expert_up_weights,
-                   const torch::Tensor& expert_up_weights_scale,
-                   const torch::Tensor& expert_down_weights,
-                   const torch::Tensor& expert_down_weights_scale,
-                   const torch::Tensor& shared_up_weight,
-                   const torch::Tensor& shared_up_weight_scale,
-                   const torch::Tensor& shared_down_weight,
-                   const torch::Tensor& shared_down_weight_scale,
-                   const std::optional<torch::Tensor>& latent_down_weight,
-                   const std::optional<torch::Tensor>& latent_down_weight_scale,
-                   const torch::Tensor& workspace,
-                   const torch::Tensor& routed_out,
-                   const torch::Tensor& shared_out, int64_t top_k,
-                   int64_t num_router_gates, const std::string& scoring_func,
-                   bool renormalize, const std::string& activation,
-                   double situ_beta, double situ_linear_beta,
-                   const std::string& quant_mode) {
+void LowLatencyMoE(
+    const torch::Tensor& input, const torch::Tensor& router_weight,
+    const torch::Tensor& expert_up_weights,
+    const torch::Tensor& expert_up_weights_scale,
+    const torch::Tensor& expert_down_weights,
+    const torch::Tensor& expert_down_weights_scale,
+    const torch::Tensor& shared_up_weight,
+    const torch::Tensor& shared_up_weight_scale,
+    const torch::Tensor& shared_down_weight,
+    const torch::Tensor& shared_down_weight_scale,
+    const torch::Tensor& latent_down_weight,
+    const torch::Tensor& latent_down_weight_scale,
+    const torch::Tensor& tail_fc2_weight, const torch::Tensor& tail_fc2_scale,
+    const torch::Tensor& tail_norm_weight, const torch::Tensor& tail_epochs,
+    const torch::Tensor& tail_uc_bases, const torch::Tensor& workspace,
+    const torch::Tensor& tail_out, int64_t top_k, int64_t num_router_gates,
+    int64_t tail_rank, int64_t tail_mc_base, int64_t tail_grid_cap,
+    const std::string& scoring_func, const std::string& activation,
+    bool renormalize, double situ_beta, double situ_linear_beta,
+    double tail_eps, const std::string& quant_mode) {
     TORCH_CHECK(
         quant_mode == "w8a8-mxfp8" || quant_mode == "w4a8-mxfp4" ||
             quant_mode == "w8a8-blockwise",
@@ -305,10 +329,6 @@ void LowLatencyMoE(const torch::Tensor& input,
         quant_mode, ".");
     TORCH_CHECK(num_router_gates == 2, "Only support 2 router gates, got ",
                 num_router_gates, ".");
-    TORCH_CHECK(
-        latent_down_weight.has_value() && latent_down_weight_scale.has_value(),
-        "latent_down_weight and latent_down_weight_scale should be set.");
-
     TORCH_CHECK(input.dim() == 2, "The input' shape must be [tokens, hidden].");
 
     const int64_t num_tokens = input.size(0);
@@ -329,28 +349,22 @@ void LowLatencyMoE(const torch::Tensor& input,
     const int64_t scoring_type = scoring_func == "sigmoid" ? 0 : 1;
     const int64_t activation_type = activation == "silu" ? 0 : 1;
 
-    const torch::Tensor absent;
-    const torch::Tensor& latent_weight =
-        latent_down_weight.has_value() ? *latent_down_weight : absent;
-    const torch::Tensor& latent_scale = latent_down_weight_scale.has_value()
-                                            ? *latent_down_weight_scale
-                                            : absent;
-
     const auto launch_func = [&](auto dims_tag) {
         using MoEDims = decltype(dims_tag);
         moe::MoEImpl<MoEDims>(
             input, router_weight, expert_up_weights, expert_up_weights_scale,
             expert_down_weights, expert_down_weights_scale, shared_up_weight,
             shared_up_weight_scale, shared_down_weight,
-            shared_down_weight_scale, latent_weight, latent_scale, workspace,
-            routed_out, shared_out, top_k, scoring_type, renormalize,
-            activation_type, situ_beta, situ_linear_beta);
+            shared_down_weight_scale, latent_down_weight,
+            latent_down_weight_scale, tail_fc2_weight, tail_fc2_scale,
+            tail_norm_weight, tail_epochs, tail_uc_bases, workspace, tail_out,
+            top_k, scoring_type, activation_type, tail_rank, tail_mc_base,
+            tail_grid_cap, renormalize, situ_beta, situ_linear_beta, tail_eps);
     };
 
     constexpr auto kBWFP8 = moe::QuantMethod::kBlockwiseFP8;
     constexpr auto kMXFP8 = moe::QuantMethod::kMXFP8;
     constexpr auto kMXFP4 = moe::QuantMethod::kMXFP4;
-
     using QuantBWFP8 = moe::QuantConfig<kBWFP8, kBWFP8, kBWFP8>;
     using QuantMXFP8 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP8>;
     using QuantMXFP4 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP4>;
@@ -376,9 +390,18 @@ void LowLatencyMoE(const torch::Tensor& input,
     }
 }
 
+int64_t MoETailRegionBytes(bool wide) {
+    using QuantBWFP8 = moe::QuantConfig<>;
+    return wide ? moe::tail_region_bytes<
+                      moe::Dims_BS16_E512_N512_K2048_SM100<QuantBWFP8{}>>()
+                : moe::tail_region_bytes<
+                      moe::Dims_BS8_E512_N512_K2048_SM100<QuantBWFP8{}>>();
+}
+
 int64_t RouterTileM(int64_t num_tokens = 0) {
-    using Bs8 = moe::Dims_BS8_E512_N512_K2048_SM100<moe::QuantConfig<>{}>;
-    using Bs16 = moe::Dims_BS16_E512_N512_K2048_SM100<moe::QuantConfig<>{}>;
+    using QuantBWFP8 = moe::QuantConfig<>;
+    using Bs8 = moe::Dims_BS8_E512_N512_K2048_SM100<QuantBWFP8{}>;
+    using Bs16 = moe::Dims_BS16_E512_N512_K2048_SM100<QuantBWFP8{}>;
     return (num_tokens > 8) ? moe::RouterGemmTraits<Bs16>::kTileShapeM
                             : moe::RouterGemmTraits<Bs8>::kTileShapeM;
 }

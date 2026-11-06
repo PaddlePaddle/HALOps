@@ -660,6 +660,8 @@ struct LatentDownProjection<KernelTraits, false>
     static constexpr std::uint32_t kNumAccSlots = LatentDownGemm::kNumAccSlots;
     static constexpr std::uint32_t kAccColumns =
         get_gemm_acc_columns<Traits::UpGemm>();
+    static constexpr bool kLocalScale =
+        LatentDownGemm::OutputQuant::kBlockSize <= Base::kTileShapeM;
 
     __device__ static void run(
         CUtensorMap const& tma_latent_down_weight_desc,
@@ -791,7 +793,7 @@ struct LatentDownProjection<KernelTraits, false>
     __device__ static float cluster_token_max(SharedStorage* __restrict__ smem,
                                               std::uint32_t tok) {
         float amax = smem->latent_down.token_amax[tok];
-        if constexpr (LatentDownGemm::kClusterSize > 1u) {
+        if constexpr (!kLocalScale) {
 #pragma unroll
             for (std::uint32_t rank = 0; rank < LatentDownGemm::kClusterSize;
                  ++rank) {
@@ -874,7 +876,6 @@ struct LatentDownProjection<KernelTraits, false>
         static_assert(kCells <= Traits::kThreads,
                       "one output cell per thread keeps the quantized bytes in "
                       "registers across the cluster barrier");
-        constexpr bool kLocalScale = LatentDownGemm::kClusterSize == 1u;
         const bool owns_slice = Base::split_idx() == 0u;
         if (kLocalScale && !owns_slice) {
             __syncthreads();

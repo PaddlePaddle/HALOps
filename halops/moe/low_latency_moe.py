@@ -14,12 +14,16 @@
 # limitations under the License.
 """
 
+from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
 import torch
 
 import halops.halops_kernel as halops_kernel
 from halops.moe.low_latency_moe_utils import (
+    _NARROW_TOKENS,
+    _TAIL_ALIGN,
+    _check_workspace,
     _interleave_up_for_pair_layout,
     _pack_router_weight,
     _prepare_shared_expert_up_weight,
@@ -28,11 +32,98 @@ from halops.moe.low_latency_moe_utils import (
 )
 
 __all__ = [
+    "MoEWorkspace",
     "low_latency_moe",
     "get_workspace_for_moe",
     "get_workspace_size_for_moe",
     "transform_weights_for_moe",
 ]
+
+
+@dataclass
+class MoEWorkspace:
+    """Scratchpad and tail communication state of ``low_latency_moe``.
+
+    The kernel has a narrow (1 <= T <= 8) and a wide (9 <= T <= 16)
+    schedule; each has its own scratchpad and tail layout, so a workspace is
+    bound to one of them.  ``buffer`` is the head of one NVLS multicast
+    capable symmetric region whose tail part is the fused tail's mailbox.
+    """
+
+    buffer: torch.Tensor
+    uc_bases: torch.Tensor
+    epochs: torch.Tensor
+    rank: int
+    world: int
+    wide: bool
+    mc_base: int
+    _keepalive: tuple
+
+
+def _workspace_layout(input: Optional[torch.Tensor]):
+    """Return (scratchpad bytes, tail offset, total bytes) of the symmetric region."""
+    scratch = int(halops_kernel.moe_get_workspace_size(input))
+    offset = -(-scratch // _TAIL_ALIGN) * _TAIL_ALIGN
+    if input is None:
+        tail = max(int(halops_kernel.moe_tail_region_bytes(w)) for w in (False, True))
+    else:
+        tail = int(halops_kernel.moe_tail_region_bytes(input.size(0) > _NARROW_TOKENS))
+    return scratch, offset, offset + tail
+
+
+def get_workspace_for_moe(
+    input: torch.Tensor,
+    group_name: str,
+    rank: int,
+    world: int,
+) -> MoEWorkspace:
+    """Allocate the workspace of ``low_latency_moe`` for ``input``'s token count.
+
+    Collective over ``group_name``.  Allocate it once, before any CUDA-graph
+    capture, and reuse it across calls and graph replays; it is returned
+    zero-initialized.  A workspace must always be launched with the same
+    grid.
+
+    Args:
+        input: [T, 4096] bfloat16 CUDA tensor; T selects the schedule.
+        group_name: Name of the torch process group of the tensor-parallel
+            ranks.
+        rank: Rank in that group.
+        world: Size of that group; this build requires 4.
+
+    Returns:
+        The workspace to pass to ``low_latency_moe``.
+    """
+    from torch._C._distributed_c10d import _SymmetricMemory
+
+    wide = input.size(0) > _NARROW_TOKENS
+    device = input.device
+    scratch, offset, nbytes = _workspace_layout(input)
+    with torch.inference_mode(False):
+        region = _SymmetricMemory.empty_strided_p2p(
+            (nbytes,), [1], torch.uint8, device, group_name
+        )
+    handle = _SymmetricMemory.rendezvous(region)
+    if handle is None or handle.multicast_ptr == 0:
+        raise RuntimeError("the fused tail needs an NVLS multicast-capable region")
+    region.zero_()
+    peers = [handle.get_buffer(r, [nbytes], torch.uint8) for r in range(world)]
+    uc_bases = torch.tensor(
+        [b.data_ptr() + offset for b in peers], dtype=torch.int64, device="cpu"
+    )
+    epochs = torch.zeros(1, dtype=torch.int32, device=device)
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    return MoEWorkspace(
+        buffer=region[:scratch],
+        rank=rank,
+        world=world,
+        wide=wide,
+        mc_base=int(handle.multicast_ptr) + offset,
+        uc_bases=uc_bases,
+        epochs=epochs,
+        _keepalive=(region, peers),
+    )
 
 
 def low_latency_moe(
@@ -46,11 +137,13 @@ def low_latency_moe(
     shared_up_weight_scale: torch.Tensor,
     shared_down_weight: torch.Tensor,
     shared_down_weight_scale: torch.Tensor,
-    latent_down_weight: Optional[torch.Tensor],
-    latent_down_weight_scale: Optional[torch.Tensor],
-    workspace: torch.Tensor,
-    routed_out: torch.Tensor,
-    shared_out: torch.Tensor,
+    latent_down_weight: torch.Tensor,
+    latent_down_weight_scale: torch.Tensor,
+    latent_up_weight: torch.Tensor,
+    latent_up_weight_scale: torch.Tensor,
+    norm_weight: torch.Tensor,
+    out: torch.Tensor,
+    workspace: MoEWorkspace,
     top_k: int,
     num_router_gates: int = 2,
     scoring_func: str = "sigmoid",
@@ -58,13 +151,15 @@ def low_latency_moe(
     activation: str = "silu",
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
+    eps: float = 1e-6,
     quant_mode: str = "w8a8-blockwise",
+    grid_cap: int = 0,
 ) -> None:
     """MoE forward pass on Blackwell SM100, support latent.
 
     Runs the router, the latent down-projection, the routed experts' fused
     up/down projections and the shared expert for 1..16 tokens, writing
-    ``routed_out`` and ``shared_out`` in place.  The shipped schedule is
+    ``out`` in place.  The shipped schedule is
     fixed to E=512 experts, hidden size 4096, intermediate size 512 and
     latent size 2048.  Every weight group runs block-wise FP8 (128x128 blocks)
     or MXFP8 (1x32 UE8M0 groups); the "w4a8-mxfp4" recipe packs only the routed
@@ -76,6 +171,18 @@ def low_latency_moe(
     weights are quantized directly in the kernel layout and passed as-is.
     This build runs the latent stage, so ``latent_down_weight`` and
     ``latent_down_weight_scale`` are required.
+
+    The fused tail always runs as the kernel's last phase (the same single
+    launch)::
+
+        out = fc2(RMSNorm(AllReduce(routed))) + AllReduce(shared)
+
+    where ``routed`` is this rank's combined routed latent and ``shared`` its
+    partial shared-expert output (computed in-kernel, kept in ``workspace``).  Both
+    AllReduces run over the tensor-parallel group of ``workspace`` (4 ranks, NVLS
+    multicast).  A scratchpad must always be launched with the same grid, so
+    keep ``grid_cap`` fixed per workspace; the tail needs the shared-expert
+    blocks and its own CTAs inside the grid.
 
     Args:
         input (Tensor): Activations, shape [T, 4096], dtype bfloat16, with
@@ -117,13 +224,12 @@ def low_latency_moe(
             "w8a8-blockwise", or shape [2048, 128] and dtype uint8 in the
             CUTLASS SfAtom layout (from ``group_wise_quant(use_swizzle=True)``)
             for "w8a8-mxfp8".
-        workspace (Tensor): 1-D uint8 workspace of
-            ``get_workspace_size_for_moe(input)`` bytes from
-            ``get_workspace_for_moe``.
-        routed_out (Tensor): Routed-expert output written in place, shape
-            [T, 2048], dtype bfloat16.
-        shared_out (Tensor): Shared-expert output written in place, shape
-            [T, 4096], dtype bfloat16.
+        latent_up_weight (Tensor): [4096, 2048] float8_e4m3fn latent up weight.
+        latent_up_weight_scale (Tensor): [32, 16] float32 block scales, powers of two.
+        norm_weight (Tensor): [2048] bfloat16 RMSNorm weight.
+        out (Tensor): [T, 4096] bfloat16 output, identical across ranks.
+        workspace (MoEWorkspace): Scratchpad and tail communication state
+            from ``get_workspace_for_moe``, matching the token schedule.
         top_k (int): Experts selected per token, in [1, 10].
         num_router_gates (int, optional): Router gates merged into
             ``router_weight``; this build requires 2. Default: 2.
@@ -137,14 +243,18 @@ def low_latency_moe(
             Must be finite. Default: 4.0.
         situ_linear_beta (float, optional): SiTU up soft cap; <= 0 disables
             it. Must be finite. Default: 25.0.
+        eps (float, optional): RMSNorm epsilon. Default: 1e-6.
         quant_mode (str, optional): Quantization recipe: "w8a8-blockwise"
             (every group block-wise), "w8a8-mxfp8" (every group MXFP8) or
             "w4a8-mxfp4" (routed experts MXFP4, latent and shared MXFP8).
             Default: "w8a8-blockwise".
+        grid_cap (int, optional): Maximum resident CTAs; 0 uses the device
+            limit. Keep this fixed for each workspace. Default: 0.
 
     Returns:
-        None. Both outputs are written in place.
+        None. The outputs are written in place.
     """
+    _check_workspace(workspace, input.size(0))
     halops_kernel.low_latency_moe(
         input,
         router_weight,
@@ -158,39 +268,30 @@ def low_latency_moe(
         shared_down_weight_scale,
         latent_down_weight,
         latent_down_weight_scale,
-        workspace,
-        routed_out,
-        shared_out,
+        latent_up_weight,
+        latent_up_weight_scale,
+        norm_weight,
+        workspace.epochs,
+        workspace.uc_bases,
+        workspace.buffer,
+        out,
         top_k,
         num_router_gates,
+        workspace.rank,
+        workspace.mc_base,
+        grid_cap,
         scoring_func,
-        renormalize,
         activation,
+        renormalize,
         situ_beta,
         situ_linear_beta,
+        eps,
         quant_mode,
     )
 
 
-def get_workspace_for_moe(input: torch.Tensor) -> torch.Tensor:
-    """Allocate the uint8 workspace of ``low_latency_moe`` for ``input``'s token count.
-
-    Allocate it once, before any CUDA-graph capture, and reuse it across
-    calls and graph replays; it is returned zero-initialized.
-
-    Args:
-        input (Tensor): Activations, shape [T, 4096], dtype bfloat16; T
-            selects the schedule.
-
-    Returns:
-        1-D uint8 workspace tensor of ``get_workspace_size_for_moe(input)``
-        bytes, on ``input``'s device.
-    """
-    return halops_kernel.moe_get_workspace(input)
-
-
 def get_workspace_size_for_moe(input: Optional[torch.Tensor] = None) -> int:
-    """Return the workspace size in bytes for a token count.
+    """Return the size in bytes of the workspace's symmetric region for a token count.
 
     Args:
         input (Tensor, optional): Activations, shape [T, 4096], dtype
@@ -198,15 +299,15 @@ def get_workspace_size_for_moe(input: Optional[torch.Tensor] = None) -> int:
             returned. Default: None.
 
     Returns:
-        Workspace size in bytes.
+        Size in bytes of the scratchpad plus the tail mailbox.
     """
-    return halops_kernel.moe_get_workspace_size(input)
+    return _workspace_layout(input)[2]
 
 
 def transform_weights_for_moe(
-    router_weight: Union[torch.Tensor, Sequence[torch.Tensor]],
-    expert_up_weights: torch.Tensor,
-    shared_up_weight: torch.Tensor,
+    router_weight: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]],
+    expert_up_weights: Optional[torch.Tensor],
+    shared_up_weight: Optional[torch.Tensor],
     num_tokens: int = 1,
     num_router_gates: int = 2,
     expert_up_weights_scale: Optional[torch.Tensor] = None,
@@ -227,15 +328,17 @@ def transform_weights_for_moe(
     here.
 
     ``num_tokens`` selects the router schedule and must match the ``low_latency_moe``
-    call.
+    call.  Every operand is optional: only the ones that are given are packed (and
+    returned), e.g. to pack the experts as soon as they are loaded and the router once
+    per schedule.
 
     Args:
-        router_weight (Tensor): Router weight, shape [K, E], dtype bfloat16;
+        router_weight (Tensor, optional): Router weight, shape [K, E], dtype bfloat16;
             shape [G, K, E] or a sequence of G [K, E] tensors is also
             accepted, and a single [K, E] weight is reused for every gate.
-        expert_up_weights (Tensor): Routed weights, shape [E, 2N, K], dtype
+        expert_up_weights (Tensor, optional): Routed weights, shape [E, 2N, K], dtype
             float8_e4m3fn; rows [0, N) are gate and [N, 2N) up.
-        shared_up_weight (Tensor): Shared-expert weights, shape [2N, H],
+        shared_up_weight (Tensor, optional): Shared-expert weights, shape [2N, H],
             dtype float8_e4m3fn, same gate/up split.
         num_tokens (int, optional): Token count of the ``low_latency_moe``
             call, which picks the router tile M. Default: 1.
@@ -272,11 +375,14 @@ def transform_weights_for_moe(
           when ``shared_up_weight_scale`` is given.
     """
     packed = {}
-    packed["router_weight"] = _pack_router_weight(
-        _router_gates(router_weight, num_router_gates), num_tokens
-    )
-    packed["expert_up_weights"] = _interleave_up_for_pair_layout(expert_up_weights)
-    packed["shared_up_weight"] = _prepare_shared_expert_up_weight(shared_up_weight)
+    if router_weight is not None:
+        packed["router_weight"] = _pack_router_weight(
+            _router_gates(router_weight, num_router_gates), num_tokens
+        )
+    if expert_up_weights is not None:
+        packed["expert_up_weights"] = _interleave_up_for_pair_layout(expert_up_weights)
+    if shared_up_weight is not None:
+        packed["shared_up_weight"] = _prepare_shared_expert_up_weight(shared_up_weight)
     if expert_up_weights_scale is not None:
         packed["expert_up_weights_scale"] = _prepare_up_scale(expert_up_weights_scale)
     if shared_up_weight_scale is not None:

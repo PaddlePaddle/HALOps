@@ -36,6 +36,7 @@ def low_latency_mma_gemm(
     output2: Optional[torch.Tensor] = None,
     sm_count: int = -1,
     use_pdl: bool = True,
+    use_sigmoid: bool = False,
 ) -> None:
     """Low-latency W8A8-MXFP8 GEMM for decode-sized M (M <= 16).
 
@@ -73,6 +74,8 @@ def low_latency_mma_gemm(
             combinable with ``input2``.
         sm_count: Number of SMs to use (-1 for all available).
         use_pdl: Enable Programmatic Dependent Launch (on by default).
+        use_sigmoid: Write ``torch.sigmoid`` of the bf16 result instead.
+            Not combinable with ``input2`` or ``output2``.
 
     Returns:
         None. The result is written in-place to output (and output2).
@@ -101,4 +104,5 @@ def low_latency_mma_gemm(
         output2,
         sm_count,
         use_pdl,
+        use_sigmoid,
     )

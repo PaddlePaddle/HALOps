@@ -26,8 +26,10 @@
 #include "kernel/moe/moe_mainloop_routed_up.cuh"
 #include "kernel/moe/moe_mainloop_router.cuh"
 #include "kernel/moe/moe_mainloop_shared.cuh"
+#include "kernel/moe/moe_mainloop_tail.cuh"
 #include "kernel/moe/moe_scheduler.cuh"
 #include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_tail.cuh"
 #include "kernel/moe/moe_tma.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/moe_workspace.cuh"
@@ -43,6 +45,8 @@ struct CollectiveMainloopMoE {
     using Workspace = MoEWorkspace<Dims>;
     using Router = RouterProjection<KernelTraits, Traits::RouterGemm::kUseUmma>;
     using Latent = LatentDownProjection<KernelTraits>;
+    using Tail = TailPhase<KernelTraits>;
+    using TailGeometry = TailGeometryT<Dims>;
 
     // Routing tables are copied as 4-byte words.
     static constexpr std::uint32_t kRoutingTableWords =
@@ -79,16 +83,23 @@ struct CollectiveMainloopMoE {
         const typename Traits::LatentDownGemm::MmaElement* latent_down_weight;
         const typename Traits::LatentDownGemm::ElementScale*
             latent_down_weight_scale;
-        DataType::ElementOut* routed_out;
-        DataType::ElementOut* shared_out;
+        const typename TailGeometry::ElementWeight* tail_fc2_w8;
+        const typename TailGeometry::ElementScale* tail_fc2_scale;
+        const DataType::ElementA* tail_norm_weight;
+        std::uint8_t* tail_uc_base[TailGeometryT<Dims>::kWorld];
+        std::uint8_t* tail_mc_base;
+        std::uint32_t* tail_epochs;
+        DataType::ElementOut* tail_out;
         void* workspace;
         std::uint32_t top_k;
+        std::uint32_t tail_rank;
         ScoringFunc scoring_func;
         bool renormalize;
         Activation activation;
         float situ_beta;
         float situ_linear_beta;
         std::uint32_t l2_cached_bytes;
+        float tail_eps;
     };
 
     // Device-side launch parameters.
@@ -108,7 +119,6 @@ struct CollectiveMainloopMoE {
             Dims>::MmaElement* __restrict__ expert_weights_down;
         const typename RoutedDownGemmTraits<
             Dims>::ElementScale* __restrict__ expert_scales_down;
-        DataType::ElementOut* __restrict__ activations_out;
         const typename Traits::LatentDownGemm::
             MmaElement* __restrict__ latent_down_weight;
         const typename Traits::LatentDownGemm::
@@ -121,7 +131,14 @@ struct CollectiveMainloopMoE {
             Dims>::MmaElement* __restrict__ shared_down_weight;
         const typename SharedDownGemmTraits<
             Dims>::ElementScale* __restrict__ shared_down_scale;
+        const typename TailGeometry::ElementWeight* tail_fc2_w8;
+        const typename TailGeometry::ElementScale* tail_fc2_scale;
+        const DataType::ElementA* tail_norm_weight;
+        std::uint8_t* tail_uc_base[TailGeometryT<Dims>::kWorld];
+        std::uint8_t* tail_mc_base;
+        std::uint32_t* tail_epochs;
         DataType::ElementOut* __restrict__ shared_out;
+        DataType::ElementOut* tail_out;
         void* __restrict__ scratchpad;
         std::uint32_t top_k;
         ScoringFunc scoring_func;
@@ -131,6 +148,9 @@ struct CollectiveMainloopMoE {
         float situ_linear_beta;
         // Evict weights first when their working set exceeds L2 capacity.
         std::uint32_t l2_expert_capacity;
+        float tail_eps;
+        std::uint32_t tail_shared_ctas;
+        std::uint32_t tail_rank;
         alignas(128) CUtensorMap tma_up_weights_desc;
         alignas(128) CUtensorMap tma_input_desc;
         // Router and latent input share the K-tile descriptor.
@@ -155,21 +175,35 @@ struct CollectiveMainloopMoE {
         params.expert_scales_up = args.expert_up_weights_scale;
         params.expert_weights_down = args.expert_down_weights;
         params.expert_scales_down = args.expert_down_weights_scale;
-        params.activations_out = args.routed_out;
         params.latent_down_weight = args.latent_down_weight;
         params.latent_down_weight_scale = args.latent_down_weight_scale;
         params.shared_up_weight = args.shared_up_weight;
         params.shared_up_scale = args.shared_up_weight_scale;
         params.shared_down_weight = args.shared_down_weight;
         params.shared_down_scale = args.shared_down_weight_scale;
-        params.shared_out = args.shared_out;
+        params.tail_fc2_w8 = args.tail_fc2_w8;
+        params.tail_fc2_scale = args.tail_fc2_scale;
+        params.tail_norm_weight = args.tail_norm_weight;
+        // The shared expert's partial output lives in the workspace.
+        params.shared_out = reinterpret_cast<DataType::ElementOut*>(
+            static_cast<char*>(args.workspace) +
+            offsetof(Workspace, shared_down_out));
+        params.tail_out = args.tail_out;
         params.scratchpad = args.workspace;
+        for (int r = 0; r < TailGeometryT<Dims>::kWorld; ++r) {
+            params.tail_uc_base[r] = args.tail_uc_base[r];
+        }
+        params.tail_mc_base = args.tail_mc_base;
+        params.tail_epochs = args.tail_epochs;
         params.top_k = args.top_k;
         params.scoring_func = args.scoring_func;
         params.renormalize = args.renormalize;
         params.activation = args.activation;
         params.situ_beta = args.situ_beta;
         params.situ_linear_beta = args.situ_linear_beta;
+        params.tail_eps = args.tail_eps;
+        params.tail_shared_ctas = SharedDownGemmTraits<Dims>::kNumCtas;
+        params.tail_rank = args.tail_rank;
 
         const std::uint64_t expert_width =
             args.latent_size > 0u ? args.latent_size : args.hidden_size;
@@ -263,6 +297,12 @@ struct CollectiveMainloopMoE {
         }
         Down::run(params.tma_shared_down_desc, params.shared_down_scale,
                   params.shared_out, workspace, smem, batch_size);
+        __syncthreads();
+        if (threadIdx.x == 0u) {
+            __threadfence();
+            workspace->cta_comm.publish_shared_down_done(smem->launch_parity,
+                                                         1u);
+        }
     }
 
     // Compute router logits and build routing tables.
@@ -562,8 +602,6 @@ struct CollectiveMainloopMoE {
                             CtaGroup<Traits::kCtasPerExpert> const& cta_group) {
         Workspace* __restrict__ workspace =
             reinterpret_cast<Workspace*>(params.scratchpad);
-        DataType::ElementOut* __restrict__ activations_out =
-            params.activations_out;
         const std::uint32_t batch_size = params.num_tokens;
         constexpr std::uint32_t kDownOutputColsPerCta =
             Traits::DownGemm::MmaCore::kTileShapeM;
@@ -577,7 +615,7 @@ struct CollectiveMainloopMoE {
         const std::uint32_t num_cells = batch_size * kDownOutputColsPerCta;
         const std::uint32_t top_k = params.top_k;
 
-        // Waits are warp-uniform; every lane acquires output readiness.
+        // Every lane acquires readiness before pushing its output to the tail.
         static_assert(kDownOutputColsPerCta % WarpRole::kThreadsPerWarp == 0u,
                       "a warp's combine cells must share one token");
         __syncwarp();
@@ -588,17 +626,28 @@ struct CollectiveMainloopMoE {
                 smem->launch_parity, m_block,
                 tok * PackedTokenCounts<Dims>::kBits,
                 PackedTokenCounts<Dims>::kMask, top_k);
-            gather_cell(workspace, activations_out, tok,
-                        base_col + flat % kDownOutputColsPerCta, top_k);
+            emit_cell(params, workspace, tok,
+                      base_col + flat % kDownOutputColsPerCta, top_k,
+                      smem->tail_parity);
         }
     }
 
+    __device__ __forceinline__ void prefetch_tail_weights(
+        Params const& params) {
+        Tail::prefetch_weights(params);
+    }
+
+    __device__ void run_tail(
+        Params const& params, SharedStorage* __restrict__ smem,
+        CtaGroup<Traits::kCtasPerExpert> const& cta_group) {
+        Tail::run(params, reinterpret_cast<Workspace*>(params.scratchpad), smem,
+                  cta_group);
+    }
+
     // Sum a token's top-k output slots in rank order using FP32.
-    __device__ static __forceinline__ void gather_cell(
-        Workspace* __restrict__ workspace,
-        DataType::ElementOut* __restrict__ activations_out, std::uint32_t tok,
-        std::uint32_t col, std::uint32_t top_k) {
-        // Consecutive lanes load consecutive output columns.
+    __device__ static __forceinline__ float gather_value(
+        Workspace* __restrict__ workspace, std::uint32_t tok, std::uint32_t col,
+        std::uint32_t top_k) {
         DataType::ElementOut slot_v[Dims::kMaxTopk];
 #pragma unroll
         for (std::uint32_t k = 0; k < Dims::kMaxTopk; ++k) {
@@ -610,8 +659,18 @@ struct CollectiveMainloopMoE {
         for (std::uint32_t k = 0; k < Dims::kMaxTopk; ++k) {
             if (k < top_k) v += static_cast<float>(slot_v[k]);
         }
-        activations_out[tok * Workspace::RoutedDownOut::kNumCols + col] =
-            static_cast<DataType::ElementOut>(v);
+        return v;
+    }
+
+    __device__ __forceinline__ void emit_cell(Params const& params,
+                                              Workspace* __restrict__ workspace,
+                                              std::uint32_t tok,
+                                              std::uint32_t col,
+                                              std::uint32_t top_k,
+                                              std::uint32_t tail_parity) {
+        const DataType::ElementOut b = static_cast<DataType::ElementOut>(
+            gather_value(workspace, tok, col, top_k));
+        Tail::push_cell(params, tok, col, b, tail_parity);
     }
 };
 

@@ -74,6 +74,9 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
 
     // Initialize the launcher-thread states and publish to all warps.
     collective_mainloop.initialize(mainloop_params, smem);
+    if (threadIdx.x == 0) {
+        smem->tail_parity = __ldcg(mainloop_params.tail_epochs) & 1u;
+    }
 
     // Run routing, latent projection and the shared expert on separate CTAs.
     collective_mainloop.run_latent_down(mainloop_params, smem);
@@ -98,8 +101,12 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     sched.begin_phase(BlockPhase::kDown, smem->routing.active_expert_count);
     collective_mainloop.run_down(mainloop_params, smem, sched);
 
+    collective_mainloop.prefetch_tail_weights(mainloop_params);
     // Phase 4: gather and combine each token's top_k combine slots.
     collective_mainloop.combine(mainloop_params, smem, sched.cta_group());
+
+    // Phase 5: the latent moe tail.
+    collective_mainloop.run_tail(mainloop_params, smem, sched.cta_group());
 
     __syncthreads();
     if (WarpRole::is_tmem_warp(warp_idx)) {

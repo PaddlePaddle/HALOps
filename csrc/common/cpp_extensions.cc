@@ -104,7 +104,8 @@ void LowLatencyMmaGemm(const torch::Tensor& input, const torch::Tensor& weight,
                        const std::optional<torch::Tensor>& sfa2,
                        const std::optional<torch::Tensor>& sfb2,
                        const std::optional<torch::Tensor>& output2,
-                       const int sm_count, const bool use_pdl);
+                       const int sm_count, const bool use_pdl,
+                       const bool use_sigmoid);
 
 std::vector<torch::Tensor> GroupWiseQuant(const torch::Tensor& input,
                                           const std::string& mode,
@@ -173,27 +174,28 @@ void MlaOutputProj(const torch::Tensor& wo_a_weight,
                    const torch::Tensor& wo_b_sf, torch::Tensor& out,
                    const torch::Tensor& workspace);
 
-void LowLatencyMoE(const torch::Tensor& input,
-                   const torch::Tensor& router_weight,
-                   const torch::Tensor& expert_up_weights,
-                   const torch::Tensor& expert_up_weights_scale,
-                   const torch::Tensor& expert_down_weights,
-                   const torch::Tensor& expert_down_weights_scale,
-                   const torch::Tensor& shared_up_weight,
-                   const torch::Tensor& shared_up_weight_scale,
-                   const torch::Tensor& shared_down_weight,
-                   const torch::Tensor& shared_down_weight_scale,
-                   const std::optional<torch::Tensor>& latent_down_weight,
-                   const std::optional<torch::Tensor>& latent_down_weight_scale,
-                   const torch::Tensor& workspace,
-                   const torch::Tensor& routed_out,
-                   const torch::Tensor& shared_out, int64_t top_k,
-                   int64_t num_router_gates, const std::string& scoring_func,
-                   bool renormalize, const std::string& activation,
-                   double situ_beta, double situ_linear_beta,
-                   const std::string& quant_mode);
+void LowLatencyMoE(
+    const torch::Tensor& input, const torch::Tensor& router_weight,
+    const torch::Tensor& expert_up_weights,
+    const torch::Tensor& expert_up_weights_scale,
+    const torch::Tensor& expert_down_weights,
+    const torch::Tensor& expert_down_weights_scale,
+    const torch::Tensor& shared_up_weight,
+    const torch::Tensor& shared_up_weight_scale,
+    const torch::Tensor& shared_down_weight,
+    const torch::Tensor& shared_down_weight_scale,
+    const torch::Tensor& latent_down_weight,
+    const torch::Tensor& latent_down_weight_scale,
+    const torch::Tensor& tail_fc2_weight, const torch::Tensor& tail_fc2_scale,
+    const torch::Tensor& tail_norm_weight, const torch::Tensor& tail_epochs,
+    const torch::Tensor& tail_uc_bases, const torch::Tensor& workspace,
+    const torch::Tensor& tail_out, int64_t top_k, int64_t num_router_gates,
+    int64_t tail_rank, int64_t tail_mc_base, int64_t tail_grid_cap,
+    const std::string& scoring_func, const std::string& activation,
+    bool renormalize, double situ_beta, double situ_linear_beta,
+    double tail_eps, const std::string& quant_mode);
 
-torch::Tensor GetWorkspace(const torch::Tensor& input);
+int64_t MoETailRegionBytes(bool wide);
 
 int64_t GetWorkspaceSize(const std::optional<torch::Tensor>& input);
 
@@ -219,7 +221,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("weight"), py::arg("sfa"), py::arg("sfb"), py::arg("output"),
           py::arg("input2"), py::arg("weight2"), py::arg("sfa2"),
           py::arg("sfb2"), py::arg("output2"), py::arg("sm_count"),
-          py::arg("use_pdl") = true);
+          py::arg("use_pdl") = true, py::arg("use_sigmoid") = false);
     m.def("group_wise_quant", &halops::GroupWiseQuant, py::arg("input"),
           py::arg("mode"), py::arg("use_swizzle") = true,
           py::arg("use_pdl") = true);
@@ -234,7 +236,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mla_output_proj", &halops::MlaOutputProj);
 
     m.def("low_latency_moe", &halops::LowLatencyMoE);
-    m.def("moe_get_workspace", &halops::GetWorkspace, py::arg("input"));
+    m.def("moe_tail_region_bytes", &halops::MoETailRegionBytes);
     m.def("moe_get_workspace_size", &halops::GetWorkspaceSize,
           py::arg("input") = py::none());
     m.def("moe_router_tile_m", &halops::RouterTileM, py::arg("num_tokens") = 0);
