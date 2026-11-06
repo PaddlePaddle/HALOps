@@ -205,19 +205,19 @@ CUTE_DEVICE void group_rope(
     }
 }
 
-// Match group_wise_quant: E2M1 midpoint ties round away from zero.
+// Match cvt.rn.e2m1: E2M1 midpoint ties select the even FP4 code.
 CUTE_DEVICE uint8_t to_e2m1(float value) {
     const float magnitude = fabsf(value);
-    const uint8_t code = (magnitude >= 0.25f) + (magnitude >= 0.75f) +
-                         (magnitude >= 1.25f) + (magnitude >= 1.75f) +
-                         (magnitude >= 2.5f) + (magnitude >= 3.5f) +
-                         (magnitude >= 5.0f);
+    const uint8_t code = (magnitude > 0.25f) + (magnitude >= 0.75f) +
+                         (magnitude > 1.25f) + (magnitude >= 1.75f) +
+                         (magnitude > 2.5f) + (magnitude >= 3.5f) +
+                         (magnitude > 5.0f);
     return code | (value < 0.f ? 8 : 0);
 }
 
 CUTE_DEVICE uint8_t pack_e2m1x2(float first, float second) {
-    // The biased inverse resolves ties; RN addition canonicalizes signed zero.
-    // Even elements occupy the low nibble.
+    // RN conversion handles midpoint ties; the additions canonicalize signed
+    // zero. Even elements occupy the low nibble.
     uint16_t packed;
     asm("{ .reg .b8 packed_byte; .reg .f32 a, b;"
         "add.rn.f32 a, %1, 0f00000000;"
@@ -239,9 +239,7 @@ CUTE_DEVICE uint8_t pack_scaled_e2m1x2(float first, float second,
 CUTE_DEVICE uint8_t mxfp4_scale(float amax, float& inverse_scale) {
     // Select the scale exponent exactly at power-of-two boundaries.
     const uint8_t exponent = quant_scale_exponent<2, 0x400000u>(amax);
-    // One FP32 ulp makes exact BF16 midpoint ties round away from zero.
-    inverse_scale =
-        __uint_as_float(__float_as_uint(quant_scale_inverse(exponent)) + 1);
+    inverse_scale = quant_scale_inverse(exponent);
     return exponent;
 }
 

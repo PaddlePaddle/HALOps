@@ -64,19 +64,21 @@ __device__ __forceinline__ uint8_t quantize_to_fp4_code(float val) {
     uint8_t sign = (val < 0.0f) ? 0x8 : 0x0;
     float abs_val = fabsf(val);
     uint8_t mag;
-    if (abs_val < 0.25f)
+    // Match cvt.rn.e2m1: ties select the representable value with an even
+    // FP4 code (0, 2, 4, 6), while non-ties select the nearest value.
+    if (abs_val <= 0.25f)
         mag = 0;
     else if (abs_val < 0.75f)
         mag = 1;
-    else if (abs_val < 1.25f)
+    else if (abs_val <= 1.25f)
         mag = 2;
     else if (abs_val < 1.75f)
         mag = 3;
-    else if (abs_val < 2.5f)
+    else if (abs_val <= 2.5f)
         mag = 4;
     else if (abs_val < 3.5f)
         mag = 5;
-    else if (abs_val < 5.0f)
+    else if (abs_val <= 5.0f)
         mag = 6;
     else
         mag = 7;

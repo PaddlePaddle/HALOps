@@ -1,18 +1,18 @@
+"""
 # Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved.
-#
+
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
+
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
+
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Indexer preparation: numerical reference, API contracts and serving regressions."""
+"""
 
 from dataclasses import dataclass
 
@@ -21,6 +21,11 @@ import torch
 
 import halops
 from halops import indexer_prepare
+from tests.utils.gemm_utils import (
+    per_token_cast_to_fp8,
+    per_token_cast_to_mxfp4,
+    ue8m0_to_float32,
+)
 
 FP8 = torch.float8_e4m3fn
 HIDDEN, HEADS, HEAD_DIM, RANK, ROPE_DIM = 4096, 64, 128, 1024, 64
@@ -32,16 +37,6 @@ pytestmark = pytest.mark.skipif(
     or torch.cuda.get_device_properties(0).multi_processor_count < 128,
     reason="indexer_prepare requires SM100 with at least 128 SMs",
 )
-
-
-def quantize_blocks(x, group_size):
-    groups = x.float().reshape(x.shape[0], -1, group_size)
-    # MXFP8 input quantization has a different floor from FP8 output rows.
-    power = torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-10) / 448))
-    scale = torch.exp2(power)
-    codes = (groups / scale[..., None]).clamp(-448, 448).to(FP8)
-    dequantized = (codes.float() * scale[..., None]).reshape(x.shape)
-    return codes.reshape(x.shape), (power + 127).to(torch.uint8), dequantized
 
 
 def sfatom_scales(exponents):
@@ -72,11 +67,11 @@ def rope(x, table, positions, is_neox_style=True):
         shape
     )
     result = x.clone()
-    if is_neox_style:
-        first = slice(0, ROPE_DIM // 2)
-        second = slice(ROPE_DIM // 2, ROPE_DIM)
-    else:
-        first, second = slice(0, ROPE_DIM, 2), slice(1, ROPE_DIM, 2)
+    first, second = (
+        (slice(0, ROPE_DIM // 2), slice(ROPE_DIM // 2, ROPE_DIM))
+        if is_neox_style
+        else (slice(0, ROPE_DIM, 2), slice(1, ROPE_DIM, 2))
+    )
     left, right = x[..., first], x[..., second]
     result[..., first] = left * cos - right * sin
     result[..., second] = left * sin + right * cos
@@ -89,33 +84,31 @@ def quantize_rows(x):
     return (rounded / scale[..., None]).clamp(-448, 448).to(FP8), scale
 
 
-def quantize_mxfp8(x):
-    rounded = x.to(torch.bfloat16).float().reshape(*x.shape[:-1], -1, 32)
-    power = torch.ceil(torch.log2(rounded.abs().amax(-1).clamp_min(1e-10) / 448))
-    exponents = (power + 127).clamp(0, 254).to(torch.uint8)
-    scale = torch.exp2(exponents.float() - 127)
-    return (rounded / scale[..., None]).clamp(-448, 448).to(FP8).reshape(
-        x.shape
-    ), exponents
+def quantize_mx(x, *, fp4=False, group_size=32):
+    """Quantize indexer values with the shared MX reference implementation."""
+    quantize = per_token_cast_to_mxfp4 if fp4 else per_token_cast_to_fp8
+    codes, scales = quantize(
+        x.to(torch.bfloat16).reshape(-1, x.shape[-1]),
+        block_size=group_size,
+        amax_floor=1e-10,
+    )[:2]
+    shape = (*x.shape[:-1], -1)
+    return codes.to(x.device).reshape(shape), scales.to(x.device).reshape(shape)
 
 
 def dequantize_mxfp8(codes, scales):
-    return codes.float() * torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
-
-
-def quantize_mxfp4(x):
-    rounded = x.to(torch.bfloat16).float().reshape(*x.shape[:-1], -1, 32)
-    power = torch.ceil(torch.log2(rounded.abs().amax(-1).clamp_min(1e-10) / 6))
-    exponents = (power + 127).clamp(0, 254).to(torch.uint8)
-    scale = torch.exp2(exponents.float() - 127)
-    normalized = (rounded / scale[..., None]).reshape(x.shape)
-    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
-    # HALOps quantization resolves a midpoint toward the larger magnitude.
-    magnitudes = torch.bucketize(normalized.abs(), midpoints, right=True).to(
-        torch.uint8
+    return codes.float() * ue8m0_to_float32(scales).to(codes.device).repeat_interleave(
+        32, -1
     )
-    codes = magnitudes | ((normalized < 0).to(torch.uint8) << 3)
-    return codes[..., ::2] | (codes[..., 1::2] << 4), exponents
+
+
+def quantize_blocks(x, group_size):
+    codes, exponents = quantize_mx(x, group_size=group_size)
+    scale = ue8m0_to_float32(exponents).to(x.device)
+    dequantized = (codes.float() * scale.repeat_interleave(group_size, -1)).reshape(
+        x.shape
+    )
+    return codes, exponents, dequantized
 
 
 def dequantize_mxfp4(packed, scales):
@@ -135,21 +128,27 @@ class Case:
     def cache(self):
         return self.kwargs["paged_kv_cache_with_scale"]
 
+    @property
+    def is_fp4(self):
+        return self.kwargs.get("out_qk_dtype_str", "fp8") == "mxfp4"
+
+    @property
+    def data_bytes(self):
+        return HEAD_DIM // 2 if self.is_fp4 else HEAD_DIM
+
     def read_cache(self):
         loc = self.kwargs["out_cache_loc"].long()
         valid = loc >= 0
         loc = loc[valid]
         page, slot = loc // self.page_size, loc % self.page_size
-        is_fp4 = self.kwargs.get("out_qk_dtype_str", "fp8") == "mxfp4"
-        data_bytes = HEAD_DIM // 2 if is_fp4 else HEAD_DIM
-        offsets = slot[:, None] * data_bytes + torch.arange(
-            data_bytes, device=self.cache.device
+        offsets = slot[:, None] * self.data_bytes + torch.arange(
+            self.data_bytes, device=self.cache.device
         )
         codes = self.cache[page[:, None], offsets].contiguous()
-        if not is_fp4:
+        if not self.is_fp4:
             codes = codes.view(FP8)
         offsets = (
-            self.page_size * data_bytes
+            self.page_size * self.data_bytes
             + slot[:, None] * 4
             + torch.arange(4, device=self.cache.device)
         )
@@ -163,17 +162,12 @@ class Case:
         loc = loc[loc >= 0]
         page, slot = loc // self.page_size, loc % self.page_size
         mask = torch.zeros_like(self.cache, dtype=torch.bool)
-        data_bytes = (
-            HEAD_DIM // 2
-            if self.kwargs.get("out_qk_dtype_str", "fp8") == "mxfp4"
-            else HEAD_DIM
-        )
-        columns = slot[:, None] * data_bytes + torch.arange(
-            data_bytes, device=self.cache.device
+        columns = slot[:, None] * self.data_bytes + torch.arange(
+            self.data_bytes, device=self.cache.device
         )
         mask[page[:, None], columns] = True
         columns = (
-            self.page_size * data_bytes
+            self.page_size * self.data_bytes
             + slot[:, None] * 4
             + torch.arange(4, device=self.cache.device)
         )
@@ -264,12 +258,12 @@ def reference(case):
     if weight_scale is None:
         weight_scale = DEFAULT_WEIGHT_SCALE
     if inp.get("out_qk_dtype_str", "fp8") == "mxfp4":
-        key_codes, key_scales = quantize_mxfp4(key)
-        q_codes, q_scales = quantize_mxfp4(q)
+        key_codes, key_scales = quantize_mx(key, fp4=True)
+        q_codes, q_scales = quantize_mx(q, fp4=True)
         weights = raw_weights * weight_scale
     elif inp.get("out_qk_dtype_str", "fp8") == "mxfp8":
-        key_codes, key_scales = quantize_mxfp8(key)
-        q_codes, q_scales = quantize_mxfp8(q)
+        key_codes, key_scales = quantize_mx(key)
+        q_codes, q_scales = quantize_mx(q)
         weights = raw_weights * weight_scale
     else:
         key_codes, key_scales = quantize_rows(key)
@@ -494,7 +488,8 @@ def test_invalid_output_buffers_are_rejected():
         )
 
 
-def test_reference_rope_and_quantizer_contracts():
+@pytest.mark.parametrize("fp4,zero_exponent", [(False, 85), (True, 92)])
+def test_reference_rope_and_quantizer_contracts(fp4, zero_exponent):
     values = torch.arange(128, dtype=torch.float32, device="cuda").reshape(1, 128)
     table = torch.cat(
         (torch.zeros(1, 32, device="cuda"), torch.ones(1, 32, device="cuda")), -1
@@ -507,3 +502,13 @@ def test_reference_rope_and_quantizer_contracts():
     _, exponents, decoded = quantize_blocks(x, 32)
     assert (exponents == 85).all()
     assert torch.equal(decoded, x.float())
+
+    # The shared helpers are 2-D/BF16; Q is 3-D/FP32 before quantization.
+    values = torch.zeros((2, 3, 128), dtype=torch.float32, device="cuda")
+    codes, scales = quantize_mx(values, fp4=fp4)
+    assert codes.shape == (2, 3, 64 if fp4 else 128)
+    assert scales.shape == (2, 3, 4)
+    assert codes.device == scales.device == values.device
+    assert (scales == zero_exponent).all()
+    decode = dequantize_mxfp4 if fp4 else dequantize_mxfp8
+    assert torch.equal(decode(codes, scales), values)

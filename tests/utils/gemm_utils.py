@@ -20,8 +20,7 @@ import torch
 from tests.utils.fp4_utils import (
     FP4_E2M1_MAX,
     FP4_E2M1_VALUES,
-    FP4_MIDPOINTS,
-    fp4_abs_to_idx_round_half_up,
+    fp4_abs_to_idx_rne,
 )
 
 # Comparison tolerances shared by the GEMM tests.
@@ -47,15 +46,15 @@ def ue8m0_to_float32(scale_ue8m0):
     return torch.pow(torch.tensor(2.0, dtype=torch.float32), exp)
 
 
-def per_token_cast_to_fp8(x, block_size=32):
-    """Quantize an (m, k) bfloat16 tensor to float8_e4m3fn at block_size granularity along k."""
+def per_token_cast_to_fp8(x, block_size=32, *, amax_floor=1e-4):
+    """Quantize (m, k) BF16 to FP8; amax_floor selects the caller's scale floor."""
     assert x.dtype == torch.bfloat16
     m, k = x.shape
     assert k % block_size == 0, f"k({k}) must be divisible by block_size({block_size})"
 
     num_blocks = k // block_size
     x_blocked = x.reshape([m, num_blocks, block_size]).to(torch.float32)
-    amax = x_blocked.abs().amax(dim=-1).clip(min=1e-4)
+    amax = x_blocked.abs().amax(dim=-1).clip(min=amax_floor)
 
     FP8_E4M3_MAX = 448.0
     scale = amax / FP8_E4M3_MAX
@@ -144,7 +143,21 @@ def per_block_cast_to_fp8(x, block_size=32):
 
 
 def _fp4_abs_to_idx(abs_x_flat):
-    return np.searchsorted(FP4_MIDPOINTS, abs_x_flat).astype(np.uint8)
+    # cvt.rn.e2m1 uses round-to-nearest-even at the FP4 midpoints.
+    abs_x_flat = np.asarray(abs_x_flat)
+    return np.select(
+        [
+            abs_x_flat <= 0.25,
+            abs_x_flat < 0.75,
+            abs_x_flat <= 1.25,
+            abs_x_flat < 1.75,
+            abs_x_flat <= 2.5,
+            abs_x_flat < 3.5,
+            abs_x_flat <= 5.0,
+        ],
+        [0, 1, 2, 3, 4, 5, 6],
+        default=7,
+    ).astype(np.uint8)
 
 
 def float_to_fp4_e2m1(x_f32):
@@ -382,11 +395,11 @@ def _pack_scaled_fp4(x_scaled):
 
     Matches the CUDA kernel bit-for-bit: the sign comes from the scaled value
     (so values that round to zero keep their sign) and magnitudes split at the
-    midpoints with the higher code winning exact ties (strict ``<`` compares).
+    midpoint ties follow the hardware `cvt.rn.satfinite.e2m1x2.f32` round-to-nearest-even rule.
     Returns the packed uint8 bytes and the rounded values in E2M1 units.
     """
     flat = np.asarray(x_scaled, dtype=np.float32)
-    idx = fp4_abs_to_idx_round_half_up(np.abs(flat))
+    idx = fp4_abs_to_idx_rne(np.abs(flat))
     negative = flat < 0
     codes = (negative.astype(np.uint8) << 3) | idx
     lo = codes[..., 0::2]
@@ -395,10 +408,11 @@ def _pack_scaled_fp4(x_scaled):
     return (hi << 4) | lo, fp4_vals
 
 
-def per_token_cast_to_mxfp4(x, block_size=32):
+def per_token_cast_to_mxfp4(x, block_size=32, *, amax_floor=1e-12):
     """Quantize an (m, k) bfloat16 tensor to MXFP4 per token.
 
     FP4 E2M1 values with one UE8M0 scale per ``block_size`` (32) elements.
+    ``amax_floor`` selects the caller's minimum block maximum.
     Returns (packed_uint8, scale_ue8m0, fp4_dequant_float32).
     """
     assert x.dtype == torch.bfloat16
@@ -411,7 +425,7 @@ def per_token_cast_to_mxfp4(x, block_size=32):
     x_blocked = x_f32.reshape(m, num_blocks, block_size)
 
     amax = np.abs(x_blocked).max(axis=-1)
-    amax = np.clip(amax, 1e-12, None)
+    amax = np.clip(amax, amax_floor, None)
 
     scale = amax / FP4_E2M1_MAX
     scale_ue8m0 = _float32_to_ue8m0_np(scale)
