@@ -26,8 +26,8 @@ __all__ = ["group_contiguous_gemm"]
 def group_contiguous_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
-    sfa: torch.Tensor,
-    sfb: torch.Tensor,
+    sfa: Optional[torch.Tensor],
+    sfb: Optional[torch.Tensor],
     expert_ids: torch.Tensor,
     output: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
@@ -66,7 +66,9 @@ def group_contiguous_gemm(
         alpha: Optional float32 per-expert scale with shape [num_experts].
             Required for ``w4a4-nvfp4``; not accepted for ``w4a4-mxfp4``.
         sm_count: Number of SMs to use (-1 for all available).
-        mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``.
+        mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"`` for
+            quantized GEMM, or ``"bf16"`` for native BF16 GEMM (no
+            quantization; pass ``sfa=None, sfb=None``).
 
     Returns:
         None. The result is written in-place to output.

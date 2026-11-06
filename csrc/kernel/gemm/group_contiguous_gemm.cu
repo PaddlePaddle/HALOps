@@ -21,8 +21,9 @@
 namespace halops {
 
 void GroupContiguousGemm(const torch::Tensor& input,
-                         const torch::Tensor& weight, const torch::Tensor& sfa,
-                         const torch::Tensor& sfb,
+                         const torch::Tensor& weight,
+                         const std::optional<torch::Tensor>& sfa,
+                         const std::optional<torch::Tensor>& sfb,
                          const torch::Tensor& expert_ids, torch::Tensor& output,
                          const std::optional<torch::Tensor>& bias,
                          const std::optional<torch::Tensor>& alpha,
@@ -30,9 +31,10 @@ void GroupContiguousGemm(const torch::Tensor& input,
                          const std::string& mode = "w8a8-mxfp8") {
     const CudaDeviceGuard device_guard(input.device());
     TORCH_CHECK(
-        mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" || mode == "w4a4-mxfp4",
+        mode == "bf16" || mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" ||
+            mode == "w4a4-mxfp4",
         "Unsupported mode: ", mode,
-        ". Expected 'w8a8-mxfp8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
+        ". Expected 'bf16', 'w8a8-mxfp8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
     TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor of shape [M, K]");
     TORCH_CHECK(weight.dim() == 3,
                 "weight must be a 3D tensor of shape [num_experts, N, K]");
@@ -61,7 +63,31 @@ void GroupContiguousGemm(const torch::Tensor& input,
     params.n = n;
     params.num_experts = num_experts;
 
-    if (mode == "w8a8-mxfp8") {
+    if (mode == "bf16") {
+        // Native BF16: sfa/sfb/bias/alpha are ignored; dispatch and launch
+        // live in gemm_dispatch.cuh (bf16::LaunchContiguous).
+        const int k = weight.size(2);
+        TORCH_CHECK(input.size(1) == k,
+                    "input K must match weight K, got input K=", input.size(1),
+                    ", weight K=", k);
+        TORCH_CHECK(input.dtype() == torch::kBFloat16,
+                    "bf16 contiguous GEMM: input must be bfloat16");
+        TORCH_CHECK(weight.dtype() == torch::kBFloat16,
+                    "bf16 contiguous GEMM: weight must be bfloat16");
+        TORCH_CHECK(output.dtype() == torch::kBFloat16,
+                    "bf16 contiguous GEMM: output must be bfloat16");
+        params.k = k;
+        params.ptr_a = input.data_ptr();
+        params.ptr_b = weight.data_ptr();
+        params.ptr_sfa = nullptr;
+        params.ptr_sfb = nullptr;
+        params.ptr_alpha = nullptr;
+        bf16::LaunchContiguous(params, sm, stream);
+    } else if (mode == "w8a8-mxfp8") {
+        TORCH_CHECK(sfa.has_value() && sfb.has_value(),
+                    "w8a8-mxfp8 contiguous grouped GEMM requires sfa/sfb "
+                    "scale factors (only mode='bf16' accepts sfa=None, "
+                    "sfb=None)");
         const int k = weight.size(2);
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),
@@ -69,8 +95,8 @@ void GroupContiguousGemm(const torch::Tensor& input,
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();
-        params.ptr_sfa = sfa.data_ptr();
-        params.ptr_sfb = sfb.data_ptr();
+        params.ptr_sfa = sfa->data_ptr();
+        params.ptr_sfb = sfb->data_ptr();
         if (bias.has_value()) {
             params.ptr_c = bias->data_ptr();
         }
@@ -85,6 +111,9 @@ void GroupContiguousGemm(const torch::Tensor& input,
              .has_bias = bias.has_value()},
             stream);
     } else {
+        TORCH_CHECK(sfa.has_value() && sfb.has_value(),
+                    "W4A4 contiguous grouped GEMM requires sfa/sfb scale "
+                    "factors (only mode='bf16' accepts sfa=None, sfb=None)");
         const int k = weight.size(2) * 2;  // 2 FP4 per packed byte
         TORCH_CHECK(
             input.size(1) == weight.size(2),
@@ -93,18 +122,18 @@ void GroupContiguousGemm(const torch::Tensor& input,
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();
-        params.ptr_sfa = sfa.data_ptr();
-        params.ptr_sfb = sfb.data_ptr();
+        params.ptr_sfa = sfa->data_ptr();
+        params.ptr_sfb = sfb->data_ptr();
         TORCH_CHECK(!bias.has_value(), "W4A4 mode does not support bias yet.");
 
         const bool mxfp4 = mode == "w4a4-mxfp4";
         const int sf_k = k / (mxfp4 ? 32 : 16);
-        TORCH_CHECK(sfa.size(-1) == sf_k && sfb.size(-1) == sf_k,
+        TORCH_CHECK(sfa->size(-1) == sf_k && sfb->size(-1) == sf_k,
                     "W4A4 scale-factor shape does not match mode ",
                     mxfp4 ? "'w4a4-mxfp4' (UE8M0 per 32)"
                           : "'w4a4-nvfp4' (UE4M3 per 16)",
-                    " requires SF K = ", sf_k, ", got sfa K=", sfa.size(-1),
-                    " and sfb K=", sfb.size(-1), ".");
+                    " requires SF K = ", sf_k, ", got sfa K=", sfa->size(-1),
+                    " and sfb K=", sfb->size(-1), ".");
 
         TORCH_CHECK(!mxfp4 || !alpha.has_value(),
                     "'w4a4-mxfp4' does not take alpha; the per-expert scaling "
