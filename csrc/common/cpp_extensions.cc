@@ -15,26 +15,8 @@
 #include <torch/extension.h>
 
 #include <optional>
-#include <string>
 
 #include "kernel/gemm/epilogue_op.h"
-
-namespace halops::indexer {
-
-void IndexerPrepare(
-    const torch::Tensor& x, const torch::Tensor& q_lora,
-    const torch::Tensor& wk_w, const torch::Tensor& wq_b,
-    const torch::Tensor& wq_b_sf, const torch::Tensor& k_norm_weight,
-    const torch::Tensor& k_norm_bias, double k_norm_eps,
-    const torch::Tensor& rope_cos_sin_cache, const torch::Tensor& positions,
-    const torch::Tensor& paged_kv_cache_with_scale,
-    const torch::Tensor& out_cache_loc, const torch::Tensor& out_q,
-    const std::optional<torch::Tensor>& out_q_sf,
-    const torch::Tensor& out_weights, double weight_scale, int64_t n_heads,
-    int64_t head_dim, bool is_neox_style, bool apply_hadamard, bool use_pdl,
-    bool is_mx_sf, bool is_fp4);
-
-}  // namespace halops::indexer
 
 namespace halops {
 
@@ -242,6 +224,19 @@ int64_t GetWorkspaceSize(const std::optional<torch::Tensor>& input);
 
 int64_t RouterTileM(int64_t num_tokens);
 
+void IndexerPrepare(
+    const torch::Tensor& x, const torch::Tensor& q_lora,
+    const torch::Tensor& wk_w, const torch::Tensor& wq_b,
+    const torch::Tensor& wq_b_sf, const torch::Tensor& k_norm_weight,
+    const torch::Tensor& k_norm_bias, double k_norm_eps,
+    const torch::Tensor& rope_cos_sin_cache, const torch::Tensor& positions,
+    const torch::Tensor& paged_kv_cache_with_scale,
+    const torch::Tensor& out_cache_loc, const torch::Tensor& out_q,
+    const std::optional<torch::Tensor>& out_q_sf,
+    const torch::Tensor& out_weights, double weight_scale, int64_t n_heads,
+    int64_t head_dim, bool is_neox_style, bool apply_hadamard, bool use_pdl,
+    bool is_mx_sf, bool is_fp4);
+
 }  // namespace halops
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -308,7 +303,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("input") = py::none());
     m.def("moe_router_tile_m", &halops::RouterTileM, py::arg("num_tokens") = 0);
     m.def(
-        "indexer_prepare", &halops::indexer::IndexerPrepare, pybind11::arg("x"),
+        "indexer_prepare", &halops::IndexerPrepare, pybind11::arg("x"),
         pybind11::arg("q_lora"), pybind11::arg("wk_w"), pybind11::arg("wq_b"),
         pybind11::arg("wq_b_sf"), pybind11::arg("k_norm_weight"),
         pybind11::arg("k_norm_bias"), pybind11::arg("k_norm_eps"),

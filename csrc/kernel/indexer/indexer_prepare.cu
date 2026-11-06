@@ -14,7 +14,7 @@
 
 #include "indexer_dispatch.cuh"
 
-namespace halops::indexer {
+namespace halops {
 
 void IndexerPrepare(
     const torch::Tensor& x, const torch::Tensor& q_lora,
@@ -28,31 +28,31 @@ void IndexerPrepare(
     const torch::Tensor& out_weights, double weight_scale, int64_t n_heads,
     int64_t head_dim, bool is_neox_style, bool apply_hadamard, bool use_pdl,
     bool is_mx_sf, bool is_fp4) {
-    const IndexerHostParams host{x,
-                                 q_lora,
-                                 wk_w,
-                                 wq_b,
-                                 wq_b_sf,
-                                 k_norm_weight,
-                                 k_norm_bias,
-                                 k_norm_eps,
-                                 rope_cos_sin_cache,
-                                 positions,
-                                 paged_kv_cache_with_scale,
-                                 out_cache_loc,
-                                 out_q,
-                                 out_q_sf,
-                                 out_weights,
-                                 weight_scale,
-                                 n_heads,
-                                 head_dim,
-                                 is_neox_style,
-                                 apply_hadamard,
-                                 use_pdl,
-                                 is_mx_sf,
-                                 is_fp4};
+    const indexer::IndexerHostParams host{x,
+                                          q_lora,
+                                          wk_w,
+                                          wq_b,
+                                          wq_b_sf,
+                                          k_norm_weight,
+                                          k_norm_bias,
+                                          k_norm_eps,
+                                          rope_cos_sin_cache,
+                                          positions,
+                                          paged_kv_cache_with_scale,
+                                          out_cache_loc,
+                                          out_q,
+                                          out_q_sf,
+                                          out_weights,
+                                          weight_scale,
+                                          n_heads,
+                                          head_dim,
+                                          is_neox_style,
+                                          apply_hadamard,
+                                          use_pdl,
+                                          is_mx_sf,
+                                          is_fp4};
     const CudaDeviceGuard device_guard(host.x.device());
-    dispatch_indexer(host, indexer_sm_count());
+    indexer::dispatch_indexer(host, indexer::indexer_sm_count());
 }
 
-}  // namespace halops::indexer
+}  // namespace halops
