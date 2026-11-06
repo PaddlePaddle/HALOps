@@ -47,8 +47,8 @@ def ue8m0_to_float32(scale_ue8m0):
 
 
 def per_token_cast_to_fp8(x, block_size=32, *, amax_floor=1e-4):
-    """Quantize (m, k) BF16 to FP8; amax_floor selects the caller's scale floor."""
-    assert x.dtype == torch.bfloat16
+    """Quantize an (m, k) BF16 or FP32 tensor to FP8."""
+    assert x.dtype in (torch.bfloat16, torch.float32)
     m, k = x.shape
     assert k % block_size == 0, f"k({k}) must be divisible by block_size({block_size})"
 
@@ -409,13 +409,13 @@ def _pack_scaled_fp4(x_scaled):
 
 
 def per_token_cast_to_mxfp4(x, block_size=32, *, amax_floor=1e-12):
-    """Quantize an (m, k) bfloat16 tensor to MXFP4 per token.
+    """Quantize an (m, k) BF16 or FP32 tensor to MXFP4 per token.
 
     FP4 E2M1 values with one UE8M0 scale per ``block_size`` (32) elements.
     ``amax_floor`` selects the caller's minimum block maximum.
     Returns (packed_uint8, scale_ue8m0, fp4_dequant_float32).
     """
-    assert x.dtype == torch.bfloat16
+    assert x.dtype in (torch.bfloat16, torch.float32)
     m, k = x.shape
     assert k % block_size == 0, f"k({k}) must be divisible by {block_size}"
     assert k % 2 == 0

@@ -79,7 +79,7 @@ def rope(x, table, positions, is_neox_style=True):
 
 
 def quantize_rows(x):
-    rounded = x.to(torch.bfloat16).float()
+    rounded = x.float()
     scale = rounded.abs().amax(-1).clamp_min(1e-4) / 448
     return (rounded / scale[..., None]).clamp(-448, 448).to(FP8), scale
 
@@ -88,7 +88,7 @@ def quantize_mx(x, *, fp4=False, group_size=32):
     """Quantize indexer values with the shared MX reference implementation."""
     quantize = per_token_cast_to_mxfp4 if fp4 else per_token_cast_to_fp8
     codes, scales = quantize(
-        x.to(torch.bfloat16).reshape(-1, x.shape[-1]),
+        x.float().reshape(-1, x.shape[-1]),
         block_size=group_size,
         amax_floor=1e-10,
     )[:2]

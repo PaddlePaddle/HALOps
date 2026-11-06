@@ -14,17 +14,12 @@
 
 #pragma once
 
-#include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
 #include "indexer_config.cuh"
 #include "indexer_utils.cuh"
 
 namespace halops::indexer {
-
-CUTE_DEVICE float bf16_round(float x) {
-    return __bfloat162float(__float2bfloat16(x));
-}
 
 CUTE_DEVICE uint8_t to_e4m3(float x) {
     return __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
@@ -102,17 +97,6 @@ CUTE_DEVICE void scale_values(V&& values, float scale) {
     for (int i = 0; i < COUNT; i += 2) {
         const float2 pair = __fmul2_rn(make_float2(values[i], values[i + 1]),
                                        make_float2(scale, scale));
-        values[i] = pair.x;
-        values[i + 1] = pair.y;
-    }
-}
-
-template <int COUNT, class V>
-CUTE_DEVICE void round_values_bf16(V&& values) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < COUNT; i += 2) {
-        const float2 pair = __bfloat1622float2(
-            __float22bfloat162_rn(make_float2(values[i], values[i + 1])));
         values[i] = pair.x;
         values[i + 1] = pair.y;
     }
@@ -259,7 +243,6 @@ CUTE_DEVICE float group_quantize_output(
     constexpr int SCALE_LANES = IndexerDimensions::MX_GROUP_SIZE / VALUES;
     const unsigned mask = __activemask();
     float amax = 0.f;
-    round_values_bf16<VALUES>(values);
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < VALUES; ++i) {
         amax = fmaxf(amax, fabsf(values[i]));
@@ -395,7 +378,6 @@ template <class V>
 CUTE_DEVICE float thread_quantize_output(V&& values, uint8_t* data,
                                          uint8_t* scales, bool is_mx_sf,
                                          bool is_fp4, bool use_256bit_stores) {
-    round_values_bf16<IndexerDimensions::HEAD_DIM>(values);
     if (is_fp4) {
         uint32_t scale_word = 0;
         CUTLASS_PRAGMA_UNROLL

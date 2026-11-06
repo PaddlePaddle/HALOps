@@ -90,7 +90,6 @@ CUTE_DEVICE void q_two_lane_row(Context const& context, float (&values)[64],
         thread_hadamard<64>(values);
         scale_values<64>(values, IndexerDimensions::HADAMARD_SCALE);
     }
-    round_values_bf16<64>(values);
     const int64_t row =
         (int64_t)token * IndexerDimensions::NUM_HEADS + work_item.weight_tile;
     float scale = 1.f;
