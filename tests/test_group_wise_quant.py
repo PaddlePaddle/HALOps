@@ -27,7 +27,7 @@ from tests.utils.fp4_utils import (
     FP4_E2M1_VALUES,
     MXFP4_BLOCK_SIZE,
     float32_to_ue4m3_rne,
-    fp4_abs_to_idx_round_half_up,
+    fp4_abs_to_idx_rne,
 )
 from tests.utils.gemm_utils import ue8m0_to_float32
 
@@ -135,7 +135,7 @@ def ref_per_token_cast_to_nvfp4(x, group_size=16):
     # Compute FP4 codes directly from x_scaled (consistent with CUDA quantize_to_fp4_code)
     flat = x_scaled.reshape(m, k)
     sign_bits = (flat < 0).astype(np.uint8) << 3
-    mag_idx = fp4_abs_to_idx_round_half_up(np.abs(flat))
+    mag_idx = fp4_abs_to_idx_rne(np.abs(flat))
     fp4_codes = sign_bits | mag_idx  # (m, k), 4-bit codes
 
     # Dequantized values (for reference computation)
@@ -193,7 +193,7 @@ def ref_per_token_cast_to_mxfp4(x, group_size=32):
 
     flat = x_scaled.reshape(m, k)
     sign_bits = (flat < 0).astype(np.uint8) << 3
-    mag_idx = fp4_abs_to_idx_round_half_up(np.abs(flat))
+    mag_idx = fp4_abs_to_idx_rne(np.abs(flat))
     fp4_codes = sign_bits | mag_idx  # (m, k), 4-bit codes
 
     fp4_float = (np.where(flat < 0, -1.0, 1.0) * FP4_E2M1_VALUES[mag_idx]).astype(

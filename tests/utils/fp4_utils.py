@@ -24,9 +24,22 @@ FP4_E2M1_VALUES = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.fl
 FP4_MIDPOINTS = (FP4_E2M1_VALUES[:-1] + FP4_E2M1_VALUES[1:]) / 2.0
 
 
-def fp4_abs_to_idx_round_half_up(abs_x_flat):
-    """FP4 magnitude index; a value on a midpoint takes the higher bin."""
-    return np.searchsorted(FP4_MIDPOINTS, abs_x_flat, side="right").astype(np.uint8)
+def fp4_abs_to_idx_rne(abs_x_flat):
+    """Return FP4 E2M1 magnitude codes using round-to-nearest-even."""
+    abs_x_flat = np.asarray(abs_x_flat)
+    return np.select(
+        [
+            abs_x_flat <= 0.25,
+            abs_x_flat < 0.75,
+            abs_x_flat <= 1.25,
+            abs_x_flat < 1.75,
+            abs_x_flat <= 2.5,
+            abs_x_flat < 3.5,
+            abs_x_flat <= 5.0,
+        ],
+        [0, 1, 2, 3, 4, 5, 6],
+        default=7,
+    ).astype(np.uint8)
 
 
 def float32_to_ue4m3_rne(x):

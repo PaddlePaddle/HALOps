@@ -21,7 +21,7 @@ from halops import fused_swiglu_quant
 from tests.utils.fp4_utils import (
     FP4_E2M1_MAX,
     float32_to_ue4m3_rne,
-    fp4_abs_to_idx_round_half_up,
+    fp4_abs_to_idx_rne,
 )
 
 
@@ -165,7 +165,7 @@ def swiglu_and_quant_group16_ref(x, token_nums_per_expert, group_num, group_size
     x_scaled = np.clip(x_scaled, -FP4_E2M1_MAX, FP4_E2M1_MAX)
     flat = x_scaled.reshape(total_tokens, hidden)
     sign_bits = (flat < 0).astype(np.uint8) << 3
-    mag_idx = fp4_abs_to_idx_round_half_up(np.abs(flat))
+    mag_idx = fp4_abs_to_idx_rne(np.abs(flat))
     fp4_codes = sign_bits | mag_idx  # [total_tokens, hidden]
 
     # Pack: even index = low nibble, odd index = high nibble
