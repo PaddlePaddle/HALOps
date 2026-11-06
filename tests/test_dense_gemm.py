@@ -19,7 +19,7 @@ import re
 import pytest
 import torch
 
-from halops import dense_gemm
+from halops import EpilogueOp, dense_gemm, interleave_gate_up
 from tests.utils.fp4_utils import MXFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE
 
 from tests.utils.gemm_utils import (
@@ -32,6 +32,8 @@ from tests.utils.gemm_utils import (
     per_token_cast_to_fp8,
     per_token_cast_to_mxfp4,
     reorder_sf_to_cutlass,
+    sfatom_offsets,
+    sfatom_rows,
     ue8m0_to_float32,
 )
 
@@ -208,6 +210,123 @@ def test_gemm_w8a8_mxfp8(m, n, k):
         **W8A8_MXFP8_TOL,
         msg=lambda s: f"W8A8-MXFP8 dense_gemm m={m}, n={n}, k={k}: {s}",
     )
+
+
+@pytest.mark.parametrize("mode", ["w8a8-mxfp8", "w4a4-nvfp4", "w4a4-mxfp4"])
+@pytest.mark.parametrize(
+    "m, n, k",
+    [(16, 7168, 4096), (64, 4096, 512), (512, 4096, 1024), (4096, 7168, 2048)],
+)
+def test_gemm_sigmoid(mode, m, n, k):
+    args, kwargs, _, _ = make_mode_inputs(mode, m, n, k)
+    alpha = kwargs.get("alpha")
+    ref = torch.empty([m, n], dtype=torch.bfloat16)
+    dense_gemm(*args, ref, None, alpha, -1, mode)
+    output = torch.empty([m, n], dtype=torch.bfloat16)
+    dense_gemm(*args, output, None, alpha, -1, mode, True, EpilogueOp.Sigmoid)
+    torch.testing.assert_close(
+        output.float(), torch.sigmoid(ref.float()), rtol=1e-2, atol=4e-3
+    )
+
+
+@pytest.mark.parametrize("m, n, k", [(1024, 4096, 1024), (2048, 7168, 512)])
+def test_gemm_sigmoid_bias(m, n, k):
+    args, _, _, _ = make_mode_inputs("w8a8-mxfp8", m, n, k)
+    bias = torch.rand([n], dtype=torch.bfloat16)
+    ref = torch.empty([m, n], dtype=torch.bfloat16)
+    dense_gemm(*args, ref, bias, None, -1, "w8a8-mxfp8")
+    output = torch.empty([m, n], dtype=torch.bfloat16)
+    dense_gemm(*args, output, bias, None, -1, "w8a8-mxfp8", True, EpilogueOp.Sigmoid)
+    torch.testing.assert_close(
+        output.float(), torch.sigmoid(ref.float()), rtol=1e-2, atol=8e-3
+    )
+
+
+E4M3_REL_ULP = 2**-3
+E4M3_MIN_SUBNORMAL = 2**-9
+
+
+@pytest.mark.parametrize(
+    "m, n, k, with_bias, beta, linear_beta",
+    [
+        (16, 8192, 4096, False, 4.0, 25.0),
+        (64, 16384, 1024, False, 4.0, 25.0),
+        (100, 4096, 512, False, 4.0, 25.0),
+        (512, 4096, 1024, False, 4.0, 25.0),
+        (4096, 7168, 2048, False, 4.0, 25.0),
+        (1024, 4096, 1024, True, 4.0, 25.0),
+        (16, 8192, 4096, True, 4.0, 25.0),
+        (100, 4096, 512, True, 4.0, 25.0),
+        (16, 8192, 4096, False, 2.0, None),
+        (512, 4096, 1024, False, 1.0, 8.0),
+    ],
+)
+def test_gemm_situ_quant(m, n, k, with_bias, beta, linear_beta):
+    inp = make_w8a8_mxfp8_inputs(m, n, k)
+
+    def deq(q, e):
+        return q.float() * ue8m0_to_float32(e).repeat_interleave(FP8_BLOCK_SIZE, 1)
+
+    y = deq(inp["x"], inp["sfa_logical"]) @ deq(inp["w"], inp["sfb_logical"]).T
+    bias = torch.randn([n], dtype=torch.bfloat16) if with_bias else None
+    gate, up = (y + (bias.float() if with_bias else 0)).chunk(2, dim=1)
+    ref = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    if linear_beta is not None:
+        up = linear_beta * torch.tanh(up / linear_beta)
+    ref = (ref * up).to(torch.bfloat16).float()
+
+    w = interleave_gate_up(inp["w"])
+    sfb = reorder_sf_to_cutlass(
+        interleave_gate_up(inp["sfb_logical"]), n, k // FP8_BLOCK_SIZE
+    )
+    b = interleave_gate_up(bias) if with_bias else None
+    q = torch.empty([m, n // 2], dtype=torch.float8_e4m3fn)
+    kb_out = n // 2 // FP8_BLOCK_SIZE
+    sf = torch.zeros([sfatom_rows(m) * kb_out], dtype=torch.uint8)
+    dense_gemm(
+        inp["x"],
+        w,
+        inp["sfa"],
+        sfb,
+        q,
+        b,
+        None,
+        -1,
+        "w8a8-mxfp8",
+        True,
+        EpilogueOp.SituQuant,
+        sf,
+        beta,
+        linear_beta,
+    )
+    scale = ue8m0_to_float32(sf[sfatom_offsets(m, kb_out)])
+    scale = scale.repeat_interleave(FP8_BLOCK_SIZE, 1)
+    err = (q.float() * scale - ref).abs()
+    assert (err <= ref.abs() * E4M3_REL_ULP + scale * E4M3_MIN_SUBNORMAL).all()
+
+
+@pytest.mark.parametrize("epilogue", [EpilogueOp.Identity, EpilogueOp.SituQuant])
+@pytest.mark.parametrize("m, n, k", [(1344, 16384, 1024), (100, 7168, 512)])
+def test_gemm_no_out_of_bounds_write(m, n, k, epilogue):
+    """Output and scale tensors are views of larger sentinel-filled buffers;
+    the bytes past the views must stay untouched."""
+    args, _, _, _ = make_mode_inputs("w8a8-mxfp8", m, n, k)
+    guard = 128
+    sentinel = 0x5A
+    quant = epilogue == EpilogueOp.SituQuant
+    out_n = n // 2 if quant else n
+    dtype = torch.float8_e4m3fn if quant else torch.bfloat16
+    out_buf = torch.full(
+        [(m + guard) * out_n * dtype.itemsize], sentinel, dtype=torch.uint8
+    )
+    out = out_buf[: m * out_n * dtype.itemsize].view(dtype).view(m, out_n)
+    sf_len = sfatom_rows(m) * out_n // FP8_BLOCK_SIZE
+    sf_buf = torch.full([sf_len + guard], sentinel, dtype=torch.uint8)
+    sf = sf_buf[:sf_len] if quant else None
+    dense_gemm(*args, out, None, None, -1, "w8a8-mxfp8", True, epilogue, sf)
+    torch.cuda.synchronize()
+    assert (out_buf[m * out_n * dtype.itemsize :] == sentinel).all()
+    assert (sf_buf[sf_len:] == sentinel).all()
 
 
 # =====================================================================

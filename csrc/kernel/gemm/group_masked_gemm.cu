@@ -69,6 +69,7 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.n = n;
     params.num_experts = num_experts;
     params.max_m_per_expert = max_m_per_expert;
+    params.use_pdl = true;
 
     if (mode == "w8a8-mxfp8") {
         const int k = weight.size(2);

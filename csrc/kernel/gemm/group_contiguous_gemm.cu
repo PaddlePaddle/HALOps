@@ -60,6 +60,7 @@ void GroupContiguousGemm(const torch::Tensor& input,
     params.m = m;
     params.n = n;
     params.num_experts = num_experts;
+    params.use_pdl = true;
 
     if (mode == "w8a8-mxfp8") {
         const int k = weight.size(2);

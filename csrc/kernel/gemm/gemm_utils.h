@@ -17,6 +17,7 @@
 #include <c10/util/BFloat16.h>
 #include <c10/util/Float8_e4m3fn.h>
 #include <c10/util/Half.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
@@ -33,6 +34,23 @@ inline int GetSmCount() {
         cudaDeviceGetAttribute(&cached, cudaDevAttrMultiProcessorCount, device);
     }
     return cached;
+}
+
+template <int Rank>
+inline void EncodeTmaDesc(
+    void* desc, CUtensorMapDataType dtype, const void* ptr,
+    const cuuint64_t (&dims)[Rank], const cuuint64_t (&strides)[Rank - 1],
+    const cuuint32_t (&box)[Rank], CUtensorMapSwizzle swizzle, const char* what,
+    CUtensorMapL2promotion promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_256B) {
+    cuuint32_t elem_strides[Rank];
+    for (int i = 0; i < Rank; ++i) elem_strides[i] = 1;
+    const CUresult r = cuTensorMapEncodeTiled(
+        reinterpret_cast<CUtensorMap*>(desc), dtype, Rank,
+        const_cast<void*>(ptr), dims, strides, box, elem_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, promotion,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled(", what,
+                ") failed: ", r);
 }
 
 inline constexpr int kSfAtomM = 128;

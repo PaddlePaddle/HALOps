@@ -47,11 +47,14 @@ if not os.path.exists(os.path.join(CUTLASS_DIR, "include")):
         cwd=PROJECT_DIR,
     )
 
+include_dirs = [
+    PROJECT_DIR,
+    os.path.join(PROJECT_DIR, "csrc"),
+    os.path.join(CUTLASS_DIR, "include"),
+    os.path.join(CUTLASS_DIR, "tools", "util", "include"),
+]
+
 gencode_flags = [
-    f"-I{PROJECT_DIR}",
-    f"-I{PROJECT_DIR}/csrc",
-    f"-I{CUTLASS_DIR}/include",
-    f"-I{CUTLASS_DIR}/tools/util/include",
     "-std=c++20",
     "-gencode",
     "arch=compute_100f,code=sm_100f",
@@ -85,16 +88,21 @@ setup(
                 "csrc/kernel/gemm/group_contiguous_gemm.cu",
                 "csrc/kernel/gemm/batch_gemm.cu",
                 "csrc/kernel/gemm/group_wise_quant.cu",
+                "csrc/kernel/gemm/rms_norm_quant.cu",
                 "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
                 "csrc/kernel/gemm/fused_swiglu_quant.cu",
+                "csrc/kernel/gemm/low_latency_mma_gemm.cu",
                 "csrc/kernel/mla/mla_plan.cu",
                 "csrc/kernel/mla/mla_attention.cu",
                 "csrc/kernel/mla/mla_prequant_x.cu",
                 "csrc/kernel/mla/mla_output_proj.cu",
                 "csrc/kernel/mla/combine_with_rope_quant.cu",
+                "csrc/kernel/mla/vha_postmix_quant.cu",
+                "csrc/kernel/moe/low_latency_moe.cu",
                 "csrc/kernel/indexer/indexer_prepare.cu",
                 "csrc/common/cpp_extensions.cc",
             ],
+            include_dirs=include_dirs,
             extra_compile_args={"nvcc": gencode_flags},
             libraries=["cuda"],
         ),

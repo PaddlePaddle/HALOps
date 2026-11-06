@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <vector>
 
+#include "common/mx_quant.cuh"
 #include "kernel/gemm/gemm_utils.h"
 
 namespace halops {
@@ -45,7 +46,6 @@ __device__ __forceinline__ void Store(const AlignedVector<T, Size>& vec,
 }
 
 constexpr float kEpsilon = 1e-10f;
-constexpr float kFP8Max = 448.f;
 constexpr float kFP4Max = 6.f;
 
 __device__ __forceinline__ uint8_t quantize_to_fp4_code(float val) {
@@ -74,7 +74,7 @@ __device__ __forceinline__ uint8_t quantize_to_fp4_code(float val) {
 }
 
 __device__ __forceinline__ uint8_t float32_to_ue4m3(float val) {
-    val = fmaxf(fminf(val, 448.0f), 0.0f);
+    val = fmaxf(fminf(val, mxfp8::kE4m3Max), 0.0f);
     __nv_fp8_e4m3 fp8_val(val);
     uint8_t bits;
     memcpy(&bits, &fp8_val, sizeof(uint8_t));
@@ -253,7 +253,7 @@ __global__ void FusedSwigluQuantKernel(
             auto* out = reinterpret_cast<c10::Float8_e4m3fn*>(out_quant) +
                         token * hidden_size;
 
-            const float inv_fp8_max = 1.f / kFP8Max;
+            const float inv_fp8_max = 1.f / mxfp8::kE4m3Max;
             const int64_t num_iters = hidden_size / SFATOM_TILE;
             const int64_t hidden_size_scale = num_iters;
             const int64_t n_scale = ceil_div_i64(hidden_size_scale, 4);

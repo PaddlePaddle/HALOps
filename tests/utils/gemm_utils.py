@@ -25,6 +25,7 @@ from tests.utils.fp4_utils import (
 
 # Comparison tolerances shared by the GEMM tests.
 W8A8_MXFP8_TOL = dict(rtol=2e-2, atol=2e-3)
+MXFP8_BLOCK_SIZE = 32
 W4A4_TOL = dict(rtol=5e-2, atol=5e-2)
 
 # =====================================================================
@@ -40,15 +41,52 @@ def float32_to_ue8m0(x):
     return biased_exp.to(torch.uint8)
 
 
+SF_ATOM_ROWS = 128
+SF_ATOM_COLS = 4
+SF_ATOM_COL_ROWS = 32
+
+
+def sfatom_rows(rows):
+    """Rows of a CUTLASS SfAtom scale tensor: ``rows`` padded to whole atoms."""
+    return -(-rows // SF_ATOM_ROWS) * SF_ATOM_ROWS
+
+
+def sfatom_offsets(rows, kb_dim):
+    """[rows, kb_dim] byte offsets of logical scales in the CUTLASS SfAtom layout."""
+    r = torch.arange(rows)[:, None]
+    kb = torch.arange(kb_dim)[None, :]
+    atom = SF_ATOM_ROWS * SF_ATOM_COLS
+    return (
+        ((r // SF_ATOM_ROWS) * (kb_dim // SF_ATOM_COLS) + kb // SF_ATOM_COLS) * atom
+        + (r % SF_ATOM_COL_ROWS) * SF_ATOM_COLS * SF_ATOM_COLS
+        + ((r % SF_ATOM_ROWS) // SF_ATOM_COL_ROWS) * SF_ATOM_COLS
+        + kb % SF_ATOM_COLS
+    )
+
+
 def ue8m0_to_float32(scale_ue8m0):
     """Decode UE8M0 (uint8) back to a float32 scale value: value = 2^(byte - 127)."""
     exp = scale_ue8m0.to(torch.float32) - 127.0
     return torch.pow(torch.tensor(2.0, dtype=torch.float32), exp)
 
 
+def ulp_diff(a, b):
+    """Elementwise distance in ulps of two 1- or 2-byte float tensors (sign-
+    magnitude bit patterns mapped to ordered integers)."""
+    bits = 8 * a.element_size()
+    int_dtype = {8: torch.int8, 16: torch.int16}[bits]
+    magnitude = (1 << (bits - 1)) - 1
+
+    def ordered(t):
+        i = t.view(int_dtype).to(torch.int32)
+        return torch.where(i < 0, -(i & magnitude), i)
+
+    return (ordered(a) - ordered(b)).abs()
+
+
 def per_token_cast_to_fp8(x, block_size=32, *, amax_floor=1e-4):
-    """Quantize an (m, k) BF16 or FP32 tensor to FP8."""
-    assert x.dtype in (torch.bfloat16, torch.float32)
+    """Quantize an (m, k) bfloat16 tensor to float8_e4m3fn at block_size granularity along k."""
+    assert x.dtype == torch.bfloat16
     m, k = x.shape
     assert k % block_size == 0, f"k({k}) must be divisible by block_size({block_size})"
 

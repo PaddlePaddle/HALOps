@@ -24,7 +24,9 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
                const torch::Tensor& sfa, const torch::Tensor& sfb,
                torch::Tensor& output, const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha, const int sm_count,
-               const std::string& mode = "w8a8-mxfp8") {
+               const std::string& mode, const EpilogueOp epilogue,
+               const std::optional<torch::Tensor>& output_sf,
+               const std::optional<torch::Tensor>& gate, const bool use_pdl) {
     const CudaDeviceGuard device_guard(input.device());
     TORCH_CHECK(
         mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" || mode == "w4a4-mxfp4",
@@ -34,8 +36,8 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
                 "input must be a 3D tensor of shape [B, M, K]");
     TORCH_CHECK(weight.dim() == 3,
                 "weight must be a 3D tensor of shape [B, N, K]");
-    TORCH_CHECK(output.dim() == 3,
-                "output must be a 3D tensor of shape [B, M, N]");
+    TORCH_CHECK(output.dim() == 2,
+                "output must be a 2D tensor of shape [M, B * N]");
 
     const int batches = input.size(0);
     const int m = input.size(1);
@@ -43,9 +45,11 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
     TORCH_CHECK(weight.size(0) == batches,
                 "weight batch dim must match input batch dim, got ",
                 weight.size(0));
+    TORCH_CHECK(output.size(0) == m && output.size(1) == int64_t(batches) * n,
+                "output shape must be [M, B * N]");
     TORCH_CHECK(
-        output.size(0) == batches && output.size(1) == m && output.size(2) == n,
-        "output shape must be [B, M, N]");
+        !output_sf.has_value() || n % (mxfp8::kGroup * mxfp8::kAtomCols) == 0,
+        "quantized output needs N % 128 == 0, got ", n);
 
     // sfa/sfb: [B*M, sf_k] or [B, M, sf_k] -- same underlying memory.
 
@@ -60,6 +64,7 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.n = n;
     params.num_experts = batches;
     params.max_m_per_expert = m;
+    params.use_pdl = use_pdl;
 
     if (mode == "w8a8-mxfp8") {
         const int k = weight.size(2);
@@ -74,15 +79,57 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
         if (bias.has_value()) {
             params.ptr_c = bias->data_ptr();
         }
-        LaunchCfg<KernelMode::Batch, MmaKind::MXFP8>(
-            params,
-            {.m = m,
-             .n = n,
-             .k = k,
-             .m_grid = m * batches,
-             .sm_count = sm,
-             .has_bias = bias.has_value()},
-            stream);
+        const GemmShape shape = {.m = m,
+                                 .n = n,
+                                 .k = k,
+                                 .m_grid = m * batches,
+                                 .sm_count = sm,
+                                 .has_bias = bias.has_value()};
+        if (output_sf.has_value()) {
+            params.ptr_sfd = output_sf->data_ptr();
+        }
+        TORCH_CHECK(
+            gate.has_value() || (epilogue != EpilogueOp::GateMulQuant &&
+                                 epilogue != EpilogueOp::SigmoidGateMulQuant),
+            "GateMulQuant epilogues need gate");
+        if (gate.has_value()) {
+            constexpr int kGateAlign = sizeof(cute::uint256_t);
+            TORCH_CHECK(gate->scalar_type() == torch::kBFloat16 &&
+                            gate->sizes() == output.sizes(),
+                        "gate must be a bfloat16 [M, B * N] tensor");
+            TORCH_CHECK(
+                gate->stride(1) == 1 &&
+                    gate->stride(0) * gate->element_size() % kGateAlign == 0 &&
+                    reinterpret_cast<uintptr_t>(gate->data_ptr()) %
+                            kGateAlign ==
+                        0,
+                "gate rows must be contiguous and ", kGateAlign,
+                "-byte aligned");
+            params.ptr_gate = gate->data_ptr();
+            params.gate_ld = gate->stride(0);
+        }
+        switch (epilogue) {
+            case EpilogueOp::Identity:
+                LaunchCfg<KernelMode::Batch, MmaKind::MXFP8>(params, shape,
+                                                             stream);
+                break;
+            case EpilogueOp::Quant:
+                LaunchCfg<KernelMode::Batch, MmaKind::MXFP8, EpilogueOp::Quant>(
+                    params, shape, stream);
+                break;
+            case EpilogueOp::GateMulQuant:
+                LaunchCfg<KernelMode::Batch, MmaKind::MXFP8,
+                          EpilogueOp::GateMulQuant>(params, shape, stream);
+                break;
+            case EpilogueOp::SigmoidGateMulQuant:
+                LaunchCfg<KernelMode::Batch, MmaKind::MXFP8,
+                          EpilogueOp::SigmoidGateMulQuant>(params, shape,
+                                                           stream);
+                break;
+            default:
+                TORCH_CHECK(false, "Unsupported epilogue ",
+                            static_cast<int>(epilogue), " for ", mode);
+        }
     } else {
         const int k = weight.size(2) * 2;  // 2 FP4 per packed byte
         TORCH_CHECK(input.size(2) == weight.size(2),

@@ -145,12 +145,27 @@ struct CollectiveMainloop {
             cute::cosize(cute::take<0, 3>(SmemLayoutA{})) *
             cute::sizeof_bits_v<TypeA> * cute::size(AtomThrShapeMNK{})));
     static constexpr uint32_t TmaTransactionBytesA = TmaTransactionBytesAFull;
-    // Bytes the A/B/SF TMA actually delivers for this launch.
-    CUTLASS_DEVICE static uint32_t TmaTransactionBytesABFor(int m) {
+    CUTLASS_HOST_DEVICE static int NarrowARows(int m, int num_experts) {
         if constexpr (KernelTraits::KNarrowA) {
-            if (m > 0 && m < static_cast<int>(KernelTraits::KBlockM)) {
+            const int rows = KernelTraits::KernelType == KernelMode::Batch
+                                 ? m / num_experts
+                                 : m;
+            if (rows > 0 && rows < static_cast<int>(KernelTraits::KBlockM) &&
+                (KernelTraits::KernelType != KernelMode::Batch ||
+                 rows % 8 == 0)) {
+                return rows;
+            }
+        }
+        return 0;
+    }
+    // Bytes the A/B/SF TMA actually delivers for this launch.
+    CUTLASS_DEVICE static uint32_t TmaTransactionBytesABFor(int m,
+                                                            int num_experts) {
+        if constexpr (KernelTraits::KNarrowA) {
+            const int rows = NarrowARows(m, num_experts);
+            if (rows > 0) {
                 return TmaTransactionBytesAB - TmaTransactionBytesAFull +
-                       static_cast<uint32_t>(m) * KernelTraits::KBlockK *
+                       static_cast<uint32_t>(rows) * KernelTraits::KBlockK *
                            sizeof(TypeA);
             }
         }
@@ -210,6 +225,7 @@ struct CollectiveMainloop {
         // Hand-built A descriptor whose box M is min(m, KBlockM) rows.
         // Used when KernelTraits::KNarrowA and m < KBlockM.
         cute::TmaDescriptor a_run_desc;
+        cute::TmaDescriptor act_row_desc;
         int m;
         int k;
         int num_experts;
@@ -313,61 +329,63 @@ struct CollectiveMainloop {
                 TileShape_SF{}, TiledMma_SF{}, cluster_layout_sfb_vmnk);
         }
 
+        const auto row_box_desc = [&](cute::TmaDescriptor& desc,
+                                      const void* ptr, auto layout,
+                                      int box_rows, const char* what) {
+            EncodeTmaDesc<2>(&desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, ptr,
+                             {static_cast<cuuint64_t>(k),
+                              static_cast<cuuint64_t>(cute::size<0>(layout))},
+                             {static_cast<cuuint64_t>(cute::stride<0>(layout))},
+                             {static_cast<cuuint32_t>(KernelTraits::KBlockK),
+                              static_cast<cuuint32_t>(box_rows)},
+                             CU_TENSOR_MAP_SWIZZLE_128B, what);
+        };
         cute::TmaDescriptor a_run_desc{};
         if constexpr (KernelTraits::KNarrowA) {
-            const uint64_t a_k = static_cast<uint64_t>(k);
-            const uint64_t a_m =
-                static_cast<uint64_t>(cute::size<0>(args.layout_A));
-            const uint64_t a_ld =
-                static_cast<uint64_t>(cute::stride<0>(args.layout_A)) *
-                sizeof(TypeA);
-            const uint64_t box_m = std::min<uint64_t>(
-                a_m, static_cast<uint64_t>(KernelTraits::KBlockM));
-            cuuint64_t dims[2] = {a_k, a_m};
-            cuuint64_t strides[1] = {a_ld};
-            cuuint32_t box[2] = {static_cast<cuuint32_t>(KernelTraits::KBlockK),
-                                 static_cast<cuuint32_t>(box_m)};
-            cuuint32_t elem_strides[2] = {1, 1};
-            CUresult r = cuTensorMapEncodeTiled(
-                reinterpret_cast<CUtensorMap*>(&a_run_desc),
-                CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
-                const_cast<typename TiledMma::ValTypeA*>(args.ptr_a), dims,
-                strides, box, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-                CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-            TORCH_CHECK(r == CUDA_SUCCESS,
-                        "cuTensorMapEncodeTiled(narrow A) failed: ", r);
+            const int rows = NarrowARows(args.m, args.num_experts);
+            row_box_desc(a_run_desc, args.ptr_a, args.layout_A,
+                         rows > 0 ? rows
+                                  : std::min<int>(cute::size<0>(args.layout_A),
+                                                  KernelTraits::KBlockM),
+                         "narrow A");
+        }
+        cute::TmaDescriptor act_row_desc{};
+        if constexpr (KernelTraits::KActRowTma) {
+            row_box_desc(act_row_desc, args.ptr_b, args.layout_B,
+                         KernelTraits::KBlockN / KernelTraits::KNumCTA,
+                         "activation rows");
         }
         cute::TmaDescriptor sfb_run_desc{};
         if constexpr (IsSfbUnaligned) {
             // tile_atom_to_shape_SFB orders atoms K-block first, then N.
             const uint64_t k_blks = cute::size<1, 1>(args.layout_SFB);
-
             // Grouped modes lay the experts out after the N atoms, so they fold
             // into the same run dimension (one stride per atom).
             const uint64_t n_atoms = static_cast<uint64_t>(
                 cute::ceil_div(cute::size<0>(args.layout_B), 128));
-            const uint64_t n_atoms_all =
-                n_atoms * static_cast<uint64_t>(args.num_experts);
-            cuuint64_t dims[3] = {kSfbAtomBytes / 2, k_blks, n_atoms_all};
-            cuuint64_t strides[2] = {kSfbAtomBytes, k_blks * kSfbAtomBytes};
-            cuuint32_t box[3] = {kSfbAtomBytes / 2, 1, KSfbAtoms};
-            cuuint32_t elem_strides[3] = {1, 1, 1};
-            CUresult r = cuTensorMapEncodeTiled(
-                reinterpret_cast<CUtensorMap*>(&sfb_run_desc),
-                CU_TENSOR_MAP_DATA_TYPE_UINT16, 3,
-                const_cast<TypeSF*>(args.ptr_sfb), dims, strides, box,
-                elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-                CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-            TORCH_CHECK(r == CUDA_SUCCESS,
-                        "cuTensorMapEncodeTiled(SFB atom run) failed: ", r);
+            EncodeTmaDesc<3>(
+                &sfb_run_desc, CU_TENSOR_MAP_DATA_TYPE_UINT16, args.ptr_sfb,
+                {kSfbAtomBytes / 2, k_blks,
+                 n_atoms *
+                     static_cast<uint64_t>(SwapAB ? 1 : args.num_experts)},
+                {kSfbAtomBytes, k_blks * kSfbAtomBytes},
+                {kSfbAtomBytes / 2, 1, KSfbAtoms}, CU_TENSOR_MAP_SWIZZLE_NONE,
+                "SFB atom run");
         }
 
-        return {args.layout_A,   args.layout_B, args.layout_SFA,
-                args.layout_SFB, tma_load_A,    tma_load_B,
-                tma_load_sfa,    tma_load_sfb,  sfb_run_desc,
-                a_run_desc,      args.m,        k,
+        return {args.layout_A,
+                args.layout_B,
+                args.layout_SFA,
+                args.layout_SFB,
+                tma_load_A,
+                tma_load_B,
+                tma_load_sfa,
+                tma_load_sfb,
+                sfb_run_desc,
+                a_run_desc,
+                act_row_desc,
+                args.m,
+                k,
                 args.num_experts};
     }
 
@@ -406,9 +424,9 @@ struct CollectiveMainloop {
             IsSfbUnaligned ? 0 : block_rank_in_cluster);
 
         // Each warp only computes its own multicast mask
-        const bool narrow_a =
-            KernelTraits::KNarrowA &&
-            mainloop_params.m < static_cast<int>(KernelTraits::KBlockM);
+        const int narrow_rows =
+            NarrowARows(mainloop_params.m, mainloop_params.num_experts);
+        const bool narrow_a = KernelTraits::KNarrowA && narrow_rows > 0;
         uint16_t mcast_mask_a = cute::create_tma_multicast_mask<2>(
             cluster_layout_vmnk, cta_coord_vmnk);
         uint16_t mcast_mask_b = cute::create_tma_multicast_mask<1>(
@@ -575,10 +593,79 @@ struct CollectiveMainloop {
 
         uint32_t prologue_stage_idx = 0;
 
+        [[maybe_unused]] constexpr int kSfbStageElems =
+            IsSfbUnaligned ? cute::size(cute::filter_zeros(SmemLayoutAtomSFB{}))
+                           : 0;
+        [[maybe_unused]] auto issue_sfb_run = [&](uint64_t* bar, uint32_t stage,
+                                                  uint32_t k_tile_id,
+                                                  uint32_t b_row0,
+                                                  uint32_t expert_idx) {
+            using SfbLoad3D =
+                cute::conditional_t<IsSfbRowShift || KernelTraits::KNumCTA == 1,
+                                    cute::SM90_TMA_LOAD_3D,
+                                    cute::SM100_TMA_2SM_LOAD_3D>;
+            const int32_t expert_atoms =
+                SwapAB ? 0
+                       : static_cast<int32_t>(
+                             expert_idx *
+                             cute::ceil_div(
+                                 cute::size<0>(mainloop_params.layout_B), 128));
+            SfbLoad3D::copy(
+                &mainloop_params.sfb_run_desc, bar,
+                static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
+                shared_storage.SFB.begin() + stage * kSfbStageElems, 0,
+                static_cast<int32_t>(k_tile_id),
+                expert_atoms + static_cast<int32_t>(b_row0 / 128));
+        };
+
+        const auto a_tile = [](auto& t, uint32_t m, uint32_t k, uint32_t e) {
+            if constexpr (SwapAB) {
+                return t(cute::_, m, k, e);
+            } else {
+                return t(cute::_, m, k);
+            }
+        };
+        const auto b_tile = [](auto& t, uint32_t n, uint32_t k, uint32_t e) {
+            if constexpr (SwapAB) {
+                return t(cute::_, n, k);
+            } else {
+                return t(cute::_, n, k, e);
+            }
+        };
+        [[maybe_unused]] constexpr int kBStageRows =
+            cute::cosize(cute::take<0, 3>(SmemLayoutB{})) /
+            KernelTraits::KBlockK;
+        [[maybe_unused]] const auto load_rows =
+            [&](const cute::TmaDescriptor* desc, BarrierType* bar,
+                auto* smem_base, int smem_row, uint32_t k, int32_t row) {
+                using RowLoad =
+                    cute::conditional_t<KernelTraits::KNumCTA == 1,
+                                        cute::SM90_TMA_LOAD_2D,
+                                        cute::SM100_TMA_2SM_LOAD_2D>;
+                RowLoad::copy(desc, reinterpret_cast<uint64_t*>(bar),
+                              static_cast<uint64_t>(
+                                  cute::TMA::CacheHintSm90::EVICT_NORMAL),
+                              smem_base + smem_row * KernelTraits::KBlockK,
+                              static_cast<int32_t>(k * KernelTraits::KBlockK),
+                              row);
+            };
+
         while (scheduler.is_valid()) {
             uint32_t m_idx = scheduler.m_idx();
             uint32_t n_idx = scheduler.n_idx();
             uint32_t expert_idx = scheduler.expert_idx();
+            const uint32_t b_row0 = sfb_row0(scheduler);
+            int32_t narrow_row = 0;
+            int32_t narrow_smem_row = 0;
+            if constexpr (KernelTraits::KNarrowA) {
+                const int32_t lo =
+                    static_cast<int32_t>(m_idx) * KernelTraits::KBlockM;
+                narrow_row = cute::min(
+                    cute::max(static_cast<int32_t>(expert_idx) * narrow_rows,
+                              lo),
+                    lo + KernelTraits::KBlockM - narrow_rows);
+                narrow_smem_row = narrow_row - lo;
+            }
             for (uint32_t k_tile_id = 0; k_tile_id < tile_num_k; ++k_tile_id) {
                 ab_pipeline.producer_acquire(mainloop_pipe_producer_state);
                 BarrierType* tma_barrier = ab_pipeline.producer_get_barrier(
@@ -586,130 +673,64 @@ struct CollectiveMainloop {
                 prologue_stage_idx = mainloop_pipe_producer_state.index();
 
                 if (select_thr) {
-                    if constexpr (SwapAB) {
-                        cute::copy(
-                            mainloop_params.tma_load_A.with(*tma_barrier,
-                                                            mcast_mask_a),
-                            tma_gA(cute::_, m_idx, k_tile_id, expert_idx),
-                            tma_sA(cute::_,
-                                   (cute::Int<0>{}, prologue_stage_idx)));
+                    if constexpr (IsSfbRowShift) {
+                        cutlass::arch::ClusterTransactionBarrier::
+                            arrive_and_expect_tx(
+                                &shared_storage.sf_full[prologue_stage_idx],
+                                TmaTransactionBytesSfbStage);
+                        issue_sfb_run(
+                            reinterpret_cast<uint64_t*>(
+                                &shared_storage.sf_full[prologue_stage_idx]),
+                            prologue_stage_idx, k_tile_id, b_row0, expert_idx);
+                    }
+                    bool a_issued = false;
+                    if constexpr (KernelTraits::KNarrowA) {
+                        if (narrow_a) {
+                            load_rows(
+                                &mainloop_params.a_run_desc, tma_barrier,
+                                shared_storage.A.begin(),
+                                prologue_stage_idx * KernelTraits::KBlockM +
+                                    narrow_smem_row,
+                                k_tile_id, narrow_row);
+                            a_issued = true;
+                        }
+                    }
+                    if (!a_issued) {
+                        cute::copy(mainloop_params.tma_load_A.with(
+                                       *tma_barrier, mcast_mask_a),
+                                   a_tile(tma_gA, m_idx, k_tile_id, expert_idx),
+                                   tma_sA(cute::_, (cute::Int<0>{},
+                                                    prologue_stage_idx)));
+                    }
+                    if constexpr (KernelTraits::KActRowTma) {
+                        load_rows(&mainloop_params.act_row_desc, tma_barrier,
+                                  shared_storage.B.begin(),
+                                  prologue_stage_idx * kBStageRows, k_tile_id,
+                                  b_row0 + scheduler.cta_v() *
+                                               (KernelTraits::KBlockN /
+                                                KernelTraits::KNumCTA));
+                    } else {
                         cute::copy(mainloop_params.tma_load_B.with(
                                        *tma_barrier, mcast_mask_b),
-                                   tma_gB(cute::_, n_idx, k_tile_id),
+                                   b_tile(tma_gB, n_idx, k_tile_id, expert_idx),
                                    tma_sB(cute::_, (cute::Int<0>{},
                                                     prologue_stage_idx)));
+                    }
+                    cute::copy(mainloop_params.tma_load_SFA.with(
+                                   *tma_barrier, mcast_mask_sfa),
+                               a_tile(tma_gSFA, m_idx, k_tile_id, expert_idx),
+                               tma_sSFA(cute::_,
+                                        (cute::Int<0>{}, prologue_stage_idx)));
+                    if constexpr (!IsSfbUnaligned) {
                         cute::copy(
-                            mainloop_params.tma_load_SFA.with(*tma_barrier,
-                                                              mcast_mask_sfa),
-                            tma_gSFA(cute::_, m_idx, k_tile_id, expert_idx),
-                            tma_sSFA(cute::_,
+                            mainloop_params.tma_load_SFB.with(*tma_barrier,
+                                                              mcast_mask_sfb),
+                            b_tile(tma_gSFB, n_idx, k_tile_id, expert_idx),
+                            tma_sSFB(cute::_,
                                      (cute::Int<0>{}, prologue_stage_idx)));
-                        cute::copy(mainloop_params.tma_load_SFB.with(
-                                       *tma_barrier, mcast_mask_sfb),
-                                   tma_gSFB(cute::_, n_idx, k_tile_id),
-                                   tma_sSFB(cute::_, (cute::Int<0>{},
-                                                      prologue_stage_idx)));
-                    } else {
-                        // Per-CTA SFB copy on `sf_full` (a rewriter warp fixes
-                        // it up); issued first to overlap the A/B transfer.
-                        if constexpr (IsSfbRowShift) {
-                            constexpr int kSfbStageElems = cute::size(
-                                cute::filter_zeros(SmemLayoutAtomSFB{}));
-                            cutlass::arch::ClusterTransactionBarrier::
-                                arrive_and_expect_tx(
-                                    &shared_storage.sf_full[prologue_stage_idx],
-                                    TmaTransactionBytesSfbStage);
-                            cute::SM90_TMA_LOAD_3D::copy(
-                                &mainloop_params.sfb_run_desc,
-                                reinterpret_cast<uint64_t*>(
-                                    &shared_storage
-                                         .sf_full[prologue_stage_idx]),
-                                static_cast<uint64_t>(
-                                    cute::TMA::CacheHintSm90::EVICT_NORMAL),
-                                shared_storage.SFB.begin() +
-                                    prologue_stage_idx * kSfbStageElems,
-                                0, static_cast<int32_t>(k_tile_id),
-                                static_cast<int32_t>(
-                                    expert_idx *
-                                        cute::ceil_div(
-                                            cute::size<0>(
-                                                mainloop_params.layout_B),
-                                            128) +
-                                    n_idx * cute::size<1>(TileShape{}) / 128));
-                        }
-                        // When NarrowA is used, the UMMA still
-                        // reads KBlockM rows, so the tail rows are stale and
-                        // their D rows are discarded by the epilogue.
-                        auto issue_full_a = [&]() {
-                            cute::copy(mainloop_params.tma_load_A.with(
-                                           *tma_barrier, mcast_mask_a),
-                                       tma_gA(cute::_, m_idx, k_tile_id),
-                                       tma_sA(cute::_, (cute::Int<0>{},
-                                                        prologue_stage_idx)));
-                        };
-                        if constexpr (KernelTraits::KNarrowA) {
-                            if (narrow_a) {
-                                cute::SM90_TMA_LOAD_2D::copy(
-                                    &mainloop_params.a_run_desc,
-                                    reinterpret_cast<uint64_t*>(tma_barrier),
-                                    static_cast<uint64_t>(
-                                        cute::TMA::CacheHintSm90::EVICT_NORMAL),
-                                    shared_storage.A.begin() +
-                                        prologue_stage_idx *
-                                            (KernelTraits::KBlockM *
-                                             KernelTraits::KBlockK),
-                                    static_cast<int32_t>(k_tile_id *
-                                                         KernelTraits::KBlockK),
-                                    static_cast<int32_t>(
-                                        m_idx * KernelTraits::KBlockM));
-                            } else {
-                                issue_full_a();
-                            }
-                        } else {
-                            issue_full_a();
-                        }
-                        cute::copy(
-                            mainloop_params.tma_load_B.with(*tma_barrier,
-                                                            mcast_mask_b),
-                            tma_gB(cute::_, n_idx, k_tile_id, expert_idx),
-                            tma_sB(cute::_,
-                                   (cute::Int<0>{}, prologue_stage_idx)));
-                        cute::copy(mainloop_params.tma_load_SFA.with(
-                                       *tma_barrier, mcast_mask_sfa),
-                                   tma_gSFA(cute::_, m_idx, k_tile_id),
-                                   tma_sSFA(cute::_, (cute::Int<0>{},
-                                                      prologue_stage_idx)));
-                        if constexpr (IsSfbRowShift) {
-                            // Issued first, see above.
-                        } else if constexpr (IsSfbUnaligned) {
-                            // Atoms past N are out of bounds (zero-filled);
-                            // they only feed overhang columns never stored.
-                            constexpr int kSfbStageElems = cute::size(
-                                cute::filter_zeros(SmemLayoutAtomSFB{}));
-                            {
-                                using SfbLoad3D = cute::conditional_t<
-                                    KernelTraits::KNumCTA == 1,
-                                    cute::SM90_TMA_LOAD_3D,
-                                    cute::SM100_TMA_2SM_LOAD_3D>;
-                                SfbLoad3D::copy(
-                                    &mainloop_params.sfb_run_desc, tma_barrier,
-                                    static_cast<uint64_t>(
-                                        cute::TMA::CacheHintSm90::EVICT_NORMAL),
-                                    shared_storage.SFB.begin() +
-                                        prologue_stage_idx * kSfbStageElems,
-                                    0, static_cast<int32_t>(k_tile_id),
-                                    static_cast<int32_t>(
-                                        n_idx * cute::size<1>(TileShape{}) /
-                                        128));
-                            }
-                        } else {
-                            cute::copy(
-                                mainloop_params.tma_load_SFB.with(
-                                    *tma_barrier, mcast_mask_sfb),
-                                tma_gSFB(cute::_, n_idx, k_tile_id, expert_idx),
-                                tma_sSFB(cute::_,
-                                         (cute::Int<0>{}, prologue_stage_idx)));
-                        }
+                    } else if constexpr (!IsSfbRowShift) {
+                        issue_sfb_run(tma_barrier, prologue_stage_idx,
+                                      k_tile_id, b_row0, expert_idx);
                     }
                 }
                 ++mainloop_pipe_producer_state;
@@ -720,6 +741,15 @@ struct CollectiveMainloop {
     }
 
   public:
+    CUTLASS_DEVICE static uint32_t sfb_row0(
+        TileScheduler<KernelTraits> const& scheduler) {
+        if constexpr (KernelTraits::KActRowTma) {
+            return scheduler.act_row0();
+        } else {
+            return scheduler.n_idx() * cute::size<1>(TileShape{});
+        }
+    }
+
     // Shift one SFB stage up by 32 rows (odd in-atom offset -> even): rotate
     // the atom's four 32-row words, the tail one coming from the next atom.
     CUTLASS_DEVICE static void sfb_shift_rows_stage(SharedStorage& storage,
@@ -763,8 +793,7 @@ struct CollectiveMainloop {
         MainloopPipelineState stage;
         for (auto walk = scheduler; walk.is_valid(); walk.advance()) {
             // The tile's start column inside the window, in 32-row columns.
-            const bool odd =
-                (((walk.n_idx() * cute::size<1>(TileShape{})) % 128) / 32) & 1;
+            const bool odd = ((sfb_row0(walk) % 128) / 32) & 1;
             for (uint32_t k_tile_id = 0; k_tile_id < tile_num_k; ++k_tile_id) {
                 const uint32_t s = stage.index();
                 if (s % kWarps == xpose) {
@@ -871,8 +900,7 @@ struct CollectiveMainloop {
             if constexpr (IsSfbUnaligned) {
                 // The window lands from column 0 and the MMA starts at the
                 // tile's own column (already moved to the even one by 224).
-                const uint32_t sfb_row_col =
-                    (n_idx * cute::size<1>(TileShape{}) % 128) / 32;
+                const uint32_t sfb_row_col = (sfb_row0(scheduler) % 128) / 32;
                 sfb_mma_col = sfb_row_col & ~1u;
             }
             auto thr_tSFB_s2t_tile = thr_tSFB_s2t;

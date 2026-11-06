@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/pdl.cuh"
 #include "kernel/gemm/gemm_utils.h"
 
 namespace halops::mla {
@@ -114,8 +115,7 @@ void launch_pdl(Kernel* kernel, const LaunchDims& dims, Args... args) {
     cfg.dynamicSmemBytes = dims.smem;
     cfg.stream = GetCurrentCUDAStream();
     cudaLaunchAttribute attr[2] = {};
-    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    attr[0] = PdlLaunchAttribute();
     attr[1].id = cudaLaunchAttributeClusterDimension;
     attr[1].val.clusterDim.x = dims.cluster;
     attr[1].val.clusterDim.y = 1;
