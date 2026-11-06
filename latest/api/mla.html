@@ -274,6 +274,9 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#halops.mla_workspace" title="halops.mla_workspace"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mla_workspace</span></code></a></p></td>
 <td><p>Allocate the gmem workspace of <code class="docutils literal notranslate"><span class="pre">mla_attention_plan</span></code>, <code class="docutils literal notranslate"><span class="pre">mla_attention</span></code> and <code class="docutils literal notranslate"><span class="pre">mla_output_proj</span></code>.</p></td>
 </tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.vha_postmix_quant" title="halops.vha_postmix_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">vha_postmix_quant</span></code></a></p></td>
+<td><p>Inverse RoPE + VHA cross-head postmix + W8A8-MXFP8 quantization.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -573,6 +576,77 @@ reads its KV runs and work list); per layer <code class="docutils literal notran
 </dd></dl>
 
 </section>
+<section class="api-entry" id="vha-postmix-quant">
+<h2>vha_postmix_quant<a class="headerlink" href="#vha-postmix-quant" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.vha_postmix_quant">
+<span class="sig-name descname"><span class="pre">vha_postmix_quant</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">o</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">mix</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">freqs</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">positions</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">groups</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">8</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">group_major</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">output_quant</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">output_sf</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.vha_postmix_quant" title="Link to this definition">¶</a></dt>
+<dd><p>Inverse RoPE + VHA cross-head postmix + W8A8-MXFP8 quantization.</p>
+<p>For every token <code class="docutils literal notranslate"><span class="pre">t</span></code>: the last 64 dims of each head of <code class="docutils literal notranslate"><span class="pre">o</span></code> are rotated
+back (interleaved pairs, <code class="docutils literal notranslate"><span class="pre">e'</span> <span class="pre">=</span> <span class="pre">e</span> <span class="pre">cos</span> <span class="pre">+</span> <span class="pre">o</span> <span class="pre">sin</span></code>, <code class="docutils literal notranslate"><span class="pre">o'</span> <span class="pre">=</span> <span class="pre">o</span> <span class="pre">cos</span> <span class="pre">-</span> <span class="pre">e</span> <span class="pre">sin</span></code> in
+fp32, rounded to bf16), mixed across heads with
+<code class="docutils literal notranslate"><span class="pre">out[t,</span> <span class="pre">h]</span> <span class="pre">=</span> <span class="pre">sum_h'</span> <span class="pre">mix[h,</span> <span class="pre">h']</span> <span class="pre">o'[t,</span> <span class="pre">h']</span></code> (fp32 accumulation, rounded to
+bf16), viewed as <code class="docutils literal notranslate"><span class="pre">[groups,</span> <span class="pre">D</span> <span class="pre">=</span> <span class="pre">64</span> <span class="pre">/</span> <span class="pre">groups</span> <span class="pre">*</span> <span class="pre">512]</span></code> (group g = heads
+<code class="docutils literal notranslate"><span class="pre">g</span> <span class="pre">*</span> <span class="pre">64</span> <span class="pre">/</span> <span class="pre">groups</span> <span class="pre">...</span></code>) and quantized like
+<code class="docutils literal notranslate"><span class="pre">group_wise_quant(...,</span> <span class="pre">&quot;w8a8-mxfp8&quot;)</span></code>.</p>
+<p>With <code class="docutils literal notranslate"><span class="pre">mix</span> <span class="pre">=</span> <span class="pre">I</span></code> the result is bit-identical to inverse RoPE followed by
+<code class="docutils literal notranslate"><span class="pre">group_wise_quant</span></code>; otherwise the mix’s accumulation order differs from
+<code class="docutils literal notranslate"><span class="pre">torch.matmul</span></code> by at most 1 bf16 ulp per element.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>o</strong> (<em>torch.Tensor</em>) – [T, 64, 512] bfloat16 contiguous attention output.</p></li>
+<li><p><strong>mix</strong> (<em>torch.Tensor</em>) – [64, 64] bfloat16 postmix matrix.</p></li>
+<li><p><strong>freqs</strong> (<em>torch.Tensor</em>) – [max_pos, 64] float32 table, (cos, sin) of rope pair <code class="docutils literal notranslate"><span class="pre">j</span></code> at
+columns <code class="docutils literal notranslate"><span class="pre">2j,</span> <span class="pre">2j</span> <span class="pre">+</span> <span class="pre">1</span></code>.</p></li>
+<li><p><strong>positions</strong> (<em>torch.Tensor</em>) – [T] int32 / int64 positions.</p></li>
+<li><p><strong>groups</strong> (<em>int</em>) – Head groups G (divides 64).</p></li>
+<li><p><strong>group_major</strong> (<em>bool</em>) – <code class="docutils literal notranslate"><span class="pre">True</span></code> for a <code class="docutils literal notranslate"><span class="pre">[G,</span> <span class="pre">T,</span> <span class="pre">D]</span></code> output with scale rows
+<code class="docutils literal notranslate"><span class="pre">g</span> <span class="pre">*</span> <span class="pre">T</span> <span class="pre">+</span> <span class="pre">t</span></code> (the A operand of <code class="docutils literal notranslate"><span class="pre">batch_gemm</span></code>); <code class="docutils literal notranslate"><span class="pre">False</span></code> for
+<code class="docutils literal notranslate"><span class="pre">[T,</span> <span class="pre">G,</span> <span class="pre">D]</span></code> with scale rows <code class="docutils literal notranslate"><span class="pre">t</span> <span class="pre">*</span> <span class="pre">G</span> <span class="pre">+</span> <span class="pre">g</span></code>.</p></li>
+<li><p><strong>use_pdl</strong> (<em>bool</em>) – Enable Programmatic Dependent Launch (on by default).</p></li>
+<li><p><strong>output_quant</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional pre-allocated contiguous float8_e4m3fn output.</p></li>
+<li><p><strong>output_sf</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional pre-allocated contiguous scale buffer.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><code class="docutils literal notranslate"><span class="pre">(output_quant,</span> <span class="pre">output_sf)</span></code> – float8_e4m3fn codes and
+[ceil(G * T / 128) * 128, D / 32] uint8 UE8M0 scales in the CUTLASS
+SfAtom layout (padding rows hold 0).</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><em>Tuple</em>[torch.Tensor, torch.Tensor]</p>
+</dd>
+</dl>
+<p class="rubric">Example</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">halops</span><span class="w"> </span><span class="kn">import</span> <span class="n">vha_postmix_quant</span>
+
+<span class="n">t</span> <span class="o">=</span> <span class="mi">128</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">mix</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">eye</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">theta</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">4096</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">freqs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">([</span><span class="n">theta</span><span class="o">.</span><span class="n">cos</span><span class="p">(),</span> <span class="n">theta</span><span class="o">.</span><span class="n">sin</span><span class="p">()],</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">flatten</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+<span class="n">pos</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">o_fp8</span><span class="p">,</span> <span class="n">sf</span> <span class="o">=</span> <span class="n">vha_postmix_quant</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="n">mix</span><span class="p">,</span> <span class="n">freqs</span><span class="p">,</span> <span class="n">pos</span><span class="p">,</span> <span class="n">groups</span><span class="o">=</span><span class="mi">8</span><span class="p">)</span>
+</pre></div>
+</div>
+</dd></dl>
+
+</section>
 </section>
 
         </article>
@@ -635,6 +709,7 @@ reads its KV runs and work list); per layer <code class="docutils literal notran
 <li><a class="reference internal" href="#mla-attention-plan">mla_attention_plan</a></li>
 <li><a class="reference internal" href="#mla-output-proj">mla_output_proj</a></li>
 <li><a class="reference internal" href="#mla-workspace">mla_workspace</a></li>
+<li><a class="reference internal" href="#vha-postmix-quant">vha_postmix_quant</a></li>
 </ul>
 </li>
 </ul>

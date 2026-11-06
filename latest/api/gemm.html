@@ -268,23 +268,29 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#halops.dense_gemm" title="halops.dense_gemm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">dense_gemm</span></code></a></p></td>
 <td><p>Dense GEMM on Blackwell SM100 tensor cores.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#halops.fused_swiglu_quant" title="halops.fused_swiglu_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fused_swiglu_quant</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.interleave_gate_up" title="halops.interleave_gate_up"><code class="xref py py-obj docutils literal notranslate"><span class="pre">interleave_gate_up</span></code></a></p></td>
+<td><p>Reorder <code class="docutils literal notranslate"><span class="pre">[gate;</span> <span class="pre">up]</span></code> rows for <code class="docutils literal notranslate"><span class="pre">EpilogueOp.SituQuant</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.fused_swiglu_quant" title="halops.fused_swiglu_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fused_swiglu_quant</span></code></a></p></td>
 <td><p>Fused SwiGLU activation + FP8/FP4 quantization in a single pass.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#halops.group_contiguous_gemm" title="halops.group_contiguous_gemm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_contiguous_gemm</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.group_contiguous_gemm" title="halops.group_contiguous_gemm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_contiguous_gemm</span></code></a></p></td>
 <td><p>Grouped contiguous GEMM for MoE on Blackwell.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#halops.group_masked_gemm" title="halops.group_masked_gemm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_masked_gemm</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.group_masked_gemm" title="halops.group_masked_gemm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_masked_gemm</span></code></a></p></td>
 <td><p>Grouped masked GEMM for MoE on Blackwell with per-expert token masking.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#halops.group_wise_quant" title="halops.group_wise_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_wise_quant</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.group_wise_quant" title="halops.group_wise_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">group_wise_quant</span></code></a></p></td>
 <td><p>Group-wise quantization from BF16/FP16 to FP8/FP4 with scale factors.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#halops.low_latency_mma_gemm" title="halops.low_latency_mma_gemm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">low_latency_mma_gemm</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.low_latency_mma_gemm" title="halops.low_latency_mma_gemm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">low_latency_mma_gemm</span></code></a></p></td>
 <td><p>Low-latency W8A8-MXFP8 GEMM for decode-sized M (M &lt;= 16).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#halops.prefill_permute_to_masked_gemm" title="halops.prefill_permute_to_masked_gemm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">prefill_permute_to_masked_gemm</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.prefill_permute_to_masked_gemm" title="halops.prefill_permute_to_masked_gemm"><code class="xref py py-obj docutils literal notranslate"><span class="pre">prefill_permute_to_masked_gemm</span></code></a></p></td>
 <td><p>Permute tokens into padded expert layout for masked GEMM.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.rms_norm_quant" title="halops.rms_norm_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rms_norm_quant</span></code></a></p></td>
+<td><p>RMSNorm fused with W8A8-MXFP8 quantization.</p></td>
 </tr>
 </tbody>
 </table>
@@ -305,11 +311,16 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">alpha</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">sm_count</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'w8a8-mxfp8'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">epilogue</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">halops.halops_kernel.EpilogueOp.Identity</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">output_sf</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">gate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="headerlink" href="#halops.batch_gemm" title="Link to this definition">¶</a></dt>
 <dd><p>Batch GEMM on Blackwell SM100 tensor cores.</p>
-<p>Computes <code class="docutils literal notranslate"><span class="pre">output[b]</span> <span class="pre">=</span> <span class="pre">input[b]</span> <span class="pre">&#64;</span> <span class="pre">weight[b]^T</span></code> for each batch item.
+<p>Computes <code class="docutils literal notranslate"><span class="pre">output[:,</span> <span class="pre">b</span> <span class="pre">*</span> <span class="pre">N:(b</span> <span class="pre">+</span> <span class="pre">1)</span> <span class="pre">*</span> <span class="pre">N]</span> <span class="pre">=</span> <span class="pre">input[b]</span> <span class="pre">&#64;</span> <span class="pre">weight[b]^T</span></code> for
+each batch item.
 The batch dimension <code class="docutils literal notranslate"><span class="pre">B</span></code> acts as the group (expert) index: batch item
 <code class="docutils literal notranslate"><span class="pre">b</span></code> is multiplied only by <code class="docutils literal notranslate"><span class="pre">weight[b]</span></code>, i.e. there is a one-to-one
 mapping between input batch index and weight batch index (no separate
@@ -334,13 +345,25 @@ layout. Shape: <code class="docutils literal notranslate"><span class="pre">[cei
 </ul>
 </p></li>
 <li><p><strong>sfb</strong> (<em>torch.Tensor</em>) – [B, N, sf_k] scale factor for B, dtype uint8, same SfAtom layout as sfa.</p></li>
-<li><p><strong>output</strong> (<em>torch.Tensor</em>) – [B, M, N] pre-allocated output tensor, dtype bfloat16. Written in-place.</p></li>
+<li><p><strong>output</strong> (<em>torch.Tensor</em>) – [M, B * N] pre-allocated output tensor, dtype bfloat16, or
+float8_e4m3fn (<code class="docutils literal notranslate"><span class="pre">w8a8-mxfp8</span></code>) for an MXFP8-quantized output.</p></li>
 <li><p><strong>bias</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional [B, N] bfloat16 bias vector. Only supported in w8a8-mxfp8 mode.</p></li>
 <li><p><strong>alpha</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional float32 per-batch scaling factor with shape [B], one
 value per batch item. Required for <code class="docutils literal notranslate"><span class="pre">w4a4-nvfp4</span></code>; not accepted for
 <code class="docutils literal notranslate"><span class="pre">w4a4-mxfp4</span></code>.</p></li>
 <li><p><strong>sm_count</strong> (<em>int</em>) – Number of SMs to use (-1 for all available).</p></li>
 <li><p><strong>mode</strong> (<em>str</em>) – <code class="docutils literal notranslate"><span class="pre">&quot;w8a8-mxfp8&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-mxfp4&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-nvfp4&quot;</span></code>.</p></li>
+<li><p><strong>epilogue</strong> (<em>halops.halops_kernel.EpilogueOp</em>) – <code class="docutils literal notranslate"><span class="pre">EpilogueOp.Identity</span></code>, <code class="docutils literal notranslate"><span class="pre">EpilogueOp.Quant</span></code>,
+<code class="docutils literal notranslate"><span class="pre">EpilogueOp.GateMulQuant</span></code> or <code class="docutils literal notranslate"><span class="pre">EpilogueOp.SigmoidGateMulQuant</span></code>
+(<code class="docutils literal notranslate"><span class="pre">w8a8-mxfp8</span></code>: float8_e4m3fn output, the result (times <code class="docutils literal notranslate"><span class="pre">gate</span></code>,
+or times <code class="docutils literal notranslate"><span class="pre">bf16(sigmoid(gate))</span></code>) quantized per 32 columns).</p></li>
+<li><p><strong>output_sf</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – UE8M0 SfAtom scales of a quantized output, over
+<code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">B</span> <span class="pre">*</span> <span class="pre">N</span> <span class="pre">/</span> <span class="pre">32]</span></code>; N must be a multiple of 128.</p></li>
+<li><p><strong>gate</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [M, B * N] bfloat16 tensor of the GateMulQuant epilogues
+(logits for <code class="docutils literal notranslate"><span class="pre">SigmoidGateMulQuant</span></code>). Rows may be strided
+(<code class="docutils literal notranslate"><span class="pre">stride(1)</span> <span class="pre">==</span> <span class="pre">1</span></code>, 32-byte aligned row starts), e.g. a column
+slice of a merged GEMM output.</p></li>
+<li><p><strong>use_pdl</strong> (<em>bool</em>) – Enable Programmatic Dependent Launch (on by default).</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
@@ -357,7 +380,7 @@ value per batch item. Required for <code class="docutils literal notranslate"><s
 <span class="n">w</span><span class="p">,</span> <span class="n">sfb</span> <span class="o">=</span> <span class="n">group_wise_quant</span><span class="p">(</span><span class="n">w_bf16</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">b</span> <span class="o">*</span> <span class="n">n</span><span class="p">,</span> <span class="n">k</span><span class="p">),</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"w8a8-mxfp8"</span><span class="p">)</span>
 <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">m</span><span class="p">,</span> <span class="n">k</span><span class="p">);</span> <span class="n">sfa</span> <span class="o">=</span> <span class="n">sfa</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">m</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
 <span class="n">w</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">k</span><span class="p">);</span> <span class="n">sfb</span> <span class="o">=</span> <span class="n">sfb</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
-<span class="n">out</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">b</span><span class="p">,</span> <span class="n">m</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">out</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">b</span> <span class="o">*</span> <span class="n">n</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
 <span class="n">batch_gemm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">,</span> <span class="n">sfa</span><span class="p">,</span> <span class="n">sfb</span><span class="p">,</span> <span class="n">out</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"w8a8-mxfp8"</span><span class="p">)</span>
 </pre></div>
 </div>
@@ -381,6 +404,10 @@ value per batch item. Required for <code class="docutils literal notranslate"><s
 <dd><em class="sig-param"><span class="n"><span class="pre">sm_count</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'w8a8-mxfp8'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">epilogue</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">halops.halops_kernel.EpilogueOp.Identity</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">output_sf</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">situ_beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">4.0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">situ_linear_beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">25.0</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="headerlink" href="#halops.dense_gemm" title="Link to this definition">¶</a></dt>
@@ -419,6 +446,18 @@ layout as sfa. Shape [N, K // 32] (w8a8-mxfp8, w4a4-mxfp4) or
 <li><p><strong>mode</strong> (<em>str</em>) – Quantization mode: <code class="docutils literal notranslate"><span class="pre">&quot;w8a8-mxfp8&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-mxfp4&quot;</span></code> or
 <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-nvfp4&quot;</span></code>.</p></li>
 <li><p><strong>use_pdl</strong> (<em>bool</em>) – Enable Programmatic Dependent Launch (on by default).</p></li>
+<li><p><strong>epilogue</strong> (<em>halops.halops_kernel.EpilogueOp</em>) – <code class="docutils literal notranslate"><span class="pre">EpilogueOp.Identity</span></code>, <code class="docutils literal notranslate"><span class="pre">EpilogueOp.Sigmoid</span></code> (bfloat16
+<code class="docutils literal notranslate"><span class="pre">sigmoid(input</span> <span class="pre">&#64;</span> <span class="pre">weight^T</span> <span class="pre">+</span> <span class="pre">bias)</span></code>) or <code class="docutils literal notranslate"><span class="pre">EpilogueOp.SituQuant</span></code>
+(<code class="docutils literal notranslate"><span class="pre">w8a8-mxfp8</span></code> SiTU-GLU: with <code class="docutils literal notranslate"><span class="pre">y</span> <span class="pre">=</span> <span class="pre">input</span> <span class="pre">&#64;</span> <span class="pre">weight^T</span> <span class="pre">+</span> <span class="pre">bias</span></code>
+and the <code class="docutils literal notranslate"><span class="pre">[gate;</span> <span class="pre">up]</span></code> rows of weight, sfb and bias reordered by
+<code class="docutils literal notranslate"><span class="pre">interleave_gate_up</span></code>, output <code class="docutils literal notranslate"><span class="pre">[M,</span> <span class="pre">N</span> <span class="pre">/</span> <span class="pre">2]</span></code> float8_e4m3fn is
+<code class="docutils literal notranslate"><span class="pre">situ_beta</span> <span class="pre">*</span> <span class="pre">tanh(gate</span> <span class="pre">/</span> <span class="pre">situ_beta)</span> <span class="pre">*</span> <span class="pre">sigmoid(gate)</span> <span class="pre">*</span>
+<span class="pre">situ_linear_beta</span> <span class="pre">*</span> <span class="pre">tanh(up</span> <span class="pre">/</span> <span class="pre">situ_linear_beta)</span></code> (<code class="docutils literal notranslate"><span class="pre">up</span></code> as is
+when <code class="docutils literal notranslate"><span class="pre">situ_linear_beta</span></code> is None) with UE8M0 scales per 32
+columns in <code class="docutils literal notranslate"><span class="pre">output_sf</span></code>).</p></li>
+<li><p><strong>output_sf</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – SfAtom scales of a quantized output.</p></li>
+<li><p><strong>situ_beta</strong> (<em>float</em>) – SiTU gate softcap.</p></li>
+<li><p><strong>situ_linear_beta</strong> (<em>float</em><em> | </em><em>None</em>) – SiTU up softcap, or None for none.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
@@ -437,6 +476,27 @@ layout as sfa. Shape [N, K // 32] (w8a8-mxfp8, w4a4-mxfp4) or
 <span class="n">dense_gemm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">,</span> <span class="n">sfa</span><span class="p">,</span> <span class="n">sfb</span><span class="p">,</span> <span class="n">out</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">"w8a8-mxfp8"</span><span class="p">)</span>
 </pre></div>
 </div>
+</dd></dl>
+
+</section>
+<section class="api-entry" id="interleave-gate-up">
+<h2>interleave_gate_up<a class="headerlink" href="#interleave-gate-up" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.interleave_gate_up">
+<span class="sig-name descname"><span class="pre">interleave_gate_up</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">t</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#halops.interleave_gate_up" title="Link to this definition">¶</a></dt>
+<dd><p>Reorder <code class="docutils literal notranslate"><span class="pre">[gate;</span> <span class="pre">up]</span></code> rows for <code class="docutils literal notranslate"><span class="pre">EpilogueOp.SituQuant</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>t</strong> (<em>torch.Tensor</em>) – [2 * I, …] weight, logical (unswizzled) weight scale or bias of a
+gate/up projection, gate rows first.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><em>[2 * I, …] tensor with gate and up rows interleaved in blocks of 16</em> – gate rows <code class="docutils literal notranslate"><span class="pre">16i..16i+15</span></code>, then up rows <code class="docutils literal notranslate"><span class="pre">16i..16i+15</span></code>.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>torch.Tensor</p>
+</dd>
+</dl>
 </dd></dl>
 
 </section>
@@ -677,6 +737,8 @@ Required for <code class="docutils literal notranslate"><span class="pre">w4a4-n
 <dd><em class="sig-param"><span class="n"><span class="pre">mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'w8a8-mxfp8'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_swizzle</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">output_quant</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">output_sf</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="headerlink" href="#halops.group_wise_quant" title="Link to this definition">¶</a></dt>
@@ -690,13 +752,17 @@ FP4 (W4A4) quantization. The FP4 recipe is selected explicitly by
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>input</strong> (<em>torch.Tensor</em>) – [m, k] CUDA tensor, dtype bfloat16 or float16. Source tensor.</p></li>
+<li><p><strong>input</strong> (<em>torch.Tensor</em>) – [m, k] CUDA tensor, dtype bfloat16 or float16. Rows may be
+strided (<code class="docutils literal notranslate"><span class="pre">stride(1)</span> <span class="pre">==</span> <span class="pre">1</span></code>, 16-byte aligned row starts), e.g. a
+column slice of a wider tensor.</p></li>
 <li><p><strong>mode</strong> (<em>str</em>) – <code class="docutils literal notranslate"><span class="pre">&quot;w8a8-mxfp8&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-mxfp4&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-nvfp4&quot;</span></code>. Selects both
 the value encoding and the scale recipe.</p></li>
 <li><p><strong>use_swizzle</strong> (<em>bool</em>) – <code class="docutils literal notranslate"><span class="pre">True</span></code> to output scales in the CUTLASS SfAtom 128x4
 interleaved layout consumed by the GEMM kernels; <code class="docutils literal notranslate"><span class="pre">False</span></code> for a
 plain row-major scale layout.</p></li>
 <li><p><strong>use_pdl</strong> (<em>bool</em>) – Enable Programmatic Dependent Launch (on by default).</p></li>
+<li><p><strong>output_quant</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional pre-allocated contiguous <code class="docutils literal notranslate"><span class="pre">output_quant</span></code>.</p></li>
+<li><p><strong>output_sf</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional pre-allocated contiguous <code class="docutils literal notranslate"><span class="pre">output_sf</span></code>.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
@@ -901,6 +967,68 @@ of bounds (illegal memory access). Size it with headroom above
 </dd></dl>
 
 </section>
+<section class="api-entry" id="rms-norm-quant">
+<h2>rms_norm_quant<a class="headerlink" href="#rms-norm-quant" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.rms_norm_quant">
+<span class="sig-name descname"><span class="pre">rms_norm_quant</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">input</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-06</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">return_bf16</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">output_quant</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">output_sf</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">output_bf16</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.rms_norm_quant" title="Link to this definition">¶</a></dt>
+<dd><p>RMSNorm fused with W8A8-MXFP8 quantization.</p>
+<p>Computes <code class="docutils literal notranslate"><span class="pre">y</span> <span class="pre">=</span> <span class="pre">bf16(x</span> <span class="pre">*</span> <span class="pre">rsqrt(mean(x^2)</span> <span class="pre">+</span> <span class="pre">eps)</span> <span class="pre">*</span> <span class="pre">weight)</span></code> in fp32 and
+quantizes it exactly as <code class="docutils literal notranslate"><span class="pre">group_wise_quant(y,</span> <span class="pre">&quot;w8a8-mxfp8&quot;)</span></code> does, reading
+<code class="docutils literal notranslate"><span class="pre">x</span></code> once.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>input</strong> (<em>torch.Tensor</em>) – [M, K] bfloat16 CUDA tensor; rows may be strided
+(<code class="docutils literal notranslate"><span class="pre">stride(1)</span> <span class="pre">==</span> <span class="pre">1</span></code>, 16-byte aligned row starts). K must be a
+multiple of 128 and at most 8192.</p></li>
+<li><p><strong>weight</strong> (<em>torch.Tensor</em>) – [K] bfloat16 RMSNorm gamma.</p></li>
+<li><p><strong>eps</strong> (<em>float</em>) – RMSNorm epsilon.</p></li>
+<li><p><strong>return_bf16</strong> (<em>bool</em>) – Also return the bfloat16 <code class="docutils literal notranslate"><span class="pre">y</span></code>.</p></li>
+<li><p><strong>use_pdl</strong> (<em>bool</em>) – Enable Programmatic Dependent Launch (on by default).</p></li>
+<li><p><strong>output_quant</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional pre-allocated contiguous [M, K] float8_e4m3fn.</p></li>
+<li><p><strong>output_sf</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional pre-allocated contiguous scale buffer.</p></li>
+<li><p><strong>output_bf16</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional pre-allocated contiguous [M, K] bfloat16 <code class="docutils literal notranslate"><span class="pre">y</span></code>;
+implies <code class="docutils literal notranslate"><span class="pre">return_bf16</span></code>.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><p><code class="docutils literal notranslate"><span class="pre">(output_quant,</span> <span class="pre">output_sf)</span></code>, plus the bfloat16 <code class="docutils literal notranslate"><span class="pre">y</span></code> when requested –</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">output_quant</span></code>: [M, K] float8_e4m3fn</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">output_sf</span></code>: [ceil(M / 128) * 128, K / 32] uint8 UE8M0 scales in
+the CUTLASS SfAtom layout (padding rows hold 0)</p></li>
+</ul>
+</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><em>Tuple</em>[torch.Tensor, torch.Tensor] | <em>Tuple</em>[torch.Tensor, torch.Tensor, torch.Tensor]</p>
+</dd>
+</dl>
+<p class="rubric">Example</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">halops</span><span class="w"> </span><span class="kn">import</span> <span class="n">rms_norm_quant</span>
+
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">128</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">w</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">x_fp8</span><span class="p">,</span> <span class="n">sf</span> <span class="o">=</span> <span class="n">rms_norm_quant</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">w</span><span class="p">,</span> <span class="mf">1e-6</span><span class="p">)</span>
+</pre></div>
+</div>
+</dd></dl>
+
+</section>
 </section>
 
         </article>
@@ -961,12 +1089,14 @@ of bounds (illegal memory access). Size it with headroom above
 <li><a class="reference internal" href="#">GEMM</a><ul>
 <li><a class="reference internal" href="#batch-gemm">batch_gemm</a></li>
 <li><a class="reference internal" href="#dense-gemm">dense_gemm</a></li>
+<li><a class="reference internal" href="#interleave-gate-up">interleave_gate_up</a></li>
 <li><a class="reference internal" href="#fused-swiglu-quant">fused_swiglu_quant</a></li>
 <li><a class="reference internal" href="#group-contiguous-gemm">group_contiguous_gemm</a></li>
 <li><a class="reference internal" href="#group-masked-gemm">group_masked_gemm</a></li>
 <li><a class="reference internal" href="#group-wise-quant">group_wise_quant</a></li>
 <li><a class="reference internal" href="#low-latency-mma-gemm">low_latency_mma_gemm</a></li>
 <li><a class="reference internal" href="#prefill-permute-to-masked-gemm">prefill_permute_to_masked_gemm</a></li>
+<li><a class="reference internal" href="#rms-norm-quant">rms_norm_quant</a></li>
 </ul>
 </li>
 </ul>
