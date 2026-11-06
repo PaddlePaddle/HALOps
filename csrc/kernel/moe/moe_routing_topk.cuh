@@ -21,10 +21,10 @@
 #include <cstdint>
 
 #include "kernel/moe/moe_configs.cuh"
-#include "kernel/moe/moe_input.cuh"
 #include "kernel/moe/moe_shared_storage.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/moe_workspace.cuh"
+#include "kernel/moe/quant_utils.cuh"
 
 namespace halops::moe {
 
@@ -72,14 +72,6 @@ load_logits_one_token(const MoEWorkspace<Dims>* __restrict__ workspace,
     return slice;
 }
 
-// Tie-break-by-lowest-expert-index argmax winner.
-__device__ static inline uint32_t warp_min_expert_with_max(float my_max,
-                                                           float warp_max,
-                                                           uint32_t my_expert) {
-    return __reduce_min_sync(FULL_MASK,
-                             (my_max == warp_max) ? my_expert : 0xFFFFFFFFu);
-}
-
 // Warp-cooperative softmax over logits distributed across threads.
 template <uint32_t Count>
 __device__ static void warp_softmax_inplace(float (&logits)[Count]) {
@@ -96,7 +88,7 @@ __device__ static void warp_softmax_inplace(float (&logits)[Count]) {
         local_sum += logits[i];
     }
     for (int off = 16; off >= 1; off /= 2)
-        local_sum += __shfl_xor_sync(FULL_MASK, local_sum, off, 32);
+        local_sum += __shfl_xor_sync(0xFFFFFFFFu, local_sum, off, 32);
 
     float inv_sum = 1.0f / local_sum;
 #pragma unroll
@@ -111,9 +103,9 @@ __device__ static __forceinline__ void warp_argmax_expert(
     uint32_t& warp_expert) {
     const uint32_t bits = __float_as_uint(my_score);
     const uint32_t moe = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-    const uint32_t best = __reduce_max_sync(FULL_MASK, moe);
+    const uint32_t best = __reduce_max_sync(0xFFFFFFFFu, moe);
     warp_expert =
-        __reduce_min_sync(FULL_MASK, (moe == best) ? my_expert : 0xFFFFFFFFu);
+        __reduce_min_sync(0xFFFFFFFFu, (moe == best) ? my_expert : 0xFFFFFFFFu);
     const uint32_t best_bits =
         (best & 0x80000000u) ? (best & 0x7FFFFFFFu) : ~best;
     warp_score = __uint_as_float(best_bits);
@@ -134,12 +126,12 @@ __device__ static void fp32_candidates(
     }
 }
 
-// Packs one bf16 logit pattern into a packed score (see packed_candidates).
+// Pack a BF16 logit into an ordered score.
 __device__ static __forceinline__ uint32_t pack_logit_bits(uint32_t bits,
                                                            uint32_t expert_id) {
     // NaN/Inf -> the lowest finite score.
     if ((bits & 0x7F80u) == 0x7F80u) bits = 0xFF7Fu;
-    // -0.0 -> +0.0: equal as floats, so they must not order here either.
+    // Normalize signed zero before ordering.
     if ((bits & 0x7FFFu) == 0u) bits = 0u;
     const uint32_t moe = (bits & 0x8000u) ? (bits ^ 0xFFFFu) : (bits | 0x8000u);
     return (moe << 16) | (expert_id ^ 0xFFFFu);
@@ -243,53 +235,11 @@ __device__ static void sort_descending(uint32_t (&keys)[N]) {
     }
 }
 
-// Sorts (score, expert_id) pairs by descending score, ties to the lower id.
-template <uint32_t N, uint32_t C = 0>
-__device__ static void sort_descending_pairs(float (&score)[N],
-                                             uint32_t (&expert_id)[N]) {
-    static_assert((N & (N - 1u)) == 0u, "the network is built for 2^m keys");
-    if constexpr (C < kMergeSortSize<N>) {
-        constexpr uint32_t lo = kMergeSortPairs<N>.lo[C];
-        constexpr uint32_t hi = kMergeSortPairs<N>.hi[C];
-        const float a = score[lo];
-        const float b = score[hi];
-        const uint32_t ia = expert_id[lo];
-        const uint32_t ib = expert_id[hi];
-        const bool swap = (a < b) || (a == b && ia > ib);
-        // Equal scores are equal bits here, so only the ids need the tie-break.
-        score[lo] = fmaxf(a, b);
-        score[hi] = fminf(a, b);
-        expert_id[lo] = swap ? ib : ia;
-        expert_id[hi] = swap ? ia : ib;
-        sort_descending_pairs<N, C + 1u>(score, expert_id);
-    }
-}
-
-// Pops the pair lists' head: warp max, tie-break, then a shift and refill.
-template <uint32_t N, uint32_t kKeep>
-__device__ static __forceinline__ void select_next_scored_pair(
-    float (&score)[N], uint32_t (&expert_id)[N], float& selected_score,
-    uint32_t& selected_expert) {
-    const float warp_max = warp_reduce_max_float(score[0]);
-    selected_expert =
-        warp_min_expert_with_max(score[0], warp_max, expert_id[0]);
-    selected_score = warp_max;
-    const bool won = (score[0] == warp_max && expert_id[0] == selected_expert);
-#pragma unroll
-    for (uint32_t i = 0; i + 1u < kKeep; i++) {
-        score[i] = won ? score[i + 1u] : score[i];
-        expert_id[i] = won ? expert_id[i + 1u] : expert_id[i];
-    }
-    score[kKeep - 1u] = won ? -FLT_MAX : score[kKeep - 1u];
-    expert_id[kKeep - 1u] = won ? 0xFFFFFFFFu : expert_id[kKeep - 1u];
-}
-
-// Picks the highest remaining packed score (score, then inverted expert id),
-// then shifts the winner's list and refills its tail with 0.
+// Select the highest packed score and remove it from the winner's list.
 template <uint32_t N, uint32_t kKeep>
 __device__ static __forceinline__ void select_next_packed_score(
     uint32_t (&best)[N], uint32_t& selected_packed_score) {
-    selected_packed_score = __reduce_max_sync(FULL_MASK, best[0]);
+    selected_packed_score = __reduce_max_sync(0xFFFFFFFFu, best[0]);
     const bool won = best[0] == selected_packed_score;
 #pragma unroll
     for (uint32_t i = 0; i + 1u < kKeep; i++)
@@ -306,7 +256,7 @@ __device__ static __forceinline__ void unpack_packed_score(
     expert_id = (packed_score ^ 0xFFFFu) & 0xFFFFu;
 }
 
-// Slow path: softmax + renormalize=False; weights are row probabilities.
+// Unnormalized softmax weights use full-row probabilities.
 template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
 __device__ static void topk_weights_from_softmax_probs(
     uint32_t token, uint32_t top_k, float (&scores)[kExpertsPerThread],
@@ -327,21 +277,21 @@ __device__ static void topk_weights_from_softmax_probs(
     }
 }
 
-// Sums `v` over lanes [0, top_k) in rank order, like a serial loop.
+// Sum lanes [0, top_k) in rank order.
 template <uint32_t kMaxTopk>
 __device__ static __forceinline__ float sum_over_ranks(float v,
                                                        uint32_t top_k) {
     float sum = 0.0f;
 #pragma unroll
     for (uint32_t k = 0; k < kMaxTopk; k++) {
-        const float rank_v = __shfl_sync(FULL_MASK, v, k);
+        const float rank_v = __shfl_sync(0xFFFFFFFFu, v, k);
         if (k < top_k) sum += rank_v;
     }
     return sum;
 }
 
-// Fast path: softmax + renormalize=True, or sigmoid (either setting).
-// Selection runs on packed scores; lane k keeps the rank-k winner.
+// Select packed scores for renormalized softmax or sigmoid. Lane k holds rank
+// k.
 template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
 __device__ static void topk_weights_from_logits(
     uint32_t token, uint32_t top_k, ScoringFunc scoring_func, bool renormalize,
@@ -393,29 +343,66 @@ __device__ static void topk_weights_from_logits(
     }
 }
 
-// Selection on fp32 scores; `renormalize` divides by the selected sum.
-template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
-__device__ static void topk_weights_from_scores_fp32(
-    uint32_t token, uint32_t top_k, bool renormalize,
-    float (&scores)[kExpertsPerThread],
-    uint32_t (&expert_id)[kExpertsPerThread], uint16_t* topk_ids,
-    float* topk_weights) {
-    const uint32_t lane_idx = WarpRole::get_lane_idx();
-    constexpr uint32_t kKeep =
-        kExpertsPerThread < kMaxTopk ? kExpertsPerThread : kMaxTopk;
+// An order-preserving uint32 image of a float: a larger float, a larger key.
+__device__ static __forceinline__ uint32_t score_key(float score) {
+    const uint32_t bits = __float_as_uint(score);
+    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
 
-    // One sort per lane, then each round is a warp max over the list heads.
-    sort_descending_pairs<kExpertsPerThread>(scores, expert_id);
+__device__ static __forceinline__ float key_score(uint32_t key) {
+    return __uint_as_float((key & 0x80000000u) ? (key & 0x7FFFFFFFu) : ~key);
+}
+
+// Scan each lane's remaining scores; ties select the lowest expert ID.
+template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
+__device__ static void topk_weights_from_scores_fp32_scan(
+    uint32_t token, uint32_t top_k, bool renormalize,
+    const float (&scores)[kExpertsPerThread], uint16_t* topk_ids,
+    float* topk_weights) {
+    static_assert((kExpertsPerThread & (kExpertsPerThread - 1u)) == 0u,
+                  "a lane's best is the root of a binary tree");
+    const uint32_t lane_idx = WarpRole::get_lane_idx();
+    // Key 0 is below every score's key: it marks a taken expert.
+    uint32_t key[kExpertsPerThread];
+#pragma unroll
+    for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
+        key[i] = score_key(scores[i]);
+    }
+
+    uint16_t* const ids = topk_ids + token * kMaxTopk;
     float my_score = 0.0f;
-    uint32_t my_expert = 0u;
+#pragma unroll 1
     for (uint32_t k = 0; k < top_k; k++) {
-        float selected_score;
-        uint32_t selected_expert;
-        select_next_scored_pair<kExpertsPerThread, kKeep>(
-            scores, expert_id, selected_score, selected_expert);
-        if (lane_idx == k) {
-            my_score = selected_score;
-            my_expert = selected_expert;
+        // The lane's best, ties to the lower index: a tree whose ties go left.
+        uint32_t best[kExpertsPerThread];
+        uint32_t at[kExpertsPerThread];
+#pragma unroll
+        for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
+            best[i] = key[i];
+            at[i] = i;
+        }
+#pragma unroll
+        for (uint32_t w = 1; w < kExpertsPerThread; w *= 2) {
+#pragma unroll
+            for (uint32_t i = 0; i < kExpertsPerThread; i += 2 * w) {
+                const bool right = best[i + w] > best[i];
+                best[i] = right ? best[i + w] : best[i];
+                at[i] = right ? at[i + w] : at[i];
+            }
+        }
+        const uint32_t top = __reduce_max_sync(0xFFFFFFFFu, best[0]);
+        const uint32_t winner =
+            __ffs(__ballot_sync(0xFFFFFFFFu, best[0] == top)) - 1u;
+        if (lane_idx == k) my_score = key_score(top);
+        // The winning lane records and removes its expert.
+        const bool won = lane_idx == winner;
+        if (won) {
+            ids[k] =
+                static_cast<uint16_t>(lane_idx * kExpertsPerThread + at[0]);
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
+            key[i] = (won && i == at[0]) ? 0u : key[i];
         }
     }
 
@@ -426,7 +413,78 @@ __device__ static void topk_weights_from_scores_fp32(
         inv = (sum > 0.0f) ? (1.0f / sum) : 1.0f;
     }
     if (lane_idx < top_k) {
-        topk_ids[token * kMaxTopk + lane_idx] = (uint16_t)my_expert;
+        topk_weights[token * kMaxTopk + lane_idx] = my_score * inv;
+    }
+}
+
+// Select sorted FP32 scores, breaking ties by expert ID. Repeated lane-local
+// keys use the scan variant; renormalization uses the selected sum.
+template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
+__device__ static void topk_weights_from_scores_fp32(
+    uint32_t token, uint32_t top_k, bool renormalize,
+    const float (&scores)[kExpertsPerThread], uint16_t* topk_ids,
+    float* topk_weights) {
+    // A lane wins at most top_k rounds, so kKeep heads suffice.
+    constexpr uint32_t kKeep =
+        kExpertsPerThread < kMaxTopk ? kExpertsPerThread : kMaxTopk;
+    const uint32_t lane_idx = WarpRole::get_lane_idx();
+    uint32_t key[kExpertsPerThread];
+    uint32_t head[kExpertsPerThread];
+#pragma unroll
+    for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
+        key[i] = score_key(scores[i]);
+        head[i] = key[i];
+    }
+    sort_descending<kExpertsPerThread>(head);
+    bool repeated = false;
+#pragma unroll
+    for (uint32_t i = 0; i + 1u < kExpertsPerThread; ++i) {
+        repeated |= head[i] == head[i + 1u];
+    }
+    if (__any_sync(0xFFFFFFFFu, repeated)) {
+        topk_weights_from_scores_fp32_scan<kExpertsPerThread, kMaxTopk>(
+            token, top_k, renormalize, scores, topk_ids, topk_weights);
+        return;
+    }
+
+    // Lane k keeps rank k's key and lane.
+    uint32_t lanes_below;
+    asm("mov.u32 %0, %%lanemask_lt;" : "=r"(lanes_below));
+    uint32_t my_key = 0u;
+    uint32_t my_lane = 0u;
+#pragma unroll 1
+    for (uint32_t k = 0; k < top_k; k++) {
+        const uint32_t top = __reduce_max_sync(0xFFFFFFFFu, head[0]);
+        const bool tied = head[0] == top;
+        const uint32_t ties = __ballot_sync(0xFFFFFFFFu, tied);
+        // The lowest tied lane wins.
+        const bool won = tied && (ties & lanes_below) == 0u;
+        if (lane_idx == k) {
+            my_key = top;
+            my_lane = __ffs(ties) - 1u;
+        }
+#pragma unroll
+        for (uint32_t i = 0; i + 1u < kKeep; ++i) {
+            head[i] = won ? head[i + 1u] : head[i];
+        }
+        head[kKeep - 1u] = won ? 0u : head[kKeep - 1u];
+    }
+
+    // Rank k's expert: the one slot of its key in its lane.
+    uint32_t at = 0u;
+#pragma unroll
+    for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
+        at = __shfl_sync(0xFFFFFFFFu, key[i], my_lane) == my_key ? i : at;
+    }
+    const float my_score = lane_idx < top_k ? key_score(my_key) : 0.0f;
+    float inv = 1.0f;
+    if (renormalize) {
+        const float sum = sum_over_ranks<kMaxTopk>(my_score, top_k);
+        inv = (sum > 0.0f) ? (1.0f / sum) : 1.0f;
+    }
+    if (lane_idx < top_k) {
+        topk_ids[token * kMaxTopk + lane_idx] =
+            static_cast<uint16_t>(my_lane * kExpertsPerThread + at);
         topk_weights[token * kMaxTopk + lane_idx] = my_score * inv;
     }
 }
@@ -473,8 +531,8 @@ __device__ static void topk_one_token(
             hi[i] += lo[i];
         }
         topk_weights_from_scores_fp32<kExpertsPerThread, kMaxTopk>(
-            token_idx, top_k, renormalize, hi, expert_id,
-            smem->routing_scratch.topk_ids, smem->routing_scratch.topk_weights);
+            token_idx, top_k, renormalize, hi, smem->routing_scratch.topk_ids,
+            smem->routing_scratch.topk_weights);
         return;
     }
 

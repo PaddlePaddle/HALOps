@@ -49,47 +49,59 @@ struct RouterLogits {
     }
 };
 
-// The latent down-projection's output, as the up phase consumes it.
-template <typename Dims, bool IsQuantized>
-struct LatentDownOutput;
+// Latent output scales in routed-up staging layout: FP32 blocks or MXFP8
+// SfAtoms.
+template <typename Dims, bool IsMx>
+struct LatentScaleImage;
 
 template <typename Dims>
-struct LatentDownOutput<Dims, false> {
+struct LatentScaleImage<Dims, false> {
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
-    using Element = DataType::ElementA;
+    using Element = float;
 
+    static constexpr std::uint32_t kNumBlocks = LatentDownGemm::kGemmM / 128u;
     static constexpr std::uint32_t kNumRows = LatentDownGemm::kGemmN;
-    static constexpr std::uint32_t kNumCols = LatentDownGemm::kGemmM;
 
-    alignas(16) Element data[kNumRows][kNumCols];
+    alignas(16) Element data[kNumBlocks][kNumRows];
 
-    __device__ __forceinline__ void store(std::uint32_t tok, std::uint32_t col,
-                                          Element value) {
-        data[tok][col] = value;
-    }
-
-    __host__ __device__ __forceinline__ Element* data_ptr() {
-        return &data[0][0];
+    __device__ __forceinline__ Element* row(std::uint32_t block) {
+        return data[block];
     }
 };
 
 template <typename Dims>
-struct LatentDownOutput<Dims, true> {
+struct LatentScaleImage<Dims, true> {
+    using UpGemm = RoutedUpGemmTraits<Dims>;
+    using Element = std::uint8_t;
+
+    // One 128-token SfAtom slab per up K tile holds that tile's 32-K groups.
+    static constexpr std::uint32_t kNumSlots = UpGemm::kNumTilesK;
+    static constexpr std::uint32_t kSfAtomBytes =
+        128u * (UpGemm::kTileShapeK / 32u);
+
+    alignas(16) Element data[kNumSlots][kSfAtomBytes];
+
+    __device__ __forceinline__ Element* slab(std::uint32_t slot) {
+        return data[slot];
+    }
+};
+
+// Latent output data and scales in routed-up staging layout.
+template <typename Dims>
+struct LatentDownOutput {
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
     using Element = DataType::ElementQA;
-    using ElementScale = DataType::ElementScale;
+    using ScaleImage =
+        LatentScaleImage<Dims, LatentDownGemm::kOutputUseBlockscaled>;
 
     static constexpr std::uint32_t kNumRows = LatentDownGemm::kGemmN;
     static constexpr std::uint32_t kNumCols = LatentDownGemm::kGemmM;
 
-    static constexpr std::uint32_t kLboChunk =
-        MoEKernelTraits<Dims>::kLboChunkK;
+    static constexpr std::uint32_t kLboChunk = LboChunkK<Element>::value;
     static constexpr std::uint32_t kNumChunks = kNumCols / kLboChunk;
-    static constexpr std::uint32_t kNumScaleBlocks =
-        kNumCols / Dims::kQuantBlockM;
 
     alignas(16) Element data[kNumChunks][kNumRows + 1u][kLboChunk];
-    alignas(16) ElementScale scale[kNumScaleBlocks][kNumRows];
+    alignas(16) ScaleImage scale;
 
     static constexpr std::uint32_t kDataBytes = sizeof(data);
     static constexpr std::uint32_t kScaleBytes = sizeof(scale);
@@ -105,36 +117,47 @@ struct LatentDownOutput<Dims, true> {
             make_uint4(0u, 0u, 0u, 0u);
     }
 
-    __device__ __forceinline__ ElementScale* scale_row(std::uint32_t block) {
-        return scale[block];
+    __device__ __forceinline__ auto* scale_row(std::uint32_t block) {
+        return scale.row(block);
+    }
+
+    __device__ __forceinline__ auto* sf_slab(std::uint32_t slot) {
+        return scale.slab(slot);
     }
 
     __host__ __device__ __forceinline__ Element* data_ptr() {
         return &data[0][0][0];
     }
-    __host__ __device__ __forceinline__ ElementScale* scale_ptr() {
-        return &scale[0][0];
-    }
+    __host__ __device__ __forceinline__ void* scale_ptr() { return &scale; }
 };
 
 // The shared expert's up output, in the down's staging layout.
 template <typename Dims>
 struct SharedUpOutput {
     using ElementType = DataType::ElementQA;
-    using ScaleType = DataType::ElementScale;
+    using ScaleType = float;
     using SharedUpGemm = SharedUpGemmTraits<Dims>;
+    using SharedDownGemm = SharedDownGemmTraits<Dims>;
 
-    static constexpr std::uint32_t kQuantBlock = SharedUpGemm::kActQuantBlock;
+    static constexpr std::uint32_t kQuantBlock = SharedUpGemm::kTileShapeM / 2u;
 
     static constexpr std::uint32_t kNumRows = SharedUpGemm::kGemmN;
     static constexpr std::uint32_t kNumCols = SharedUpGemm::kGemmM / 2u;
 
-    static constexpr std::uint32_t kLboChunk = kFp8ActChunkK;
+    static constexpr std::uint32_t kLboChunk = LboChunkK<ElementType>::value;
     static constexpr std::uint32_t kNumChunks = kNumCols / kLboChunk;
     static constexpr std::uint32_t kNumScaleCols = kNumCols / kQuantBlock;
 
+    // The union keeps workspace sizing identical across quantization recipes.
+    static constexpr std::uint32_t kDownTilesK = SharedDownGemm::kNumTilesK;
+    static constexpr std::uint32_t kSfAtomBytes =
+        128u * (SharedDownGemm::kTileShapeK / 32u);
+
     alignas(16) ElementType data[kNumChunks][kNumRows + 1u][kLboChunk];
-    ScaleType scale[kNumScaleCols][kNumRows];
+    union alignas(16) ScaleImage {
+        ScaleType blockwise[kNumScaleCols][kNumRows];
+        std::uint8_t mxfp8[kDownTilesK][kSfAtomBytes];
+    } scale;
 
     __device__ __forceinline__ ElementType* cell(std::uint32_t chunk,
                                                  std::uint32_t row) {
@@ -147,14 +170,22 @@ struct SharedUpOutput {
     }
 
     __device__ __forceinline__ ScaleType* scale_row(std::uint32_t block) {
-        return scale[block];
+        return scale.blockwise[block];
+    }
+
+    // UE8M0 scale slab for one down-input K tile.
+    __device__ __forceinline__ std::uint8_t* sf_slab(std::uint32_t tile) {
+        return scale.mxfp8[tile];
     }
 
     __host__ __device__ __forceinline__ ElementType* data_ptr() {
         return &data[0][0][0];
     }
     __host__ __device__ __forceinline__ ScaleType* scale_ptr() {
-        return &scale[0][0];
+        return &scale.blockwise[0][0];
+    }
+    __host__ __device__ __forceinline__ std::uint8_t* scale_bytes() {
+        return &scale.mxfp8[0][0];
     }
 };
 
@@ -169,17 +200,24 @@ struct SharedDownOutput {
 template <typename Dims>
 struct RoutedUpOutput {
     using ElementType = DataType::ElementQA;
-    using ScaleType = DataType::ElementScale;
-    using UpGemm = UpGemmTraits<Dims>;
+    using ScaleType = float;
+    using UpGemm = RoutedUpGemmTraits<Dims>;
 
     static constexpr std::uint32_t kNumRows = UpGemm::kGemmN * Dims::kMaxTopk;
     static constexpr std::uint32_t kNumCols = UpGemm::kGemmM / 2u;
 
     static constexpr std::uint32_t kQuantBlock = UpGemm::kTileShapeM / 2u;
     static constexpr std::uint32_t kNumScaleCols = kNumCols / kQuantBlock;
+    // MX uses one UE8M0 byte per row and 32 features, repacked into SfAtoms
+    // during down loading.
+    static constexpr std::uint32_t kNumMxScaleCols = kNumCols / 32u;
 
     alignas(16) ElementType data[(kNumRows + 8u) * kNumCols];
-    ScaleType scale[kNumRows * kNumScaleCols];
+    // The union keeps workspace sizing identical across quantization recipes.
+    union alignas(16) ScaleImage {
+        ScaleType blockwise[kNumRows * kNumScaleCols];
+        std::uint8_t mxfp8[kNumRows * kNumMxScaleCols];
+    } scale;
 
     __device__ __forceinline__ ElementType* row(std::uint32_t row_idx) {
         return data + row_idx * kNumCols;
@@ -191,12 +229,17 @@ struct RoutedUpOutput {
     }
 
     __device__ __forceinline__ ScaleType* scale_row(std::uint32_t row_idx) {
-        return scale + row_idx * kNumScaleCols;
+        return scale.blockwise + row_idx * kNumScaleCols;
     }
 
     __device__ __forceinline__ const ScaleType* scale_row(
         std::uint32_t row_idx) const {
-        return scale + row_idx * kNumScaleCols;
+        return scale.blockwise + row_idx * kNumScaleCols;
+    }
+
+    __device__ __forceinline__ std::uint8_t* mx_scale_row(
+        std::uint32_t row_idx) {
+        return scale.mxfp8 + row_idx * kNumMxScaleCols;
     }
 };
 
@@ -204,7 +247,7 @@ struct RoutedUpOutput {
 template <typename Dims>
 struct RoutedDownOutput {
     using ElementType = DataType::ElementOut;
-    using DownGemm = DownGemmTraits<Dims>;
+    using DownGemm = RoutedDownGemmTraits<Dims>;
 
     static constexpr std::uint32_t kNumRows = DownGemm::kGemmN * Dims::kMaxTopk;
     static constexpr std::uint32_t kNumCols = DownGemm::kGemmM;
@@ -223,7 +266,7 @@ struct RoutedDownOutput {
 
 template <typename Dims>
 struct MoEWorkspace {
-    using DownGemm = DownGemmTraits<Dims>;
+    using DownGemm = RoutedDownGemmTraits<Dims>;
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
     using RoutedUpOut = RoutedUpOutput<Dims>;
     using RoutedDownOut = RoutedDownOutput<Dims>;
@@ -231,7 +274,6 @@ struct MoEWorkspace {
 
     static constexpr uint32_t kMaxTopk = Dims::kMaxTopk;
 
-    static constexpr uint32_t kMaxRoutedRowsPadding = RoutedUpOut::kNumRows;
     static constexpr uint32_t kMaxRoutedRows = RoutedDownOut::kNumRows;
 
     static constexpr uint32_t kSpecMaxGrid = moe::kSpecMaxGrid;
@@ -239,8 +281,7 @@ struct MoEWorkspace {
     SharedUpOut shared_up_out;
     SharedDownOutput<Dims> shared_down_out;
 
-    using LatentOut =
-        LatentDownOutput<Dims, MoEKernelTraits<Dims>::kLatentQuantizeOutput>;
+    using LatentOut = LatentDownOutput<Dims>;
     LatentOut latent_down_out;
 
     RouterLogits<Dims> router_logits;

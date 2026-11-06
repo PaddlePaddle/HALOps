@@ -23,6 +23,10 @@ namespace halops::moe {
 template <typename Dims>
 struct TailGeometryT {
     using Config = typename Dims::KernelConfig;
+    using WeightQuant =
+        QuantSpec<QuantMethod::kBlockwiseFP8, Dims::kQuantConfig.kBlockSize>;
+    using ElementWeight = typename WeightQuant::ElementType;
+    using ElementScale = typename WeightQuant::ScaleType;
     static constexpr int kWorld = Config::kTailWorld;
     static constexpr int kMaxM = static_cast<int>(Dims::kNumTokens);
     static constexpr int kTpg = Config::kTailTpg;
@@ -48,9 +52,8 @@ struct TailGeometryT {
                   "work items must tile over the warps");
     static constexpr int kMaxStageSmemBytes = Config::kTailMaxStageSmemBytes;
     static constexpr std::uint32_t kPrefetchChunk = Config::kTailPrefetchChunk;
-    static constexpr int kScaleBlock = static_cast<int>(Dims::kQuantBlockM);
-    static_assert(Dims::kQuantBlockM == Dims::kQuantBlockK,
-                  "fc2 scales are square blocks");
+    static constexpr int kScaleBlock =
+        static_cast<int>(WeightQuant::kBlockSize);
     static constexpr std::uint32_t kNumCtas = (kMaxM / kTpg) * kGsize;
     static_assert(kMaxM % kTpg == 0, "tail groups tile the token capacity");
     static_assert(kThreads == static_cast<int>(WarpRole::kCalcWarpCount *

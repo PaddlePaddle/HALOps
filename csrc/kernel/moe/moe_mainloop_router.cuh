@@ -14,8 +14,6 @@
 
 #pragma once
 
-// Phase 0: the router Linear, logits = input x weight.
-
 #include <cuda_bf16.h>
 #include <cutlass/arch/barrier.h>
 
@@ -45,6 +43,10 @@ struct RouterProjectionBase {
     using Element = typename RouterGemm::MmaElement;
 
     static constexpr std::uint32_t kTileShapeM = RouterGemm::kTileShapeM;
+    // TMA byte count for the staged BF16 input tile.
+    static constexpr std::uint32_t kInputTileTxBytes =
+        RouterGemm::kTileShapeN * RouterGemm::kTileShapeK *
+        static_cast<std::uint32_t>(sizeof(DataType::ElementA));
 
     // The gate this block scores; each gate owns a CTA range.
     __device__ static std::uint32_t router_gate() {
@@ -76,48 +78,42 @@ struct RouterProjectionBase {
         return blockIdx.x < RouterGemm::kNumCtas;
     }
 
-    // Staging thread: the launch's bf16 input through the ring, one K tile
-    // per slot.
+    // Stream input K tiles through the ring.
     __device__ static void run_load_input_k_loop(
         CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem) {
-        constexpr std::uint32_t kInputTileBytes =
-            RouterGemm::kNumSwizzleBoxKs * RouterGemm::kTileShapeN *
-            RouterGemm::kSwizzleBoxK *
-            static_cast<std::uint32_t>(sizeof(DataType::ElementA));
-
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < RouterGemm::kNumTilesK;
              ++k_iter_id) {
-            const std::uint32_t slot = k_iter_id % Traits::kRouterInputSlots;
+            const std::uint32_t slot = k_iter_id % RouterGemm::kNumInputSlots;
             // The slot about to be overwritten must have been consumed.
-            smem->barriers.wait_router_input_empty(k_iter_id);
-            smem->barriers.router_input_ready.arrive(k_iter_id,
-                                                     kInputTileBytes);
-            load_input_tile<RouterGemm::kTileShapeN>(
+            smem->barriers.router.wait_input_empty(k_iter_id);
+            smem->barriers.router.input_ready.arrive(k_iter_id,
+                                                     kInputTileTxBytes);
+            load_input_tile_chunks<RouterGemm::kTileShapeN>(
                 tma_input_desc, k_iter_id, token_begin(),
                 smem->router.input.data[slot],
-                smem->barriers.router_input_ready.raw(slot));
+                smem->barriers.router.input_ready.raw(slot));
         }
     }
 
-    // TMA launcher thread: the block's slice of its router M tile, one bulk
-    // copy per K tile into ring slot `j % kNumRouterWeightSlots`.
+    // Load each weight K tile into its ring slot.
     __device__ static void run_load_weight_k_loop(
         const Element* __restrict__ router_weight,
         SharedStorage* __restrict__ smem, std::uint32_t tile) {
 #pragma unroll 1
         for (std::uint32_t j = 0; j < RouterGemm::kNumTilesK; ++j) {
-            const std::uint32_t slot = j % KernelTraits::kNumRouterWeightSlots;
-            if (j >= KernelTraits::kNumRouterWeightSlots) {
-                smem->barriers.wait_router_weight_empty(j);
-            }
-            smem->barriers.router_weight_ready.arrive(
+            const std::uint32_t slot = j % RouterGemm::kNumWeightSlots;
+            smem->barriers.router.wait_weight_empty(j);
+            smem->barriers.router.weight_ready.arrive(
                 j, RouterGemm::MmaCore::kWeightTileBytes);
-            tma_load_router_weight_tile(
-                router_weight, tile, j, RouterGemm::kNumTilesK,
-                RouterGemm::MmaCore::kWeightTileBytes,
-                &smem->router.w_router[slot][0],
-                smem->barriers.router_weight_ready.raw(slot));
+            // The tile's byte range inside the `[m, k]` weight matrix.
+            const char* src =
+                reinterpret_cast<const char*>(router_weight) +
+                static_cast<std::size_t>(tile * RouterGemm::kNumTilesK + j) *
+                    RouterGemm::MmaCore::kWeightTileBytes;
+            tma_load_1d(src, RouterGemm::MmaCore::kWeightTileBytes,
+                        &smem->router.w_router[slot][0],
+                        smem->barriers.router.weight_ready.raw(slot));
         }
     }
 
@@ -225,12 +221,11 @@ struct RouterProjection<KernelTraits, true>
         cute::Tensor tCt = cta_mma.make_fragment_C(tC_proxy);
 
         // The streamed input holds one tile at a time; a block reads all K.
-        constexpr std::uint32_t kInputSlots = KernelTraits::kRouterInputSlots;
+        constexpr std::uint32_t kInputSlots = RouterGemm::kNumInputSlots;
         for (std::uint32_t j = 0; j < RouterGemm::kNumTilesK; ++j) {
             const std::uint32_t k_iter_id = j;
             const std::uint32_t slot = k_iter_id % kInputSlots;
-            smem->barriers.router_input_ready.wait(k_iter_id);
-            smem->barriers.router_weight_ready.wait(j);
+            smem->barriers.router.wait_mma_ready(k_iter_id);
             cute::Tensor tCrB = cta_mma.make_fragment_B(cute::make_tensor(
                 cute::make_smem_ptr(
                     reinterpret_cast<typename MmaCore::TiledMma::ValTypeB*>(
@@ -238,20 +233,19 @@ struct RouterProjection<KernelTraits, true>
                 SBLayout{}));
             MmaCore::run(
                 tiled_mma, cta_mma,
-                &smem->router
-                     .w_router[j % KernelTraits::kNumRouterWeightSlots][0],
+                &smem->router.w_router[j % RouterGemm::kNumWeightSlots][0],
                 tCrB, tCt, tmem_addr(tmem_base, 0u, 0u),
                 /*accumulate=*/j != 0u);
-            // The commit frees the slot kNumRouterWeightSlots K tiles later.
+            // Release the weight slot after UMMA completes.
             cutlass::arch::umma_arrive(
-                smem->barriers.router_weight_empty.raw(j));
-            if (WarpRole::get_lane_idx() == 0u) {
-                smem->barriers.arrive_router_input_empty(k_iter_id);
-            }
+                smem->barriers.router.weight_empty.raw(j));
+            // UMMA must finish reading the input before its slot is reused.
+            cutlass::arch::umma_arrive(
+                smem->barriers.router.input_empty.raw(k_iter_id));
         }
         // The commit covers every UMMA issued before it.
         cutlass::arch::umma_arrive(
-            smem->barriers.router_accumulator_ready.raw(0u));
+            smem->barriers.router.accumulator_ready.raw(0u));
     }
 
     // Reads this block's M tile back, stores its logits and publishes them.
@@ -264,13 +258,12 @@ struct RouterProjection<KernelTraits, true>
                       "the calc warps cover at most 8 lane blocks");
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
-        // An M=64 UMMA accumulator keeps its 16-row groups in the low lanes
-        // of each 32-lane window; warp w reads window w.
+        // M=64 accumulators use the low 16 rows of each warp window.
         constexpr std::uint32_t kRowsPerRead = 16u;
         const std::uint32_t row_base = kRowsPerRead * warp_idx;
-        tcgen05_fence_after_thread_sync();
         if (row_base < kTileShapeM) {
-            smem->barriers.router_accumulator_ready.wait(0u);
+            smem->barriers.router.accumulator_ready.wait(0u);
+            tcgen05_fence_after_thread_sync();
             float v[RouterGemm::kTileShapeN];
             tmem_ld_tokens(tmem_addr(smem->tmem_ptr, 32u * warp_idx, 0u), v);
             cutlass::arch::fence_view_async_tmem_load();
@@ -306,25 +299,22 @@ struct RouterProjection<KernelTraits, false>
     using typename Base::SharedStorage;
     using typename Base::Workspace;
 
+    // A warp owns this many K tiles; the last warps may own fewer.
+    static constexpr std::uint32_t kNumTilesKPerWarp =
+        (RouterGemm::kNumTilesK + WarpRole::kCalcWarpCount - 1u) /
+        WarpRole::kCalcWarpCount;
+
     // The B (input) operand of one K tile: its N rows of SW128 boxes.
     using SBLayout = decltype(cute::tile_to_shape(
         cute::composition(
             cute::Swizzle<3, 3, 3>{},
             cute::Layout<
-                cute::Shape<cute::_8, cute::Int<RouterGemm::kSwizzleBoxK>>,
-                cute::Stride<cute::Int<RouterGemm::kSwizzleBoxK>, cute::_1>>{}),
+                cute::Shape<cute::_8,
+                            cute::Int<RouterGemm::MmaCore::kSwizzleBoxK>>,
+                cute::Stride<cute::Int<RouterGemm::MmaCore::kSwizzleBoxK>,
+                             cute::_1>>{}),
         cute::Shape<cute::Int<RouterGemm::kTileShapeN>,
                     cute::Int<RouterGemm::kTileShapeK>>{}));
-
-    // The HMMA reader's release of a weight slot: `ldmatrix` is synchronous,
-    // so the reads have landed; every lane fences, one returns the slot.
-    __device__ static void arrive_router_weight_empty(
-        SharedStorage* __restrict__ smem, std::uint32_t k_tile) {
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-        if (WarpRole::get_lane_idx() == 0u) {
-            smem->barriers.router_weight_empty.arrive(k_tile);
-        }
-    }
 
     // Every thread of the block: the loader streams, the calc warps consume.
     __device__ static void run(const Element* __restrict__ router_weight,
@@ -363,37 +353,33 @@ struct RouterProjection<KernelTraits, false>
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         float acc[MmaCore::kNumAtomMs][MmaCore::kAtomElemsC] = {};
-        constexpr std::uint32_t kInputSlots = KernelTraits::kRouterInputSlots;
+        constexpr std::uint32_t kInputSlots = RouterGemm::kNumInputSlots;
 #pragma unroll 1
-        for (std::uint32_t j = 0; j < RouterGemm::kNumTilesKPerWarp; ++j) {
+        for (std::uint32_t j = 0; j < kNumTilesKPerWarp; ++j) {
             const std::uint32_t k_iter_id =
                 j * WarpRole::kCalcWarpCount + warp_idx;
             if (k_iter_id >= RouterGemm::kNumTilesK) break;
             const std::uint32_t slot = k_iter_id % kInputSlots;
-            smem->barriers.router_input_ready.wait(k_iter_id);
-            smem->barriers.router_weight_ready.wait(k_iter_id);
+            smem->barriers.router.wait_mma_ready(k_iter_id);
             MmaCore::run(
                 cute::make_tensor(
                     cute::make_smem_ptr(
-                        &smem->router
-                             .w_router[k_iter_id %
-                                       KernelTraits::kNumRouterWeightSlots][0]),
+                        &smem->router.w_router[k_iter_id %
+                                               RouterGemm::kNumWeightSlots][0]),
                     typename MmaCore::WeightTileLayout{}),
                 cute::make_tensor(cute::make_smem_ptr(
                                       &smem->router.input.data[slot][0][0][0]),
                                   SBLayout{}),
                 acc);
-            // `ldmatrix` is synchronous: the K tile is read, the slot can
-            // return to the ring.
-            arrive_router_weight_empty(smem, k_iter_id);
-            // This warp is the tile's only reader, so it frees the input
-            // slot; the fence above already ordered both operands' reads.
+            // Every lane fences operand reads before lane 0 releases the
+            // slots.
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             if (WarpRole::get_lane_idx() == 0u) {
-                smem->barriers.arrive_router_input_empty(k_iter_id);
+                smem->barriers.router.weight_empty.arrive(k_iter_id);
+                smem->barriers.router.input_empty.arrive(k_iter_id);
             }
         }
-        // The m16n8 fragment: this lane holds rows local and local+8 of
-        // every atom.
+        // Each lane holds rows local and local+8 of every atom.
         const std::uint32_t local = lane_idx / 4u;
         const std::uint32_t col = 2u * (lane_idx & 3u);
         float* const cell = &smem->router.mma_out[warp_idx][0][0];
@@ -460,8 +446,7 @@ struct RouterProjection<KernelTraits, false>
         }
     }
 
-    // TMA launcher thread, after the block barrier that ends routing: the
-    // tile reads are fenced per slot, this one covers the logits buffer.
+    // Fence logits-buffer reads after the routing block barrier.
     __device__ static void release_weight_smem() {
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }

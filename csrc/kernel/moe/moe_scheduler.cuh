@@ -14,8 +14,6 @@
 
 #pragma once
 
-// A task is a `TaskInfo` naming the (expert, m block) it covers.
-
 #include <cstdint>
 
 #include "kernel/moe/moe_shared_storage.cuh"
@@ -30,7 +28,7 @@ enum class BlockPhase : std::uint32_t { kNone = 0u, kUp = 1u, kDown = 2u };
 // No further expert for this block.
 inline constexpr std::uint32_t kNoExpert = 0xffffffffu;
 
-// One scheduled task: the unit of work a block consumes in one loop iteration.
+// One scheduled (expert, m-block) task.
 struct TaskInfo {
     std::uint32_t local_expert_idx;
     std::uint32_t m_block_idx;
@@ -76,8 +74,8 @@ class TaskScheduler {
         if (phase == BlockPhase::kUp) next_ = first_up_expert();
     }
 
-    // Down phase, TMA launcher thread only: claim the next grid task and
-    // publish it to the block ahead of the `get_next_task` that consumes it.
+    // The down TMA thread claims and publishes the next task before
+    // consumption.
     __device__ void claim_next_task() {
         const std::uint32_t num_tasks = expert_count_ * kCtasPerExpert;
         const std::uint32_t num_static_tasks =
@@ -115,8 +113,7 @@ class TaskScheduler {
     // The id the next `get_next_task` will hand out.
     __device__ std::uint32_t next_task_id() const { return task_count_; }
 
-    // Up phase only: set before the loop so the caller can prime the first
-    // expert's work.
+    // Prime the first up expert before entering the task loop.
     __device__ bool is_active() const { return next_ < expert_count_; }
     __device__ std::uint32_t first_expert_idx() const { return next_; }
     __device__ Group const& cta_group() const { return cta_group_; }

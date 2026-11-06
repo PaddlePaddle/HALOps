@@ -94,7 +94,8 @@ struct TailPhase {
         const std::uint32_t shared_ctas = params.tail_shared_ctas;
         if (blockIdx.x >= Geometry::kNumCtas) return;
         if (!WarpRole::is_calc_warp(WarpRole::get_warp_idx())) return;
-        static_assert(Geometry::kSmemBytes <= sizeof(RoutedExpertsSmem<Dims>),
+        static_assert(Geometry::kSmemBytes <=
+                          sizeof(decltype(SharedStorage::routed_experts)),
                       "the tail scratch must fit the weight-ring union");
         if (shared_ctas != 0u) {
             if (threadIdx.x == 0) {

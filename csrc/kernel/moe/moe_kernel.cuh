@@ -54,8 +54,7 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     assert(gridDim.x <= MoEKernelTraits<Dims>::kMaxGrid);
     assert(gridDim.y == 1 && gridDim.z == 1);
 
-    assert(mainloop_params.token_count <= Dims::kNumTokens);
-    assert(mainloop_params.token_count > 0);
+    assert(mainloop_params.num_tokens <= Dims::kNumTokens);
     assert(mainloop_params.top_k >= 1 &&
            mainloop_params.top_k <= Dims::kMaxTopk);
 
@@ -79,33 +78,26 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
         smem->tail_parity = __ldcg(mainloop_params.tail_epochs) & 1u;
     }
 
-    // Phase 1: prologue, including routing + latent_down + shared_expert,
-    // overlapped on different CTAs.
+    // Run routing, latent projection and the shared expert on separate CTAs.
     collective_mainloop.run_latent_down(mainloop_params, smem);
-    if constexpr (Traits::kUseSharedExpert) {
-        collective_mainloop.run_shared(mainloop_params, smem);
-    }
+    collective_mainloop.run_shared(mainloop_params, smem);
     collective_mainloop.run_router(mainloop_params, smem);
-    // Phase boundary: publishes the routing tables and orders the router's
-    // SMEM traffic before the next phase's TMA writes into those bytes.
+    // Publish routing tables and order SMEM reads before reusing storage.
     __syncthreads();
     if (WarpRole::is_weight_loader_thread()) {
         CollectiveMainloop::Router::release_weight_smem();
     }
 
-    // Scheduler per thread drives both projections; `begin_phase` opens
-    // the task sequence of the projection about to run.
+    // Each thread follows the same projection task sequence.
     TaskScheduler<Traits> sched(smem, workspace);
 
-    // Phase 2: up-projection — expert groups in parallel. The scheduler maps
-    // this block to (expert group, feature block) statically.
+    // Run up-projection tasks assigned to this expert group and feature block.
     sched.begin_phase(BlockPhase::kUp, smem->routing.active_expert_count);
     if (sched.is_active()) {
         collective_mainloop.run_up(mainloop_params, smem, sched);
     }
 
-    // Phase 3: down-projection over (expert, m-block) tasks, each published
-    // to its m-block's completion count.
+    // Run down-projection tasks and publish their completion counts.
     sched.begin_phase(BlockPhase::kDown, smem->routing.active_expert_count);
     collective_mainloop.run_down(mainloop_params, smem, sched);
 
@@ -122,7 +114,6 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     }
 }
 
-// Launches `fused_moe_kernel` on `stream` with the caller's final grid.
 template <typename MoEDims>
 cudaError_t LaunchMoEKernel(
     typename CollectiveMainloopMoE<MoEKernelTraits<MoEDims>>::Arguments& args,
