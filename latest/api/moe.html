@@ -275,7 +275,7 @@
 <td><p>Return the size in bytes of the workspace's symmetric region for a token count.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#halops.transform_weights_for_moe" title="halops.transform_weights_for_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code></a></p></td>
-<td><p>Pack the router, up-projection and latent-down weights for <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p></td>
+<td><p>Pack the router and up-projection weights for <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p></td>
 </tr>
 </tbody>
 </table>
@@ -327,8 +327,8 @@ capable symmetric region whose tail part is the fused tail’s mailbox.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">shared_down_weight_scale</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">latent_down_weight</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">latent_down_weight_scale</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">fc2_weight</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">fc2_scale</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">latent_up_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">latent_up_weight_scale</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">norm_weight</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">out</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">workspace</span></span></em>,</dd>
@@ -340,6 +340,7 @@ capable symmetric region whose tail part is the fused tail’s mailbox.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">situ_beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">4.0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">situ_linear_beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">25.0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-06</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">quant_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'w8a8-blockwise'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">grid_cap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>,</dd>
 </dl>
 
@@ -349,11 +350,15 @@ capable symmetric region whose tail part is the fused tail’s mailbox.</p>
 up/down projections and the shared expert for 1..16 tokens, writing
 <code class="docutils literal notranslate"><span class="pre">out</span></code> in place.  The shipped schedule is
 fixed to E=512 experts, hidden size 4096, intermediate size 512 and
-latent size 2048, with block-wise FP8 weights (128x128 blocks).</p>
-<p>Weights are block-wise quantized by the caller; the router, up-projection
-and latent-down operands must first be packed with
-<code class="docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code>.  This build runs the latent stage, so
-<code class="docutils literal notranslate"><span class="pre">latent_down_weight</span></code> and <code class="docutils literal notranslate"><span class="pre">latent_down_weight_scale</span></code> are required.</p>
+latent size 2048.  Every weight group runs block-wise FP8 (128x128 blocks)
+or MXFP8 (1x32 UE8M0 groups); the “w4a8-mxfp4” recipe packs only the routed
+experts’ weights to MXFP4 and keeps the activations fp8.</p>
+<p>Weights are quantized by the caller (<code class="docutils literal notranslate"><span class="pre">group_wise_quant</span></code> for MX
+recipes); the router and up-projection operands are then packed with
+<code class="docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code>.  The down-projection and latent-down
+weights are quantized directly in the kernel layout and passed as-is.
+This build runs the latent stage, so <code class="docutils literal notranslate"><span class="pre">latent_down_weight</span></code> and
+<code class="docutils literal notranslate"><span class="pre">latent_down_weight_scale</span></code> are required.</p>
 <p>The fused tail always runs as the kernel’s last phase (the same single
 launch):</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">out</span> <span class="o">=</span> <span class="n">fc2</span><span class="p">(</span><span class="n">RMSNorm</span><span class="p">(</span><span class="n">AllReduce</span><span class="p">(</span><span class="n">routed</span><span class="p">)))</span> <span class="o">+</span> <span class="n">AllReduce</span><span class="p">(</span><span class="n">shared</span><span class="p">)</span>
@@ -368,48 +373,71 @@ blocks and its own CTAs inside the grid.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>input</strong> (<em>torch.Tensor</em>) – [T, 4096] bfloat16 activations, 1 &lt;= T &lt;= 16.</p></li>
-<li><p><strong>router_weight</strong> (<em>torch.Tensor</em>) – Packed router weight (bfloat16) from
-<code class="docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code>.</p></li>
-<li><p><strong>expert_up_weights</strong> (<em>torch.Tensor</em>) – [512, 1024, 2048] float8_e4m3fn fused gate/up
-weights, in the pair layout returned by
-<code class="docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code>.</p></li>
-<li><p><strong>expert_up_weights_scale</strong> (<em>torch.Tensor</em>) – [512, 8, 16] float32 block scales of
-<code class="docutils literal notranslate"><span class="pre">expert_up_weights</span></code>.</p></li>
-<li><p><strong>expert_down_weights</strong> (<em>torch.Tensor</em>) – [512, 2048, 512] float8_e4m3fn down weights.</p></li>
-<li><p><strong>expert_down_weights_scale</strong> (<em>torch.Tensor</em>) – [512, 16, 4] float32 block scales of
-<code class="docutils literal notranslate"><span class="pre">expert_down_weights</span></code>.</p></li>
-<li><p><strong>shared_up_weight</strong> (<em>torch.Tensor</em>) – [1024, 4096] float8_e4m3fn shared-expert gate/up
-weights, pair layout.</p></li>
-<li><p><strong>shared_up_weight_scale</strong> (<em>torch.Tensor</em>) – [8, 32] float32 block scales of
-<code class="docutils literal notranslate"><span class="pre">shared_up_weight</span></code>.</p></li>
-<li><p><strong>shared_down_weight</strong> (<em>torch.Tensor</em>) – [4096, 512] float8_e4m3fn shared-expert down
-weights.</p></li>
-<li><p><strong>shared_down_weight_scale</strong> (<em>torch.Tensor</em>) – [32, 4] float32 block scales of
-<code class="docutils literal notranslate"><span class="pre">shared_down_weight</span></code>.</p></li>
-<li><p><strong>latent_down_weight</strong> (<em>torch.Tensor</em>) – [2048, 4096] float8_e4m3fn latent
-down-projection weight, transposed by
-<code class="docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code>.</p></li>
-<li><p><strong>latent_down_weight_scale</strong> (<em>torch.Tensor</em>) – [16, 32] float32 block scales of
-<code class="docutils literal notranslate"><span class="pre">latent_down_weight</span></code>.</p></li>
-<li><p><strong>fc2_weight</strong> (<em>torch.Tensor</em>) – [H, L] float8_e4m3fn, replicated on every rank.</p></li>
-<li><p><strong>fc2_scale</strong> (<em>torch.Tensor</em>) – [H/128, L/128] float32 block scales, powers of two.</p></li>
-<li><p><strong>norm_weight</strong> (<em>torch.Tensor</em>) – [L] bfloat16 RMSNorm weight.</p></li>
-<li><p><strong>out</strong> (<em>torch.Tensor</em>) – [T, H] bfloat16 result of the tail, identical on every rank.</p></li>
-<li><p><strong>workspace</strong> (<em>MoEWorkspace</em>) – Workspace from <code class="docutils literal notranslate"><span class="pre">get_workspace_for_moe</span></code> whose schedule
-width matches the token count (<code class="docutils literal notranslate"><span class="pre">T</span> <span class="pre">&gt;</span> <span class="pre">8</span></code> needs the wide one).</p></li>
+<li><p><strong>input</strong> (<em>Tensor</em>) – Activations, shape [T, 4096], dtype bfloat16, with
+1 &lt;= T &lt;= 16.</p></li>
+<li><p><strong>router_weight</strong> (<em>Tensor</em>) – Packed router weight from
+<code class="docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code>, dtype bfloat16. Shape is
+[G * (E // tile_m), K // 64, tile_m, 64], concretely
+[64, 64, 16, 64] for T &lt;= 8 and [32, 64, 32, 64] otherwise.</p></li>
+<li><p><strong>expert_up_weights</strong> (<em>Tensor</em>) – Fused gate/up weights in the pair layout
+returned by <code class="docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code>, shape [512, 1024,
+2048].  Under “w4a8-mxfp4” the dtype is uint8 and the shape is
+[512, 1024, 1024]: two 4-bit values per byte, low nibble first,
+as <code class="docutils literal notranslate"><span class="pre">group_wise_quant(mode=&quot;w4a4-mxfp4&quot;)</span></code> packs them.</p></li>
+<li><p><strong>expert_up_weights_scale</strong> (<em>Tensor</em>) – Block scales of
+<code class="docutils literal notranslate"><span class="pre">expert_up_weights</span></code>, shape [512, 8, 16], dtype float32.</p></li>
+<li><p><strong>expert_down_weights</strong> (<em>Tensor</em>) – Down weights, shape [512, 2048, 512],
+dtype float8_e4m3fn; under “w4a8-mxfp4” uint8 of shape [512,
+2048, 256], packed the same way.</p></li>
+<li><p><strong>expert_down_weights_scale</strong> (<em>Tensor</em>) – Block scales of
+<code class="docutils literal notranslate"><span class="pre">expert_down_weights</span></code>, shape [512, 16, 4], dtype float32.</p></li>
+<li><p><strong>shared_up_weight</strong> (<em>Tensor</em>) – Shared-expert gate/up weights in the pair
+layout, shape [1024, 4096], dtype float8_e4m3fn.</p></li>
+<li><p><strong>shared_up_weight_scale</strong> (<em>Tensor</em>) – Scales of <code class="docutils literal notranslate"><span class="pre">shared_up_weight</span></code>:
+shape [8, 32] and dtype float32 for “w8a8-blockwise”, or shape
+[1024, 128] and dtype uint8 in the CUTLASS SfAtom layout for
+“w8a8-mxfp8”.  The MXFP8 scales follow the <em>packed</em> pair row
+order, as returned by <code class="docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code>.</p></li>
+<li><p><strong>shared_down_weight</strong> (<em>Tensor</em>) – Shared-expert down weights, shape
+[4096, 512], dtype float8_e4m3fn.</p></li>
+<li><p><strong>shared_down_weight_scale</strong> (<em>Tensor</em>) – Scales of <code class="docutils literal notranslate"><span class="pre">shared_down_weight</span></code>:
+shape [32, 4] and dtype float32 for “w8a8-blockwise”, or shape
+[4096, 16] and dtype uint8 in the SfAtom layout for
+“w8a8-mxfp8”.</p></li>
+<li><p><strong>latent_down_weight</strong> (<em>Tensor</em>) – Latent down-projection weight in the
+kernel layout, shape [2048, 4096], dtype float8_e4m3fn.
+Quantize it in this layout and pass it directly.</p></li>
+<li><p><strong>latent_down_weight_scale</strong> (<em>Tensor</em>) – Scales of
+<code class="docutils literal notranslate"><span class="pre">latent_down_weight</span></code>: shape [16, 32] and dtype float32 for
+“w8a8-blockwise”, or shape [2048, 128] and dtype uint8 in the
+CUTLASS SfAtom layout (from <code class="docutils literal notranslate"><span class="pre">group_wise_quant(use_swizzle=True)</span></code>)
+for “w8a8-mxfp8”.</p></li>
+<li><p><strong>latent_up_weight</strong> (<em>Tensor</em>) – [4096, 2048] float8_e4m3fn latent up weight.</p></li>
+<li><p><strong>latent_up_weight_scale</strong> (<em>Tensor</em>) – [32, 16] float32 block scales, powers of two.</p></li>
+<li><p><strong>norm_weight</strong> (<em>Tensor</em>) – [2048] bfloat16 RMSNorm weight.</p></li>
+<li><p><strong>out</strong> (<em>Tensor</em>) – [T, 4096] bfloat16 output, identical across ranks.</p></li>
+<li><p><strong>workspace</strong> (<em>MoEWorkspace</em>) – Scratchpad and tail communication state
+from <code class="docutils literal notranslate"><span class="pre">get_workspace_for_moe</span></code>, matching the token schedule.</p></li>
 <li><p><strong>top_k</strong> (<em>int</em>) – Experts selected per token, in [1, 10].</p></li>
-<li><p><strong>num_router_gates</strong> (<em>int</em>) – Router gates merged into <code class="docutils literal notranslate"><span class="pre">router_weight</span></code>; this
-build requires 2.</p></li>
-<li><p><strong>scoring_func</strong> (<em>str</em>) – Router scoring, <code class="docutils literal notranslate"><span class="pre">&quot;sigmoid&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;softmax&quot;</span></code>.</p></li>
-<li><p><strong>renormalize</strong> (<em>bool</em>) – Renormalize the top-k weights to sum to one.</p></li>
-<li><p><strong>activation</strong> (<em>str</em>) – Expert activation, <code class="docutils literal notranslate"><span class="pre">&quot;silu&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;situ&quot;</span></code>.</p></li>
-<li><p><strong>situ_beta</strong> (<em>float</em>) – SiTU gate soft cap; &lt;= 0 disables it.  Must be finite.</p></li>
-<li><p><strong>situ_linear_beta</strong> (<em>float</em>) – SiTU up soft cap; &lt;= 0 disables it.  Must be
-finite.</p></li>
-<li><p><strong>eps</strong> (<em>float</em>) – RMSNorm epsilon.</p></li>
-<li><p><strong>grid_cap</strong> (<em>int</em>) – 0 uses one block per SM; otherwise at most this many
-blocks, leaving the other SMs to concurrent work.</p></li>
+<li><p><strong>num_router_gates</strong> (<em>int</em><em>, </em><em>optional</em>) – Router gates merged into
+<code class="docutils literal notranslate"><span class="pre">router_weight</span></code>; this build requires 2. Default: 2.</p></li>
+<li><p><strong>scoring_func</strong> (<em>str</em><em>, </em><em>optional</em>) – Router scoring, either “sigmoid” or
+“softmax”. Default: “sigmoid”.</p></li>
+<li><p><strong>renormalize</strong> (<em>bool</em><em>, </em><em>optional</em>) – Renormalize the top-k weights to sum to
+one. Default: True.</p></li>
+<li><p><strong>activation</strong> (<em>str</em><em>, </em><em>optional</em>) – Expert activation, either “silu” or
+“situ”. Default: “silu”.</p></li>
+<li><p><strong>situ_beta</strong> (<em>float</em><em>, </em><em>optional</em>) – SiTU gate soft cap; &lt;= 0 disables it.
+Must be finite. Default: 4.0.</p></li>
+<li><p><strong>situ_linear_beta</strong> (<em>float</em><em>, </em><em>optional</em>) – SiTU up soft cap; &lt;= 0 disables
+it. Must be finite. Default: 25.0.</p></li>
+<li><p><strong>eps</strong> (<em>float</em><em>, </em><em>optional</em>) – RMSNorm epsilon. Default: 1e-6.</p></li>
+<li><p><strong>quant_mode</strong> (<em>str</em><em>, </em><em>optional</em>) – Quantization recipe: “w8a8-blockwise”
+(every group block-wise), “w8a8-mxfp8” (every group MXFP8) or
+“w4a8-mxfp4” (routed experts MXFP4, latent and shared MXFP8).
+Default: “w8a8-blockwise”.</p></li>
+<li><p><strong>grid_cap</strong> (<em>int</em><em>, </em><em>optional</em>) – Maximum resident CTAs; 0 uses the device
+limit. Keep this fixed for each workspace. Default: 0.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
@@ -457,8 +485,9 @@ ranks.</p></li>
 <dd><p>Return the size in bytes of the workspace’s symmetric region for a token count.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>input</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional [T, 4096] bfloat16 CUDA tensor.  Without it, the
-larger of the supported schedules is returned.</p>
+<dd class="field-odd"><p><strong>input</strong> (<em>Tensor</em><em>, </em><em>optional</em>) – Activations, shape [T, 4096], dtype
+bfloat16. Without it, the larger of the supported schedules is
+returned. Default: None.</p>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
 <dd class="field-even"><p>Size in bytes of the scratchpad plus the tail mailbox.</p>
@@ -480,23 +509,25 @@ larger of the supported schedules is returned.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">router_weight</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">expert_up_weights</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">shared_up_weight</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">latent_down_weight</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">num_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">num_router_gates</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">expert_up_weights_scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">shared_up_weight_scale</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="headerlink" href="#halops.transform_weights_for_moe" title="Link to this definition">¶</a></dt>
-<dd><p>Pack the router, up-projection and latent-down weights for <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p>
-<p>The down-projection weights and all block scales already follow torch’s
-<code class="docutils literal notranslate"><span class="pre">[out,</span> <span class="pre">in]</span></code> layout and are passed to <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> as-is.  This repacks the
-operands the kernel reads differently:</p>
+<dd><p>Pack the router and up-projection weights for <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p>
+<p>The down-projection and latent-down weights, and the scales, already follow
+the layout the kernel reads and are passed to <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> as-is.
+This repacks the operands whose layout differs:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">router_weight</span></code> – the router’s SW128 swizzle, one packed blob per
 gate.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">expert_up_weights</span></code> / <code class="docutils literal notranslate"><span class="pre">shared_up_weight</span></code> – the gate/up pair
-layout (pack after quantizing: the scales stay on the raw layout).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">latent_down_weight</span></code> – transposed to <code class="docutils literal notranslate"><span class="pre">[latent,</span> <span class="pre">hidden]</span></code>.</p></li>
+layout.</p></li>
 </ul>
+<p>Only the layout changes: quantize every weight first, then convert it
+here.</p>
 <p><code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> selects the router schedule and must match the <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>
 call.  Every operand is optional: only the ones that are given are packed (and
 returned), e.g. to pack the experts as soon as they are loaded and the router once
@@ -504,27 +535,55 @@ per schedule.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>router_weight</strong> (<em>torch.Tensor</em><em> | </em><em>Sequence</em><em>[</em><em>torch.Tensor</em><em>] </em><em>| </em><em>None</em>) – Router weight <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">E]</span></code> bfloat16, <code class="docutils literal notranslate"><span class="pre">[G,</span> <span class="pre">K,</span> <span class="pre">E]</span></code> or a
-sequence of G <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">E]</span></code> tensors.  A single <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">E]</span></code> weight is
-reused for every gate.  None to skip.</p></li>
-<li><p><strong>expert_up_weights</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [E, 2N, K] float8_e4m3fn routed weights; rows
-[0, N) are gate and [N, 2N) up.  None to skip.</p></li>
-<li><p><strong>shared_up_weight</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [2N, H] float8_e4m3fn shared-expert weights, same
-gate/up split.  None to skip.</p></li>
-<li><p><strong>latent_down_weight</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional [H, L] float8_e4m3fn latent
-down-projection weight.</p></li>
-<li><p><strong>num_tokens</strong> (<em>int</em>) – Token count of the <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> call, which picks the router
-tile M.</p></li>
-<li><p><strong>num_router_gates</strong> (<em>int</em>) – Gates to merge; this build requires 2.</p></li>
+<li><p><strong>router_weight</strong> (<em>Tensor</em><em>, </em><em>optional</em>) – Router weight, shape [K, E], dtype bfloat16;
+shape [G, K, E] or a sequence of G [K, E] tensors is also
+accepted, and a single [K, E] weight is reused for every gate.</p></li>
+<li><p><strong>expert_up_weights</strong> (<em>Tensor</em><em>, </em><em>optional</em>) – Routed weights, shape [E, 2N, K], dtype
+float8_e4m3fn; rows [0, N) are gate and [N, 2N) up.</p></li>
+<li><p><strong>shared_up_weight</strong> (<em>Tensor</em><em>, </em><em>optional</em>) – Shared-expert weights, shape [2N, H],
+dtype float8_e4m3fn, same gate/up split.</p></li>
+<li><p><strong>num_tokens</strong> (<em>int</em><em>, </em><em>optional</em>) – Token count of the <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>
+call, which picks the router tile M. Default: 1.</p></li>
+<li><p><strong>num_router_gates</strong> (<em>int</em><em>, </em><em>optional</em>) – Gates to merge; this build requires
+2. Default: 2.</p></li>
+<li><p><strong>expert_up_weights_scale</strong> (<em>Tensor</em><em>, </em><em>optional</em>) – Scales of
+<code class="docutils literal notranslate"><span class="pre">expert_up_weights</span></code>, shape [E, 2N, K/32] and dtype uint8 for
+“w8a8-mxfp8”, or [E, 2N/128, K/128] and dtype float32 for
+“w8a8-blockwise”.  Default: None, to convert the weights only.</p></li>
+<li><p><strong>shared_up_weight_scale</strong> (<em>Tensor</em><em>, </em><em>optional</em>) – Scales of
+<code class="docutils literal notranslate"><span class="pre">shared_up_weight</span></code>, shape [2N, H/32] and dtype uint8 for
+“w8a8-mxfp8”, or [2N/128, H/128] and dtype float32 for
+“w8a8-blockwise”.  Default: None, to convert the weights only.</p></li>
 </ul>
 </dd>
-<dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>A dict with the keys <code class="docutils literal notranslate"><span class="pre">&quot;router_weight&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;expert_up_weights&quot;</span></code>,
-<code class="docutils literal notranslate"><span class="pre">&quot;shared_up_weight&quot;</span></code> and <code class="docutils literal notranslate"><span class="pre">&quot;latent_down_weight&quot;</span></code> of the operands
-that were given.</p>
+</dl>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The up-projection’s gate/up pairing reorders weight rows, so the
+MXFP8 SfAtom tables passed in are moved onto the packed rows too.
+Block-wise f32 tables are addressed by raw row and come back
+unchanged.</p>
+</div>
+<dl class="field-list simple">
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p><p><em>A dict with the packed operands</em> –</p>
+<ul class="simple">
+<li><p>“router_weight” (Tensor): dtype bfloat16, shape
+[G * (E // tile_m), K // 64, tile_m, 64], where tile_m is 16 for
+num_tokens &lt;= 8 and 32 otherwise.</p></li>
+<li><p>”expert_up_weights” (Tensor): dtype float8_e4m3fn, shape
+[E, 2N, K], gate/up interleaved.</p></li>
+<li><p>”shared_up_weight” (Tensor): dtype float8_e4m3fn, shape [2N, H],
+gate/up interleaved.</p></li>
+<li><p>”expert_up_weights_scale” (Tensor): the converted scale table, only
+when <code class="docutils literal notranslate"><span class="pre">expert_up_weights_scale</span></code> is given.</p></li>
+<li><p>”shared_up_weight_scale” (Tensor): the converted scale table, only
+when <code class="docutils literal notranslate"><span class="pre">shared_up_weight_scale</span></code> is given.</p></li>
+</ul>
+</p>
 </dd>
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>dict</p>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>dict</p>
 </dd>
 </dl>
 </dd></dl>
