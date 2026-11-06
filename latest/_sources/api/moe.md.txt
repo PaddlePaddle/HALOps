@@ -6,10 +6,22 @@
 .. autosummary::
    :nosignatures:
 
+   MoEWorkspace
    low_latency_moe
    get_workspace_for_moe
    get_workspace_size_for_moe
    transform_weights_for_moe
+```
+
+```{rst-class} api-entry
+```
+
+## MoEWorkspace
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: MoEWorkspace
 ```
 
 ```{rst-class} api-entry

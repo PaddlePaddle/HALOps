@@ -262,21 +262,52 @@
 <div class="table-wrapper autosummary longtable docutils container">
 <table class="autosummary longtable docutils align-default">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#halops.low_latency_moe" title="halops.low_latency_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">low_latency_moe</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.MoEWorkspace" title="halops.MoEWorkspace"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MoEWorkspace</span></code></a></p></td>
+<td><p>Scratchpad and tail communication state of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.low_latency_moe" title="halops.low_latency_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">low_latency_moe</span></code></a></p></td>
 <td><p>MoE forward pass on Blackwell SM100, support latent.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#halops.get_workspace_for_moe" title="halops.get_workspace_for_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_workspace_for_moe</span></code></a></p></td>
-<td><p>Allocate the uint8 workspace of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> for <code class="docutils literal notranslate"><span class="pre">input</span></code>'s token count.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.get_workspace_for_moe" title="halops.get_workspace_for_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_workspace_for_moe</span></code></a></p></td>
+<td><p>Allocate the workspace of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> for <code class="docutils literal notranslate"><span class="pre">input</span></code>'s token count.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#halops.get_workspace_size_for_moe" title="halops.get_workspace_size_for_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_workspace_size_for_moe</span></code></a></p></td>
-<td><p>Return the workspace size in bytes for a token count.</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.get_workspace_size_for_moe" title="halops.get_workspace_size_for_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_workspace_size_for_moe</span></code></a></p></td>
+<td><p>Return the size in bytes of the workspace's symmetric region for a token count.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#halops.transform_weights_for_moe" title="halops.transform_weights_for_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.transform_weights_for_moe" title="halops.transform_weights_for_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code></a></p></td>
 <td><p>Pack the router, up-projection and latent-down weights for <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<section class="api-entry" id="moeworkspace">
+<h2>MoEWorkspace<a class="headerlink" href="#moeworkspace" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.MoEWorkspace">
+<span class="sig-name descname"><span class="pre">MoEWorkspace</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">buffer</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">uc_bases</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">epochs</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">rank</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">world</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">wide</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">mc_base</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">_keepalive</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.MoEWorkspace" title="Link to this definition">¶</a></dt>
+<dd><p>Scratchpad and tail communication state of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p>
+<p>The kernel has a narrow (1 &lt;= T &lt;= 8) and a wide (9 &lt;= T &lt;= 16)
+schedule; each has its own scratchpad and tail layout, so a workspace is
+bound to one of them.  <code class="docutils literal notranslate"><span class="pre">buffer</span></code> is the head of one NVLS multicast
+capable symmetric region whose tail part is the fused tail’s mailbox.</p>
+<dl class="field-list simple">
+</dl>
+</dd></dl>
+
+</section>
 <section class="api-entry" id="low-latency-moe">
 <h2>low_latency_moe<a class="headerlink" href="#low-latency-moe" title="Link to this heading">¶</a></h2>
 <dl class="py function">
@@ -296,9 +327,11 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">shared_down_weight_scale</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">latent_down_weight</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">latent_down_weight_scale</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">fc2_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">fc2_scale</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">norm_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">out</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">workspace</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">routed_out</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">shared_out</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">top_k</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">num_router_gates</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">2</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">scoring_func</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'sigmoid'</span></span></em>,</dd>
@@ -306,19 +339,32 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">activation</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'silu'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">situ_beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">4.0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">situ_linear_beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">25.0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-06</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">grid_cap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="headerlink" href="#halops.low_latency_moe" title="Link to this definition">¶</a></dt>
 <dd><p>MoE forward pass on Blackwell SM100, support latent.</p>
 <p>Runs the router, the latent down-projection, the routed experts’ fused
 up/down projections and the shared expert for 1..16 tokens, writing
-<code class="docutils literal notranslate"><span class="pre">routed_out</span></code> and <code class="docutils literal notranslate"><span class="pre">shared_out</span></code> in place.  The shipped schedule is
+<code class="docutils literal notranslate"><span class="pre">out</span></code> in place.  The shipped schedule is
 fixed to E=512 experts, hidden size 4096, intermediate size 512 and
 latent size 2048, with block-wise FP8 weights (128x128 blocks).</p>
 <p>Weights are block-wise quantized by the caller; the router, up-projection
 and latent-down operands must first be packed with
 <code class="docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code>.  This build runs the latent stage, so
 <code class="docutils literal notranslate"><span class="pre">latent_down_weight</span></code> and <code class="docutils literal notranslate"><span class="pre">latent_down_weight_scale</span></code> are required.</p>
+<p>The fused tail always runs as the kernel’s last phase (the same single
+launch):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">out</span> <span class="o">=</span> <span class="n">fc2</span><span class="p">(</span><span class="n">RMSNorm</span><span class="p">(</span><span class="n">AllReduce</span><span class="p">(</span><span class="n">routed</span><span class="p">)))</span> <span class="o">+</span> <span class="n">AllReduce</span><span class="p">(</span><span class="n">shared</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>where <code class="docutils literal notranslate"><span class="pre">routed</span></code> is this rank’s combined routed latent and <code class="docutils literal notranslate"><span class="pre">shared</span></code> its
+partial shared-expert output (computed in-kernel, kept in <code class="docutils literal notranslate"><span class="pre">workspace</span></code>).  Both
+AllReduces run over the tensor-parallel group of <code class="docutils literal notranslate"><span class="pre">workspace</span></code> (4 ranks, NVLS
+multicast).  A scratchpad must always be launched with the same grid, so
+keep <code class="docutils literal notranslate"><span class="pre">grid_cap</span></code> fixed per workspace; the tail needs the shared-expert
+blocks and its own CTAs inside the grid.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -341,16 +387,17 @@ weights, pair layout.</p></li>
 weights.</p></li>
 <li><p><strong>shared_down_weight_scale</strong> (<em>torch.Tensor</em>) – [32, 4] float32 block scales of
 <code class="docutils literal notranslate"><span class="pre">shared_down_weight</span></code>.</p></li>
-<li><p><strong>latent_down_weight</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [2048, 4096] float8_e4m3fn latent
+<li><p><strong>latent_down_weight</strong> (<em>torch.Tensor</em>) – [2048, 4096] float8_e4m3fn latent
 down-projection weight, transposed by
 <code class="docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code>.</p></li>
-<li><p><strong>latent_down_weight_scale</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [16, 32] float32 block scales of
+<li><p><strong>latent_down_weight_scale</strong> (<em>torch.Tensor</em>) – [16, 32] float32 block scales of
 <code class="docutils literal notranslate"><span class="pre">latent_down_weight</span></code>.</p></li>
-<li><p><strong>workspace</strong> (<em>torch.Tensor</em>) – uint8 workspace from <code class="docutils literal notranslate"><span class="pre">get_workspace_for_moe</span></code>.</p></li>
-<li><p><strong>routed_out</strong> (<em>torch.Tensor</em>) – [T, 2048] bfloat16 output of the routed experts, written
-in place.</p></li>
-<li><p><strong>shared_out</strong> (<em>torch.Tensor</em>) – [T, 4096] bfloat16 output of the shared expert, written
-in place.</p></li>
+<li><p><strong>fc2_weight</strong> (<em>torch.Tensor</em>) – [H, L] float8_e4m3fn, replicated on every rank.</p></li>
+<li><p><strong>fc2_scale</strong> (<em>torch.Tensor</em>) – [H/128, L/128] float32 block scales, powers of two.</p></li>
+<li><p><strong>norm_weight</strong> (<em>torch.Tensor</em>) – [L] bfloat16 RMSNorm weight.</p></li>
+<li><p><strong>out</strong> (<em>torch.Tensor</em>) – [T, H] bfloat16 result of the tail, identical on every rank.</p></li>
+<li><p><strong>workspace</strong> (<em>MoEWorkspace</em>) – Workspace from <code class="docutils literal notranslate"><span class="pre">get_workspace_for_moe</span></code> whose schedule
+width matches the token count (<code class="docutils literal notranslate"><span class="pre">T</span> <span class="pre">&gt;</span> <span class="pre">8</span></code> needs the wide one).</p></li>
 <li><p><strong>top_k</strong> (<em>int</em>) – Experts selected per token, in [1, 10].</p></li>
 <li><p><strong>num_router_gates</strong> (<em>int</em>) – Router gates merged into <code class="docutils literal notranslate"><span class="pre">router_weight</span></code>; this
 build requires 2.</p></li>
@@ -360,10 +407,13 @@ build requires 2.</p></li>
 <li><p><strong>situ_beta</strong> (<em>float</em>) – SiTU gate soft cap; &lt;= 0 disables it.  Must be finite.</p></li>
 <li><p><strong>situ_linear_beta</strong> (<em>float</em>) – SiTU up soft cap; &lt;= 0 disables it.  Must be
 finite.</p></li>
+<li><p><strong>eps</strong> (<em>float</em>) – RMSNorm epsilon.</p></li>
+<li><p><strong>grid_cap</strong> (<em>int</em>) – 0 uses one block per SM; otherwise at most this many
+blocks, leaving the other SMs to concurrent work.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>None. Both outputs are written in place.</p>
+<dd class="field-even"><p>None. The outputs are written in place.</p>
 </dd>
 </dl>
 </dd></dl>
@@ -373,19 +423,27 @@ finite.</p></li>
 <h2>get_workspace_for_moe<a class="headerlink" href="#get-workspace-for-moe" title="Link to this heading">¶</a></h2>
 <dl class="py function">
 <dt class="sig sig-object py" id="halops.get_workspace_for_moe">
-<span class="sig-name descname"><span class="pre">get_workspace_for_moe</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#halops.get_workspace_for_moe" title="Link to this definition">¶</a></dt>
-<dd><p>Allocate the uint8 workspace of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> for <code class="docutils literal notranslate"><span class="pre">input</span></code>’s token count.</p>
-<p>Allocate it once, before any CUDA-graph capture, and reuse it across
-calls and graph replays; it is returned zero-initialized.</p>
+<span class="sig-name descname"><span class="pre">get_workspace_for_moe</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">group_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rank</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">world</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#halops.get_workspace_for_moe" title="Link to this definition">¶</a></dt>
+<dd><p>Allocate the workspace of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> for <code class="docutils literal notranslate"><span class="pre">input</span></code>’s token count.</p>
+<p>Collective over <code class="docutils literal notranslate"><span class="pre">group_name</span></code>.  Allocate it once, before any CUDA-graph
+capture, and reuse it across calls and graph replays; it is returned
+zero-initialized.  A workspace must always be launched with the same
+grid.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>input</strong> (<em>torch.Tensor</em>) – [T, 4096] bfloat16 CUDA tensor; T selects the schedule.</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>input</strong> (<em>torch.Tensor</em>) – [T, 4096] bfloat16 CUDA tensor; T selects the schedule.</p></li>
+<li><p><strong>group_name</strong> (<em>str</em>) – Name of the torch process group of the tensor-parallel
+ranks.</p></li>
+<li><p><strong>rank</strong> (<em>int</em>) – Rank in that group.</p></li>
+<li><p><strong>world</strong> (<em>int</em>) – Size of that group; this build requires 4.</p></li>
+</ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>1-D uint8 CUDA tensor on <code class="docutils literal notranslate"><span class="pre">input</span></code>’s device.</p>
+<dd class="field-even"><p>The workspace to pass to <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p>
 </dd>
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>torch.Tensor</p>
+<dd class="field-odd"><p><em>MoEWorkspace</em></p>
 </dd>
 </dl>
 </dd></dl>
@@ -396,14 +454,14 @@ calls and graph replays; it is returned zero-initialized.</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="halops.get_workspace_size_for_moe">
 <span class="sig-name descname"><span class="pre">get_workspace_size_for_moe</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#halops.get_workspace_size_for_moe" title="Link to this definition">¶</a></dt>
-<dd><p>Return the workspace size in bytes for a token count.</p>
+<dd><p>Return the size in bytes of the workspace’s symmetric region for a token count.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>input</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional [T, 4096] bfloat16 CUDA tensor.  Without it, the
 larger of the supported schedules is returned.</p>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>Workspace size in bytes.</p>
+<dd class="field-even"><p>Size in bytes of the scratchpad plus the tail mailbox.</p>
 </dd>
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>int</p>
@@ -440,17 +498,19 @@ layout (pack after quantizing: the scales stay on the raw layout).</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">latent_down_weight</span></code> – transposed to <code class="docutils literal notranslate"><span class="pre">[latent,</span> <span class="pre">hidden]</span></code>.</p></li>
 </ul>
 <p><code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> selects the router schedule and must match the <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>
-call.</p>
+call.  Every operand is optional: only the ones that are given are packed (and
+returned), e.g. to pack the experts as soon as they are loaded and the router once
+per schedule.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>router_weight</strong> (<em>torch.Tensor</em><em> | </em><em>Sequence</em><em>[</em><em>torch.Tensor</em><em>]</em>) – Router weight <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">E]</span></code> bfloat16, <code class="docutils literal notranslate"><span class="pre">[G,</span> <span class="pre">K,</span> <span class="pre">E]</span></code> or a
+<li><p><strong>router_weight</strong> (<em>torch.Tensor</em><em> | </em><em>Sequence</em><em>[</em><em>torch.Tensor</em><em>] </em><em>| </em><em>None</em>) – Router weight <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">E]</span></code> bfloat16, <code class="docutils literal notranslate"><span class="pre">[G,</span> <span class="pre">K,</span> <span class="pre">E]</span></code> or a
 sequence of G <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">E]</span></code> tensors.  A single <code class="docutils literal notranslate"><span class="pre">[K,</span> <span class="pre">E]</span></code> weight is
-reused for every gate.</p></li>
-<li><p><strong>expert_up_weights</strong> (<em>torch.Tensor</em>) – [E, 2N, K] float8_e4m3fn routed weights; rows
-[0, N) are gate and [N, 2N) up.</p></li>
-<li><p><strong>shared_up_weight</strong> (<em>torch.Tensor</em>) – [2N, H] float8_e4m3fn shared-expert weights, same
-gate/up split.</p></li>
+reused for every gate.  None to skip.</p></li>
+<li><p><strong>expert_up_weights</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [E, 2N, K] float8_e4m3fn routed weights; rows
+[0, N) are gate and [N, 2N) up.  None to skip.</p></li>
+<li><p><strong>shared_up_weight</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [2N, H] float8_e4m3fn shared-expert weights, same
+gate/up split.  None to skip.</p></li>
 <li><p><strong>latent_down_weight</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional [H, L] float8_e4m3fn latent
 down-projection weight.</p></li>
 <li><p><strong>num_tokens</strong> (<em>int</em>) – Token count of the <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> call, which picks the router
@@ -459,8 +519,9 @@ tile M.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>A dict with keys <code class="docutils literal notranslate"><span class="pre">&quot;router_weight&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;expert_up_weights&quot;</span></code>,
-<code class="docutils literal notranslate"><span class="pre">&quot;shared_up_weight&quot;</span></code> and, when given, <code class="docutils literal notranslate"><span class="pre">&quot;latent_down_weight&quot;</span></code>.</p>
+<dd class="field-even"><p>A dict with the keys <code class="docutils literal notranslate"><span class="pre">&quot;router_weight&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;expert_up_weights&quot;</span></code>,
+<code class="docutils literal notranslate"><span class="pre">&quot;shared_up_weight&quot;</span></code> and <code class="docutils literal notranslate"><span class="pre">&quot;latent_down_weight&quot;</span></code> of the operands
+that were given.</p>
 </dd>
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p>dict</p>
@@ -527,6 +588,7 @@ tile M.</p></li>
           <div class="toc-tree">
             <ul>
 <li><a class="reference internal" href="#">MOE</a><ul>
+<li><a class="reference internal" href="#moeworkspace">MoEWorkspace</a></li>
 <li><a class="reference internal" href="#low-latency-moe">low_latency_moe</a></li>
 <li><a class="reference internal" href="#get-workspace-for-moe">get_workspace_for_moe</a></li>
 <li><a class="reference internal" href="#get-workspace-size-for-moe">get_workspace_size_for_moe</a></li>
