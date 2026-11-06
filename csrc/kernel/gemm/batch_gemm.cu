@@ -88,8 +88,25 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
         if (output_sf.has_value()) {
             params.ptr_sfd = output_sf->data_ptr();
         }
+        TORCH_CHECK(
+            gate.has_value() || (epilogue != EpilogueOp::GateMulQuant &&
+                                 epilogue != EpilogueOp::SigmoidGateMulQuant),
+            "GateMulQuant epilogues need gate");
         if (gate.has_value()) {
+            constexpr int kGateAlign = sizeof(cute::uint256_t);
+            TORCH_CHECK(gate->scalar_type() == torch::kBFloat16 &&
+                            gate->sizes() == output.sizes(),
+                        "gate must be a bfloat16 [M, B * N] tensor");
+            TORCH_CHECK(
+                gate->stride(1) == 1 &&
+                    gate->stride(0) * gate->element_size() % kGateAlign == 0 &&
+                    reinterpret_cast<uintptr_t>(gate->data_ptr()) %
+                            kGateAlign ==
+                        0,
+                "gate rows must be contiguous and ", kGateAlign,
+                "-byte aligned");
             params.ptr_gate = gate->data_ptr();
+            params.gate_ld = gate->stride(0);
         }
         switch (epilogue) {
             case EpilogueOp::Identity:
@@ -103,6 +120,11 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
             case EpilogueOp::GateMulQuant:
                 LaunchCfg<KernelMode::Batch, MmaKind::MXFP8,
                           EpilogueOp::GateMulQuant>(params, shape, stream);
+                break;
+            case EpilogueOp::SigmoidGateMulQuant:
+                LaunchCfg<KernelMode::Batch, MmaKind::MXFP8,
+                          EpilogueOp::SigmoidGateMulQuant>(params, shape,
+                                                           stream);
                 break;
             default:
                 TORCH_CHECK(false, "Unsupported epilogue ",

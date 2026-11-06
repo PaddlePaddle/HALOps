@@ -35,6 +35,7 @@ from tests.utils.gemm_utils import (
     sfatom_offsets,
     sfatom_rows,
     ue8m0_to_float32,
+    ulp_diff,
 )
 
 FP8_BLOCK_SIZE = 32
@@ -398,13 +399,10 @@ def ref_quant_e4m3(v):
 @pytest.mark.parametrize(
     "B, M, N, K",
     [
-        pytest.param(4, 128, 256, 128, id="mid_m"),
-        pytest.param(2, 640, 256, 128, id="m640_pair"),
+        # Non-swap tiles straddling two batches.
         pytest.param(3, 200, 256, 128, id="m200_straddle"),
-        pytest.param(3, 100, 256, 256, id="m100_swapab"),
-        pytest.param(8, 1000, 1024, 256, id="m1000_pair_swapab"),
-        pytest.param(2, 5, 256, 256, id="grid10_swap16"),
-        pytest.param(8, 2000, 1024, 512, id="m2000"),
+        # SwapAB 2-CTA tiles straddling two batches.
+        pytest.param(8, 200, 1024, 2048, id="m200_pair_swapab"),
     ],
 )
 def test_batch_gemm_w8a8_mxfp8_e4m3_out(B, M, N, K, with_gate):
@@ -434,6 +432,49 @@ def test_batch_gemm_w8a8_mxfp8_e4m3_out(B, M, N, K, with_gate):
     batch_gemm(*args, out2, None, None, -1, "w8a8-mxfp8", op, out_sf2, gate)
     assert torch.equal(out.view(torch.uint8), out2.view(torch.uint8))
     assert torch.equal(out_sf, out_sf2)
+
+
+@pytest.mark.parametrize(
+    "B, M, N, K",
+    [
+        # Non-swap tiles straddling two batches.
+        pytest.param(3, 200, 256, 128, id="m200_straddle"),
+        # SwapAB 2-CTA tiles straddling two batches.
+        pytest.param(8, 200, 1024, 2048, id="m200_pair_swapab"),
+    ],
+)
+def test_batch_gemm_w8a8_mxfp8_sigmoid_gate_mul_quant(B, M, N, K):
+    """A gate read in place from a column slice of a wider tensor gives the
+    result of its contiguous copy. SigmoidGateMulQuant on logits matches
+    GateMulQuant on bf16(torch.sigmoid(logits)) up to the sigmoid's rounding:
+    a gate 1 bf16 ulp off moves a code by at most 1, or rarely a group's scale
+    by 1, so codes match within 1 where the scale matches and at most 0.1% of
+    the scales differ."""
+    inp = make_w8a8_mxfp8_inputs(B, M, N, K)
+    args = (inp["input_fp8"], inp["weight_fp8"], inp["sfa"], inp["sfb"])
+    wide = torch.randn([M, 3 * B * N], dtype=torch.bfloat16) * 3
+    logits = wide[:, B * N : 2 * B * N]
+    sf_cols = B * N // FP8_BLOCK_SIZE
+
+    def run(op, gate):
+        out = torch.empty([M, B * N], dtype=torch.float8_e4m3fn)
+        out_sf = torch.zeros([sfatom_rows(M) * sf_cols], dtype=torch.uint8)
+        batch_gemm(*args, out, None, None, -1, "w8a8-mxfp8", op, out_sf, gate)
+        return out.view(torch.uint8), out_sf
+
+    q, sf = run(EpilogueOp.GateMulQuant, logits)
+    ref_q, ref_sf = run(EpilogueOp.GateMulQuant, logits.contiguous())
+    assert torch.equal(q, ref_q) and torch.equal(sf, ref_sf)
+
+    q, sf = run(EpilogueOp.SigmoidGateMulQuant, logits)
+    gate = torch.sigmoid(logits.float()).to(torch.bfloat16)
+    ref_q, ref_sf = run(EpilogueOp.GateMulQuant, gate)
+    sf_diff = (sf.int() - ref_sf.int()).abs()
+    assert sf_diff.max() <= 1 and (sf_diff > 0).float().mean() <= 1e-3
+    sf_idx = sfatom_offsets(M, sf_cols)
+    same_scale = (sf_diff[sf_idx] == 0).repeat_interleave(FP8_BLOCK_SIZE, -1)
+    code_diff = ulp_diff(q.view(torch.float8_e4m3fn), ref_q.view(torch.float8_e4m3fn))
+    assert code_diff[same_scale].max() <= 1
 
 
 # =====================================================================

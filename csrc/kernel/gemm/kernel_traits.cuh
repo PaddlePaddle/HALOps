@@ -40,6 +40,7 @@ struct GemmParams {
     bool use_pdl = false;
     void *__restrict__ ptr_sfd = nullptr;
     void const *__restrict__ ptr_gate = nullptr;
+    int64_t gate_ld = 0;
     SituCoef situ;
 };
 
@@ -100,7 +101,10 @@ struct GemmKernelTraits {
     static constexpr int kItersK = KBlockK / KMmaK;
     static constexpr EpilogueOp KEpiOp = KernelConfig_::KEpiOp;
     static constexpr bool KQuantD = IsQuantOp(KEpiOp);
-    static constexpr bool KGateMul = KEpiOp == EpilogueOp::GateMulQuant;
+    static constexpr bool KGateSigmoid =
+        KEpiOp == EpilogueOp::SigmoidGateMulQuant;
+    static constexpr bool KGateMul =
+        KEpiOp == EpilogueOp::GateMulQuant || KGateSigmoid;
     static constexpr bool KGlu = KEpiOp == EpilogueOp::SituQuant;
     static constexpr int KAccColsPerOut = KGlu ? 2 : 1;
     static constexpr int KQuantAccCols = KAccColsPerOut * mxfp8::kGroup;

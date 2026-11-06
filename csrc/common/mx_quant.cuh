@@ -88,8 +88,11 @@ CUTE_DEVICE __nv_bfloat162 abs_max(const __nv_bfloat162* v) {
 
 CUTE_DEVICE uint32_t e4m3x4(__nv_bfloat162 v0, __nv_bfloat162 v1,
                             __nv_bfloat162 scale) {
+    // SATFINITE saturates finite values but keeps NaN; __hmax2 returns the
+    // non-NaN operand, so NaN becomes -448 as in quant_e4m3_group.
+    const __nv_bfloat162 lo = __float2bfloat162_rn(-kE4m3Max);
     const auto cvt = [&](__nv_bfloat162 v) {
-        const __nv_bfloat162 p = __hmul2(v, scale);
+        const __nv_bfloat162 p = __hmax2(__hmul2(v, scale), lo);
         return (uint32_t)__nv_cvt_bfloat16raw2_to_fp8x2(
             reinterpret_cast<const __nv_bfloat162_raw&>(p), __NV_SATFINITE,
             __NV_E4M3);

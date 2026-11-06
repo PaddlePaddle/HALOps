@@ -72,12 +72,16 @@ def batch_gemm(
             ``w4a4-mxfp4``.
         sm_count: Number of SMs to use (-1 for all available).
         mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``.
-        epilogue: ``EpilogueOp.Identity``, ``EpilogueOp.Quant`` or
-            ``EpilogueOp.GateMulQuant`` (``w8a8-mxfp8``: float8_e4m3fn output,
-            the result (times ``gate``) quantized per 32 columns).
+        epilogue: ``EpilogueOp.Identity``, ``EpilogueOp.Quant``,
+            ``EpilogueOp.GateMulQuant`` or ``EpilogueOp.SigmoidGateMulQuant``
+            (``w8a8-mxfp8``: float8_e4m3fn output, the result (times ``gate``,
+            or times ``bf16(sigmoid(gate))``) quantized per 32 columns).
         output_sf: UE8M0 SfAtom scales of a quantized output, over
             ``[M, B * N / 32]``; N must be a multiple of 128.
-        gate: [M, B * N] bfloat16 tensor of ``EpilogueOp.GateMulQuant``.
+        gate: [M, B * N] bfloat16 tensor of the GateMulQuant epilogues
+            (logits for ``SigmoidGateMulQuant``). Rows may be strided
+            (``stride(1) == 1``, 32-byte aligned row starts), e.g. a column
+            slice of a merged GEMM output.
         use_pdl: Enable Programmatic Dependent Launch (on by default).
 
     Returns:

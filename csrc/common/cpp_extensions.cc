@@ -234,7 +234,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .value("Quant", halops::EpilogueOp::Quant)
         .value("GateMulQuant", halops::EpilogueOp::GateMulQuant)
         .value("Sigmoid", halops::EpilogueOp::Sigmoid)
-        .value("SituQuant", halops::EpilogueOp::SituQuant);
+        .value("SituQuant", halops::EpilogueOp::SituQuant)
+        .value("SigmoidGateMulQuant", halops::EpilogueOp::SigmoidGateMulQuant);
     m.def("dense_gemm", &halops::DenseGemm, py::arg("input"), py::arg("weight"),
           py::arg("sfa"), py::arg("sfb"), py::arg("output"), py::arg("bias"),
           py::arg("alpha"), py::arg("sm_count"), py::arg("mode"),

@@ -91,6 +91,7 @@ class CollectiveEpilogue {
         TypeC const* ptr_gate = nullptr;
         int rows_per_batch = 0;
         SituCoef situ{};
+        int64_t gate_ld = 0;
     };
 
     struct Params {
@@ -106,6 +107,7 @@ class CollectiveEpilogue {
         SituCoef situ;
         TypeC const* ptr_c = nullptr;
         int64_t d_ld;
+        int64_t gate_ld;
     };
 
     static Params to_underlying_arguments(Arguments const& args) {
@@ -151,7 +153,8 @@ class CollectiveEpilogue {
                 d_desc,
                 args.situ,
                 args.ptr_c,
-                d_ld};
+                d_ld,
+                args.gate_ld};
     }
 
     // Producer warp: TMA-loads one bias C stage per scheduled tile.
@@ -260,6 +263,21 @@ class CollectiveEpilogue {
     CUTLASS_DEVICE static int64_t d_row(Params const& p, TileRows const& rows,
                                         int64_t row) {
         return (row - (int64_t)rows.lo) * p.d_ld;
+    }
+    CUTLASS_DEVICE static int64_t gate_row(Params const& p,
+                                           TileRows const& rows, int64_t row) {
+        return (row - (int64_t)rows.lo) * p.gate_ld;
+    }
+    // A loaded bf16x2 gate word; SigmoidGateMulQuant gates are logits, turned
+    // into bf16 sigmoids while the tile's accumulator is still being computed.
+    CUTLASS_DEVICE static void gate_act(uint32_t& g) {
+        if constexpr (KernelTraits::KGateSigmoid) {
+            const float2 f =
+                __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(g));
+            const __nv_bfloat162 s =
+                __floats2bfloat162_rn(sigmoid(f.x), sigmoid(f.y));
+            g = reinterpret_cast<const uint32_t&>(s);
+        }
     }
     CUTLASS_DEVICE static int64_t sf_offset(Params const& p,
                                             TileRows const& rows, int64_t row,
@@ -452,7 +470,9 @@ class CollectiveEpilogue {
                             x[i - i0][l] =
                                 in_rows(r)
                                     ? __ldg(reinterpret_cast<const uint4*>(
-                                          base + row_off(r) + dep))
+                                          base +
+                                          gate_row(epilogue_params, rows, r) +
+                                          bcol0 + dep))
                                     : make_uint4(0u, 0u, 0u, 0u);
                         }
                     }
@@ -462,6 +482,7 @@ class CollectiveEpilogue {
                         CUTLASS_PRAGMA_UNROLL
                         for (int l = 0; l < kLoads; ++l) {
                             quad_transpose_4x4(x[i - i0][l], lane, g[i][l]);
+                            for (uint32_t& e : g[i][l]) gate_act(e);
                         }
                     }
                 }
@@ -814,9 +835,12 @@ class CollectiveEpilogue {
                                 cute::SM100_LOAD_256bit_CACHE_NOALLOCATION>(
                                 *reinterpret_cast<const cute::uint256_t*>(
                                     epilogue_params.ptr_gate +
-                                    d_row(epilogue_params, rows, row) + bcol0 +
-                                    col0 + i * kE),
+                                    gate_row(epilogue_params, rows, row) +
+                                    bcol0 + col0 + i * kE),
                                 reinterpret_cast<uint32_t(&)[kW]>(g[kW * i]));
+                        }
+                        for (__nv_bfloat162& v : vals) {
+                            gate_act(reinterpret_cast<uint32_t&>(v));
                         }
                     }
                 }

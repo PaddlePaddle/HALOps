@@ -23,12 +23,13 @@ enum class EpilogueOp : int32_t {
     Quant = 1,
     GateMulQuant = 2,
     Sigmoid = 3,
-    SituQuant = 4
+    SituQuant = 4,
+    SigmoidGateMulQuant = 5
 };
 
 constexpr bool IsQuantOp(EpilogueOp op) {
     return op == EpilogueOp::Quant || op == EpilogueOp::GateMulQuant ||
-           op == EpilogueOp::SituQuant;
+           op == EpilogueOp::SituQuant || op == EpilogueOp::SigmoidGateMulQuant;
 }
 
 inline constexpr int kGluInterleave = 16;
