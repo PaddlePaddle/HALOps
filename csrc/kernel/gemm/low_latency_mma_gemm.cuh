@@ -19,9 +19,9 @@
 #include <iterator>
 #include <utility>
 
+#include "common/pdl.cuh"
 #include "kernel/gemm/gemm_utils.h"
 #include "kernel/gemm/low_latency_utils.cuh"
-#include "kernel/gemm/pdl.cuh"
 
 namespace halops {
 
@@ -232,7 +232,7 @@ __device__ __forceinline__ void ll_producer_warp(const LlGemmParams& params,
             ++b_state;
             if constexpr (UsePdl) {
                 if (first_tile && phase_block == 0) {
-                    PdlWaitForDependents();
+                    pdl_wait();
                     ll_load_sfa(params, smem, lane);
                 }
             }
@@ -478,7 +478,7 @@ __global__ void __launch_bounds__(Tile::KThreads, 1)
     const LlSmem smem = ll_smem<Tile>(smem_buf, params);
     if (threadIdx.x < 32) ll_init_barriers<Tile>(smem, params.k);
     __syncthreads();
-    if constexpr (UsePdl) cudaTriggerProgrammaticLaunchCompletion();
+    if constexpr (UsePdl) pdl_trigger();
 
     const int warp = threadIdx.x >> 5;
     if (warp < Tile::KConsumerWarps) {

@@ -14,13 +14,13 @@
 
 #pragma once
 
+#include "common/pdl.cuh"
 #include "cutlass/arch/arch.h"
 #include "cutlass/arch/reg_reconfig.h"
 #include "cutlass/cluster_launch.hpp"
 #include "kernel/gemm/epilogue.cuh"
 #include "kernel/gemm/gemm_utils.h"
 #include "kernel/gemm/mainloop_fwd.cuh"
-#include "kernel/gemm/pdl.cuh"
 #include "kernel/gemm/tile_scheduler.cuh"
 
 namespace halops {
@@ -59,7 +59,7 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
     using X = cute::Underscore;
 
     auto tx = threadIdx.x;
-    auto warp_idx = tx / 32;
+    auto warp_idx = cutlass::canonical_warp_idx_sync();
     uint32_t lane_predicate = cute::elect_one_sync();
     auto tx_in_warp = tx % 32;
 
@@ -92,6 +92,9 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
             mainloop_params.tma_load_SFA.get_tma_descriptor());
         if constexpr (KernelTraits::IsSfbUnaligned) {
             cute::prefetch_tma_descriptor(&mainloop_params.sfb_run_desc);
+            if constexpr (KernelTraits::KActRowTma) {
+                cute::prefetch_tma_descriptor(&mainloop_params.act_row_desc);
+            }
         } else {
             cute::prefetch_tma_descriptor(
                 mainloop_params.tma_load_SFB.get_tma_descriptor());
@@ -129,7 +132,8 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
     mainloop_pipeline_params.is_leader =
         tx_in_warp == 0 && is_mma_leader_cta && is_load_ab_warp;
     mainloop_pipeline_params.transaction_bytes =
-        CollectiveMainloop::TmaTransactionBytesABFor(mainloop_params.m);
+        CollectiveMainloop::TmaTransactionBytesABFor(
+            mainloop_params.m, mainloop_params.num_experts);
 
     mainloop_pipeline_params.initializing_warp = KernelTraits::KLoadABWarpId;
 
@@ -195,7 +199,7 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
     }
 
     if constexpr (KernelTraits::KUsePdl) {
-        PdlWaitForDependents();
+        pdl_wait();
     }
 
     // Per-expert alpha to SMEM; visible to all warps after the sync below.
@@ -224,6 +228,9 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
         }
         main_loop.tma_loadAB(mainloop_params, mainloop_pipeline, shared_storage,
                              tiled_mma, scheduler);
+        if constexpr (KernelTraits::KUsePdl) {
+            pdl_trigger();
+        }
     } else if (warp_idx == KernelTraits::KMmaWarpId && is_mma_leader_cta) {
         if constexpr (KEpilogueWarpGroupCount != 1) {
             cutlass::arch::warpgroup_reg_dealloc<KernelTraits::KNumRegsOther>();
@@ -246,15 +253,9 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
             cutlass::arch::warpgroup_reg_alloc<
                 KernelTraits::KNumRegsEpilogue>();
         }
-        if constexpr (KernelTraits::AddBias) {
-            epilogue_loop.epilogue_with_bias(
-                epilogue_params, accumulator_pipeline, bias_pipeline,
-                shared_storage, tmem_storage, warp_idx, scheduler);
-        } else {
-            epilogue_loop.epilogue(epilogue_params, accumulator_pipeline,
-                                   shared_storage, tmem_storage, warp_idx,
-                                   scheduler);
-        }
+        epilogue_loop.epilogue(epilogue_params, accumulator_pipeline,
+                               bias_pipeline, shared_storage, tmem_storage,
+                               warp_idx, scheduler);
     } else if (KernelTraits::AddBias &&
                warp_idx == KernelTraits::KLoadCWarpId) {
         if constexpr (KEpilogueWarpGroupCount != 1) {
@@ -274,10 +275,6 @@ __global__ void __launch_bounds__(KernelTraits::KThreads, 1)
         cute::cluster_wait();
     } else {
         __syncthreads();
-    }
-
-    if constexpr (KernelTraits::KUsePdl) {
-        PdlTriggerAfterBlockWrites();
     }
 
     if (warp_idx == KernelTraits::KMmaWarpId) {
@@ -400,19 +397,23 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
         // use aligned M for selecting tiles.
         const int m_for_tiles =
             KernelTraits::KIsDense ? AlignSfM(params.m) : params.m;
+        // Batch takes a partial last M tile.
+        constexpr bool kBatchPartialM =
+            KernelTraits::KernelType == KernelMode::Batch;
         if constexpr (KernelTraits::SwapAB) {
             TORCH_CHECK(
                 params.n % KernelTraits::KBlockM == 0,
                 "SwapAB gemm_impl requires N to be divisible by KBlockM=",
                 KernelTraits::KBlockM, ", got ", params.n);
             TORCH_CHECK(
-                m_for_tiles % KernelTraits::KBlockN == 0 ||
+                m_for_tiles % KernelTraits::KBlockN == 0 || kBatchPartialM ||
                     (KernelTraits::KIsDense &&
                      params.m <= KernelTraits::KBlockN),
                 "SwapAB gemm_impl requires M to be divisible by KBlockN=",
                 KernelTraits::KBlockN, ", got ", params.m);
         } else {
             TORCH_CHECK(m_for_tiles % KernelTraits::KBlockM == 0 ||
+                            kBatchPartialM ||
                             (KernelTraits::KDenseW8A8MXFP8 &&
                              params.m <= KernelTraits::KBlockM),
                         "gemm_impl requires M to be divisible by KBlockM=",
@@ -500,7 +501,9 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
 
     constexpr int TileSF_N =
         cute::size<1>(typename KernelTraits::TileShape_SF{});
-    int N_sfb = cutlass::ceil_div(N, KernelTraits::KBlockN) * TileSF_N;
+    int N_sfb = KernelTraits::IsCtaN64
+                    ? cutlass::ceil_div(N, TileSF_N) * TileSF_N
+                    : cutlass::ceil_div(N, KernelTraits::KBlockN) * TileSF_N;
 
     cute::Layout layout_A =
         SwapAB ? cute::make_layout(cute::make_shape(N, K, num_experts),
@@ -545,7 +548,13 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
         CollectiveEpilogue<KernelTraits>::to_underlying_arguments(
             {static_cast<TypeC const*>(params.ptr_c),
              static_cast<TypeD*>(params.ptr_d), params.m, params.n,
-             params.num_experts, params.ptr_alpha});
+             params.num_experts, params.ptr_alpha,
+             static_cast<uint8_t*>(params.ptr_sfd),
+             static_cast<TypeC const*>(params.ptr_gate),
+             KernelTraits::KernelType == KernelMode::Batch
+                 ? params.max_m_per_expert
+                 : params.m,
+             params.situ, params.gate_ld});
 
     int scheduler_m = SwapAB ? N : M;
     int scheduler_n = SwapAB ? M : N;
@@ -553,7 +562,7 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
         scheduler_m, scheduler_n, params.num_experts, params.max_m_per_expert,
         params.masked_m, params.expert_ids);
 
-    int smem_size = sizeof(typename KernelTraits::SharedStorage);
+    int smem_size = KernelTraits::KSmemBytes;
 
     static_assert(sizeof(typename KernelTraits::SharedStorage) <=
                       cutlass::arch::sm100_smem_capacity_bytes,
@@ -585,7 +594,8 @@ void gemm_impl_for_pdl(GemmParams& params, const int sm_count,
                                     TypeAccumulate, KernelConfig,
                                     /*NarrowA_=*/true, UsePdl>;
     if constexpr (Traits::KNarrowA) {
-        if (params.m < KernelConfig::KBlockM) {
+        if (CollectiveMainloop<Traits>::NarrowARows(params.m,
+                                                    params.num_experts) > 0) {
             gemm_impl_body<TypeA, TypeB, TypeC, TypeD, TypeSF, TypeAccumulate,
                            KernelConfig, /*NarrowA=*/true, UsePdl>(
                 params, sm_count, stream);

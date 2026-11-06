@@ -52,6 +52,16 @@ class CudaDeviceGuard {
     bool restore_ = false;
 };
 
+// Rows of the 2D tensor t are contiguous and start 16-byte aligned, so a kernel
+// can read them with 128-bit loads at the tensor's row stride.
+inline void CheckRowsVecAligned(const torch::Tensor& t, const char* name) {
+    constexpr int kVecBytes = sizeof(uint4);
+    TORCH_CHECK(t.stride(1) == 1 &&
+                    t.stride(0) * t.element_size() % kVecBytes == 0 &&
+                    reinterpret_cast<uintptr_t>(t.data_ptr()) % kVecBytes == 0,
+                name, " rows must be contiguous and 16-byte aligned");
+}
+
 inline int CurrentDevice() {
     int device = 0;
     HALOPS_CUDA_CHECK(cudaGetDevice(&device));

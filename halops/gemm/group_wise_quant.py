@@ -14,7 +14,7 @@
 # limitations under the License.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -28,6 +28,8 @@ def group_wise_quant(
     mode: str = "w8a8-mxfp8",
     use_swizzle: bool = True,
     use_pdl: bool = True,
+    output_quant: Optional[torch.Tensor] = None,
+    output_sf: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Group-wise quantization from BF16/FP16 to FP8/FP4 with scale factors.
 
@@ -40,13 +42,17 @@ def group_wise_quant(
     ``group_masked_gemm`` / ``group_contiguous_gemm`` of the same ``mode``.
 
     Args:
-        input: [m, k] CUDA tensor, dtype bfloat16 or float16. Source tensor.
+        input: [m, k] CUDA tensor, dtype bfloat16 or float16. Rows may be
+            strided (``stride(1) == 1``, 16-byte aligned row starts), e.g. a
+            column slice of a wider tensor.
         mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``. Selects both
             the value encoding and the scale recipe.
         use_swizzle: ``True`` to output scales in the CUTLASS SfAtom 128x4
             interleaved layout consumed by the GEMM kernels; ``False`` for a
             plain row-major scale layout.
         use_pdl: Enable Programmatic Dependent Launch (on by default).
+        output_quant: Optional pre-allocated contiguous ``output_quant``.
+        output_sf: Optional pre-allocated contiguous ``output_sf``.
 
     Returns:
         A tuple ``(output_quant, output_sf)`` where:
@@ -73,4 +79,6 @@ def group_wise_quant(
         >>> # FP4 with UE4M3 scales, one per 16 elements (NVFP4)
         >>> x_nvfp4, sf = group_wise_quant(x_bf16, mode="w4a4-nvfp4")
     """
-    return halops_kernel.group_wise_quant(input, mode, use_swizzle, use_pdl)
+    return halops_kernel.group_wise_quant(
+        input, mode, use_swizzle, use_pdl, output_quant, output_sf
+    )

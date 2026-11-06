@@ -19,6 +19,7 @@ from typing import Optional
 import torch
 
 import halops.halops_kernel as halops_kernel
+from halops.halops_kernel import EpilogueOp
 
 __all__ = ["batch_gemm"]
 
@@ -33,10 +34,15 @@ def batch_gemm(
     alpha: Optional[torch.Tensor] = None,
     sm_count: int = -1,
     mode: str = "w8a8-mxfp8",
+    epilogue: EpilogueOp = EpilogueOp.Identity,
+    output_sf: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+    use_pdl: bool = True,
 ) -> None:
     """Batch GEMM on Blackwell SM100 tensor cores.
 
-    Computes ``output[b] = input[b] @ weight[b]^T`` for each batch item.
+    Computes ``output[:, b * N:(b + 1) * N] = input[b] @ weight[b]^T`` for
+    each batch item.
     The batch dimension ``B`` acts as the group (expert) index: batch item
     ``b`` is multiplied only by ``weight[b]``, i.e. there is a one-to-one
     mapping between input batch index and weight batch index (no separate
@@ -58,13 +64,25 @@ def batch_gemm(
             - ``w4a4-nvfp4``: UE4M3 encoding.
 
         sfb: [B, N, sf_k] scale factor for B, dtype uint8, same SfAtom layout as sfa.
-        output: [B, M, N] pre-allocated output tensor, dtype bfloat16. Written in-place.
+        output: [M, B * N] pre-allocated output tensor, dtype bfloat16, or
+            float8_e4m3fn (``w8a8-mxfp8``) for an MXFP8-quantized output.
         bias: Optional [B, N] bfloat16 bias vector. Only supported in w8a8-mxfp8 mode.
         alpha: Optional float32 per-batch scaling factor with shape [B], one
             value per batch item. Required for ``w4a4-nvfp4``; not accepted for
             ``w4a4-mxfp4``.
         sm_count: Number of SMs to use (-1 for all available).
         mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``.
+        epilogue: ``EpilogueOp.Identity``, ``EpilogueOp.Quant``,
+            ``EpilogueOp.GateMulQuant`` or ``EpilogueOp.SigmoidGateMulQuant``
+            (``w8a8-mxfp8``: float8_e4m3fn output, the result (times ``gate``,
+            or times ``bf16(sigmoid(gate))``) quantized per 32 columns).
+        output_sf: UE8M0 SfAtom scales of a quantized output, over
+            ``[M, B * N / 32]``; N must be a multiple of 128.
+        gate: [M, B * N] bfloat16 tensor of the GateMulQuant epilogues
+            (logits for ``SigmoidGateMulQuant``). Rows may be strided
+            (``stride(1) == 1``, 32-byte aligned row starts), e.g. a column
+            slice of a merged GEMM output.
+        use_pdl: Enable Programmatic Dependent Launch (on by default).
 
     Returns:
         None. The result is written in-place to output.
@@ -79,9 +97,21 @@ def batch_gemm(
         >>> w, sfb = group_wise_quant(w_bf16.view(b * n, k), mode="w8a8-mxfp8")
         >>> x = x.view(b, m, k); sfa = sfa.view(b, m, -1)
         >>> w = w.view(b, n, k); sfb = sfb.view(b, n, -1)
-        >>> out = torch.empty(b, m, n, dtype=torch.bfloat16, device="cuda")
+        >>> out = torch.empty(m, b * n, dtype=torch.bfloat16, device="cuda")
         >>> batch_gemm(x, w, sfa, sfb, out, mode="w8a8-mxfp8")
     """
     halops_kernel.batch_gemm(
-        input, weight, sfa, sfb, output, bias, alpha, sm_count, mode
+        input,
+        weight,
+        sfa,
+        sfb,
+        output,
+        bias,
+        alpha,
+        sm_count,
+        mode,
+        epilogue,
+        output_sf,
+        gate,
+        use_pdl,
     )

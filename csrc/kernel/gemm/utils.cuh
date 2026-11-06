@@ -37,6 +37,7 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/collective/builders/sm100_common.inl"
 #include "cutlass/gemm/collective/builders/sm90_common.inl"
+#include "kernel/gemm/epilogue_op.h"
 
 namespace halops {
 
@@ -69,6 +70,8 @@ struct GemmKernelConfig {
     static constexpr int KSfVecSize = 16;
     static constexpr int KNumRegsEpilogue = 208;
     static constexpr bool SkipTmemFence = false;
+    static constexpr EpilogueOp KEpiOp = EpilogueOp::Identity;
+    static constexpr bool KSwapSfbRun = false;
 };
 
 static constexpr int get_num_warps(int load_c_warp_id, bool add_bias) {

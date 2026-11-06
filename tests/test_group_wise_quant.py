@@ -644,5 +644,26 @@ def test_pdl_consumer_reads_producer_writes(mode, use_swizzle):
         ), f"PDL read stale scale input (mode={mode}, use_swizzle={use_swizzle})"
 
 
+@pytest.mark.parametrize(
+    "mode,use_swizzle", QUANT_MODES, ids=[_mode_id(m) for m in QUANT_MODES]
+)
+@pytest.mark.parametrize("m", [1, 100, 1536], ids=lambda m: f"m{m}")
+def test_strided_input_and_preallocated_outputs(mode, use_swizzle, m):
+    """A column slice of a wider tensor quantizes like its contiguous copy, and
+    pre-allocated outputs are written in place."""
+    k = 1024
+    wide = torch.randn([m, 3 * k], dtype=torch.bfloat16)
+    x = wide[:, k : 2 * k]
+    ref, ref_sf = group_wise_quant(x.contiguous(), mode=mode, use_swizzle=use_swizzle)
+    out = torch.empty_like(ref)
+    out_sf = torch.full_like(ref_sf, 0xFF)
+    got, got_sf = group_wise_quant(
+        x, mode=mode, use_swizzle=use_swizzle, output_quant=out, output_sf=out_sf
+    )
+    assert got.data_ptr() == out.data_ptr() and got_sf.data_ptr() == out_sf.data_ptr()
+    assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8))
+    assert torch.equal(got_sf, ref_sf)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

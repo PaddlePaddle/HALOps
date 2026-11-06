@@ -18,6 +18,8 @@ import importlib
 import os
 from pathlib import Path
 
+from halops.halops_kernel import EpilogueOp  # noqa: F401
+
 _current_dir = str(Path(__file__).parent)
 
 for _fname in os.listdir(_current_dir):

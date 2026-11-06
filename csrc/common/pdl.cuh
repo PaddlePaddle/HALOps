@@ -17,25 +17,27 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cute/config.hpp>
 
 namespace halops {
 
-// Programmatic Dependent Launch (PDL) helpers.
-
-__device__ __forceinline__ void PdlWaitForDependents() {
+CUTE_DEVICE void pdl_wait() {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    cudaGridDependencySynchronize();
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
 }
 
-__device__ __forceinline__ void PdlTriggerAfterBlockWrites() {
+CUTE_DEVICE void pdl_trigger() {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
+    asm volatile("griddepcontrol.launch_dependents;" :::);
 #endif
+}
+
+inline cudaLaunchAttribute PdlLaunchAttribute() {
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    return attr;
 }
 
 template <typename KernelT, typename... Args>
@@ -43,9 +45,7 @@ inline void LaunchKernelWithPdl(KernelT kernel, dim3 grid_dim, dim3 block_dim,
                                 std::size_t smem_bytes, cudaStream_t stream,
                                 bool use_pdl, Args&&... args) {
     if (use_pdl) {
-        cudaLaunchAttribute attr;
-        attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attr.val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchAttribute attr = PdlLaunchAttribute();
         cudaLaunchConfig_t config{};
         config.gridDim = grid_dim;
         config.blockDim = block_dim;
