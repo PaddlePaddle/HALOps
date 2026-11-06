@@ -63,26 +63,19 @@ def test_bf16_gemm_large_m():
 
 
 def test_bf16_gemm_large_m_n1600():
-    # Real production shape (MLA/DSA q_a_proj, bulk prefill): 1600 % 128 == 64,
-    # so it fits neither the 256- nor the 128-wide full-tile large-M rung.
-    # Covers 256x128x64_2CTA_Ntail end to end (predicated store at
-    # KSubTileN=64 granularity, N % 64 == 0 launch check).
+    # 1600 % 128 == 64: exercises the 256x128 predicated-tail tile end to end.
     _run_bf16_gemm_case(4096, 1600, 4096)
 
 
 def test_bf16_gemm_large_m_n1600_ladder():
-    # N=1600 tail (128-wide MMA, predicated store) across all production M
-    # values in benchmark/configs/gemm/dense_bf16.yaml. M=1024/2048 are
-    # mid-M and unaffected by the large-M Ntail change; included here to pin
-    # the N=1600 correctness baseline across every M rung in one place.
+    # N=1600 across every M rung of benchmark/configs/gemm/dense_bf16.yaml.
     for m in (1024, 2048, 4096, 8192, 16384):
         _run_bf16_gemm_case(m, 1600, 4096)
 
 
 def test_bf16_gemm_large_m_n128():
-    # Real production shape (DSA indexer proj): n=128 leaves the KBlockM=256
-    # family under half a wave (32 / 64 CTAs of 152), so large-M steps M down
-    # instead of N -- covers the 64x64 and 64x128 rungs.
+    # n=128: the 256-wide family underfills a wave, so large-M steps M down
+    # (64x64 / 64x128 rungs).
     _run_bf16_gemm_case(4096, 128, 4096)
     _run_bf16_gemm_case(8192, 128, 4096)
 
@@ -93,8 +86,7 @@ def test_bf16_gemm_mid_m():
 
 def test_bf16_gemm_small_m():
     # m < 128 -> 128x64x64 SwapAB small-M path.
-    # SwapAB maps weight(N-dim) to tile_M=128 (N % 128) and activation(M-dim)
-    # to tile_N=64 (M % 64), so use n=256 (multiple of 128) and m=64.
+    # SwapAB: weight is the 128-wide MMA M, the activation the 64-wide N.
     _run_bf16_gemm_case(64, 256, 256)
 
 

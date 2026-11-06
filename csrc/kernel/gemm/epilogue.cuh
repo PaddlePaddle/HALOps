@@ -97,9 +97,8 @@ class CollectiveEpilogue {
         int rows_per_batch = 0;
         SituCoef situ{};
         int64_t gate_ld = 0;
-        // Tail-only stream-K: fp32 partial workspace, laid out as
-        //   [slot][CtaShape_M][KBlockN]  (slot = scheduler.partial_slot())
-        // nullptr when stream-K is off.
+        // Stream-K fp32 partial workspace: [slot][CtaShape_M][KBlockN]; null
+        // when stream-K is off.
         TypeAccumulate* ptr_partial = nullptr;
     };
 
@@ -724,9 +723,8 @@ class CollectiveEpilogue {
 
     // BF16 path: TMEM -> registers -> cast -> GMEM through CuTe tiled copies,
     // which follow the 16dp (64-row CTA) and 2SM "2x2" accumulator layouts.
-    // KStreamK: tail-only stream-K instantiation. Compile-time so the
-    // data-parallel store path keeps its register allocation (a runtime branch
-    // here causes heavy spills).
+    // KStreamK: compile-time stream-K instantiation; a runtime branch here
+    // would spill the data-parallel store path.
     template <bool KStreamK, class TmemStorage>
     CUTLASS_DEVICE void epilogue_bf16(Params const& epilogue_params,
                                       AccumulatorPipeline& acc_pipeline,
@@ -831,18 +829,15 @@ class CollectiveEpilogue {
             return thr_r2g_sub.partition_D(gD_sub_tile_coords);
         }();
 
-        // Tail-only stream-K: partials address a compact per-CTA
-        // [CtaShape_M][KBlockN] fp32 slot instead of the global D grid.
+        // Stream-K: partials address a compact per-CTA [CtaShape_M][KBlockN]
+        // slot instead of the global D grid.
         static constexpr int KPartialM =
             cute::size<0>(cute::take<0, 2>(CtaShape_MNK{}));
         static constexpr int KPartialN =
             cute::size<1>(cute::take<0, 2>(CtaShape_MNK{}));
 
-        // Loop-invariant partial-store partition, built once against the
-        // workspace base rather than in r2g_sub (inlined per sub-tile; doing it
-        // there causes spills). Per work item only a pointer offset changes.
-        // Same thread layout as the D store -> vectorized fp32 stores. Empty
-        // tuple when !KStreamK so data-parallel codegen is untouched.
+        // Built once against the workspace base (doing it in r2g_sub causes
+        // spills); same thread layout as the D store. Empty when !KStreamK.
         auto partial_store = [&]() {
             if constexpr (KStreamK) {
                 auto tiled_p = cute::make_tiled_copy_D(
@@ -874,8 +869,7 @@ class CollectiveEpilogue {
         while (scheduler.is_valid()) {
             uint32_t m_idx = scheduler.m_idx();
             uint32_t n_idx = scheduler.n_idx();
-            // Resolved once per work item: < 0 means it owns the whole K range
-            // and stores the final bf16 result.
+            // Resolved per work item: < 0 stores the final bf16 result.
             int partial_slot = -1;
             int64_t partial_off = 0;
             if constexpr (KStreamK) {
@@ -911,11 +905,9 @@ class CollectiveEpilogue {
 
             auto r2g_sub = [&](uint32_t epi_m_idx, uint32_t sub_n_idx) {
                 // N-overhang predicate: a KBlockN that does not divide n
-                // overhangs on the last tile. D is stored register -> GMEM
-                // (SM100_STORE_256bit, not TMA; CopyOpS2G is unused), so
-                // nothing clips OOB writes. The host enforces n % KSubTileN ==
-                // 0, so each sub-tile is entirely in or out of bounds: one
-                // scalar compare, vector store intact.
+                // overhangs on the last tile, and D is stored register -> GMEM
+                // (not TMA), so nothing clips OOB writes. The host enforces
+                // n % KSubTileN == 0, so one compare covers a whole sub-tile.
                 if constexpr (KernelTraits::KEpiNeedsNPredicate) {
                     const uint32_t sub_n_begin =
                         n_idx * static_cast<uint32_t>(KernelTraits::KBlockN) +
@@ -925,9 +917,8 @@ class CollectiveEpilogue {
                         return;
                     }
                 }
-                // Stream-K tail chunk (K-slice only): store the raw fp32
-                // accumulator to its workspace slot; the reduce kernel sums and
-                // casts. No alpha: stream-K is gated to no-alpha BF16 dense.
+                // Stream-K tail chunk: store the raw fp32 accumulator; the
+                // reduce kernel sums and casts. Stream-K is no-alpha only.
                 if constexpr (KStreamK) {
                     if (partial_slot >= 0) {
                         auto dst_p = cute::get<2>(partial_store);

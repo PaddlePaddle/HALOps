@@ -64,10 +64,8 @@ inline void CheckDivisible(int64_t value, int64_t divisor, const char* name) {
                 ", got ", value);
 }
 
-// SM count for the tile-selection heuristics. `sm_count <= 0` falls back to
-// the cached device count, so dispatch sees the same SM count gemm_impl
-// launches onto (a hard-coded value would mis-pick tiles in the
-// `tiles(...) < target_sm` ladders).
+// SM count for the tile-selection heuristics; sm_count <= 0 falls back to the
+// cached device count so dispatch matches what gemm_impl launches on.
 inline int ResolveSmCount(int sm_count) {
     return sm_count > 0 ? sm_count : GetSmCount();
 }

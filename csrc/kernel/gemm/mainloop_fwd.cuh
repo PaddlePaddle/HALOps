@@ -37,8 +37,7 @@ struct CollectiveMainloop {
 
     using TileShape = typename KernelTraits::TileShape;
     using TileShape_SF = typename KernelTraits::TileShape_SF;
-    // Stand-in tile shape the dummy SF atom accepts (== TileShape for FP8/FP4;
-    // see kernel_traits.h).
+    // Stand-in tile shape for the dummy BF16 SF atom; == TileShape for FP8/FP4.
     using SFTileShape = typename KernelTraits::SFTileShape;
     using ClusterShape_MNK = typename KernelTraits::ClusterShape_MNK;
     using EpilogueTile = typename KernelTraits::EpilogueTile;
@@ -321,8 +320,7 @@ struct CollectiveMainloop {
             SmemLayoutB{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
             TileShape{}, TiledMma{}, cluster_layout_vmnk);
 
-        // BF16: SF pointers are null (encoding a TMA atom from them would
-        // fault on the host), so return default-constructed SF atoms.
+        // BF16: SF pointers are null, so return default-constructed atoms.
         if constexpr (KIsBF16) {
             return {args.layout_A,
                     args.layout_B,
@@ -489,9 +487,8 @@ struct CollectiveMainloop {
         }();
         cute::Tensor cta_sA = shared_storage.tensor_sA();
         cute::Tensor cta_sB = shared_storage.tensor_sB();
-        // Slice by the atom's thread coordinate, not the flat cluster rank:
-        // with a 1SM atom in a multi-CTA cluster the extra CTAs would index
-        // past the atom's thread layout and get invalid A/B fragments.
+        // Slice by the atom's thread coord, not the flat cluster rank: extra
+        // CTAs of a multi-CTA cluster would index past the atom layout.
         cute::ThrMMA cta_mma = tiled_mma.get_slice(
             block_rank_in_cluster % cute::size(typename TiledMma::AtomThrID{}));
 
@@ -587,10 +584,9 @@ struct CollectiveMainloop {
             block_rank_in_cluster %
             cute::size(typename TiledMma_SF::AtomThrID{}));
 
-        // SF tiling must use SFTileShape + TiledMmaForSF consistently: for BF16
-        // they are dummy stand-ins (kernel_traits.h) and mixing them with the
-        // real ones breaks tma_partition's mode-0 sizes, even though no SF
-        // load is issued. Identical to the real ones for FP8/FP4.
+        // SFTileShape and TiledMmaForSF must be used together: for BF16 they
+        // are dummy stand-ins, and mixing them with the real ones breaks
+        // tma_partition's mode-0 sizes.
         cute::ThrMMA cta_mma_sfa = TiledMmaForSF{}.get_slice(
             block_rank_in_cluster %
             cute::size(typename TiledMmaForSF::AtomThrID{}));
@@ -707,9 +703,8 @@ struct CollectiveMainloop {
                     lo + KernelTraits::KBlockM - narrow_rows);
                 narrow_smem_row = narrow_row - lo;
             }
-            // Stream-K: a work item may cover only a K-slice. Producer and
-            // mma() consumer both take the range from the scheduler, so stage
-            // counts always match.
+            // Stream-K: a work item may cover only a K-slice; producer and
+            // consumer take the range from the scheduler, so stages match.
             const uint32_t k_lo = scheduler.k_begin();
             const uint32_t k_hi = scheduler.k_end();
             for (uint32_t k_tile_id = k_lo; k_tile_id < k_hi; ++k_tile_id) {
@@ -718,8 +713,7 @@ struct CollectiveMainloop {
                     mainloop_pipe_producer_state);
                 prologue_stage_idx = mainloop_pipe_producer_state.index();
 
-                // Issue A, B (+ SFA, SFB unless BF16) TMA copies on the same
-                // barrier.
+                // A, B (+ SFA, SFB unless BF16) TMA copies share one barrier.
                 if (select_thr) {
                     if constexpr (IsSfbRowShift) {
                         cutlass::arch::ClusterTransactionBarrier::
@@ -939,13 +933,9 @@ struct CollectiveMainloop {
         AccumulatorPipelineState accumulator_pipe_producer_state =
             cutlass::make_producer_start_state<AccumulatorPipeline>();
 
-        // KStreamK=false only: the next tile's accumulator stage and first
-        // k-stage are waited on right after the current tile's MMAs are
-        // issued, before the TMEM overlap barrier, hiding the producer's
-        // stage latency. With stream-K the K ranges of consecutive work
-        // items differ, so the first k-stage of the next item is not the
-        // next pipeline stage -- the prefetch is skipped and every k-tile
-        // waits explicitly.
+        // KStreamK=false only: prefetch the next tile's accumulator stage and
+        // first k-stage right after the MMAs are issued, hiding producer
+        // latency. With stream-K the K ranges differ, so every k-tile waits.
         [[maybe_unused]] bool next_tile_ready = false;
 
         while (scheduler.is_valid()) {
@@ -994,8 +984,8 @@ struct CollectiveMainloop {
             const uint32_t k_hi = scheduler.k_end();
             for (uint32_t k_tile_id = k_lo; k_tile_id < k_hi; ++k_tile_id) {
                 prologue_stage_idx = mainloop_pipe_consumer_state.index();
-                // Data-parallel: the first k-stage of a prefetched tile was
-                // already waited on below (after the previous tile's MMAs).
+                // Data-parallel: the prefetched first k-stage was already
+                // waited on.
                 if constexpr (KStreamK) {
                     mainloop_pipeline.consumer_wait(
                         mainloop_pipe_consumer_state);
@@ -1024,8 +1014,8 @@ struct CollectiveMainloop {
                 for (uint32_t k_block_id = 0; k_block_id < iter_k;
                      ++k_block_id) {
                     if constexpr (KIsBF16) {
-                        // kind::f16 MMA: no scale factors; accumulate flag
-                        // comes from tiled_mma.accumulate_.
+                        // kind::f16 MMA: no scale factors, only the
+                        // accumulate flag.
                         gemm(tiled_mma,
                              tile_rA(cute::_, cute::_, k_block_id,
                                      prologue_stage_idx),
@@ -1061,9 +1051,8 @@ struct CollectiveMainloop {
             scheduler.advance();
 
             if constexpr (!KStreamK) {
-                // Prefetch: acquire the next tile's accumulator stage and
-                // wait on its first mainloop stage now, so the next
-                // iteration's MMA issue path starts with data ready.
+                // Prefetch: acquire the next accumulator stage and wait on
+                // its first k-stage now.
                 next_tile_ready = scheduler.is_valid();
                 if (next_tile_ready) {
                     accumulator_pipeline.producer_acquire(
