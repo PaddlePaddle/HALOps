@@ -214,7 +214,7 @@ void LowLatencyMoE(
     int64_t tail_rank, int64_t tail_mc_base, int64_t tail_grid_cap,
     const std::string& scoring_func, const std::string& activation,
     bool renormalize, double situ_beta, double situ_linear_beta,
-    double tail_eps, const std::string& quant_mode);
+    double tail_eps, const std::string& quant_mode, bool use_pdl);
 
 int64_t MoETailRegionBytes(bool wide);
 

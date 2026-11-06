@@ -154,6 +154,7 @@ def low_latency_moe(
     eps: float = 1e-6,
     quant_mode: str = "w8a8-blockwise",
     grid_cap: int = 0,
+    use_pdl: bool = True,
 ) -> None:
     """MoE forward pass on Blackwell SM100, support latent.
 
@@ -256,6 +257,10 @@ def low_latency_moe(
             Default: "w8a8-blockwise".
         grid_cap (int, optional): Maximum resident CTAs; 0 uses the device
             limit. Keep this fixed for each workspace. Default: 0.
+        use_pdl (bool, optional): Launch with Programmatic Dependent Launch, so
+            the kernel's setup overlaps the previous kernel's tail. It waits for
+            that kernel before touching shared state, and lets the next kernel
+            start launching once the tail begins. Default: True.
 
     Returns:
         None. The outputs are written in place.
@@ -293,6 +298,7 @@ def low_latency_moe(
         situ_linear_beta,
         eps,
         quant_mode,
+        use_pdl,
     )
 
 

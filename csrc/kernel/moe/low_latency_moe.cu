@@ -184,7 +184,7 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
              const torch::Tensor& tail_out, int64_t top_k, int64_t scoring_func,
              int64_t activation, int64_t tail_rank, int64_t tail_mc_base,
              int64_t tail_grid_cap, bool renormalize, double situ_beta,
-             double situ_linear_beta, double tail_eps) {
+             double situ_linear_beta, double tail_eps, bool use_pdl) {
     const uint32_t num_tokens = static_cast<uint32_t>(input.size(0));
     TORCH_CHECK(num_tokens >= 1 && num_tokens <= MoEDims::kNumTokens,
                 "token count M=", num_tokens,
@@ -298,7 +298,7 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
                 "The shared expert and tail need at least ",
                 TailGeometry::kNumCtas, " resident CTAs; got ", grid_size, ".");
     const cudaError_t launch_status =
-        moe::LaunchMoEKernel<MoEDims>(args, grid_size, stream);
+        moe::LaunchMoEKernel<MoEDims>(args, grid_size, stream, use_pdl);
     TORCH_CHECK(launch_status == cudaSuccess,
                 "kernel launch failed: ", cudaGetErrorString(launch_status));
 }
@@ -355,7 +355,7 @@ void LowLatencyMoE(
     int64_t tail_rank, int64_t tail_mc_base, int64_t tail_grid_cap,
     const std::string& scoring_func, const std::string& activation,
     bool renormalize, double situ_beta, double situ_linear_beta,
-    double tail_eps, const std::string& quant_mode) {
+    double tail_eps, const std::string& quant_mode, bool use_pdl) {
     TORCH_CHECK(
         quant_mode == "w8a8-mxfp8" || quant_mode == "w4a8-mxfp4" ||
             quant_mode == "w8a8-blockwise",
@@ -393,7 +393,8 @@ void LowLatencyMoE(
             latent_down_weight_scale, tail_fc2_weight, tail_fc2_scale,
             tail_norm_weight, tail_epochs, tail_uc_bases, workspace, tail_out,
             top_k, scoring_type, activation_type, tail_rank, tail_mc_base,
-            tail_grid_cap, renormalize, situ_beta, situ_linear_beta, tail_eps);
+            tail_grid_cap, renormalize, situ_beta, situ_linear_beta, tail_eps,
+            use_pdl);
     };
 
     constexpr auto kBWFP8 = moe::QuantMethod::kBlockwiseFP8;

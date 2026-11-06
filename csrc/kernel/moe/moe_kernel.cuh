@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cutlass/cluster_launch.hpp>
 
+#include "common/pdl.cuh"
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_mainloop.cuh"
 #include "kernel/moe/moe_mainloop_router.cuh"
@@ -105,6 +106,8 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     // Phase 4: gather and combine each token's top_k combine slots.
     collective_mainloop.combine(mainloop_params, smem, sched.cta_group());
 
+    pdl_trigger();
+
     // Phase 5: the latent moe tail.
     collective_mainloop.run_tail(mainloop_params, smem, sched.cta_group());
 
@@ -117,7 +120,7 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
 template <typename MoEDims>
 cudaError_t LaunchMoEKernel(
     typename CollectiveMainloopMoE<MoEKernelTraits<MoEDims>>::Arguments& args,
-    std::uint32_t grid_size, cudaStream_t stream) {
+    std::uint32_t grid_size, cudaStream_t stream, bool use_pdl) {
     using Dims = MoEDims;
     using Traits = MoEKernelTraits<Dims>;
     using Mainloop = CollectiveMainloopMoE<Traits>;
@@ -134,14 +137,23 @@ cudaError_t LaunchMoEKernel(
         if (attribute != cudaSuccess) return attribute;
     }
     constexpr std::uint32_t kClusterSize = Traits::kClusterSize;
-    const cutlass::ClusterLaunchParams launch_params{
-        dim3(grid_size, 1, 1), dim3(Traits::kThreads, 1, 1),
-        dim3(kClusterSize, 1, 1), static_cast<int>(smem_size), stream};
-    const cutlass::Status launch_status = cutlass::launch_kernel_on_cluster(
-        launch_params, reinterpret_cast<void const*>(kernel_ptr), params);
-    if (launch_status != cutlass::Status::kSuccess) {
-        return cudaErrorLaunchFailure;
-    }
+    cudaLaunchAttribute attrs[2];
+    attrs[0].id = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim.x = kClusterSize;
+    attrs[0].val.clusterDim.y = 1;
+    attrs[0].val.clusterDim.z = 1;
+    unsigned int num_attrs = 1;
+    if (use_pdl) attrs[num_attrs++] = PdlLaunchAttribute();
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(grid_size, 1, 1);
+    config.blockDim = dim3(Traits::kThreads, 1, 1);
+    config.dynamicSmemBytes = smem_size;
+    config.stream = stream;
+    config.attrs = attrs;
+    config.numAttrs = num_attrs;
+    const cudaError_t launch_status =
+        cudaLaunchKernelEx(&config, kernel_ptr, params);
+    if (launch_status != cudaSuccess) return launch_status;
     return cudaGetLastError();
 }
 

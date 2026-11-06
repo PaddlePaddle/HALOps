@@ -557,13 +557,9 @@ struct CollectiveMainloopMoE {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
 
-        if (warp_idx == 3 && lane_idx == 0) {
-            // Per-CTA private launch counter.
-            smem->launch_parity = workspace->cta_comm.claim_parity();
-            // The down task queue starts empty.
-            smem->down_tasks_claimed = 0u;
-            smem->down_task_stores = 0u;
-        } else if (WarpRole::is_tmem_warp(warp_idx)) {
+        // Block-local setup (barriers, TMEM, descriptors) touches nothing the
+        // previous kernel writes, so it overlaps that kernel under PDL.
+        if (WarpRole::is_tmem_warp(warp_idx)) {
             // TMEM allocation issued by ONE fully-active warp.
             tmem_alloc(Traits::kTmemColumns, &smem->tmem_ptr);
         } else if (warp_idx == 1 && lane_idx == 0) {
@@ -582,6 +578,13 @@ struct CollectiveMainloopMoE {
             // Every block runs the expert phases.
             smem->barriers.routed.init();
             cutlass::arch::fence_barrier_init();
+        }
+
+        pdl_wait();
+        if (warp_idx == 3 && lane_idx == 0) {
+            smem->launch_parity = workspace->cta_comm.claim_parity();
+            smem->down_tasks_claimed = 0u;
+            smem->down_task_stores = 0u;
         }
         __syncthreads();
 
