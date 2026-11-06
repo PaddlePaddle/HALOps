@@ -87,14 +87,12 @@ struct GemmKernelTraits {
     static constexpr int KNumCTA = IsPairUmma ? 2 : 1;
     static constexpr int KClusterM = KernelConfig_::KClusterM;
     static constexpr int KClusterN = KernelConfig_::KClusterN;
-    // KNumCTA == 1: single-CTA UMMA (SM100_MMA_..._SS, cta_group::1)
-    // KNumCTA == 2: pair-UMMA       (SM100_MMA_..._2x1SM_SS, cta_group::2)
-    // FP4: MMA K-increment is 64 elements; FP8: MMA K-increment is 32 elements.
-    // BF16: non-block-scaled kind::f16 MMA, K-increment is 16 elements.
+    // KNumCTA 1: cta_group::1 UMMA; 2: pair-UMMA (2x1SM, cta_group::2).
+    // MMA K step: 64 for FP4, 32 for FP8, 16 for BF16.
     static constexpr bool KIsFP4 = KernelConfig_::KIsFP4;
     static constexpr bool KIsBF16 = KernelConfig_::KIsBF16;
-    // Narrow the A TMA box to the real M below KBlockM (the UMMA
-    // still reads KBlockM rows and the epilogue drops D past M);
+    // Narrow the A TMA box to the real M below KBlockM (the UMMA still reads
+    // KBlockM rows; the epilogue drops D past M).
     static constexpr bool KNarrowA =
         NarrowA_ &&
         (KDenseW8A8MXFP8 || (KernelType == KernelMode::Batch && !AddBias)) &&
@@ -102,16 +100,10 @@ struct GemmKernelTraits {
         !SwapAB && !IsPairUmma && !KernelConfig_::KIsFP4 && KBlockK == 128;
     static constexpr bool KUsePdl = UsePdl_;
     static constexpr int KMmaK = KIsFP4 ? 64 : (KIsBF16 ? 16 : 32);
-    // Tail-only stream-K eligibility; single source of truth for the
-    // scheduler's split decision and for emitting the KStreamK=true kernel.
-    // Only the BF16 dense no-bias no-alpha epilogue can deposit a raw fp32
-    // partial (the bias epilogue has no stream-K path; the reduce kernel does
-    // not apply alpha). Also excluded, each a silent wrong-result otherwise:
-    //   * SwapAB: the tail fold-back math assumes non-swap traversal
-    //     (m=64 n=19584 k=1024 gave 121% rel error; HALOPS_STREAMK=0
-    //     disables stream-K);
-    //   * N-predicated tiles: the compact per-tile fp32 partial slot would
-    //     leave holes that the reduce kernel sums.
+    // Tail-only stream-K: only the BF16 dense no-bias no-alpha epilogue can
+    // deposit an fp32 partial. SwapAB is excluded (the tail fold-back assumes
+    // non-swap traversal; m=64 n=19584 k=1024 gave 121% rel error), as are
+    // N-predicated tiles (their partial slot leaves holes the reduce sums).
     static constexpr bool KSupportsStreamK =
         KernelType == KernelMode::Dense && KIsBF16 && !AddBias && !HasAlpha &&
         !SwapAB && (KBlockN % 128 == 0 || KBlockN == 32 || KBlockN == 64) &&
@@ -140,8 +132,8 @@ struct GemmKernelTraits {
     static constexpr int KQuantAccCols = KAccColsPerOut * mxfp8::kGroup;
     // Epilogue warp groups split N: 1 for bf16 SwapAB (small N) and for a
     // quantized tile narrower than two quant groups, 2 otherwise.
-    // KEpilogueWarpGroupsOverride can force 1, e.g. to make KBlockN=32 legal
-    // at CtaM==64 (KEpiComputeN = 32 meets the T2R atom floor).
+    // KEpilogueWarpGroupsOverride forces 1, e.g. to make KBlockN=32 legal at
+    // CtaM==64 (KEpiComputeN=32 meets the T2R atom floor).
     static constexpr int KEpilogueWarpGroupCount =
         KernelConfig_::KEpilogueWarpGroupsOverride != 0
             ? KernelConfig_::KEpilogueWarpGroupsOverride
@@ -159,10 +151,9 @@ struct GemmKernelTraits {
     static constexpr int KNumRegsEpilogue = KernelConfig_::KNumRegsEpilogue;
     static constexpr bool SkipTmemFence = KernelConfig_::SkipTmemFence;
     static constexpr int KNumRegsOther = 88;
-    // Whether to do runtime register redistribution (setmaxnreg): needs enough
-    // warps for the 208+88 split. Not keyed on the epilogue warp-group count;
-    // without it ptxas gives every warp one flat budget (54-87 regs, starving
-    // the epilogue). Quantized configs keep the warp-group-count rule.
+    // setmaxnreg redistribution (208 + 88 split) for BF16 needs enough warps;
+    // without it ptxas gives every warp one flat budget (54-87 regs), starving
+    // the epilogue. Quantized configs keep the warp-group-count rule.
     static constexpr bool KRedistributeRegs =
         KIsBF16 ? (KNumWarp >= 8 && (!SwapAB || KernelType == KernelMode::Dense))
                 : KEpilogueWarpGroupCount != 1;
@@ -177,20 +168,14 @@ struct GemmKernelTraits {
     static constexpr int KEpiComputeN = KBlockN / KEpilogueWarpGroupCount;
     using EpiComputeTile =
         cute::Shape<cute::Int<KBlockM / KNumCTA>, cute::Int<KEpiComputeN>>;
-    // Sub-tile for overlap TMEM load splitting.
-    // When overlap is enabled, always use 16-wide sub-tiles (TMEM load atom
-    // width). This is fully general: KTmemOverlapCols need not divide
-    // KEpiComputeN evenly, as long as both are multiples of 16. Falls back to
-    // EpiComputeTile when overlap is disabled (KTmemOverlapCols==0).
+    // Overlap TMEM loads use 16-wide sub-tiles (the TMEM load atom width);
+    // KTmemOverlapCols need not divide KEpiComputeN, only both be multiples of
+    // 16. Without overlap this is EpiComputeTile.
     //
-    // Non-power-of-2 KBlockN (e.g. 96/112/224, for one-wave occupancy): the
-    // T2R tables only have atoms for KEpiComputeN in {16, 32, 64, 128}, so
-    // such widths are decomposed into uniform KSubTileN=32 sub-tiles (16 would
-    // give only 8 fp32/thread, too few for SM100_STORE_256bit). Not legal on
-    // the 2SM "2x2" layout, whose second N half sits on datapaths 64-127: a
-    // 32-wide slice straddles the half boundary and writes wrong elements.
-    // A per-warp-group width of 8 (224-pair, KEpiComputeN=112 falls back to
-    // 32-wide sub-tiles here) has no single atom either.
+    // Non-power-of-2 KBlockN (96/112/224) has no T2R atom for KEpiComputeN and
+    // splits into 32-wide sub-tiles (16 gives only 8 fp32/thread, too few for
+    // SM100_STORE_256bit). Not legal on the 2SM "2x2" layout: a 32-wide slice
+    // straddles the N-half boundary and writes wrong elements.
     static constexpr bool KEpiNIsSingleAtom =
         (KEpiComputeN == 16 || KEpiComputeN == 32 || KEpiComputeN == 64 ||
          KEpiComputeN == 128);
@@ -206,7 +191,6 @@ struct GemmKernelTraits {
                               : (KEpiComputeN % 32 == 0 ? 32 : 16)))
                 : ((KTmemOverlapCols == 0 && KEpiComputeNHasAtom) ? KEpiComputeN
                                                                   : 16);
-    // KIs2SmHalfM spelled out (it is declared further down).
     static_assert(!KIsBF16 || KEpiNIsSingleAtom ||
                       !(KNumCTA == 2 && KBlockM == 128),
                   "a non-power-of-2 KBlockN cannot use the 2SM 128-row \"2x2\" "
@@ -228,12 +212,10 @@ struct GemmKernelTraits {
         (KTmemOverlapCols == 16 || KTmemOverlapCols == 32 ||
          KTmemOverlapCols == 64 || KTmemOverlapCols == 128);
 
-    // ---- TMEM column budget ----------------------------------------------
-    // tcgen05.alloc takes a power-of-2 column count in [32, 512]; accumulators
-    // need KEpilogueStages * KBlockN columns. Right-sizing is perf-neutral but
-    // gives a truthful footprint for small tiles. BF16 without overlap only:
-    // block-scaled dtypes also keep SFA/SFB in TMEM, and overlap shares
-    // columns between stages, so both keep the full 512.
+    // TMEM budget: tcgen05.alloc takes a power-of-2 column count in [32, 512];
+    // accumulators need KEpilogueStages * KBlockN. Only BF16 without overlap
+    // right-sizes; block-scaled dtypes also hold SFA/SFB in TMEM and overlap
+    // shares columns between stages.
     static constexpr int KAccTmemColumns = KEpilogueStages * KBlockN;
     static constexpr int round_up_tmem_columns(int v) {
         int r = 32;
@@ -247,12 +229,10 @@ struct GemmKernelTraits {
             ? round_up_tmem_columns(KAccTmemColumns)
             : 512;
 
-    // ---- TMEM load (T2R) atom selection: depends on BOTH per-CTA M and N ----
-    // `NNdp` is the number of TMEM datapath lanes an atom addresses. A 1SM
-    // 64-row accumulator only occupies the first 16 lanes of each of the 4
-    // subpartitions, so it needs a 16dp atom (32dp fails "Non-injective
-    // Layout"), with the N repeat count HALVED relative to 32dp. The tiled
-    // copy stays 128 threads either way.
+    // T2R atom selection depends on per-CTA M and N. NNdp is the number of
+    // datapath lanes an atom addresses: a 1SM 64-row accumulator fills only 16
+    // lanes per subpartition, so it needs a 16dp atom (32dp fails
+    // "Non-injective Layout") with the N repeat halved. Both use 128 threads.
     static constexpr int KEpiCtaM = KBlockM / KNumCTA;
     static_assert(KEpiCtaM == 64 || KEpiCtaM == 128,
                   "UMMA accumulators support 64 or 128 rows per CTA only "
@@ -264,15 +244,12 @@ struct GemmKernelTraits {
                   "is half the 32dp one; KEpiComputeN < 32 would land on "
                   "16dp32b8x, which cannot fill SM100_STORE_256bit.");
 
-    // ---- Which TMEM accumulator layout are we actually reading? ------------
-    //   1CTA, KBlockM=64  -> 1SM half-subpartition: 16 lanes/subpartition, N
-    //                        in TMEM columns (16dp atom).
-    //   2CTA, KBlockM=128 -> 2SM "2x2": second half of N on datapaths 64-127,
-    //                        only N/2 columns used (32dp atom).
-    //   2CTA, KBlockM=256 -> 2SM "4x1": all 128 lanes, N in columns.
-    // The "2x2" case needs a 32dp atom AND an epilogue tile spanning the full
-    // KBlockN (KEpilogueWarpGroupsOverride = 1); otherwise warps 2/3 address
-    // outside the tile and the output is silently wrong (no assert fires).
+    // Accumulator layout being read:
+    //   1CTA M=64  -> half subpartition, 16 lanes, N in columns (16dp atom);
+    //   2CTA M=128 -> "2x2", second N half on datapaths 64-127, N/2 columns;
+    //   2CTA M=256 -> "4x1", all 128 lanes, N in columns.
+    // "2x2" needs a 32dp atom and a full-KBlockN epilogue tile
+    // (KEpilogueWarpGroupsOverride=1), else warps 2/3 address outside it.
     static constexpr bool KIs2SmHalfM = (KNumCTA == 2) && (KEpiCtaM == 64);
     static constexpr int KEpiTmemDp =
         (KNumCTA == 1 && KEpiCtaM == 64) ? 16 : 32;
@@ -283,9 +260,8 @@ struct GemmKernelTraits {
                   "KEpilogueWarpGroupsOverride = 1) or warps 2/3 address "
                   "outside the tile and the output is silently wrong.");
 
-    // CopyOp for loading the full overlap region in one shot (when
-    // KOverlapSingleLoad). Width-matched to KTmemOverlapCols. Fallback to 16x
-    // when not single-load.
+    // CopyOp for the whole overlap region when KOverlapSingleLoad; width
+    // matched to KTmemOverlapCols, else 16x.
     using CopyOpT2R_Overlap = cute::conditional_t<
         KEpiTmemDp == 16,
         // 16dp: N repeat halved relative to the 32dp column below.
@@ -312,10 +288,9 @@ struct GemmKernelTraits {
 
     static constexpr int KWideTilesTotal = KBlockN / KOverlapLoadN;
 
-    // Select TMEM load op based on EpiComputeTile N dimension (and CtaM).
-    // The `Nx` suffix is the column count; a mismatched width silently moves
-    // the wrong columns, so every width a config can ask for needs its own
-    // arm. The 16dp series (CtaM == 64) uses HALVED atom width (N/2).
+    // T2R op for EpiComputeTile N (and CtaM). `Nx` is the column count; a
+    // mismatched width moves the wrong columns, so every reachable width needs
+    // its own arm. The 16dp series (CtaM=64) uses half-width atoms.
     using CopyOpT2R = cute::conditional_t<
         KEpiTmemDp == 16,
         cute::conditional_t<
@@ -325,8 +300,7 @@ struct GemmKernelTraits {
                                 cute::SM100_TMEM_LOAD_16dp32b16x>>,
         cute::conditional_t<
             KIs2SmHalfM,
-            // 2SM "2x2": only KEpiComputeN/2 TMEM columns are used, so the
-            // column repeat is halved relative to the 4x1 case below.
+            // 2SM "2x2": N/2 columns are used, so the repeat is halved.
             cute::conditional_t<
                 KEpiComputeN == 128, cute::SM100_TMEM_LOAD_32dp32b64x,
                 cute::conditional_t<KEpiComputeN == 64,
@@ -341,12 +315,9 @@ struct GemmKernelTraits {
                         cute::conditional_t<
                             KEpiComputeN == 8, cute::SM100_TMEM_LOAD_32dp32b8x,
                             cute::SM100_TMEM_LOAD_32dp32b16x>>>>>>;
-    // Overlap path: 16-wide sub-tile load (16 fp32/thread fills
-    // SM100_STORE_256bit; 8x is too few). No overlap: width-matched CopyOpT2R.
-    // CtaM==64 halves the repeat count, as above.
-    //
-    // TMEM columns per KSubTileN-wide sub-tile: N/2 on the 16dp and 2SM "2x2"
-    // layouts (upper N half on other datapaths), N on 4x1.
+    // Overlap: 16-wide sub-tile load (16 fp32/thread fills SM100_STORE_256bit;
+    // 8x is too few). No overlap: width-matched CopyOpT2R. CtaM=64 halves the
+    // repeat. Columns per sub-tile: N/2 on 16dp and "2x2", N on 4x1.
     static constexpr int KSubTileTmemCols =
         (KEpiTmemDp == 16 || KIs2SmHalfM) ? KSubTileN / 2 : KSubTileN;
     // Width-matched atom for one sub-tile; only for non-power-of-2 KBlockN.
@@ -380,10 +351,8 @@ struct GemmKernelTraits {
                                 cute::SM100_TMEM_LOAD_16dp32b8x,
                                 cute::SM100_TMEM_LOAD_32dp32b16x>>>;
 
-    // ---- Close the CopyOpT2R fall-through ---------------------------------
-    // Each chain above ends in a default (narrowest) atom, which make_tmem_copy
-    // replicates over the tile. That is only correct when the atom width
-    // divides the tile; otherwise it compiles clean and writes wrong elements.
+    // Each chain above ends in the narrowest atom; make_tmem_copy replicates
+    // it over the tile, which is only correct when the atom width divides it.
     static_assert(!KIsBF16 || KEpiComputeN % KSubTileN == 0,
                   "the epilogue sub-tile loop must cover KEpiComputeN exactly");
     static_assert(!KIsBF16 || KEpiNIsSingleAtom || KTmemOverlapCols != 0 ||
@@ -393,10 +362,9 @@ struct GemmKernelTraits {
                   "the tile when the tile's TMEM column count is a multiple of "
                   "16. Widen the table before using such a width.");
 
-    // Non-power-of-2 KBlockN tiles may overhang N, so the store is predicated
-    // at KSubTileN granularity (n must be a multiple of it). A config can
-    // force this for a power-of-2 KBlockN via KForceEpiNPredicate (e.g.
-    // N=1600 on a 128-wide tile, KSubTileN=64).
+    // Non-power-of-2 KBlockN may overhang N, so the store is predicated at
+    // KSubTileN granularity (n must be a multiple of it). KForceEpiNPredicate
+    // forces this for a power-of-2 KBlockN (N=1600 on a 128-wide tile).
     static constexpr bool KEpiNeedsNPredicate =
         KIsBF16 && (((KBlockN & (KBlockN - 1)) != 0) ||
                     KernelConfig_::KForceEpiNPredicate);
@@ -449,16 +417,11 @@ struct GemmKernelTraits {
                          "Static cluster shape used: TileShape should be "
                          "evenly divided by TiledMma");
 
-    // The F16BF16 atom has NO scale-factor members (SFVecSize, MMA_ScaleFactor,
-    // FrgTypeSFA/SFB). For BF16 the SF types below are derived from a dummy
-    // MXF4 MMA so they stay well-formed (never used at runtime; the mainloop
-    // guards them with if constexpr(!KIsBF16)). MXF4 (SFVecSize=16) rather
-    // than MXF8F6F4 (32): 64 / 16 = 4 matches the SfAtom's 4-in-K granularity.
-    //
-    // The dummy uses a fixed SFTileShape rather than TileShape, so the
-    // block-scaled constraints (1-CTA M == 128, KBlockK == 64) do not leak
-    // into BF16 tile choices (e.g. M=64, KBlockK=32). For FP8/FP4 SFTileShape
-    // IS TileShape and TiledMmaForSF IS TiledMma: codegen unchanged.
+    // F16BF16 has no SF members, so BF16 derives the SF types below from a
+    // dummy MXF4 MMA; they are unused at runtime. MXF4 (SFVecSize=16) rather
+    // than MXF8F6F4 (32): 64/16 = 4 matches the SfAtom's 4-in-K granularity.
+    // The dummy keeps a fixed SFTileShape so the block-scaled constraints
+    // (1-CTA M==128, KBlockK==64) do not leak into BF16 tiles.
     static constexpr int KSFDummyM = KNumCTA == 1 ? 128 : 256;
     using SFTileShape = cute::conditional_t<
         KIsBF16,
@@ -480,10 +443,9 @@ struct GemmKernelTraits {
         cute::conditional_t<KIsBF16, decltype(make_tiled_mma(DummySFMma_T{})),
                             TiledMma>;
 
-    // For unaligned-N pair tiles (see IsSfbUnaligned) the SFB tile is a run of
-    // 128-row atoms, so the SF MMA atom is 128 wide rather than round_up(N).
-    // BF16 never takes this arm (KIsBF16 -> TiledMmaForSF is the dummy, no
-    // SFB is loaded) and neither does the aligned-N majority.
+    // Unaligned-N pair tiles (IsSfbUnaligned) load SFB as a run of 128-row
+    // atoms, so the SF MMA atom is 128 wide rather than round_up(N). BF16
+    // never takes this arm.
     using MMA_SF_T = cute::conditional_t<
         KIsBF16 || SwapAB || KBlockN % 128 == 0,
         typename TiledMmaForSF::MMA_ScaleFactor,
@@ -501,8 +463,7 @@ struct GemmKernelTraits {
         cute::Layout<cute::Shape<cute::_1, cute::_1, cute::_1>>,
         cute::Tile<cute::Underscore, cute::Underscore, cute::Underscore>>;
 
-    // SF fragment types for the mainloop's TMEM SF tensors (from TiledMmaForSF,
-    // since the BF16 TiledMma lacks them).
+    // SF fragment types for the mainloop's TMEM SF tensors.
     using FrgTypeSFA = typename TiledMmaForSF::FrgTypeSFA;
     using FrgTypeSFB = typename TiledMmaForSF::FrgTypeSFB;
 
@@ -524,10 +485,9 @@ struct GemmKernelTraits {
         cute::size<1>(CtaShape_MNK{}) < Blk_MN{};
     static constexpr int IsCtaN64 = cute::size<1>(CtaShape_MNK{}) == 64;
     // A pair tile whose N is not a multiple of the 128-row SF atom (e.g. 224)
-    // starts at a 32-row-aligned offset inside an atom.  SFB is then loaded as
-    // the covering run of whole atoms, and the MMA's SFB TMEM address is moved
-    // forward by the offset (one TMEM column holds 32 rows of an atom).
-    // BF16 has no scale factors and never takes this path.
+    // starts at a 32-row-aligned offset inside an atom; SFB is then the
+    // covering run of whole atoms and the MMA's SFB address moves forward by
+    // that offset (one TMEM column holds 32 atom rows). BF16 skips this.
     static constexpr bool IsSfbUnaligned =
         !KIsBF16 && !KIsFP4 && (!SwapAB || KernelConfig_::KSwapSfbRun) &&
         KBlockN > 128 && KBlockN % 128 != 0;
@@ -597,10 +557,9 @@ struct GemmKernelTraits {
     using SmemLayoutAtomSFA =
         decltype(Sm1xxBlkScaledConfig::deduce_smem_layoutSFA(TiledMmaForSF{},
                                                              SFTileShape{}));
-    // Unaligned-N SFB loads a run of KSfbAtoms whole 128-row atoms (see
-    // IsSfbUnaligned), so the SMEM atom covers CTA_N_SF rows rather than
-    // SFTileShape's N. For every other tile (incl. the BF16 dummy, whose SF
-    // layouts are never used at runtime) the SFTileShape form applies.
+    // Unaligned-N SFB loads KSfbAtoms whole atoms, so the SMEM atom covers
+    // CTA_N_SF rows instead of SFTileShape's N. Every other tile uses the
+    // SFTileShape form.
     using SmemLayoutAtomSFB = cute::conditional_t<
         IsSfbUnaligned,
         decltype(Sm1xxBlkScaledConfig::deduce_smem_layoutSFB(
@@ -705,9 +664,9 @@ struct GemmKernelTraits {
             typename AccumulatorPipeline::SharedStorage;
         alignas(16) AccumulatorPipelineStorage accumulator;
 
-        // Pair-UMMA overlap: the peer CTA's overlap WG must finish T2R before
-        // the leader issues the next UMMA; the leader's NamedBarrier cannot see
-        // it, so the peer arrives on this cluster barrier.
+        // Pair-UMMA overlap: the peer's overlap WG must finish T2R before the
+        // leader issues the next UMMA, so it arrives on this cluster barrier
+        // (the leader's NamedBarrier cannot see it).
         alignas(8) typename cutlass::arch::ClusterBarrier::ValueType
             overlap_cluster_bar;
 
