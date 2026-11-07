@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cutlass/cluster_launch.hpp>
 
+#include "common/pdl.cuh"
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_mainloop.cuh"
 #include "kernel/moe/moe_mainloop_router.cuh"
@@ -77,6 +78,7 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     if (threadIdx.x == 0) {
         smem->tail_parity = __ldcg(mainloop_params.tail_epochs) & 1u;
     }
+    pdl_wait();
 
     // Run routing, latent projection and the shared expert on separate CTAs.
     collective_mainloop.run_latent_down(mainloop_params, smem);
@@ -108,6 +110,7 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     // Phase 5: the latent moe tail.
     collective_mainloop.run_tail(mainloop_params, smem, sched.cta_group());
 
+    pdl_trigger();
     __syncthreads();
     if (WarpRole::is_tmem_warp(warp_idx)) {
         tmem_free(smem->tmem_ptr, MoEKernelTraits<Dims>::kTmemColumns);
@@ -117,7 +120,7 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
 template <typename MoEDims>
 cudaError_t LaunchMoEKernel(
     typename CollectiveMainloopMoE<MoEKernelTraits<MoEDims>>::Arguments& args,
-    std::uint32_t grid_size, cudaStream_t stream) {
+    std::uint32_t grid_size, cudaStream_t stream, bool use_pdl) {
     using Dims = MoEDims;
     using Traits = MoEKernelTraits<Dims>;
     using Mainloop = CollectiveMainloopMoE<Traits>;
@@ -134,14 +137,10 @@ cudaError_t LaunchMoEKernel(
         if (attribute != cudaSuccess) return attribute;
     }
     constexpr std::uint32_t kClusterSize = Traits::kClusterSize;
-    const cutlass::ClusterLaunchParams launch_params{
-        dim3(grid_size, 1, 1), dim3(Traits::kThreads, 1, 1),
-        dim3(kClusterSize, 1, 1), static_cast<int>(smem_size), stream};
-    const cutlass::Status launch_status = cutlass::launch_kernel_on_cluster(
-        launch_params, reinterpret_cast<void const*>(kernel_ptr), params);
-    if (launch_status != cutlass::Status::kSuccess) {
-        return cudaErrorLaunchFailure;
-    }
+    const cudaError_t launch_status = LaunchClusterKernelWithPdl(
+        kernel_ptr, dim3(grid_size, 1, 1), dim3(Traits::kThreads, 1, 1),
+        dim3(kClusterSize, 1, 1), smem_size, stream, use_pdl, params);
+    if (launch_status != cudaSuccess) return launch_status;
     return cudaGetLastError();
 }
 
