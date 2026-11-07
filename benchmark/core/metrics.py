@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
+import math
 import numpy as np
 
 from core.timing import TimingResult
@@ -196,6 +197,76 @@ def compute_gemm_metrics(
     host_us = float(np.median(timing.host_us)) if timing.host_us else 0.0
     dispatch_us = float(np.median(timing.dispatch_us)) if timing.dispatch_us else 0.0
 
+    return BenchmarkMetrics(
+        median_us,
+        std_us,
+        tflops,
+        tb_per_sec=tb_per_sec,
+        bw_pct=bw_pct,
+        arithmetic_intensity=arithmetic_intensity,
+        roofline_tflops=roofline_tflops,
+        attainable_pct=attainable_pct,
+        speedup=median_us / baseline_us if baseline_us and baseline_us > 0 else 1.0,
+        host_us=host_us,
+        dispatch_us=dispatch_us,
+    )
+
+
+def compute_moe_metrics(
+    timing: TimingResult,
+    tokens: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    latent_size: int,
+    num_experts: int,
+    dtype_bytes: float = 1,
+    baseline_us: float = 0.0,
+    gpu_type: str = _DEFAULT_GPU,
+    num_router_gates: int = 2,
+    bytes_io: int = 0,
+) -> BenchmarkMetrics:
+    """Compute approximate end-to-end FLOPs and bandwidth for latent MoE.
+
+    ``dtype_bytes`` describes the main operand precision used by the backend:
+    one byte for the quantized HALOps path and two bytes for the BF16 golden.
+    The arithmetic count covers all projections. ``bytes_io`` counts each
+    touched weight and scale once, plus input/output; bandwidth is an estimate
+    excluding intermediate tensors, routing and activation traffic.
+    """
+    gpu_peak_tflops, gpu_peak_tbps = get_gpu_peak(gpu_type, dtype_bytes)
+    median_us = float(np.median(timing.device_us))
+    std_us = float(np.std(timing.device_us))
+
+    router_flops = 2 * num_router_gates * tokens * hidden_size * num_experts
+    latent_flops = 2 * tokens * hidden_size * latent_size
+    shared_up_flops = 2 * tokens * hidden_size * (2 * intermediate_size)
+    shared_down_flops = 2 * tokens * intermediate_size * hidden_size
+    routed_flops = top_k * (
+        2 * tokens * latent_size * (2 * intermediate_size)
+        + 2 * tokens * intermediate_size * latent_size
+    )
+    tail_flops = 2 * tokens * latent_size * hidden_size
+    flops = (
+        router_flops
+        + latent_flops
+        + shared_up_flops
+        + shared_down_flops
+        + routed_flops
+        + tail_flops
+    )
+    if not math.isfinite(median_us) or median_us <= 0:
+        raise ValueError("MoE timing must contain positive, finite durations")
+    tflops = flops / (median_us * 1e-6) / 1e12
+
+    tb_per_sec = bytes_io / (median_us * 1e-6) / 1e12
+    bw_pct = tb_per_sec / gpu_peak_tbps * 100
+
+    arithmetic_intensity, roofline_tflops, attainable_pct = _roofline(
+        flops, bytes_io, tflops, gpu_peak_tflops, gpu_peak_tbps
+    )
+    host_us = float(np.median(timing.host_us)) if timing.host_us else 0.0
+    dispatch_us = float(np.median(timing.dispatch_us)) if timing.dispatch_us else 0.0
     return BenchmarkMetrics(
         median_us,
         std_us,

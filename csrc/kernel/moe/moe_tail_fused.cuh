@@ -431,6 +431,13 @@ struct TailGroup {
         }
     }
 
+    // The fused tail runs three rounds over the latent exchange buffer:
+    //   A  AllReduce the WORLD partials of each token's routed latent,
+    //      RMSNorm the sum, and exchange the normalized rows among the TPG
+    //      CTAs that share this token group.
+    //   B  fc2 GEMV: this CTA's kRows output rows of the hidden shard.
+    //   C  Add the shared-expert partial, AllReduce the full hidden band
+    //      across WORLD, and store `tail_out`.
     __device__ static __forceinline__ void run(const P& p, uint32_t cta,
                                                uint32_t tid, uint8_t* scratch,
                                                Sync sync,

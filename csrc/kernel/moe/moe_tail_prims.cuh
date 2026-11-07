@@ -95,7 +95,11 @@ __device__ __forceinline__ void push_only(const P& p, const Vec16& mine,
     sanitize(v);
     const int64_t base =
         slot_elems<WORLD, H, MAXM>(round, parity, p.tail_rank) + tok;
-    st_multimem_16B(v, p.tail_mc_base + base * 2, vid);
+    if constexpr (WORLD == 1) {
+        st_global_16B(v, p.tail_mc_base + base * 2, vid);
+    } else {
+        st_multimem_16B(v, p.tail_mc_base + base * 2, vid);
+    }
 }
 
 template <int WORLD, int L, int H, int MAXM, class P>

@@ -645,7 +645,8 @@ struct MoESharedStorage {
         RoutingSmem<Dims> routing_scratch;
         SharedExpertSmem<SharedUpGemmTraits<Dims>, SharedDownGemmTraits<Dims>>
             shared_expert;
-        RoutedExpertsSmem<typename Traits::UpGemm, typename Traits::DownGemm>
+        RoutedExpertsSmem<typename Traits::RoutedUpGemm,
+                          typename Traits::RoutedDownGemm>
             routed_experts;
     };
 
@@ -660,7 +661,7 @@ struct MoESharedStorage {
 
     static constexpr uint32_t kMaxDownTasks =
         MoERoutingTables<Dims>::kMaxActiveExperts *
-        Traits::DownGemm::kCtasPerExpert;
+        Traits::RoutedDownGemm::kCtasPerExpert;
     static constexpr uint32_t kNoDownTask = 0xFFFFu;
     static_assert(kMaxDownTasks < kNoDownTask,
                   "down grid task ids must fit in uint16 below the sentinel");

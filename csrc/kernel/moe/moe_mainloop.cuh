@@ -66,19 +66,17 @@ struct CollectiveMainloopMoE {
         std::uint32_t intermediate_size;
         const DataType::ElementA* input;
         const typename Traits::RouterGemm::MmaElement* router_weight;
-        const typename RoutedUpGemmTraits<Dims>::MmaElement* expert_up_weights;
-        const typename RoutedUpGemmTraits<Dims>::ElementScale*
+        const typename Traits::RoutedUpGemm::MmaElement* expert_up_weights;
+        const typename Traits::RoutedUpGemm::ElementScale*
             expert_up_weights_scale;
-        const typename RoutedDownGemmTraits<Dims>::MmaElement*
-            expert_down_weights;
-        const typename RoutedDownGemmTraits<Dims>::ElementScale*
+        const typename Traits::RoutedDownGemm::MmaElement* expert_down_weights;
+        const typename Traits::RoutedDownGemm::ElementScale*
             expert_down_weights_scale;
-        const typename SharedUpGemmTraits<Dims>::MmaElement* shared_up_weight;
-        const typename SharedUpGemmTraits<Dims>::ElementScale*
+        const typename Traits::SharedUpGemm::MmaElement* shared_up_weight;
+        const typename Traits::SharedUpGemm::ElementScale*
             shared_up_weight_scale;
-        const typename SharedDownGemmTraits<Dims>::MmaElement*
-            shared_down_weight;
-        const typename SharedDownGemmTraits<Dims>::ElementScale*
+        const typename Traits::SharedDownGemm::MmaElement* shared_down_weight;
+        const typename Traits::SharedDownGemm::ElementScale*
             shared_down_weight_scale;
         const typename Traits::LatentDownGemm::MmaElement* latent_down_weight;
         const typename Traits::LatentDownGemm::ElementScale*
@@ -111,26 +109,26 @@ struct CollectiveMainloopMoE {
         const DataType::ElementA* __restrict__ input;
         const typename Traits::RouterGemm::
             MmaElement* __restrict__ router_weight;
-        const typename RoutedUpGemmTraits<
-            Dims>::MmaElement* __restrict__ expert_weights_up;
-        const typename RoutedUpGemmTraits<
-            Dims>::ElementScale* __restrict__ expert_scales_up;
-        const typename RoutedDownGemmTraits<
-            Dims>::MmaElement* __restrict__ expert_weights_down;
-        const typename RoutedDownGemmTraits<
-            Dims>::ElementScale* __restrict__ expert_scales_down;
+        const typename Traits::RoutedUpGemm::
+            MmaElement* __restrict__ expert_weights_up;
+        const typename Traits::RoutedUpGemm::
+            ElementScale* __restrict__ expert_scales_up;
+        const typename Traits::RoutedDownGemm::
+            MmaElement* __restrict__ expert_weights_down;
+        const typename Traits::RoutedDownGemm::
+            ElementScale* __restrict__ expert_scales_down;
         const typename Traits::LatentDownGemm::
             MmaElement* __restrict__ latent_down_weight;
         const typename Traits::LatentDownGemm::
             ElementScale* __restrict__ latent_down_weight_scale;
-        const typename SharedUpGemmTraits<
-            Dims>::MmaElement* __restrict__ shared_up_weight;
-        const typename SharedUpGemmTraits<
-            Dims>::ElementScale* __restrict__ shared_up_scale;
-        const typename SharedDownGemmTraits<
-            Dims>::MmaElement* __restrict__ shared_down_weight;
-        const typename SharedDownGemmTraits<
-            Dims>::ElementScale* __restrict__ shared_down_scale;
+        const typename Traits::SharedUpGemm::
+            MmaElement* __restrict__ shared_up_weight;
+        const typename Traits::SharedUpGemm::
+            ElementScale* __restrict__ shared_up_scale;
+        const typename Traits::SharedDownGemm::
+            MmaElement* __restrict__ shared_down_weight;
+        const typename Traits::SharedDownGemm::
+            ElementScale* __restrict__ shared_down_scale;
         const typename TailGeometry::ElementWeight* tail_fc2_w8;
         const typename TailGeometry::ElementScale* tail_fc2_scale;
         const DataType::ElementA* tail_norm_weight;
@@ -209,9 +207,9 @@ struct CollectiveMainloopMoE {
             args.latent_size > 0u ? args.latent_size : args.hidden_size;
         const std::uint64_t expert_weight_bytes =
             (2ull * args.intermediate_size * expert_width *
-                 Traits::UpGemm::MmaCore::kElementABits +
+                 Traits::RoutedUpGemm::MmaCore::kElementABits +
              static_cast<std::uint64_t>(args.intermediate_size) * expert_width *
-                 Traits::DownGemm::MmaCore::kElementABits) /
+                 Traits::RoutedDownGemm::MmaCore::kElementABits) /
             8u;
         params.l2_expert_capacity =
             args.l2_cached_bytes > 0u && expert_weight_bytes > 0u
@@ -247,14 +245,14 @@ struct CollectiveMainloopMoE {
             CreateTmaDesc2D("up-projection weights", args.shared_up_weight,
                             /*rows=*/Dims::kIntermediateSize * 2u,
                             /*cols=*/Dims::kHiddenSize,
-                            /*box_rows=*/SharedUpGemmTraits<Dims>::kTileShapeM,
+                            /*box_rows=*/Traits::SharedUpGemm::kTileShapeM,
                             /*box_cols=*/128u);
-        params.tma_shared_down_desc = CreateTmaDesc2D(
-            "down-projection weights", args.shared_down_weight,
-            /*rows=*/Dims::kHiddenSize,
-            /*cols=*/Dims::kIntermediateSize,
-            /*box_rows=*/SharedDownGemmTraits<Dims>::kTileShapeM,
-            /*box_cols=*/128u);
+        params.tma_shared_down_desc =
+            CreateTmaDesc2D("down-projection weights", args.shared_down_weight,
+                            /*rows=*/Dims::kHiddenSize,
+                            /*cols=*/Dims::kIntermediateSize,
+                            /*box_rows=*/Traits::SharedDownGemm::kTileShapeM,
+                            /*box_cols=*/128u);
         if (args.latent_down_weight != nullptr) {
             params.tma_latent_down_weight_desc = CreateTmaDesc2D(
                 "latent-projection weights", args.latent_down_weight,
@@ -604,7 +602,7 @@ struct CollectiveMainloopMoE {
             reinterpret_cast<Workspace*>(params.scratchpad);
         const std::uint32_t batch_size = params.num_tokens;
         constexpr std::uint32_t kDownOutputColsPerCta =
-            Traits::DownGemm::MmaCore::kTileShapeM;
+            Traits::RoutedDownGemm::MmaCore::kTileShapeM;
         // Groups partition the cells of m-block cta_idx_in_group.
         if (!cta_group.in_whole_group()) return;
         const std::uint32_t m_block = cta_group.cta_idx_in_group;

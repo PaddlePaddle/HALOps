@@ -110,7 +110,7 @@ struct QuantConfig {
     static constexpr std::uint32_t kBlockSize = 128;
 };
 
-template <QuantConfig Config, bool UseLatent = true>
+template <QuantConfig Config, bool UseLatent = true, int TailWorld = 4>
 struct Dims_BS8_E512_N512_K2048_SM100 {
     static constexpr uint32_t kHiddenSize = 4096;
     static constexpr uint32_t kIntermediateSize = 512;
@@ -145,11 +145,11 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr std::uint32_t kNumDownWeightSlots = 4;
         static constexpr std::uint32_t kNumAccSlots = 4;
         // Tail configs
-        static constexpr int kTailWorld = 4;
+        static constexpr int kTailWorld = TailWorld;
         static constexpr int kTailTpg = 2;
         static constexpr int kTailGsize = 32;
         static constexpr int kTailThreads = 256;
-        static constexpr int kTailStage = 1;
+        static constexpr int kTailStage = TailWorld == 1 ? 0 : 1;
         static constexpr int kTailBlkB = 4;
         static constexpr int kTailWStagePad = 64;
         static constexpr int kTailXPad = 8;
@@ -158,12 +158,13 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
     };
 };
 
-template <QuantConfig Config, bool UseLatent = true>
+template <QuantConfig Config, bool UseLatent = true, int TailWorld = 4>
 struct Dims_BS16_E512_N512_K2048_SM100
-    : Dims_BS8_E512_N512_K2048_SM100<Config, UseLatent> {
+    : Dims_BS8_E512_N512_K2048_SM100<Config, UseLatent, TailWorld> {
     static constexpr uint32_t kNumTokens = 16;
     struct KernelConfig
-        : Dims_BS8_E512_N512_K2048_SM100<Config, UseLatent>::KernelConfig {
+        : Dims_BS8_E512_N512_K2048_SM100<Config, UseLatent,
+                                         TailWorld>::KernelConfig {
         static constexpr std::uint32_t kNumUpInputSlots = 4;
         // Router configs.
         static constexpr std::uint32_t kNumCtasForRouter = 32;

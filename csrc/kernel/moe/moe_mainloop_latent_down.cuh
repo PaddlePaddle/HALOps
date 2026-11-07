@@ -537,8 +537,9 @@ struct LatentDownProjection<KernelTraits, true>
         constexpr std::uint32_t kNumGroups = Base::kTileShapeM / kGroupRows;
         static_assert(Base::kTileShapeM % kGroupRows == 0u,
                       "an MXFP8 scale group must not straddle CTAs");
-        static_assert(Traits::UpGemm::kTileShapeK % Base::kTileShapeM == 0u,
-                      "an MXFP8 CTA's rows must sit inside one up K tile");
+        static_assert(
+            Traits::RoutedUpGemm::kTileShapeK % Base::kTileShapeM == 0u,
+            "an MXFP8 CTA's rows must sit inside one up K tile");
         constexpr bool kLocalScale = LatentDownGemm::kClusterSize == 1u;
         const bool owns_slice = Base::split_idx() == 0u;
         if (kLocalScale && !owns_slice) {
@@ -618,7 +619,8 @@ struct LatentDownProjection<KernelTraits, true>
                 }
                 packed |= biased << (8u * g);
             }
-            constexpr std::uint32_t kUpTileShapeK = Traits::UpGemm::kTileShapeK;
+            constexpr std::uint32_t kUpTileShapeK =
+                Traits::RoutedUpGemm::kTileShapeK;
             std::uint8_t* const sf = workspace->latent_down_out.sf_slab(
                 Base::row_base() / kUpTileShapeK);
             *reinterpret_cast<std::uint32_t*>(
@@ -659,7 +661,7 @@ struct LatentDownProjection<KernelTraits, false>
 
     static constexpr std::uint32_t kNumAccSlots = LatentDownGemm::kNumAccSlots;
     static constexpr std::uint32_t kAccColumns =
-        get_gemm_acc_columns<Traits::UpGemm>();
+        get_gemm_acc_columns<Traits::RoutedUpGemm>();
     static constexpr bool kLocalScale =
         LatentDownGemm::OutputQuant::kBlockSize <= Base::kTileShapeM;
 

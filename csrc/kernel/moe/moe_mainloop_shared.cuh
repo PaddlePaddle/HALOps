@@ -312,7 +312,6 @@ struct SharedUpProjection<KernelTraits, true>
         }
         __syncthreads();
     }
-
     __device__ static void run(
         CUtensorMap const& tma_up_desc, CUtensorMap const& tma_input_desc,
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
@@ -879,8 +878,8 @@ struct SharedDownProjection<KernelTraits, false>
         const std::uint32_t lane_base =
             32u * (warp_idx & 3u) + 16u * (warp_idx >> 2);
         const std::uint32_t t0 = lane_idx & 3u;
-        smem->barriers.shared_down.accumulator_ready.wait(0u);
 
+        smem->barriers.shared_down.accumulator_ready.wait(0u);
 #pragma unroll
         for (std::uint32_t atom = 0; atom < 2u; ++atom) {
 #pragma unroll

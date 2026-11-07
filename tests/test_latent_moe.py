@@ -34,9 +34,14 @@ from halops import (
 
 _FP8_MAX = 448.0  # e4m3 dynamic range
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_WORLD = 4
+_WORLD = 4  # the production tensor-parallel size
 _ROW = re.compile(r"\[rank (\d+)\] (\S+): [^\n]*? -> (OK|FAIL)")
 _TOL = 1.5e-1
+
+
+def _tp_size():
+    """The tensor-parallel size this run uses: 4 on a four-GPU box, else 1."""
+    return _WORLD if torch.cuda.device_count() >= _WORLD else 1
 
 
 def _quant_fp8_block_wise(w, block_row=128, block_col=128):
@@ -612,15 +617,15 @@ def test_transform_weights_partial(quant_mode):
             assert torch.equal(value, full[key]), key
 
 
-def _all_gather(t, world):
-    gathered = [torch.empty_like(t) for _ in range(world)]
+def _all_gather(t):
+    gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, t)
     return gathered
 
 
 def _check_outputs(ref, x, top_k, out):
     """(ok, text) for one launch: the end-to-end output against MoERef (all ranks' routed / shared, then the tail)."""
-    expected = ref.tail(*(_all_gather(t, _WORLD) for t in ref(x, top_k)))
+    expected = ref.tail(*(_all_gather(t) for t in ref(x, top_k)))
     err = (out.float() - expected).norm(dim=-1) / expected.norm(dim=-1)
     ok = bool((err < _TOL).all()) and bool(torch.isfinite(out).all())
     return ok, f"max_token_rel_l2={err.max().item():.2e}"
@@ -660,7 +665,7 @@ def _run_graph(p, tp, grid_cap, m, top_k, seed):
 
 
 def _tail_worker():
-    """One rank of the 4-GPU run (launched by ``moe_run`` or directly under torchrun)."""
+    """One rank of the TP run (launched by ``moe_run`` or directly under torchrun)."""
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
@@ -728,16 +733,17 @@ def _case_id(item):
 
 @pytest.fixture(scope="module")
 def moe_run(request):
-    """Run the worker once under torchrun for the cases of the selected tests; return its output by (case, rank)."""
-    if torch.cuda.device_count() < _WORLD:
-        pytest.skip(f"needs {_WORLD} GPUs")
+    """Run the worker once under torchrun for the cases of the selected tests; return (status, tp, output)."""
+    tp = _tp_size()
+    if torch.cuda.device_count() < tp:
+        pytest.skip(f"needs {tp} GPU(s)")
     cases = [case for case in map(_case_id, request.session.items) if case]
     cmd = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--standalone",
-        f"--nproc_per_node={_WORLD}",
+        f"--nproc_per_node={tp}",
         os.path.abspath(__file__),
     ]
     env = dict(os.environ, MOE_CASES=",".join(cases), PYTHONPATH=_ROOT)
@@ -745,17 +751,17 @@ def moe_run(request):
         cmd, cwd=_ROOT, env=env, capture_output=True, text=True, timeout=3600
     )
     out = proc.stdout + proc.stderr
-    if "NVLS multicast" in out:
+    if tp > 1 and "NVLS multicast" in out:
         pytest.skip("the fused tail needs an NVLS multicast capable node")
     status = {}
     for rank, case, res in _ROW.findall(out):
         status[(case, int(rank))] = res == "OK"
-    return status, out
+    return status, tp, out
 
 
 def _check_case(moe_run, case):
-    status, out = moe_run
-    ranks = [status.get((case, r)) for r in range(_WORLD)]
+    status, tp, out = moe_run
+    ranks = [status.get((case, r)) for r in range(tp)]
     errors = "\n".join(line for line in out.splitlines() if "Error" in line)
     details = f"{errors[-1500:]}\n--- end of worker output ---\n{out[-1500:]}"
     assert None not in ranks, f"no result for {case} on every rank:\n{details}"

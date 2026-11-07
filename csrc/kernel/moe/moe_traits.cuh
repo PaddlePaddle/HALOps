@@ -404,16 +404,17 @@ constexpr std::uint32_t get_tmem_columns() {
 template <typename Dims>
 struct MoEKernelTraits {
     using MoEDims = Dims;
-    using UpGemm = RoutedUpGemmTraits<Dims>;
-    using DownGemm = RoutedDownGemmTraits<Dims>;
+    using RoutedUpGemm = RoutedUpGemmTraits<Dims>;
+    using RoutedDownGemm = RoutedDownGemmTraits<Dims>;
     using RouterGemm = RouterGemmTraits<Dims>;
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
     using SharedUpGemm = SharedUpGemmTraits<Dims>;
     using SharedDownGemm = SharedDownGemmTraits<Dims>;
+    using TailGeometry = moe::TailGeometryT<Dims>;
 
     // Latent output and routed-up input must use the same quantization recipe.
     static_assert(std::is_same_v<typename LatentDownGemm::OutputQuant,
-                                 typename UpGemm::InputQuant>,
+                                 typename RoutedUpGemm::InputQuant>,
                   "the latent output recipe must be the up's input recipe");
 
     static constexpr std::uint32_t kThreads = Dims::KernelConfig::kBlockSize;
@@ -435,9 +436,11 @@ struct MoEKernelTraits {
     static_assert(LatentDownGemm::kNumCtas % kLatentClusterSize == 0u,
                   "the projection's groups must be whole blocks");
 
-    static constexpr std::uint32_t kMinGrid =
-        RouterGemm::kNumCtas + (kUseLatent ? 0u : LatentDownGemm::kNumCtas) +
-        cute::max(SharedUpGemm::kNumCtas, SharedDownGemm::kNumCtas);
+    static constexpr std::uint32_t kMinGrid = cute::max(
+        RouterGemm::kNumCtas + (kUseLatent ? LatentDownGemm::kNumCtas : 0u) +
+            cute::max(SharedUpGemm::kNumCtas, SharedDownGemm::kNumCtas),
+        TailGeometry::kNumCtas);
+
     static constexpr std::uint32_t kMaxGrid = kSpecMaxGrid;
     static_assert(kMinGrid <= kMaxGrid,
                   "Grid bounds must be ordered kCtasPerExpert <= kMinGrid <= "
@@ -445,18 +448,19 @@ struct MoEKernelTraits {
 
     // Gate/up rows are interleaved in groups of kPairLayoutGranularity.
     static constexpr std::uint32_t kPairLayoutGranularity = 8u;
-    static_assert(UpGemm::kTileShapeM % (2u * kPairLayoutGranularity) == 0u,
+    static_assert(RoutedUpGemm::kTileShapeM % (2u * kPairLayoutGranularity) ==
+                      0u,
                   "The pair-layout interleave period must divide the A tile's "
                   "row count.");
 
     static constexpr std::uint32_t kUpSlotsPerDownSlot =
-        (DownGemm::kTileShapeM * DownGemm::kTileShapeK) /
-        (UpGemm::kTileShapeM * UpGemm::kTileShapeK);
+        (RoutedDownGemm::kTileShapeM * RoutedDownGemm::kTileShapeK) /
+        (RoutedUpGemm::kTileShapeM * RoutedUpGemm::kTileShapeK);
 
     static constexpr std::uint32_t kUpTmemColumns =
-        get_gemm_tmem_columns<UpGemm>();
+        get_gemm_tmem_columns<RoutedUpGemm>();
     static constexpr std::uint32_t kDownTmemColumns =
-        get_gemm_tmem_columns<DownGemm>();
+        get_gemm_tmem_columns<RoutedDownGemm>();
     static constexpr std::uint32_t kSharedUpTmemColumns =
         get_gemm_tmem_columns<SharedUpGemmTraits<Dims>>();
     static constexpr std::uint32_t kSharedDownTmemColumns =
