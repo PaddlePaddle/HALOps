@@ -97,6 +97,8 @@ struct TailPhase {
         static_assert(Geometry::kSmemBytes <=
                           sizeof(decltype(SharedStorage::routed_experts)),
                       "the tail scratch must fit the weight-ring union");
+        const auto wait_shared_span =
+            KERNEL_TIMER_BEGIN(smem->timer.get(), "tail_wait_shared");
         if (shared_ctas != 0u) {
             if (threadIdx.x == 0) {
                 workspace->cta_comm.wait_shared_down_done(smem->launch_parity,
@@ -105,6 +107,8 @@ struct TailPhase {
             WarpRole::sync_calc_threads();
             __threadfence();
         }
+        KERNEL_TIMER_END(smem->timer.get(), wait_shared_span);
+
         ::halops::moe::tail::eb5_tail_group_body<
             Geometry::kWorld, Dims::kLatentSize, Dims::kHiddenSize,
             Geometry::kMaxM, Geometry>(

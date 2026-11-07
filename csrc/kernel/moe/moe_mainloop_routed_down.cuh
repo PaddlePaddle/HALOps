@@ -38,9 +38,9 @@ namespace halops::moe {
 
 template <typename KernelTraits>
 struct RoutedDownProjectionBase
-    : DownProjectionBase<KernelTraits, typename KernelTraits::DownGemm> {
+    : DownProjectionBase<KernelTraits, typename KernelTraits::RoutedDownGemm> {
     using Base =
-        DownProjectionBase<KernelTraits, typename KernelTraits::DownGemm>;
+        DownProjectionBase<KernelTraits, typename KernelTraits::RoutedDownGemm>;
     using typename Base::Accumulator;
     using typename Base::Dims;
     using typename Base::DownGemm;
@@ -58,7 +58,7 @@ struct RoutedDownProjectionBase
 
     // The up phase's weight ring depth, which the down ring aliases at 2:1.
     static constexpr std::uint32_t kNumUpWeightSlots =
-        Traits::UpGemm::kNumWeightSlots;
+        Traits::RoutedUpGemm::kNumWeightSlots;
 
     static_assert(Traits::kUpSlotsPerDownSlot >= 1u,
                   "A w_down slot must cover at least one w_up slot: the first "
@@ -101,8 +101,12 @@ struct RoutedDownProjectionBase
             while (shared_load_acquire_u32(&smem->down_task_stores) <
                    WarpRole::kCalcWarpCount * (task.task_id + 1u)) {
             }
+            const auto publish_span = KERNEL_TIMER_BEGIN(
+                smem->timer.get(), "down_publish_task",
+                smem->routing.active_experts[task.local_expert_idx]);
             workspace->cta_comm.publish_down_task(smem->launch_parity,
                                                   task.m_block_idx, done_inc);
+            KERNEL_TIMER_END(smem->timer.get(), publish_span);
         }
     }
 
@@ -164,7 +168,7 @@ struct RoutedDownProjectionBase
 
 template <typename KernelTraits,
           bool UseBlockscaled =
-              KernelTraits::DownGemm::MmaCore::kUseBlockscaled>
+              KernelTraits::RoutedDownGemm::MmaCore::kUseBlockscaled>
 struct RoutedDownProjection;
 
 // MXFP8/MXFP4: scales are applied by the blockscaled MMA.
@@ -181,7 +185,7 @@ struct RoutedDownProjection<KernelTraits, true>
 
     static_assert(DownGemm::MmaCore::kUseBlockscaled,
                   "RoutedDownProjection<true> requires a blockscaled MMA core");
-    static_assert(Traits::UpGemm::MmaCore::kUseBlockscaled,
+    static_assert(Traits::RoutedUpGemm::MmaCore::kUseBlockscaled,
                   "blockscaled down requires up to drain its weights and "
                   "accumulator before the down phase");
     static_assert(RoutedBarrier<Dims>::kNumDownWeightSlots ==
@@ -250,6 +254,8 @@ struct RoutedDownProjection<KernelTraits, true>
             const std::uint32_t e = task.local_expert_idx;
             const std::uint32_t base_m = task.m_block_idx * Base::kTileShapeM;
             const std::uint32_t expert_id = smem->routing.active_experts[e];
+            const auto task_span = KERNEL_TIMER_BEGIN(
+                smem->timer.get(), "down_expert_task", expert_id);
 
             const std::uint32_t routed_count = smem->routing.slab_count(e);
             const std::uint32_t expert_start = smem->routing.slab_begin(e);
@@ -273,9 +279,12 @@ struct RoutedDownProjection<KernelTraits, true>
                                   tmem_base, acc_task_id);
 
                 // Write each slab pair's own combine slot, then hand off.
+                KERNEL_TIMER_SCOPE(smem->timer.get(), "down_epilogue",
+                                   expert_id);
                 Base::epilogue(workspace, smem, acc_out, base_m, expert_start,
                                routed_count, m_tile_idx, lane_base);
             }
+            KERNEL_TIMER_END(smem->timer.get(), task_span);
         }
     }
 
@@ -309,6 +318,8 @@ struct RoutedDownProjection<KernelTraits, true>
         std::uint32_t routed_count) {
         const unsigned lane_idx = WarpRole::get_lane_idx();
         // Every lane acquires before reading its token's scales from up.
+        const auto up_out_span = KERNEL_TIMER_BEGIN(
+            smem->timer.get(), "down_wait_up_out", expert_id);
         workspace->cta_comm.wait_up_out(smem->launch_parity, expert_start,
                                         routed_count,
                                         Workspace::kUpOutReadyFull);
@@ -316,6 +327,7 @@ struct RoutedDownProjection<KernelTraits, true>
         if (lane_idx == 0u) {
             fence_proxy_async_global();
         }
+        KERNEL_TIMER_END(smem->timer.get(), up_out_span);
 
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kNumTilesK;
@@ -344,16 +356,22 @@ struct RoutedDownProjection<KernelTraits, true>
         auto tCt = Base::make_accumulator_fragment(cta_mma);
 
         const std::uint32_t local_id = task_id * Base::kNumTilesK;
+        const auto acc_empty_span = KERNEL_TIMER_BEGIN(
+            smem->timer.get(), "down_wait_accumulator_empty", acc_task_id);
         if (acc_task_id > 0u) {
             smem->barriers.routed.accumulator_empty.wait(acc_task_id - 1u);
         }
+        KERNEL_TIMER_END(smem->timer.get(), acc_empty_span);
 
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kNumTilesK;
              ++k_iter_id) {
             const std::uint32_t step_local = local_id + k_iter_id;
             const std::uint32_t w_slot = step_local % Base::kNumWeightSlots;
+            const auto mma_ready_span = KERNEL_TIMER_BEGIN(
+                smem->timer.get(), "down_wait_mma_ready", step_local);
             smem->barriers.routed.wait_down_mma_ready(step_local);
+            KERNEL_TIMER_END(smem->timer.get(), mma_ready_span);
             const auto sfa_tmem =
                 tmem_addr(tmem_base, 0u, down_sfa_tmem(step_local));
             const auto sfb_tmem =
@@ -373,8 +391,9 @@ struct RoutedDownProjection<KernelTraits, true>
             cutlass::arch::umma_arrive(
                 smem->barriers.routed.down_weight_empty.raw(w_slot));
         }
+        // Down keeps one TMEM accumulator but continues up's barrier ring.
         cutlass::arch::umma_arrive(
-            smem->barriers.routed.accumulator_ready.raw(0u));
+            smem->barriers.routed.accumulator_ready.raw(acc_task_id));
     }
 
     // Read the completed task once, then release its fixed accumulator.
@@ -384,7 +403,10 @@ struct RoutedDownProjection<KernelTraits, true>
                                              unsigned lane_base,
                                              std::uint32_t tmem_base,
                                              std::uint32_t acc_task_id) {
+        const auto acc_ready_span = KERNEL_TIMER_BEGIN(
+            smem->timer.get(), "down_wait_accumulator_ready", acc_task_id);
         smem->barriers.routed.accumulator_ready.wait(acc_task_id);
+        KERNEL_TIMER_END(smem->timer.get(), acc_ready_span);
 
         float values[1][DownGemm::kTileShapeN];
         Base::load_accumulator_fragment(tmem_base, 0u, m_tile_idx, lane_base,
@@ -446,6 +468,7 @@ struct RoutedDownProjection<KernelTraits, true>
     __device__ static void wait_input_empty(SharedStorage* __restrict__ smem,
                                             std::uint32_t arm_id) {
         if (arm_id < Base::kNumWeightSlots) return;
+        KERNEL_TIMER_SCOPE(smem->timer.get(), "down_wait_input_empty", arm_id);
         smem->barriers.routed.down_weight_empty.wait(arm_id -
                                                      Base::kNumWeightSlots);
     }
@@ -454,6 +477,7 @@ struct RoutedDownProjection<KernelTraits, true>
         SharedStorage* __restrict__ smem, std::uint32_t arm_id) {
         // Up drained the aliased weights before entering down's first lap.
         if (arm_id < Base::kNumWeightSlots) return;
+        KERNEL_TIMER_SCOPE(smem->timer.get(), "down_wait_weight_empty", arm_id);
         smem->barriers.routed.down_weight_empty.wait(arm_id -
                                                      Base::kNumWeightSlots);
     }
@@ -521,9 +545,10 @@ struct RoutedDownProjection<KernelTraits, false>
         // Blockwise up and down share an accumulator ring and continue its
         // iteration count.
         const std::uint32_t id_base =
-            sched.up_task_count() * (Traits::UpGemm::MmaCore::kUseBlockscaled
-                                         ? 0u
-                                         : Traits::UpGemm::kNumTilesK);
+            sched.up_task_count() *
+            (Traits::RoutedUpGemm::MmaCore::kUseBlockscaled
+                 ? 0u
+                 : Traits::RoutedUpGemm::kNumTilesK);
         const std::uint32_t tmem_base = smem->tmem_ptr;
 
         TaskInfo task;
@@ -549,6 +574,8 @@ struct RoutedDownProjection<KernelTraits, false>
             const std::uint32_t e = task.local_expert_idx;
             const std::uint32_t base_m = task.m_block_idx * Base::kTileShapeM;
             const std::uint32_t expert_id = smem->routing.active_experts[e];
+            const auto task_span = KERNEL_TIMER_BEGIN(
+                smem->timer.get(), "down_expert_task", expert_id);
 
             const std::uint32_t routed_count = smem->routing.slab_count(e);
             const std::uint32_t expert_start = smem->routing.slab_begin(e);
@@ -575,9 +602,12 @@ struct RoutedDownProjection<KernelTraits, false>
                                    tmem_base, ring_iter_id);
 
                 // Write each slab pair's own combine slot, then hand off.
+                KERNEL_TIMER_SCOPE(smem->timer.get(), "down_epilogue",
+                                   expert_id);
                 Base::epilogue(workspace, smem, acc_out, base_m, expert_start,
                                routed_count, m_tile_idx, lane_base);
             }
+            KERNEL_TIMER_END(smem->timer.get(), task_span);
         }
     }
 
@@ -589,13 +619,20 @@ struct RoutedDownProjection<KernelTraits, false>
         std::uint32_t expert_start, std::uint32_t routed_count) {
         const unsigned warp_idx = WarpRole::get_warp_idx();
         if (warp_idx == 0u) {
+            KERNEL_TIMER_SCOPE(smem->timer.get(), "down_load_weight_scale",
+                               expert_id);
             load_weight_scale(expert_scales_down, expert_id, base_m,
                               smem->routed_experts.w_down_scale[0]);
         } else if (warp_idx == 1u) {
             // Every lane acquires: each lane loads up_out_scale itself.
+            const auto up_out_span = KERNEL_TIMER_BEGIN(
+                smem->timer.get(), "down_wait_up_out", expert_id);
             workspace->cta_comm.wait_up_out(smem->launch_parity, expert_start,
                                             routed_count,
                                             Workspace::kUpOutReadyFull);
+            KERNEL_TIMER_END(smem->timer.get(), up_out_span);
+            KERNEL_TIMER_SCOPE(smem->timer.get(), "down_load_act_scale",
+                               expert_id);
             load_down_input_scale(workspace, expert_start, routed_count,
                                   smem->routed_experts.act_down_scale);
         }
@@ -610,7 +647,10 @@ struct RoutedDownProjection<KernelTraits, false>
         float values[DownGemm::MmaCore::kNumQuantBlocksB]
                     [DownGemm::kTileShapeN];
         const std::uint32_t step_id = ring_iter_id - 1u;
+        const auto acc_ready_span = KERNEL_TIMER_BEGIN(
+            smem->timer.get(), "down_wait_accumulator_ready");
         smem->barriers.routed.accumulator_ready.wait(step_id);
+        KERNEL_TIMER_END(smem->timer.get(), acc_ready_span);
 
         Base::load_accumulator_fragment(
             tmem_base, (step_id % kNumAccSlots) * Base::kAccColumns, m_tile_idx,
@@ -623,7 +663,7 @@ struct RoutedDownProjection<KernelTraits, false>
 
         const std::uint32_t nb = k_iter_id - 1u;
         const std::uint32_t a_blk =
-            (nb * 128u) / Traits::UpGemm::kOutputQuantBlock;
+            (nb * 128u) / Traits::RoutedUpGemm::kOutputQuantBlock;
         const std::uint32_t scale_idx =
             m_tile_idx * kNumDownWeightScaleBlocksK +
             ((kNumDownWeightScaleBlocksK > 1u) ? nb : 0u);
@@ -661,11 +701,14 @@ struct RoutedDownProjection<KernelTraits, false>
         std::uint32_t local_id, std::uint32_t expert_id,
         std::uint32_t expert_start, std::uint32_t routed_count) {
         // Acquire the routed_up_out readiness bitmask.
+        const auto up_out_span = KERNEL_TIMER_BEGIN(
+            smem->timer.get(), "down_wait_up_out", expert_id);
         workspace->cta_comm.wait_up_out(smem->launch_parity, expert_start,
                                         routed_count,
                                         Workspace::kUpOutReadyFull);
         // Order cross-CTA stores before TMA reads.
         fence_proxy_async_global();
+        KERNEL_TIMER_END(smem->timer.get(), up_out_span);
 
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kNumTilesK;
@@ -697,7 +740,10 @@ struct RoutedDownProjection<KernelTraits, false>
             const std::uint32_t w_slot = step_local % Base::kNumWeightSlots;
             // The previous slot occupant may be an up tile or an earlier down
             // task.
+            const auto mma_ready_span = KERNEL_TIMER_BEGIN(
+                smem->timer.get(), "down_wait_mma_ready", step_id);
             smem->barriers.routed.wait_down_mma_ready(step_local, step_id);
+            KERNEL_TIMER_END(smem->timer.get(), mma_ready_span);
             Base::mma(tiled_mma, cta_mma, sB_layout, tCt,
                       reinterpret_cast<typename Base::WeightElement*>(
                           &smem->routed_experts.w_down[w_slot][0][0]),
@@ -784,7 +830,10 @@ struct RoutedDownProjection<KernelTraits, false>
         constexpr std::uint32_t kSlots =
             RoutedBarrier<Dims>::kNumDownWeightSlots;
         if (arm_id < kSlots) return;
+        const auto act_empty_span = KERNEL_TIMER_BEGIN(
+            smem->timer.get(), "down_wait_input_empty", arm_id);
         smem->barriers.routed.accumulator_ready.wait(arm_id - kSlots);
+        KERNEL_TIMER_END(smem->timer.get(), act_empty_span);
     }
 
     // Wait for the previous down MMA or the first lap's aliased up MMAs.
@@ -792,18 +841,24 @@ struct RoutedDownProjection<KernelTraits, false>
         SharedStorage* __restrict__ smem, std::uint32_t id_base,
         std::uint32_t ring_iter_id, std::uint32_t slot) {
         if (ring_iter_id - id_base >= Base::kNumWeightSlots) {
+            const auto weight_empty_span = KERNEL_TIMER_BEGIN(
+                smem->timer.get(), "down_wait_weight_empty", ring_iter_id);
             smem->barriers.routed.accumulator_ready.wait(ring_iter_id -
                                                          Base::kNumWeightSlots);
+            KERNEL_TIMER_END(smem->timer.get(), weight_empty_span);
             return;
         }
         // A block with no up task has no previous weight occupant.
         if (id_base == 0u) return;
+        const auto up_umma_span = KERNEL_TIMER_BEGIN(
+            smem->timer.get(), "down_wait_up_umma_done", slot);
 #pragma unroll
         for (std::uint32_t h = 0; h < Traits::kUpSlotsPerDownSlot; ++h) {
             smem->barriers.routed.accumulator_ready.wait(
                 id_base - Base::kNumUpWeightSlots +
                 Traits::kUpSlotsPerDownSlot * slot + h);
         }
+        KERNEL_TIMER_END(smem->timer.get(), up_umma_span);
         // The mbarrier wait does not order SMEM reads against TMA writes.
         asm volatile("fence.proxy.async;" ::: "memory");
     }

@@ -213,7 +213,7 @@ struct UpProjectionBase {
                     tmem_addr(tmem_base, 0u, kUpSfbTmemOffset));
             }
             MmaCore::run(tiled_mma, cta_mma, weight, tCrB, tCt,
-                         tmem_addr(tmem_base, 0u, 0u),
+                         tmem_addr(tmem_base, 0u, acc_slot * kAccColumns),
                          tmem_addr(tmem_base, 0u, kUpSfaTmemOffset),
                          tmem_addr(tmem_base, 0u, kUpSfbTmemOffset),
                          accumulate);
@@ -224,17 +224,18 @@ struct UpProjectionBase {
         }
     }
 
-    // Read the fixed accumulator after all K tiles have completed.
+    // Read one slot's final sum after all K tiles have completed.
     __device__ static void load_accumulators(std::uint32_t tmem_base,
-                                             Accumulator& gate,
-                                             Accumulator& up) {
+                                             Accumulator& gate, Accumulator& up,
+                                             std::uint32_t acc_slot = 0u) {
         static_assert(MmaCore::kUseBlockscaled,
                       "only blockscaled MMA accumulates all K tiles in TMEM");
         if (!owns_up_rows(WarpRole::get_warp_idx())) return;
 #pragma unroll
         for (std::uint32_t group = 0; group < kTokenGroups; ++group) {
             float values[4];
-            load_accumulator_fragment(tmem_base, 0u, group, values);
+            load_accumulator_fragment(tmem_base, acc_slot * kAccColumns, group,
+                                      values);
             cutlass::arch::fence_view_async_tmem_load();
 #pragma unroll
             for (std::uint32_t i = 0; i < 2u; ++i) {

@@ -14,6 +14,7 @@
 
 #include <torch/extension.h>
 
+#include "common/kernel_timer_host.hpp"
 #include "kernel/gemm/epilogue_op.h"
 
 namespace halops {
@@ -211,14 +212,16 @@ void LowLatencyMoE(
     const torch::Tensor& tail_norm_weight, const torch::Tensor& tail_epochs,
     const torch::Tensor& tail_uc_bases, const torch::Tensor& workspace,
     const torch::Tensor& tail_out, int64_t top_k, int64_t num_router_gates,
-    int64_t tail_rank, int64_t tail_mc_base, int64_t tail_grid_cap,
+    int64_t tp_rank, int64_t tail_mc_base, int64_t tail_grid_cap,
     const std::string& scoring_func, const std::string& activation,
     bool renormalize, double situ_beta, double situ_linear_beta,
-    double tail_eps, const std::string& quant_mode);
+    double tail_eps, const std::string& quant_mode, int64_t tp_size);
 
-int64_t MoETailRegionBytes(bool wide);
+int64_t MoETailRegionBytes(bool wide, int64_t tp_size);
 
 int64_t GetWorkspaceSize(const std::optional<torch::Tensor>& input);
+
+pybind11::dict GetKernelTimer(const int lane);
 
 int64_t RouterTileM(int64_t num_tokens);
 
@@ -283,7 +286,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("output_sf") = py::none());
 
     m.def("low_latency_moe", &halops::LowLatencyMoE);
-    m.def("moe_tail_region_bytes", &halops::MoETailRegionBytes);
+    m.def("moe_get_kernel_timer", &halops::GetKernelTimer, py::arg("lane") = 0);
+    m.def("moe_tail_region_bytes", &halops::MoETailRegionBytes, py::arg("wide"),
+          py::arg("tp_size") = 1);
     m.def("moe_get_workspace_size", &halops::GetWorkspaceSize,
           py::arg("input") = py::none());
     m.def("moe_router_tile_m", &halops::RouterTileM, py::arg("num_tokens") = 0);

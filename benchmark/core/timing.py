@@ -280,3 +280,48 @@ def bench_gpu_time(
     raise ValueError(
         f"unknown timing method {method!r}; expected 'event', 'cupti', or 'profiler'"
     )
+
+
+def profile_kernel_timeline(
+    fn: Callable,
+    input_args: tuple,
+    output_path,
+    warmup_iters: int = 5,
+    *,
+    warp_roles: dict[int, str] | None = None,
+    launch_metadata: dict | None = None,
+    do_stats: bool = True,
+    cold_l2_cache: bool = True,
+) -> dict:
+    """Run a timer-enabled kernel once and write its Chrome trace."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required to generate a kernel timer timeline")
+    if warmup_iters < 0:
+        raise ValueError("warmup_iters must be nonnegative")
+
+    for _ in range(warmup_iters):
+        fn(*input_args)
+    torch.cuda.synchronize()
+    if cold_l2_cache:
+        _flush_l2_cache()
+    fn(*input_args)
+    torch.cuda.synchronize()
+
+    import halops.halops_kernel as halops_kernel
+    from halops.moe.device_timer import collect_and_write
+
+    data = dict(halops_kernel.moe_get_kernel_timer())
+    if data.get("records") is None:
+        raise RuntimeError("no timer records; rebuild with ENABLE_KERNEL_TIMER=1")
+    if warp_roles is not None:
+        data["warp_roles"] = warp_roles
+    if launch_metadata is not None:
+        data["launch"] = {
+            **launch_metadata,
+            "grid": int(data["ctas"]),
+        }
+    return collect_and_write(
+        output_path,
+        do_stats=do_stats,
+        data=data,
+    )

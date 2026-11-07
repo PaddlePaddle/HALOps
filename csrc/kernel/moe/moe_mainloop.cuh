@@ -66,19 +66,17 @@ struct CollectiveMainloopMoE {
         std::uint32_t intermediate_size;
         const DataType::ElementA* input;
         const typename Traits::RouterGemm::MmaElement* router_weight;
-        const typename RoutedUpGemmTraits<Dims>::MmaElement* expert_up_weights;
-        const typename RoutedUpGemmTraits<Dims>::ElementScale*
+        const typename Traits::RoutedUpGemm::MmaElement* expert_up_weights;
+        const typename Traits::RoutedUpGemm::ElementScale*
             expert_up_weights_scale;
-        const typename RoutedDownGemmTraits<Dims>::MmaElement*
-            expert_down_weights;
-        const typename RoutedDownGemmTraits<Dims>::ElementScale*
+        const typename Traits::RoutedDownGemm::MmaElement* expert_down_weights;
+        const typename Traits::RoutedDownGemm::ElementScale*
             expert_down_weights_scale;
-        const typename SharedUpGemmTraits<Dims>::MmaElement* shared_up_weight;
-        const typename SharedUpGemmTraits<Dims>::ElementScale*
+        const typename Traits::SharedUpGemm::MmaElement* shared_up_weight;
+        const typename Traits::SharedUpGemm::ElementScale*
             shared_up_weight_scale;
-        const typename SharedDownGemmTraits<Dims>::MmaElement*
-            shared_down_weight;
-        const typename SharedDownGemmTraits<Dims>::ElementScale*
+        const typename Traits::SharedDownGemm::MmaElement* shared_down_weight;
+        const typename Traits::SharedDownGemm::ElementScale*
             shared_down_weight_scale;
         const typename Traits::LatentDownGemm::MmaElement* latent_down_weight;
         const typename Traits::LatentDownGemm::ElementScale*
@@ -91,6 +89,7 @@ struct CollectiveMainloopMoE {
         std::uint32_t* tail_epochs;
         DataType::ElementOut* tail_out;
         void* workspace;
+        std::uint64_t* timer_events;
         std::uint32_t top_k;
         std::uint32_t tail_rank;
         ScoringFunc scoring_func;
@@ -111,26 +110,26 @@ struct CollectiveMainloopMoE {
         const DataType::ElementA* __restrict__ input;
         const typename Traits::RouterGemm::
             MmaElement* __restrict__ router_weight;
-        const typename RoutedUpGemmTraits<
-            Dims>::MmaElement* __restrict__ expert_weights_up;
-        const typename RoutedUpGemmTraits<
-            Dims>::ElementScale* __restrict__ expert_scales_up;
-        const typename RoutedDownGemmTraits<
-            Dims>::MmaElement* __restrict__ expert_weights_down;
-        const typename RoutedDownGemmTraits<
-            Dims>::ElementScale* __restrict__ expert_scales_down;
+        const typename Traits::RoutedUpGemm::
+            MmaElement* __restrict__ expert_weights_up;
+        const typename Traits::RoutedUpGemm::
+            ElementScale* __restrict__ expert_scales_up;
+        const typename Traits::RoutedDownGemm::
+            MmaElement* __restrict__ expert_weights_down;
+        const typename Traits::RoutedDownGemm::
+            ElementScale* __restrict__ expert_scales_down;
         const typename Traits::LatentDownGemm::
             MmaElement* __restrict__ latent_down_weight;
         const typename Traits::LatentDownGemm::
             ElementScale* __restrict__ latent_down_weight_scale;
-        const typename SharedUpGemmTraits<
-            Dims>::MmaElement* __restrict__ shared_up_weight;
-        const typename SharedUpGemmTraits<
-            Dims>::ElementScale* __restrict__ shared_up_scale;
-        const typename SharedDownGemmTraits<
-            Dims>::MmaElement* __restrict__ shared_down_weight;
-        const typename SharedDownGemmTraits<
-            Dims>::ElementScale* __restrict__ shared_down_scale;
+        const typename Traits::SharedUpGemm::
+            MmaElement* __restrict__ shared_up_weight;
+        const typename Traits::SharedUpGemm::
+            ElementScale* __restrict__ shared_up_scale;
+        const typename Traits::SharedDownGemm::
+            MmaElement* __restrict__ shared_down_weight;
+        const typename Traits::SharedDownGemm::
+            ElementScale* __restrict__ shared_down_scale;
         const typename TailGeometry::ElementWeight* tail_fc2_w8;
         const typename TailGeometry::ElementScale* tail_fc2_scale;
         const DataType::ElementA* tail_norm_weight;
@@ -140,6 +139,7 @@ struct CollectiveMainloopMoE {
         DataType::ElementOut* __restrict__ shared_out;
         DataType::ElementOut* tail_out;
         void* __restrict__ scratchpad;
+        std::uint64_t* timer_events;
         std::uint32_t top_k;
         ScoringFunc scoring_func;
         bool renormalize;
@@ -190,6 +190,7 @@ struct CollectiveMainloopMoE {
             offsetof(Workspace, shared_down_out));
         params.tail_out = args.tail_out;
         params.scratchpad = args.workspace;
+        params.timer_events = args.timer_events;
         for (int r = 0; r < TailGeometryT<Dims>::kWorld; ++r) {
             params.tail_uc_base[r] = args.tail_uc_base[r];
         }
@@ -209,9 +210,9 @@ struct CollectiveMainloopMoE {
             args.latent_size > 0u ? args.latent_size : args.hidden_size;
         const std::uint64_t expert_weight_bytes =
             (2ull * args.intermediate_size * expert_width *
-                 Traits::UpGemm::MmaCore::kElementABits +
+                 Traits::RoutedUpGemm::MmaCore::kElementABits +
              static_cast<std::uint64_t>(args.intermediate_size) * expert_width *
-                 Traits::DownGemm::MmaCore::kElementABits) /
+                 Traits::RoutedDownGemm::MmaCore::kElementABits) /
             8u;
         params.l2_expert_capacity =
             args.l2_cached_bytes > 0u && expert_weight_bytes > 0u
@@ -247,14 +248,14 @@ struct CollectiveMainloopMoE {
             CreateTmaDesc2D("up-projection weights", args.shared_up_weight,
                             /*rows=*/Dims::kIntermediateSize * 2u,
                             /*cols=*/Dims::kHiddenSize,
-                            /*box_rows=*/SharedUpGemmTraits<Dims>::kTileShapeM,
+                            /*box_rows=*/Traits::SharedUpGemm::kTileShapeM,
                             /*box_cols=*/128u);
-        params.tma_shared_down_desc = CreateTmaDesc2D(
-            "down-projection weights", args.shared_down_weight,
-            /*rows=*/Dims::kHiddenSize,
-            /*cols=*/Dims::kIntermediateSize,
-            /*box_rows=*/SharedDownGemmTraits<Dims>::kTileShapeM,
-            /*box_cols=*/128u);
+        params.tma_shared_down_desc =
+            CreateTmaDesc2D("down-projection weights", args.shared_down_weight,
+                            /*rows=*/Dims::kHiddenSize,
+                            /*cols=*/Dims::kIntermediateSize,
+                            /*box_rows=*/Traits::SharedDownGemm::kTileShapeM,
+                            /*box_cols=*/128u);
         if (args.latent_down_weight != nullptr) {
             params.tma_latent_down_weight_desc = CreateTmaDesc2D(
                 "latent-projection weights", args.latent_down_weight,
@@ -317,8 +318,11 @@ struct CollectiveMainloopMoE {
                                params.num_tokens > WarpRole::kCalcWarpCount;
         if (threadIdx.x == 0u) {
             // One task per router CTA, whatever its M tile or K slice.
+            const auto logits_span =
+                KERNEL_TIMER_BEGIN(smem->timer.get(), "router_wait_logits");
             workspace->cta_comm.wait_router_tasks(smem->launch_parity,
                                                   Traits::RouterGemm::kNumCtas);
+            KERNEL_TIMER_END(smem->timer.get(), logits_span);
         }
         WarpRole::sync_calc_threads();
         const std::uint32_t calc_warp_idx = WarpRole::get_calc_warp_idx();
@@ -332,9 +336,12 @@ struct CollectiveMainloopMoE {
             // One warp per token, and this block runs only its half.
             const std::uint32_t tok = tok_base + calc_warp_idx;
             if (calc_warp_idx < kTokensPerCta && tok < params.num_tokens) {
+                const auto topk_span =
+                    KERNEL_TIMER_BEGIN(smem->timer.get(), "topk_one_token");
                 topk_one_token<Dims, kExpertsPerThread>(
                     tok, params.top_k, params.scoring_func, params.renormalize,
                     workspace, smem);
+                KERNEL_TIMER_END(smem->timer.get(), topk_span);
             }
         } else {
             constexpr std::uint32_t kTokensPerWarp =
@@ -346,9 +353,12 @@ struct CollectiveMainloopMoE {
                 const std::uint32_t tok =
                     calc_warp_idx + g * WarpRole::kCalcWarpCount;
                 if (tok >= params.num_tokens) break;
+                const auto topk_span =
+                    KERNEL_TIMER_BEGIN(smem->timer.get(), "topk_one_token");
                 topk_one_token<Dims, kExpertsPerThread>(
                     tok, params.top_k, params.scoring_func, params.renormalize,
                     workspace, smem);
+                KERNEL_TIMER_END(smem->timer.get(), topk_span);
             }
         }
         WarpRole::sync_calc_threads();
@@ -359,9 +369,12 @@ struct CollectiveMainloopMoE {
                 const std::uint32_t peer_rank =
                     (blockIdx.x % Traits::kClusterSize) ^ 1u;
                 if (lane_idx == 0u) {
+                    const auto coop_span = KERNEL_TIMER_BEGIN(
+                        smem->timer.get(), "router_coop_exchange");
                     smem->barriers.router_coop.arrive();
                     Coop::arrive_remote(
                         smem->barriers.router_coop.partner(peer_rank));
+                    KERNEL_TIMER_END(smem->timer.get(), coop_span);
                 }
                 smem->barriers.router_coop.wait();
                 // Copy the partner IDs and weights as 16-byte words.
@@ -413,8 +426,11 @@ struct CollectiveMainloopMoE {
             if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
                 run_router_topk(params, workspace, smem, lane_idx);
                 // Each router CTA has the complete selection.
+                const auto tables_span = KERNEL_TIMER_BEGIN(
+                    smem->timer.get(), "prepare_routing_tables");
                 prepare_routing_tables<Dims>(params.num_tokens, params.top_k,
                                              smem);
+                KERNEL_TIMER_END(smem->timer.get(), tables_span);
                 // Block 0 hands its finished tables to the other blocks.
                 if (blockIdx.x == 0u && WarpRole::get_calc_warp_idx() == 0u) {
                     publish_routing_tables(workspace, smem, lane_idx);
@@ -423,7 +439,10 @@ struct CollectiveMainloopMoE {
         } else if (WarpRole::is_calc_warp(WarpRole::get_warp_idx()) &&
                    WarpRole::get_calc_warp_idx() == 0u) {
             // Copy routing tables after the latent projection finishes.
+            const auto load_span =
+                KERNEL_TIMER_BEGIN(smem->timer.get(), "load_routing_tables");
             load_routing_tables(workspace, smem, lane_idx);
+            KERNEL_TIMER_END(smem->timer.get(), load_span);
         }
     }
 
@@ -512,12 +531,18 @@ struct CollectiveMainloopMoE {
             reinterpret_cast<Workspace*>(params.scratchpad);
         if (WarpRole::is_other_loader_thread()) {
             if constexpr (Traits::kUseLatent) {
+                const auto latent_span =
+                    KERNEL_TIMER_BEGIN(smem->timer.get(), "up_wait_latent");
                 workspace->cta_comm.wait_latent_tasks(
                     smem->launch_parity, Traits::LatentDownGemm::kNumCtas);
                 // Order cross-CTA stores before TMA reads.
                 fence_proxy_async_global();
+                KERNEL_TIMER_END(smem->timer.get(), latent_span);
             }
+            const auto activation_span =
+                KERNEL_TIMER_BEGIN(smem->timer.get(), "up_load_activation");
             load_quantized_activation(workspace, smem);
+            KERNEL_TIMER_END(smem->timer.get(), activation_span);
         }
         RoutedUpProjection<KernelTraits>::run(
             params.expert_scales_up, params.num_tokens, params.activation,
@@ -604,7 +629,7 @@ struct CollectiveMainloopMoE {
             reinterpret_cast<Workspace*>(params.scratchpad);
         const std::uint32_t batch_size = params.num_tokens;
         constexpr std::uint32_t kDownOutputColsPerCta =
-            Traits::DownGemm::MmaCore::kTileShapeM;
+            Traits::RoutedDownGemm::MmaCore::kTileShapeM;
         // Groups partition the cells of m-block cta_idx_in_group.
         if (!cta_group.in_whole_group()) return;
         const std::uint32_t m_block = cta_group.cta_idx_in_group;
@@ -622,13 +647,19 @@ struct CollectiveMainloopMoE {
         for (std::uint32_t flat = first_cell; flat < num_cells;
              flat += cell_stride) {
             const std::uint32_t tok = flat / kDownOutputColsPerCta;
+            const auto wait_span =
+                KERNEL_TIMER_BEGIN(smem->timer.get(), "wait_down_out", tok);
             workspace->cta_comm.wait_down_out_field(
                 smem->launch_parity, m_block,
                 tok * PackedTokenCounts<Dims>::kBits,
                 PackedTokenCounts<Dims>::kMask, top_k);
+            KERNEL_TIMER_END(smem->timer.get(), wait_span);
+            const auto gather_span = KERNEL_TIMER_BEGIN(
+                smem->timer.get(), "gather_and_combine", tok);
             emit_cell(params, workspace, tok,
                       base_col + flat % kDownOutputColsPerCta, top_k,
                       smem->tail_parity);
+            KERNEL_TIMER_END(smem->timer.get(), gather_span);
         }
     }
 

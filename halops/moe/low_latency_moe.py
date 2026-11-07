@@ -46,59 +46,90 @@ class MoEWorkspace:
 
     The kernel has a narrow (1 <= T <= 8) and a wide (9 <= T <= 16)
     schedule; each has its own scratchpad and tail layout, so a workspace is
-    bound to one of them.  ``buffer`` is the head of one NVLS multicast
-    capable symmetric region whose tail part is the fused tail's mailbox.
+    bound to one of them.  ``buffer`` is the scratchpad head of the workspace
+    region whose tail part is the fused tail's mailbox.
     """
 
     buffer: torch.Tensor
     uc_bases: torch.Tensor
     epochs: torch.Tensor
-    rank: int
-    world: int
+    tp_rank: int
+    tp_size: int
     wide: bool
     mc_base: int
     _keepalive: tuple
 
 
-def _workspace_layout(input: Optional[torch.Tensor]):
-    """Return (scratchpad bytes, tail offset, total bytes) of the symmetric region."""
+def _workspace_layout(input: Optional[torch.Tensor], tp_size: int = 1):
+    """Return (scratchpad bytes, tail offset, total bytes) of the workspace."""
+    if tp_size not in (1, 4):
+        raise ValueError(f"tp_size must be 1 or 4, got {tp_size}")
     scratch = int(halops_kernel.moe_get_workspace_size(input))
     offset = -(-scratch // _TAIL_ALIGN) * _TAIL_ALIGN
     if input is None:
-        tail = max(int(halops_kernel.moe_tail_region_bytes(w)) for w in (False, True))
+        tail = max(
+            int(halops_kernel.moe_tail_region_bytes(w, tp_size)) for w in (False, True)
+        )
     else:
-        tail = int(halops_kernel.moe_tail_region_bytes(input.size(0) > _NARROW_TOKENS))
+        tail = int(
+            halops_kernel.moe_tail_region_bytes(input.size(0) > _NARROW_TOKENS, tp_size)
+        )
     return scratch, offset, offset + tail
 
 
 def get_workspace_for_moe(
     input: torch.Tensor,
-    group_name: str,
-    rank: int,
-    world: int,
+    group_name: Optional[str] = None,
+    tp_rank: int = 0,
+    tp_size: int = 1,
 ) -> MoEWorkspace:
     """Allocate the workspace of ``low_latency_moe`` for ``input``'s token count.
 
-    Collective over ``group_name``.  Allocate it once, before any CUDA-graph
-    capture, and reuse it across calls and graph replays; it is returned
-    zero-initialized.  A workspace must always be launched with the same
-    grid.
+    For tp_size 4, allocation is collective over ``group_name``. Allocate it
+    once, before any CUDA-graph capture, and reuse it across calls and graph
+    replays; it is returned zero-initialized. A workspace must always be
+    launched with the same grid.
 
     Args:
         input: [T, 4096] bfloat16 CUDA tensor; T selects the schedule.
         group_name: Name of the torch process group of the tensor-parallel
-            ranks.
-        rank: Rank in that group.
-        world: Size of that group; this build requires 4.
+            ranks. It is unused for a single-rank launch.
+        tp_rank: Rank in that group.
+        tp_size: Size of that group. Supported values are 1 and 4.
 
     Returns:
         The workspace to pass to ``low_latency_moe``.
     """
-    from torch._C._distributed_c10d import _SymmetricMemory
-
     wide = input.size(0) > _NARROW_TOKENS
     device = input.device
-    scratch, offset, nbytes = _workspace_layout(input)
+    if tp_size not in (1, 4):
+        raise ValueError(f"tp_size must be 1 or 4, got {tp_size}")
+    if tp_size == 1 and tp_rank != 0:
+        raise ValueError("tp_rank must be 0 when tp_size is 1")
+    if tp_size == 4 and not group_name:
+        raise ValueError("group_name is required when tp_size is 4")
+    if tp_rank < 0 or tp_rank >= tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
+    scratch, offset, nbytes = _workspace_layout(input, tp_size)
+
+    if tp_size == 1:
+        region = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+        pointer = region.data_ptr() + offset
+        uc_bases = torch.tensor([pointer], dtype=torch.int64, device="cpu")
+        epochs = torch.zeros(1, dtype=torch.int32, device=device)
+        return MoEWorkspace(
+            buffer=region[:scratch],
+            tp_rank=0,
+            tp_size=1,
+            wide=wide,
+            mc_base=pointer,
+            uc_bases=uc_bases,
+            epochs=epochs,
+            _keepalive=(region,),
+        )
+
+    from torch._C._distributed_c10d import _SymmetricMemory
+
     with torch.inference_mode(False):
         region = _SymmetricMemory.empty_strided_p2p(
             (nbytes,), [1], torch.uint8, device, group_name
@@ -107,7 +138,7 @@ def get_workspace_for_moe(
     if handle is None or handle.multicast_ptr == 0:
         raise RuntimeError("the fused tail needs an NVLS multicast-capable region")
     region.zero_()
-    peers = [handle.get_buffer(r, [nbytes], torch.uint8) for r in range(world)]
+    peers = [handle.get_buffer(r, [nbytes], torch.uint8) for r in range(tp_size)]
     uc_bases = torch.tensor(
         [b.data_ptr() + offset for b in peers], dtype=torch.int64, device="cpu"
     )
@@ -116,8 +147,8 @@ def get_workspace_for_moe(
     torch.distributed.barrier()
     return MoEWorkspace(
         buffer=region[:scratch],
-        rank=rank,
-        world=world,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
         wide=wide,
         mc_base=int(handle.multicast_ptr) + offset,
         uc_bases=uc_bases,
@@ -154,6 +185,7 @@ def low_latency_moe(
     eps: float = 1e-6,
     quant_mode: str = "w8a8-blockwise",
     grid_cap: int = 0,
+    tp_size: Optional[int] = None,
 ) -> None:
     """MoE forward pass on Blackwell SM100, support latent.
 
@@ -179,8 +211,8 @@ def low_latency_moe(
 
     where ``routed`` is this rank's combined routed latent and ``shared`` its
     partial shared-expert output (computed in-kernel, kept in ``workspace``).  Both
-    AllReduces run over the tensor-parallel group of ``workspace`` (4 ranks, NVLS
-    multicast).  A scratchpad must always be launched with the same grid, so
+    AllReduces run over the configured tensor-parallel group.  A scratchpad must
+    always be launched with the same grid, so
     keep ``grid_cap`` fixed per workspace; the tail needs the shared-expert
     blocks and its own CTAs inside the grid.
 
@@ -250,10 +282,20 @@ def low_latency_moe(
             Default: "w8a8-blockwise".
         grid_cap (int, optional): Maximum resident CTAs; 0 uses the device
             limit. Keep this fixed for each workspace. Default: 0.
+        tp_size (int, optional): Tensor-parallel size, either 1 or 4.
+            If omitted, use ``workspace.tp_size``. Must match the workspace.
 
     Returns:
         None. The outputs are written in place.
     """
+    if tp_size is None:
+        tp_size = workspace.tp_size
+    if tp_size not in (1, 4):
+        raise ValueError(f"tp_size must be 1 or 4, got {tp_size}")
+    if tp_size != workspace.tp_size:
+        raise ValueError(
+            f"tp_size={tp_size} does not match workspace.tp_size={workspace.tp_size}"
+        )
     _check_workspace(workspace, input.size(0))
     halops_kernel.low_latency_moe(
         input,
@@ -277,7 +319,7 @@ def low_latency_moe(
         out,
         top_k,
         num_router_gates,
-        workspace.rank,
+        workspace.tp_rank,
         workspace.mc_base,
         grid_cap,
         scoring_func,
@@ -287,21 +329,26 @@ def low_latency_moe(
         situ_linear_beta,
         eps,
         quant_mode,
+        tp_size,
     )
 
 
-def get_workspace_size_for_moe(input: Optional[torch.Tensor] = None) -> int:
-    """Return the size in bytes of the workspace's symmetric region for a token count.
+def get_workspace_size_for_moe(
+    input: Optional[torch.Tensor] = None, tp_size: int = 1
+) -> int:
+    """Return the workspace region size in bytes for a token count.
 
     Args:
         input (Tensor, optional): Activations, shape [T, 4096], dtype
             bfloat16. Without it, the larger of the supported schedules is
             returned. Default: None.
+        tp_size (int, optional): Tensor-parallel size, either 1 or 4.
+            Default: 1.
 
     Returns:
         Size in bytes of the scratchpad plus the tail mailbox.
     """
-    return _workspace_layout(input)[2]
+    return _workspace_layout(input, tp_size)[2]
 
 
 def transform_weights_for_moe(

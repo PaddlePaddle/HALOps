@@ -22,6 +22,7 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/tensor.hpp>
 
+#include "common/kernel_timer.hpp"
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/ptx_utils.cuh"
@@ -262,6 +263,9 @@ struct RoutedBarrier<Dims, true> {
         RoutedUpGemmTraits<Dims>::kNumWeightSlots;
     static constexpr std::uint32_t kNumDownWeightSlots =
         RoutedDownGemmTraits<Dims>::kNumWeightSlots;
+    // Up rotates its tasks over these slots; down continues the same ring.
+    static constexpr std::uint32_t kNumAccSlots =
+        RoutedUpGemmTraits<Dims>::kNumAccSlots;
 
     TransactionBarrier<1> up_input_ready;
     TransactionBarrier<kNumUpWeightSlots> up_weight_ready;
@@ -271,8 +275,8 @@ struct RoutedBarrier<Dims, true> {
     TransactionBarrier<kNumDownWeightSlots> down_weight_ready;
     SimpleBarrier<kNumDownWeightSlots> down_weight_empty;
 
-    SimpleBarrier<1> accumulator_ready;
-    SimpleBarrier<1> accumulator_empty;
+    SimpleBarrier<kNumAccSlots> accumulator_ready;
+    SimpleBarrier<kNumAccSlots> accumulator_empty;
 
     __device__ __forceinline__ void init() {
         const int num_warps = static_cast<int>(WarpRole::kCalcWarpCount);
@@ -645,7 +649,8 @@ struct MoESharedStorage {
         RoutingSmem<Dims> routing_scratch;
         SharedExpertSmem<SharedUpGemmTraits<Dims>, SharedDownGemmTraits<Dims>>
             shared_expert;
-        RoutedExpertsSmem<typename Traits::UpGemm, typename Traits::DownGemm>
+        RoutedExpertsSmem<typename Traits::RoutedUpGemm,
+                          typename Traits::RoutedDownGemm>
             routed_experts;
     };
 
@@ -660,13 +665,19 @@ struct MoESharedStorage {
 
     static constexpr uint32_t kMaxDownTasks =
         MoERoutingTables<Dims>::kMaxActiveExperts *
-        Traits::DownGemm::kCtasPerExpert;
+        Traits::RoutedDownGemm::kCtasPerExpert;
     static constexpr uint32_t kNoDownTask = 0xFFFFu;
     static_assert(kMaxDownTasks < kNoDownTask,
                   "down grid task ids must fit in uint16 below the sentinel");
     uint16_t down_grid_task[kMaxDownTasks + 1];
     uint32_t down_tasks_claimed;
     uint32_t down_task_stores;
+
+#if defined(HALOPS_KERNEL_TIMER_ENABLED)
+    halops::KernelTimerStorage timer;
+    static_assert(Dims::KernelConfig::kBlockSize / 32u <= halops::kTimerWarps,
+                  "block has more warps than timer cursors");
+#endif
 };
 
 // Dynamic shared memory required by fused_moe_kernel<Dims>.

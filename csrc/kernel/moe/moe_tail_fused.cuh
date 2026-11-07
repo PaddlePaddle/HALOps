@@ -17,6 +17,7 @@
 
 #include <cstdint>
 
+#include "common/kernel_timer.hpp"
 #include "moe_tail_prims.cuh"
 
 namespace halops::moe {
@@ -183,6 +184,7 @@ struct TailGroup {
     struct Ctx {
         const P& p;
         Sync sync;
+        halops::DeviceTimer timer;
         const DataType::ElementOut* shared;
         uint8_t* xbuf;
         uint8_t* s_wstage;
@@ -206,6 +208,7 @@ struct TailGroup {
                                                    Sync sync) {
         return Ctx{p,
                    sync,
+                   halops::DeviceTimer::ambient(p.timer_events),
                    p.shared_out,
                    p.tail_uc_base[p.tail_rank] + TC::kSlotRegionBytes,
                    scratch + TC::kSmemWStage,
@@ -232,6 +235,7 @@ struct TailGroup {
 
     __device__ static __forceinline__ void stage_weights(const Ctx& c) {
         if constexpr (STAGE != 0) {
+            const auto span = KERNEL_TIMER_BEGIN(c.timer, "tail_stage_weights");
             const uint8_t* wrow0 =
                 reinterpret_cast<const uint8_t*>(c.p.tail_fc2_w8) +
                 (int64_t(c.p.tail_rank) * kShard + int64_t(c.grank) * kRows) *
@@ -243,10 +247,12 @@ struct TailGroup {
             for (int r = int(c.tid); r < kRows; r += int(kThreads))
                 bulk_g2s(c.s_wstage + r * (L + TC::kWStagePad),
                          wrow0 + int64_t(r) * L, L, c.s_wbar);
+            KERNEL_TIMER_END(c.timer, span);
         }
     }
 
     __device__ static __forceinline__ void clear_xbuf(const Ctx& c) {
+        const auto span = KERNEL_TIMER_BEGIN(c.timer, "tail_clear_xbuf");
         if (int(c.tid) < kSliceVec) {
             Vec16 z;
             z.fill(__nv_bfloat162{get_pos_zero<__nv_bfloat16>(),
@@ -254,9 +260,11 @@ struct TailGroup {
             st_global_16B(z, c.xbuf + int64_t(c.parityA ^ 1) * kXBufBytes,
                           c.cta * kSliceVec + c.tid);
         }
+        KERNEL_TIMER_END(c.timer, span);
     }
 
     __device__ static __forceinline__ void zero_inactive_group(const Ctx& c) {
+        const auto span = KERNEL_TIMER_BEGIN(c.timer, "tail_zero_inactive");
         constexpr int kGroupVecs = TPG * (H / int(kVec));
         for (int v = int(c.grank * kThreads + c.tid); v < kGroupVecs;
              v += GSIZE * int(kThreads)) {
@@ -268,16 +276,23 @@ struct TailGroup {
             st_global_16B(z, c.p.tail_out + int64_t(t) * H,
                           uint32_t(v % (H / int(kVec))));
         }
+        KERNEL_TIMER_END(c.timer, span);
     }
 
     __device__ static __forceinline__ void round_a_produce(const Ctx& c) {
+        const auto span = KERNEL_TIMER_BEGIN(c.timer, "tail_a_allreduce_norm");
         const P& p = c.p;
         const uint32_t tid = c.tid;
         uint4 xrow = make_uint4(0u, 0u, 0u, 0u);
         const uint32_t t = c.t0 + c.grank;
         if (t < c.m) {
+            const auto poll_span =
+                KERNEL_TIMER_BEGIN(c.timer, "tail_a_allreduce_wait");
             Vec16 lat = poll_reduce<WORLD, L, H, MAXM>(p, /*round=*/0,
                                                        c.parityA, t, L, tid);
+            KERNEL_TIMER_END(c.timer, poll_span);
+            const auto norm_span =
+                KERNEL_TIMER_BEGIN(c.timer, "tail_a_rmsnorm");
             float sq = 0.f;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -314,6 +329,7 @@ struct TailGroup {
                 }
                 xrow = h;
             }
+            KERNEL_TIMER_END(c.timer, norm_span);
         }
         *reinterpret_cast<uint4*>(
             reinterpret_cast<uint8_t*>(&c.s_x[c.grank * kXStride]) + tid * 16) =
@@ -323,9 +339,11 @@ struct TailGroup {
         if (t < c.m)
             st_global_16B(
                 pv, c.xbuf + (int64_t(c.parityA) * MAXM + t) * (L * 2), tid);
+        KERNEL_TIMER_END(c.timer, span);
     }
 
     __device__ static __forceinline__ void round_a_gather(const Ctx& c) {
+        const auto span = KERNEL_TIMER_BEGIN(c.timer, "tail_a_exchange_gather");
 #pragma unroll
         for (int r = 0; r < TPG; ++r) {
             if (c.grank == uint32_t(r)) continue;
@@ -349,6 +367,7 @@ struct TailGroup {
                 reinterpret_cast<uint8_t*>(&c.s_x[r * kXStride]) + c.tid * 16) =
                 row;
         }
+        KERNEL_TIMER_END(c.timer, span);
     }
 
     __device__ static __forceinline__ uint32_t round_c_vec(const Ctx& c,
@@ -362,19 +381,24 @@ struct TailGroup {
     __device__ static __forceinline__ Vec16 prefetch_round_c(const Ctx& c) {
         Vec16 vpre;
         if constexpr (kPrefetchC) {
+            const auto span =
+                KERNEL_TIMER_BEGIN(c.timer, "tail_c_prefetch_shared");
             const int tt = int(c.tid) / kPer, j = int(c.tid) % kPer;
             if (int(c.tid) < TPG * kPer && c.t0 + tt < c.m) {
                 ld_global_16B(vpre, c.shared + int64_t(c.t0 + tt) * H,
                               round_c_vec(c, j));
             }
+            KERNEL_TIMER_END(c.timer, span);
         }
         return vpre;
     }
 
     __device__ static __forceinline__ void round_b(const Ctx& c) {
+        const auto span = KERNEL_TIMER_BEGIN(c.timer, "tail_b_fc2");
         const P& p = c.p;
         const int64_t row0 =
             int64_t(p.tail_rank) * kShard + int64_t(c.grank) * kRows;
+        const auto gemv_span = KERNEL_TIMER_BEGIN(c.timer, "tail_b_fc2_gemv");
         if constexpr (STAGE != 0) {
             mbar_wait_phase0(c.s_wbar);
             shared_weight_mma_gemv_fp8<TC, L, true>(
@@ -389,6 +413,9 @@ struct TailGroup {
                 reinterpret_cast<const uint16_t*>(c.s_x), kXStride, c.s_part,
                 c.tid >> 5, c.tid & 31);
         }
+        KERNEL_TIMER_END(c.timer, gemv_span);
+        const auto reduce_span =
+            KERNEL_TIMER_BEGIN(c.timer, "tail_b_fc2_reduce");
         c.sync();
         for (int i = c.tid; i < TPG * kRows; i += kThreads) {
             float a = 0.f;
@@ -398,11 +425,15 @@ struct TailGroup {
             c.s_col[i] = a;
         }
         c.sync();
+        KERNEL_TIMER_END(c.timer, reduce_span);
+        KERNEL_TIMER_END(c.timer, span);
     }
 
     // Round C: distributed combine (shard result + shared partial) + AllReduce,
     __device__ static __forceinline__ void round_c(const Ctx& c,
                                                    const Vec16& vpre) {
+        const auto span =
+            KERNEL_TIMER_BEGIN(c.timer, "tail_c_combine_allreduce");
         const P& p = c.p;
         for (int i = int(c.tid); i < TPG * kPer; i += int(kThreads)) {
             const int tt = i / kPer, j = i % kPer;
@@ -429,8 +460,16 @@ struct TailGroup {
                                                H, hv);
             st_global_16B(v, p.tail_out + int64_t(t) * H, hv);
         }
+        KERNEL_TIMER_END(c.timer, span);
     }
 
+    // The fused tail runs three rounds over the latent exchange buffer:
+    //   A  AllReduce the WORLD partials of each token's routed latent,
+    //      RMSNorm the sum, and exchange the normalized rows among the TPG
+    //      CTAs that share this token group.
+    //   B  fc2 GEMV: this CTA's kRows output rows of the hidden shard.
+    //   C  Add the shared-expert partial, AllReduce the full hidden band
+    //      across WORLD, and store `tail_out`.
     __device__ static __forceinline__ void run(const P& p, uint32_t cta,
                                                uint32_t tid, uint8_t* scratch,
                                                Sync sync,

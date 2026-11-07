@@ -229,6 +229,8 @@ def _backend_versions(name: str) -> list[tuple[str, str]]:
 
     if base == "halops":
         return [("halops", f"commit {get_halops_commit()}")]
+    if base == "golden":
+        return [("torch", get_torch_version())]
     if base == "cudnn":
         return [("cudnn", get_cudnn_version())]
     if base in {"deepgemm", "deep_gemm"}:

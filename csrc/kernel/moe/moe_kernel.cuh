@@ -50,8 +50,8 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     assert(blockDim.x == Dims::KernelConfig::kBlockSize);
     assert(blockDim.y == 1 && blockDim.z == 1);
 
-    assert(gridDim.x >= MoEKernelTraits<Dims>::kMinGrid);
-    assert(gridDim.x <= MoEKernelTraits<Dims>::kMaxGrid);
+    assert(gridDim.x >= Traits::kMinGrid);
+    assert(gridDim.x <= Traits::kMaxGrid);
     assert(gridDim.y == 1 && gridDim.z == 1);
 
     assert(mainloop_params.num_tokens <= Dims::kNumTokens);
@@ -68,17 +68,29 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
 
     const std::uint32_t warp_idx = WarpRole::get_warp_idx();
 
+#if defined(HALOPS_KERNEL_TIMER_ENABLED)
+    smem->timer.init(mainloop_params.timer_events);
+#endif
+
+    KERNEL_TIMER_CALIBRATE(smem->timer.get());
+    const auto kernel_span =
+        KERNEL_TIMER_BEGIN(smem->timer.get(), "fused_moe_kernel");
+
     using Workspace = MoEWorkspace<Dims>;
     Workspace* __restrict__ workspace =
         reinterpret_cast<Workspace*>(mainloop_params.scratchpad);
 
     // Initialize the launcher-thread states and publish to all warps.
+    const auto init_span = KERNEL_TIMER_BEGIN(smem->timer.get(), "initialize");
     collective_mainloop.initialize(mainloop_params, smem);
+    KERNEL_TIMER_END(smem->timer.get(), init_span);
     if (threadIdx.x == 0) {
         smem->tail_parity = __ldcg(mainloop_params.tail_epochs) & 1u;
     }
 
     // Run routing, latent projection and the shared expert on separate CTAs.
+    const auto prologue_span =
+        KERNEL_TIMER_BEGIN(smem->timer.get(), "prologue_phase");
     collective_mainloop.run_latent_down(mainloop_params, smem);
     collective_mainloop.run_shared(mainloop_params, smem);
     collective_mainloop.run_router(mainloop_params, smem);
@@ -87,31 +99,46 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     if (WarpRole::is_weight_loader_thread()) {
         CollectiveMainloop::Router::release_weight_smem();
     }
+    KERNEL_TIMER_END(smem->timer.get(), prologue_span);
 
     // Each thread follows the same projection task sequence.
     TaskScheduler<Traits> sched(smem, workspace);
 
     // Run up-projection tasks assigned to this expert group and feature block.
     sched.begin_phase(BlockPhase::kUp, smem->routing.active_expert_count);
+    const auto up_span =
+        KERNEL_TIMER_BEGIN(smem->timer.get(), "routed_up_phase",
+                           smem->routing.active_expert_count);
     if (sched.is_active()) {
         collective_mainloop.run_up(mainloop_params, smem, sched);
     }
+    KERNEL_TIMER_END(smem->timer.get(), up_span);
 
     // Run down-projection tasks and publish their completion counts.
     sched.begin_phase(BlockPhase::kDown, smem->routing.active_expert_count);
+    const auto down_span =
+        KERNEL_TIMER_BEGIN(smem->timer.get(), "routed_down_phase",
+                           smem->routing.active_expert_count);
     collective_mainloop.run_down(mainloop_params, smem, sched);
+    KERNEL_TIMER_END(smem->timer.get(), down_span);
 
     collective_mainloop.prefetch_tail_weights(mainloop_params);
     // Phase 4: gather and combine each token's top_k combine slots.
+    const auto combine_span =
+        KERNEL_TIMER_BEGIN(smem->timer.get(), "combine_phase");
     collective_mainloop.combine(mainloop_params, smem, sched.cta_group());
+    KERNEL_TIMER_END(smem->timer.get(), combine_span);
 
     // Phase 5: the latent moe tail.
+    const auto tail_span = KERNEL_TIMER_BEGIN(smem->timer.get(), "tail_phase");
     collective_mainloop.run_tail(mainloop_params, smem, sched.cta_group());
+    KERNEL_TIMER_END(smem->timer.get(), tail_span);
 
     __syncthreads();
     if (WarpRole::is_tmem_warp(warp_idx)) {
-        tmem_free(smem->tmem_ptr, MoEKernelTraits<Dims>::kTmemColumns);
+        tmem_free(smem->tmem_ptr, Traits::kTmemColumns);
     }
+    KERNEL_TIMER_END(smem->timer.get(), kernel_span);
 }
 
 template <typename MoEDims>

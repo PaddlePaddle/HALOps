@@ -17,7 +17,7 @@
 from __future__ import annotations
 import csv
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from core.metrics import BenchmarkMetrics
 
 
@@ -65,6 +65,38 @@ class GemmRowResult:
     mismatch_pct: float | None = None  # refcheck mismatch percentage
 
 
+@dataclass
+class MoeRowResult:
+    """Single latent MoE benchmark result row with scenario parameters."""
+
+    scenario: str
+    backend: str
+    tokens: int
+    top_k: int
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+    latent_size: int
+    tp_size: int
+    quant_mode: str
+    dtype: str
+    metrics: BenchmarkMetrics
+    refcheck_pass: bool | None
+    active_experts: int | None = None
+    activation: str = "silu"
+    scoring_func: str = "sigmoid"
+    renormalize: bool = True
+    grid_cap: int = 0
+    use_cuda_graph: bool = False
+    max_atol: float | None = None
+    avg_atol: float | None = None
+    refcheck_atol: float = 0.15
+    refcheck_rtol: float = 0.15
+    case_tag: str = ""
+    status: str = "OK"
+    mismatch_pct: float | None = None
+
+
 _COMMON_FIELDS = [
     "median_us",
     "std_us",
@@ -106,6 +138,32 @@ _GEMM_CSV_FIELDS = [
     "k",
     "mode",
     *_COMMON_FIELDS,
+    "case_tag",
+    "status",
+]
+_MOE_CSV_FIELDS = [
+    "scenario",
+    "backend",
+    "tokens",
+    "top_k",
+    "num_experts",
+    "active_experts",
+    "hidden_size",
+    "intermediate_size",
+    "latent_size",
+    "tp_size",
+    "quant_mode",
+    "dtype",
+    "activation",
+    "scoring_func",
+    "renormalize",
+    "grid_cap",
+    "use_cuda_graph",
+    *_COMMON_FIELDS,
+    "max_atol",
+    "avg_atol",
+    "refcheck_atol",
+    "refcheck_rtol",
     "case_tag",
     "status",
 ]
@@ -154,7 +212,30 @@ def gemm_scenario_str(
     return f"scenario: {scenario} | {experts}{per_expert}m={m} | n={n} | k={k} | mode={mode}"
 
 
-def scenario_header_str(row: AttnRowResult | GemmRowResult) -> str:
+def moe_scenario_str(
+    scenario: str,
+    tokens: int,
+    top_k: int,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    latent_size: int,
+    tp_size: int,
+    quant_mode: str,
+    active_experts: int | None = None,
+) -> str:
+    """Format a latent MoE scenario descriptor for logs and reports."""
+    active = f" | active_E={active_experts}" if active_experts is not None else ""
+    return (
+        f"scenario: {scenario} | tokens={tokens} | top_k={top_k}"
+        f" | E={num_experts}{active} | H={hidden_size} | N={intermediate_size}"
+        f" | L={latent_size} | tp_size={tp_size} | mode={quant_mode}"
+    )
+
+
+def scenario_header_str(
+    row: AttnRowResult | GemmRowResult | MoeRowResult,
+) -> str:
     """Format scenario descriptor plus per-scenario arithmetic intensity."""
     if isinstance(row, GemmRowResult):
         s = gemm_scenario_str(
@@ -165,6 +246,19 @@ def scenario_header_str(row: AttnRowResult | GemmRowResult) -> str:
             row.mode,
             row.num_experts,
             row.max_m,
+        )
+    elif isinstance(row, MoeRowResult):
+        s = moe_scenario_str(
+            row.scenario,
+            row.tokens,
+            row.top_k,
+            row.num_experts,
+            row.hidden_size,
+            row.intermediate_size,
+            row.latent_size,
+            row.tp_size,
+            row.quant_mode,
+            row.active_experts,
         )
     else:
         s = attention_scenario_str(
@@ -185,17 +279,16 @@ def scenario_header_str(row: AttnRowResult | GemmRowResult) -> str:
     )
 
 
-def print_scenario_header(row: AttnRowResult | GemmRowResult) -> None:
+def print_scenario_header(
+    row: AttnRowResult | GemmRowResult | MoeRowResult,
+) -> None:
     """Print scenario descriptor line, auto-dispatching by row type."""
     print(f"\n{scenario_header_str(row)}")
 
 
-def table_header_str() -> str:
+def table_header_str(include_dispatch: bool = True) -> str:
     """Return header + rule as a single string for the benchmark table."""
-    _HEADER_FMT = (
-        "{:<20} {:>10} {:>8} {:>8} {:>8} {:>8} {:>7} {:>12} {:>10} {:>10} {:>10} {:>8}"
-    )
-    h = _HEADER_FMT.format(
+    labels = [
         "backend",
         "median(us)",
         "std(us)",
@@ -205,9 +298,18 @@ def table_header_str() -> str:
         "BW%",
         "roof_util%",
         "host(us)",
-        "disp(us)",
-        "mismatch%",
-        "status",
+    ]
+    # One width per label, matching the fields of `_ROW_FMT` / `_FAIL_FMT`
+    # below, and one space between columns so the header lines up with them.
+    widths = [20, 10, 8, 8, 8, 8, 7, 12, 10]
+    if include_dispatch:
+        labels.append("disp(us)")
+        widths.append(10)
+    labels += ["mismatch%", "status"]
+    widths += [10, 8]
+    h = " ".join(
+        f"{label:<{width}}" if index == 0 else f"{label:>{width}}"
+        for index, (label, width) in enumerate(zip(labels, widths))
     )
     return h + "\n" + "-" * len(h)
 
@@ -231,34 +333,32 @@ def format_row_str(
     refcheck_pass=None,
     status: str = "OK",
     mismatch_pct: float | None = None,
+    include_dispatch: bool = True,
 ) -> str:
     """Format a single benchmark row as a fixed-width string."""
     tag = ""
     if refcheck_pass is False:
         tag = " [!]"
     if status != "OK":
-        _FAIL_FMT = "{:<20} {:>10} {:>8} {:>8} {:>8} {:>8} {:>7} {:>12} {:>10} {:>10} {:>10} {:>8}"
-        mismatch_str = f"{mismatch_pct:.1f}%" if mismatch_pct is not None else "N/A"
-        return _FAIL_FMT.format(
-            backend + tag,
-            "-",
-            "-",
-            "-",
-            "-",
-            "-",
-            "-",
-            "-",
-            "-",
-            "-",
-            mismatch_str,
-            status,
+        _FAIL_FMT = (
+            "{:<20} {:>10} {:>8} {:>8} {:>8} {:>8} {:>7} {:>12} "
+            + ("{:>10} " if include_dispatch else "")
+            + "{:>10} {:>8}"
         )
+        mismatch_str = f"{mismatch_pct:.1f}%" if mismatch_pct is not None else "N/A"
+        values = [backend + tag] + ["-"] * 7
+        if include_dispatch:
+            values.append("-")
+        values += [mismatch_str, status]
+        return _FAIL_FMT.format(*values)
     _ROW_FMT = (
         "{:<20} {:>10.3f} {:>8.3f} {:>7.2f}x {:>8.2f} {:>8.3f} {:>6.1f}% "
-        "{:>11.1f}% {:>10.3f} {:>10.3f} {:>10} {:>8}"
+        "{:>11.1f}% {:>10.3f} "
+        + ("{:>10.3f} " if include_dispatch else "")
+        + "{:>10} {:>8}"
     )
     mismatch_str = f"{mismatch_pct:.1f}%" if mismatch_pct is not None else "N/A"
-    return _ROW_FMT.format(
+    values = [
         backend + tag,
         median_us,
         std_us,
@@ -268,13 +368,14 @@ def format_row_str(
         bw_pct,
         attainable_pct,
         host_us,
-        dispatch_us,
-        mismatch_str,
-        status,
-    )
+    ]
+    if include_dispatch:
+        values.append(dispatch_us)
+    values += [mismatch_str, status]
+    return _ROW_FMT.format(*values)
 
 
-def print_table_row(row: AttnRowResult | GemmRowResult) -> None:
+def print_table_row(row: AttnRowResult | GemmRowResult | MoeRowResult) -> None:
     """Print one benchmark result row; appends [!] if refcheck failed."""
     status = row.status if hasattr(row, "status") else "OK"
     mismatch_pct = row.mismatch_pct if hasattr(row, "mismatch_pct") else None
@@ -381,3 +482,16 @@ def append_gemm_csv(row: GemmRowResult, output_path: str) -> None:
                 "status": row.status,
             }
         )
+
+
+def append_moe_csv(row: MoeRowResult, output_path: str) -> None:
+    """Append one latent MoE result, including timing and BF16 accuracy."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    write_header = not os.path.exists(output_path)
+    values = asdict(row)
+    values.update(values.pop("metrics"))
+    with open(output_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_MOE_CSV_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(values)
