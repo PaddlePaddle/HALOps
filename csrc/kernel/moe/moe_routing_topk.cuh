@@ -353,11 +353,20 @@ __device__ static __forceinline__ float key_score(uint32_t key) {
     return __uint_as_float((key & 0x80000000u) ? (key & 0x7FFFFFFFu) : ~key);
 }
 
+// The routed scaling of `expert`: 1 without a per-expert scale.
+__device__ static __forceinline__ float expert_scale(
+    const float* __restrict__ per_expert_scale, uint32_t expert) {
+    return per_expert_scale != nullptr ? __ldg(per_expert_scale + expert)
+                                       : 1.0f;
+}
+
 // Scan each lane's remaining scores; ties select the lowest expert ID.
 template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
 __device__ static void topk_weights_from_scores_fp32_scan(
     uint32_t token, uint32_t top_k, bool renormalize,
-    const float (&scores)[kExpertsPerThread], uint16_t* topk_ids,
+    const float* __restrict__ per_expert_scale,
+    const float (&scores)[kExpertsPerThread],
+    const float (&weights)[kExpertsPerThread], uint16_t* topk_ids,
     float* topk_weights) {
     static_assert((kExpertsPerThread & (kExpertsPerThread - 1u)) == 0u,
                   "a lane's best is the root of a binary tree");
@@ -371,6 +380,7 @@ __device__ static void topk_weights_from_scores_fp32_scan(
 
     uint16_t* const ids = topk_ids + token * kMaxTopk;
     float my_score = 0.0f;
+    uint32_t my_expert = 0u;
 #pragma unroll 1
     for (uint32_t k = 0; k < top_k; k++) {
         // The lane's best, ties to the lower index: a tree whose ties go left.
@@ -393,7 +403,18 @@ __device__ static void topk_weights_from_scores_fp32_scan(
         const uint32_t top = __reduce_max_sync(0xFFFFFFFFu, best[0]);
         const uint32_t winner =
             __ffs(__ballot_sync(0xFFFFFFFFu, best[0] == top)) - 1u;
-        if (lane_idx == k) my_score = key_score(top);
+        const uint32_t expert = lane_idx * kExpertsPerThread + at[0];
+        float winner_weight = 0.0f;
+#pragma unroll
+        for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
+            winner_weight = at[0] == i ? weights[i] : winner_weight;
+        }
+        winner_weight = __shfl_sync(0xFFFFFFFFu, winner_weight, winner);
+        const uint32_t winner_expert = __shfl_sync(0xFFFFFFFFu, expert, winner);
+        if (lane_idx == k) {
+            my_score = winner_weight;
+            my_expert = winner_expert;
+        }
         // The winning lane records and removes its expert.
         const bool won = lane_idx == winner;
         if (won) {
@@ -413,7 +434,8 @@ __device__ static void topk_weights_from_scores_fp32_scan(
         inv = (sum > 0.0f) ? (1.0f / sum) : 1.0f;
     }
     if (lane_idx < top_k) {
-        topk_weights[token * kMaxTopk + lane_idx] = my_score * inv;
+        topk_weights[token * kMaxTopk + lane_idx] =
+            my_score * inv * expert_scale(per_expert_scale, my_expert);
     }
 }
 
@@ -422,7 +444,9 @@ __device__ static void topk_weights_from_scores_fp32_scan(
 template <uint32_t kExpertsPerThread, uint32_t kMaxTopk>
 __device__ static void topk_weights_from_scores_fp32(
     uint32_t token, uint32_t top_k, bool renormalize,
-    const float (&scores)[kExpertsPerThread], uint16_t* topk_ids,
+    const float* __restrict__ per_expert_scale,
+    const float (&scores)[kExpertsPerThread],
+    const float (&weights)[kExpertsPerThread], uint16_t* topk_ids,
     float* topk_weights) {
     // A lane wins at most top_k rounds, so kKeep heads suffice.
     constexpr uint32_t kKeep =
@@ -443,7 +467,8 @@ __device__ static void topk_weights_from_scores_fp32(
     }
     if (__any_sync(0xFFFFFFFFu, repeated)) {
         topk_weights_from_scores_fp32_scan<kExpertsPerThread, kMaxTopk>(
-            token, top_k, renormalize, scores, topk_ids, topk_weights);
+            token, top_k, renormalize, per_expert_scale, scores, weights,
+            topk_ids, topk_weights);
         return;
     }
 
@@ -476,7 +501,15 @@ __device__ static void topk_weights_from_scores_fp32(
     for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
         at = __shfl_sync(0xFFFFFFFFu, key[i], my_lane) == my_key ? i : at;
     }
-    const float my_score = lane_idx < top_k ? key_score(my_key) : 0.0f;
+
+    float weight = 0.0f;
+#pragma unroll
+    for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
+        const float w = __shfl_sync(0xFFFFFFFFu, weights[i], my_lane);
+        weight = at == i ? w : weight;
+    }
+    const float my_score = lane_idx < top_k ? weight : 0.0f;
+    const uint32_t my_expert = my_lane * kExpertsPerThread + at;
     float inv = 1.0f;
     if (renormalize) {
         const float sum = sum_over_ranks<kMaxTopk>(my_score, top_k);
@@ -484,8 +517,9 @@ __device__ static void topk_weights_from_scores_fp32(
     }
     if (lane_idx < top_k) {
         topk_ids[token * kMaxTopk + lane_idx] =
-            static_cast<uint16_t>(my_lane * kExpertsPerThread + at);
-        topk_weights[token * kMaxTopk + lane_idx] = my_score * inv;
+            static_cast<uint16_t>(my_expert);
+        topk_weights[token * kMaxTopk + lane_idx] =
+            my_score * inv * expert_scale(per_expert_scale, my_expert);
     }
 }
 
@@ -493,7 +527,9 @@ __device__ static void topk_weights_from_scores_fp32(
 template <typename Dims, uint32_t kExpertsPerThread>
 __device__ static void topk_one_token(
     uint32_t token_idx, uint32_t top_k, ScoringFunc scoring_func,
-    bool renormalize, const MoEWorkspace<Dims>* __restrict__ workspace,
+    bool renormalize, const float* __restrict__ correction_bias,
+    const float* __restrict__ per_expert_scale,
+    const MoEWorkspace<Dims>* __restrict__ workspace,
     MoESharedStorage<Dims>* smem) {
     static_assert(
         Dims::kNumTokens * Dims::kNumExperts < UINT32_MAX,
@@ -530,9 +566,17 @@ __device__ static void topk_one_token(
         for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
             hi[i] += lo[i];
         }
+
+        float choice[kExpertsPerThread];
+#pragma unroll
+        for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
+            choice[i] = hi[i] + (correction_bias != nullptr
+                                     ? __ldg(correction_bias + expert_id[i])
+                                     : 0.0f);
+        }
         topk_weights_from_scores_fp32<kExpertsPerThread, kMaxTopk>(
-            token_idx, top_k, renormalize, hi, smem->routing_scratch.topk_ids,
-            smem->routing_scratch.topk_weights);
+            token_idx, top_k, renormalize, per_expert_scale, choice, hi,
+            smem->routing_scratch.topk_ids, smem->routing_scratch.topk_weights);
         return;
     }
 

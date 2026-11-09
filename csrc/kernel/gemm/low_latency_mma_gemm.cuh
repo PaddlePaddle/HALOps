@@ -609,8 +609,8 @@ inline void LaunchLlKernel(LlGemmParams params, const LlTileSpec& tile,
 
     HALOPS_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
-    LaunchKernelWithPdl(kernel, dim3(grid), dim3(threads), smem_bytes, stream,
-                        use_pdl, params);
+    LaunchKernelWithPdl(kernel, dim3(grid), dim3(threads), kNoCluster,
+                        smem_bytes, stream, use_pdl, params);
 }
 
 }  // namespace halops
