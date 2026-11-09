@@ -51,6 +51,5 @@ def run_low_latency_moe(inp: dict):
         eps=inp["eps"],
         quant_mode=inp["quant_mode"],
         grid_cap=inp["grid_cap"],
-        tp_size=inp["tp_size"],
     )
     return inp["out"]

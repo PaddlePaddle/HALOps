@@ -134,10 +134,10 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr MmaKind kRouterMma = MmaKind::kHmma;
         // LatentDown configs.
         static constexpr std::uint32_t kNumLatentDownWeightSlots = 8;
-        static constexpr std::uint32_t kNumCtasForLatentDown = 64;
+        static constexpr std::uint32_t kNumCtasForLatentDown = 32;
         static constexpr bool kLatentDownUseSplitK = true;
         // SharedExpert configs.
-        static constexpr std::uint32_t kNumCtasForShared = 16;
+        static constexpr std::uint32_t kNumCtasForShared = 32;
         static constexpr std::uint32_t kNumSharedUpWeightSlots = 4;
         static constexpr std::uint32_t kNumSharedDownWeightSlots = 4;
         static constexpr bool kSharedUseSplitK = true;
@@ -175,7 +175,7 @@ struct Dims_BS16_E512_N512_K2048_SM100
         static constexpr std::uint32_t kNumRouterInputSlots = 16;
         static constexpr MmaKind kRouterMma = MmaKind::kHmma;
         // LatentDown configs.
-        static constexpr std::uint32_t kNumCtasForLatentDown = 64;
+        static constexpr std::uint32_t kNumCtasForLatentDown = 32;
         static constexpr std::uint32_t kNumLatentDownWeightSlots = 8;
         static constexpr bool kLatentDownUseSplitK = true;
         // SharedExpert configs.

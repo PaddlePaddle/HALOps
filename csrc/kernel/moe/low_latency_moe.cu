@@ -200,10 +200,6 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
     CheckSharedExpertShape<MoEDims>(shared_up_weight, shared_down_weight);
     CheckTailFc2Shape<MoEDims>(tail_fc2_weight, tail_fc2_scale);
     CheckRoutingVectors<MoEDims>(correction_bias, per_expert_scale);
-    TORCH_CHECK(tail_uc_bases.dim() == 1 &&
-                    tail_uc_bases.numel() ==
-                        static_cast<int64_t>(MoEDims::KernelConfig::kTailWorld),
-                "tail_uc_bases must contain one pointer per TP rank.");
 
     using Traits = moe::MoEKernelTraits<MoEDims>;
     using Mainloop = moe::CollectiveMainloopMoE<Traits>;
@@ -388,9 +384,6 @@ void LowLatencyMoE(
     }
     TORCH_CHECK(tp_size == 1 || tp_size == 4, "tp_size must be 1 or 4, got ",
                 tp_size, ".");
-    TORCH_CHECK(
-        tail_uc_bases.dim() == 1 && tail_uc_bases.numel() == tp_size,
-        "tail_uc_bases must contain one pointer per configured TP rank.");
 
     const int64_t scoring_type = scoring_func == "sigmoid" ? 0 : 1;
     const int64_t activation_type = activation == "silu" ? 0 : 1;

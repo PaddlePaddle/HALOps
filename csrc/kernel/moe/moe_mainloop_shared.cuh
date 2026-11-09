@@ -881,7 +881,8 @@ struct SharedDownProjection<KernelTraits, false>
 
         smem->barriers.shared_down.accumulator_ready.wait(0u);
 #pragma unroll
-        for (std::uint32_t atom = 0; atom < 2u; ++atom) {
+        for (std::uint32_t atom = 0; atom < SharedDownGemm::MmaCore::kNumAtomMs;
+             ++atom) {
 #pragma unroll
             for (std::uint32_t group = 0;
                  group < SharedDownGemm::kTileShapeN / 8u; ++group) {
@@ -900,8 +901,9 @@ struct SharedDownProjection<KernelTraits, false>
                                     SharedDownGemm::kTileShapeN +
                                 s * SharedDownGemm::kTileShapeN + group * 8u,
                             lane_base, v);
+                        // One scale row per 128 output rows.
                         const float ws =
-                            down_scale[(Base::cta_idx() * 2u + atom) *
+                            down_scale[(Base::row_base() / 128u + atom) *
                                            Base::kDownTilesK +
                                        t];
                         Base::dequant(v,

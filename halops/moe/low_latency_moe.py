@@ -79,9 +79,9 @@ def _workspace_layout(input: Optional[torch.Tensor], tp_size: int = 1):
 
 def get_workspace_for_moe(
     input: torch.Tensor,
-    group_name: Optional[str] = None,
-    tp_rank: int = 0,
-    tp_size: int = 1,
+    group_name: str,
+    tp_rank: int,
+    tp_size: int,
 ) -> MoEWorkspace:
     """Allocate the workspace of ``low_latency_moe`` for ``input``'s token count.
 
@@ -104,12 +104,6 @@ def get_workspace_for_moe(
     device = input.device
     if tp_size not in (1, 4):
         raise ValueError(f"tp_size must be 1 or 4, got {tp_size}")
-    if tp_size == 1 and tp_rank != 0:
-        raise ValueError("tp_rank must be 0 when tp_size is 1")
-    if tp_size == 4 and not group_name:
-        raise ValueError("group_name is required when tp_size is 4")
-    if tp_rank < 0 or tp_rank >= tp_size:
-        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
     scratch, offset, nbytes = _workspace_layout(input, tp_size)
 
     if tp_size == 1:
@@ -187,7 +181,6 @@ def low_latency_moe(
     eps: float = 1e-6,
     quant_mode: str = "w4a8-mxfp4",
     grid_cap: int = 0,
-    tp_size: Optional[int] = None,
     use_pdl: bool = True,
 ) -> None:
     """MoE forward pass on Blackwell SM100, support latent.
@@ -277,7 +270,8 @@ def low_latency_moe(
             no scaling.
         out (Tensor): [T, 4096] bfloat16 output, identical across ranks.
         workspace (MoEWorkspace): Scratchpad and tail communication state
-            from ``get_workspace_for_moe``, matching the token schedule.
+            from ``get_workspace_for_moe``, matching the token schedule. It
+            also fixes the tensor-parallel size and rank of the launch.
         top_k (int): Experts selected per token, in [1, 10].
         num_router_gates (int, optional): Router gates merged into
             ``router_weight``; this build requires 2. Default: 2.
@@ -298,8 +292,6 @@ def low_latency_moe(
             Default: "w4a8-mxfp4".
         grid_cap (int, optional): Maximum resident CTAs; 0 uses the device
             limit. Keep this fixed for each workspace. Default: 0.
-        tp_size (int, optional): Tensor-parallel size, either 1 or 4.
-            If omitted, use ``workspace.tp_size``. Must match the workspace.
         use_pdl (bool, optional): Launch with Programmatic Dependent Launch, so
             the kernel's setup overlaps the previous kernel's tail. It waits for
             that kernel before touching shared state, and lets the next kernel
@@ -308,14 +300,6 @@ def low_latency_moe(
     Returns:
         None. The outputs are written in place.
     """
-    if tp_size is None:
-        tp_size = workspace.tp_size
-    if tp_size not in (1, 4):
-        raise ValueError(f"tp_size must be 1 or 4, got {tp_size}")
-    if tp_size != workspace.tp_size:
-        raise ValueError(
-            f"tp_size={tp_size} does not match workspace.tp_size={workspace.tp_size}"
-        )
     _check_workspace(workspace, input.size(0))
     halops_kernel.low_latency_moe(
         input,
@@ -351,7 +335,7 @@ def low_latency_moe(
         situ_linear_beta,
         eps,
         quant_mode,
-        tp_size,
+        workspace.tp_size,
         use_pdl,
     )
 

@@ -226,7 +226,7 @@ def adapt_halops(raw: MoeInput) -> dict:
         "input": raw.input,
         "out": torch.empty_like(raw.input),
         "num_router_gates": 2,
-        "workspace": get_workspace_for_moe(raw.input, tp_size=raw.options["tp_size"]),
+        "workspace": get_workspace_for_moe(raw.input, None, 0, raw.options["tp_size"]),
     }
 
 
