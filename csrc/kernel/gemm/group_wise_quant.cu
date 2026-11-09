@@ -20,7 +20,6 @@
 #include <stdint.h>
 
 #include <algorithm>
-#include <cfloat>
 #include <cmath>
 #include <cstdlib>
 #include <optional>
@@ -60,25 +59,10 @@ QuantMode ParseQuantMode(const std::string& mode) {
     return QuantMode::W4A4NVFP4;
 }
 
-// Two FP4 E2M1 codes (x in the low nibble), rounded to nearest with ties away
-// from zero and -0 coded as +0. cvt rounds ties to even, so the inputs are
-// first moved off the midpoints: kExactInputs (bf16 / fp16 times a power of
-// two, at most 11 significant bits) cannot lie within an ulp below a midpoint,
-// so the caller scales them by 1 + FLT_EPSILON; otherwise the midpoints that
-// would round down to an even code (0.25, 1.25, 2.5, 5) are moved one ulp up.
-template <bool kExactInputs>
+// Two FP4 E2M1 codes (x in the low nibble), rounded to nearest even with -0
+// coded as +0.
 __device__ __forceinline__ uint8_t quantize_to_fp4x2(float2 v) {
-    const auto away = [](float x) {
-        const uint32_t b = __float_as_uint(x);
-        const uint32_t a = b & 0x7fffffffu;
-        const bool tie =
-            ((a - 0x3fa00000u) & ~0x01800000u) == 0 || a == 0x3e800000u;
-        return __uint_as_float(b + tie);
-    };
     v = __fadd2_rn(v, make_float2(0.0f, 0.0f));
-    if constexpr (!kExactInputs) {
-        v = make_float2(away(v.x), away(v.y));
-    }
     return __nv_cvt_float2_to_fp4x2(v, __NV_E2M1, cudaRoundNearest);
 }
 
@@ -194,13 +178,11 @@ __global__ void group_wise_quant_kernel(
                 inv_scale = 1.0f / ue4m3_to_float32(scale_byte);
             } else {
                 scale_byte = mxfp8::ue8m0_scale(amax / FP4_E2M1_MAX, inv_scale);
-                inv_scale *= 1.0f + FLT_EPSILON;
             }
-            constexpr bool kExactInputs = MODE == QuantMode::W4A4MXFP4;
             uint8_t fp4[GROUP_SIZE / 2];
 #pragma unroll
             for (int i = 0; i < GROUP_SIZE; i += 2) {
-                fp4[i / 2] = quantize_to_fp4x2<kExactInputs>(make_float2(
+                fp4[i / 2] = quantize_to_fp4x2(make_float2(
                     fminf(fmaxf(vals[i] * inv_scale, -FP4_E2M1_MAX),
                           FP4_E2M1_MAX),
                     fminf(fmaxf(vals[i + 1] * inv_scale, -FP4_E2M1_MAX),

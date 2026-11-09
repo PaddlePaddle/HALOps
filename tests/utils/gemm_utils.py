@@ -85,8 +85,8 @@ def ulp_diff(a, b):
 
 
 def per_token_cast_to_fp8(x, block_size=32, *, amax_floor=1e-4):
-    """Quantize an (m, k) bfloat16 tensor to float8_e4m3fn at block_size granularity along k."""
-    assert x.dtype == torch.bfloat16
+    """Quantize an (m, k) BF16 or FP32 tensor to float8_e4m3fn per block."""
+    assert x.dtype in (torch.bfloat16, torch.float32)
     m, k = x.shape
     assert k % block_size == 0, f"k({k}) must be divisible by block_size({block_size})"
 
