@@ -444,8 +444,10 @@ struct WeightScaleStorage<GemmTraits, false> {
 template <typename GemmTraits>
 struct WeightScaleStorage<GemmTraits, true> {
     static constexpr std::uint32_t kNumSlots = GemmTraits::kNumWeightSlots;
+    // A natural-scale slot stages the gate and up atoms side by side.
     static constexpr std::uint32_t kScaleCols =
-        GemmTraits::MmaCore::ScaleTraits::kSfaSmemBytes;
+        GemmTraits::MmaCore::ScaleTraits::kSfaSmemBytes *
+        (GemmTraits::kScaleLayout == ScaleLayout::kNaturalAtom ? 2u : 1u);
     alignas(128) std::uint8_t scale[kNumSlots][kScaleCols];
 
     __device__ auto& operator[](std::uint32_t slot) { return scale[slot]; }
@@ -552,8 +554,11 @@ struct LatentDownSmem {
         GemmTraits::InputQuant::kBlockSize, GemmTraits::InputQuant::kMethod>
         quantized_input;
 
-    // MX stages SfAtoms here; blockwise reads scales directly from gmem.
-    WeightScaleStorage<GemmTraits> w_latent_down_scale;
+    // MXFP8: this CTA's 128-row SfAtom scale slab.
+    static constexpr std::uint32_t kSfaSlabBytes =
+        GemmTraits::MmaCore::kUseBlockscaled ? 128u * (GemmTraits::kGemmK / 32u)
+                                             : 0u;
+    alignas(16) std::uint8_t sfa_slab[kSfaSlabBytes ? kSfaSlabBytes : 1u];
 
     // BF16 staging follows the quantized output's chunk boundaries.
     static constexpr std::uint32_t kOutChunkK =

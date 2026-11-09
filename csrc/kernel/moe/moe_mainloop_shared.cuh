@@ -345,7 +345,7 @@ struct SharedUpProjection<KernelTraits, true>
         } else if (WarpRole::is_weight_loader_thread()) {
             run_load_weight_k_loop(tma_up_desc, up_scale, smem);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
-            run_mma_k_loop(smem);
+            run_mma_k_loop(smem, up_scale);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
 #pragma unroll 1
             for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kUpTilesK;
@@ -386,7 +386,9 @@ struct SharedUpProjection<KernelTraits, true>
         }
     }
 
-    __device__ static void run_mma_k_loop(SharedStorage* __restrict__ smem) {
+    __device__ static void run_mma_k_loop(
+        SharedStorage* __restrict__ smem,
+        const typename SharedUpGemm::ElementScale* __restrict__ up_scale) {
         typename SharedUpGemm::TiledMma tiled_mma{};
         auto cta_mma = tiled_mma.get_slice(cute::_0{});
         auto tCt = Base::make_accumulator_fragment(cta_mma);
@@ -399,6 +401,16 @@ struct SharedUpProjection<KernelTraits, true>
             smem->barriers.shared_up.template wait_mma_ready<true, false>(
                 k_iter_id);
             KERNEL_TIMER_END(smem->timer.get(), mma_ready_span);
+            if constexpr (SharedUpGemm::kScaleLayout ==
+                          ScaleLayout::kPlainRows) {
+                Base::build_plain_scale</*Paired=*/true>(
+                    smem->shared_expert.w_up_scale[ring],
+                    reinterpret_cast<const std::uint8_t*>(up_scale),
+                    static_cast<std::uint32_t>(Base::slab_idx()) *
+                        (SharedUpGemm::kTileShapeM / 2u),
+                    Base::split_idx() * Base::kUpTilesK + k_iter_id,
+                    SharedUpGemm::kGemmK / 32u, SharedUpGemm::kGemmM / 2u);
+            }
             Base::mma(tiled_mma, cta_mma, tCt,
                       &smem->shared_expert.w_up[ring][0][0][0],
                       &smem->shared_expert.quantized_input.data[ring][0][0][0],
@@ -766,7 +778,7 @@ struct SharedDownProjection<KernelTraits, true>
         } else if (WarpRole::is_weight_loader_thread()) {
             run_load_weight_k_loop(tma_down_desc, down_scale, smem);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
-            run_mma_k_loop(smem);
+            run_mma_k_loop(smem, down_scale);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
             epilogue(out, smem, batch_size);
         }
@@ -789,7 +801,9 @@ struct SharedDownProjection<KernelTraits, true>
         }
     }
 
-    __device__ static void run_mma_k_loop(SharedStorage* __restrict__ smem) {
+    __device__ static void run_mma_k_loop(
+        SharedStorage* __restrict__ smem,
+        const typename SharedDownGemm::ElementScale* __restrict__ down_scale) {
         typename SharedDownGemm::TiledMma tiled_mma{};
         auto cta_mma = tiled_mma.get_slice(cute::_0{});
         auto tCt = Base::make_accumulator_fragment(cta_mma);
@@ -798,6 +812,13 @@ struct SharedDownProjection<KernelTraits, true>
              ++k_iter_id) {
             const std::uint32_t slot = k_iter_id % Base::kNumDownSlots;
             smem->barriers.shared_down.wait_mma_ready(k_iter_id);
+            if constexpr (SharedDownGemm::kScaleLayout ==
+                          ScaleLayout::kPlainRows) {
+                Base::build_plain_scale(
+                    smem->shared_expert.w_down_scale[slot],
+                    reinterpret_cast<const std::uint8_t*>(down_scale),
+                    Base::row_base(), k_iter_id, SharedDownGemm::kGemmK / 32u);
+            }
             const auto sfa_tmem =
                 tmem_addr(smem->tmem_ptr, 0u, kDownSfaTmemOffset);
             const auto sfb_tmem =

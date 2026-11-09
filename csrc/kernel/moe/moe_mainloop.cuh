@@ -108,8 +108,6 @@ struct CollectiveMainloopMoE {
         std::uint32_t latent_size;
         std::uint32_t intermediate_size;
         const DataType::ElementA* __restrict__ input;
-        const typename Traits::RouterGemm::
-            MmaElement* __restrict__ router_weight;
         const typename Traits::RoutedUpGemm::
             MmaElement* __restrict__ expert_weights_up;
         const typename Traits::RoutedUpGemm::
@@ -153,8 +151,9 @@ struct CollectiveMainloopMoE {
         std::uint32_t tail_rank;
         alignas(128) CUtensorMap tma_up_weights_desc;
         alignas(128) CUtensorMap tma_input_desc;
-        // Router and latent input share the K-tile descriptor.
         alignas(128) CUtensorMap tma_input_chunks_desc;
+        // The router's gate-major [G, E, H] weight, in 128-B chunks.
+        alignas(128) CUtensorMap tma_router_weights_desc;
         alignas(128) CUtensorMap tma_down_weights_desc;
         alignas(128) CUtensorMap tma_down_activations_desc;
         alignas(128) CUtensorMap tma_latent_down_weight_desc;
@@ -162,7 +161,7 @@ struct CollectiveMainloopMoE {
         alignas(128) CUtensorMap tma_shared_down_desc;
     };
 
-    // Builds the device parameters, including the four TMA descriptors.
+    // Builds the device parameters, including the TMA descriptors.
     static Params to_underlying_arguments(Arguments const& args) {
         Params params{};
         params.num_tokens = args.num_tokens;
@@ -170,7 +169,6 @@ struct CollectiveMainloopMoE {
         params.latent_size = args.latent_size;
         params.intermediate_size = args.intermediate_size;
         params.input = args.input;
-        params.router_weight = args.router_weight;
         params.expert_weights_up = args.expert_up_weights;
         params.expert_scales_up = args.expert_up_weights_scale;
         params.expert_weights_down = args.expert_down_weights;
@@ -220,48 +218,120 @@ struct CollectiveMainloopMoE {
                                              expert_weight_bytes)
                 : 0xFFFFFFFFu;
 
-        params.tma_input_desc = CreateTmaDesc2D(
-            "activations", args.input, args.num_tokens, Dims::kHiddenSize,
-            /*box_rows=*/8u, /*box_cols=*/64u);
-        params.tma_input_chunks_desc =
-            CreateTmaDescChunks3D("activations (K tiles)", args.input,
-                                  args.num_tokens, Dims::kHiddenSize);
-        params.tma_up_weights_desc = CreateTmaDesc2D(
-            "up-projection weights", args.expert_up_weights,
-            /*rows=*/Dims::kNumExperts * 2u * Dims::kIntermediateSize,
-            /*cols=*/MoEInputSize<Dims>::value, /*box_rows=*/128u,
-            /*box_cols=*/128u);
-        params.tma_down_weights_desc = CreateTmaDesc2D(
+        constexpr std::uint64_t kInputBytes = sizeof(DataType::ElementA);
+        constexpr std::uint32_t kChunkElems =
+            128u / static_cast<std::uint32_t>(kInputBytes);
+        params.tma_input_desc = CreateTmaDesc<2>(
+            "activations", args.input,
+            /*shape=*/{Dims::kHiddenSize, args.num_tokens},
+            /*strides=*/{std::uint64_t{Dims::kHiddenSize} * kInputBytes},
+            /*box=*/{64u, 8u});
+        params.tma_input_chunks_desc = CreateTmaDesc<3>(
+            "activations (K tiles)", args.input,
+            /*shape=*/
+            {kChunkElems, args.num_tokens, Dims::kHiddenSize / kChunkElems},
+            /*strides=*/{std::uint64_t{Dims::kHiddenSize} * kInputBytes, 128u},
+            /*box=*/{kChunkElems, 8u, 4u});
+        params.tma_router_weights_desc = CreateTmaDesc<3>(
+            "router weights", args.router_weight,
+            /*shape=*/
+            {kChunkElems, Dims::kNumRouterGates * Dims::kNumExperts,
+             Dims::kHiddenSize / kChunkElems},
+            /*strides=*/{std::uint64_t{Dims::kHiddenSize} * kInputBytes, 128u},
+            /*box=*/
+            {kChunkElems, Traits::RouterGemm::kTileShapeM,
+             Traits::RouterGemm::MmaCore::kNumSwizzleBoxKs});
+        if constexpr (Traits::RoutedUpGemm::kUsePairLayout) {
+            constexpr std::uint64_t kUpBytes =
+                std::uint64_t{MoEInputSize<Dims>::value} *
+                cute::sizeof_bits_v<typename Traits::RoutedUpGemm::MmaElement> /
+                8u;
+            params.tma_up_weights_desc = CreateTmaDesc<2>(
+                "up-projection weights", args.expert_up_weights,
+                /*shape=*/
+                {MoEInputSize<Dims>::value,
+                 Dims::kNumExperts * 2u * Dims::kIntermediateSize},
+                /*strides=*/{kUpBytes}, /*box=*/{128u, 128u});
+        } else {
+            // The natural [E, 2, N, K] weight: one box interleaves each
+            // expert's gate/up 8-row groups.
+            using UpGemm = typename Traits::RoutedUpGemm;
+            constexpr std::uint64_t kElemBits =
+                cute::sizeof_bits_v<typename UpGemm::MmaElement>;
+            constexpr std::uint32_t kGran = UpGemm::kPairGran;
+            constexpr std::uint32_t kK = MoEInputSize<Dims>::value;
+            constexpr std::uint32_t kRows = Dims::kIntermediateSize;
+            params.tma_up_weights_desc = CreateTmaDesc<5>(
+                "up-projection weights", args.expert_up_weights,
+                /*shape=*/{kK, kGran, 2u, kRows / kGran, Dims::kNumExperts},
+                /*strides=*/
+                {kK * kElemBits / 8, std::uint64_t{kRows} * kK * kElemBits / 8,
+                 std::uint64_t{kGran} * kK * kElemBits / 8,
+                 2ull * kRows * kK * kElemBits / 8},
+                /*box=*/
+                {UpGemm::MmaCore::kSwizzleBoxK, kGran, 2u,
+                 UpGemm::kTileShapeM / (2u * kGran), 1u});
+        }
+        constexpr std::uint64_t kDownBytes =
+            std::uint64_t{Dims::kIntermediateSize} *
+            cute::sizeof_bits_v<typename Traits::RoutedDownGemm::MmaElement> /
+            8u;
+        params.tma_down_weights_desc = CreateTmaDesc<2>(
             "down-projection weights", args.expert_down_weights,
-            /*rows=*/Dims::kNumExperts * MoEInputSize<Dims>::value,
-            /*cols=*/Dims::kIntermediateSize, /*box_rows=*/128u,
-            /*box_cols=*/128u);
-        params.tma_down_activations_desc =
-            CreateTmaDesc2D("down-projection activations",
-                            reinterpret_cast<const DataType::ElementQA*>(
-                                static_cast<const char*>(args.workspace) +
-                                Workspace::kUpOutFp8Offset),
-                            Workspace::kMaxRoutedRows, Dims::kIntermediateSize,
-                            /*box_rows=*/Dims::kNumTokens, /*box_cols=*/128u);
-
-        params.tma_shared_up_desc =
-            CreateTmaDesc2D("up-projection weights", args.shared_up_weight,
-                            /*rows=*/Dims::kIntermediateSize * 2u,
-                            /*cols=*/Dims::kHiddenSize,
-                            /*box_rows=*/Traits::SharedUpGemm::kTileShapeM,
-                            /*box_cols=*/128u);
-        params.tma_shared_down_desc =
-            CreateTmaDesc2D("down-projection weights", args.shared_down_weight,
-                            /*rows=*/Dims::kHiddenSize,
-                            /*cols=*/Dims::kIntermediateSize,
-                            /*box_rows=*/Traits::SharedDownGemm::kTileShapeM,
-                            /*box_cols=*/128u);
+            /*shape=*/
+            {Dims::kIntermediateSize,
+             Dims::kNumExperts * MoEInputSize<Dims>::value},
+            /*strides=*/{kDownBytes}, /*box=*/{128u, 128u});
+        params.tma_down_activations_desc = CreateTmaDesc<2>(
+            "down-projection activations",
+            reinterpret_cast<const DataType::ElementQA*>(
+                static_cast<const char*>(args.workspace) +
+                Workspace::kUpOutFp8Offset),
+            /*shape=*/{Dims::kIntermediateSize, Workspace::kMaxRoutedRows},
+            /*strides=*/{std::uint64_t{Dims::kIntermediateSize}},
+            /*box=*/{128u, Dims::kNumTokens});
+        if constexpr (Traits::SharedUpGemm::kUsePairLayout) {
+            params.tma_shared_up_desc = CreateTmaDesc<2>(
+                "up-projection weights", args.shared_up_weight,
+                /*shape=*/{Dims::kHiddenSize, Dims::kIntermediateSize * 2u},
+                /*strides=*/{std::uint64_t{Dims::kHiddenSize}},
+                /*box=*/{128u, Traits::SharedUpGemm::kTileShapeM});
+        } else {
+            // The natural [2, N, H] weight: the box interleaves the gate/up
+            // 8-row groups.
+            using UpGemm = typename Traits::SharedUpGemm;
+            constexpr std::uint64_t kElemBytes =
+                sizeof(typename UpGemm::MmaElement);
+            constexpr std::uint32_t kGran = UpGemm::kPairGran;
+            params.tma_shared_up_desc = CreateTmaDesc<4>(
+                "up-projection weights", args.shared_up_weight,
+                /*shape=*/
+                {Dims::kHiddenSize, kGran, 2u, Dims::kIntermediateSize / kGran},
+                /*strides=*/
+                {std::uint64_t{Dims::kHiddenSize} * kElemBytes,
+                 std::uint64_t{Dims::kIntermediateSize} * Dims::kHiddenSize *
+                     kElemBytes,
+                 std::uint64_t{kGran} * Dims::kHiddenSize * kElemBytes},
+                /*box=*/
+                {UpGemm::MmaCore::kSwizzleBoxK, kGran, 2u,
+                 UpGemm::kTileShapeM / (2u * kGran)});
+        }
+        params.tma_shared_down_desc = CreateTmaDesc<2>(
+            "down-projection weights", args.shared_down_weight,
+            /*shape=*/{Dims::kIntermediateSize, Dims::kHiddenSize},
+            /*strides=*/{std::uint64_t{Dims::kIntermediateSize}},
+            /*box=*/{128u, Traits::SharedDownGemm::kTileShapeM});
         if (args.latent_down_weight != nullptr) {
-            params.tma_latent_down_weight_desc = CreateTmaDesc2D(
+            constexpr std::uint64_t kLatentBytes =
+                std::uint64_t{Dims::kHiddenSize} *
+                cute::sizeof_bits_v<
+                    typename Traits::LatentDownGemm::MmaElement> /
+                8u;
+            params.tma_latent_down_weight_desc = CreateTmaDesc<2>(
                 "latent-projection weights", args.latent_down_weight,
-                Dims::kLatentSize, Dims::kHiddenSize,
-                /*box_rows=*/Traits::LatentDownGemm::kTileShapeM,
-                /*box_cols=*/128u);
+                /*shape=*/{Dims::kHiddenSize, Dims::kLatentSize},
+                /*strides=*/{kLatentBytes},
+                /*box=*/{128u, Traits::LatentDownGemm::kTileShapeM});
         }
         return params;
     }
@@ -271,8 +341,7 @@ struct CollectiveMainloopMoE {
                                     SharedStorage* __restrict__ smem) {
         if constexpr (Traits::kUseLatent) {
             Latent::run(params.tma_latent_down_weight_desc,
-                        params.tma_input_chunks_desc,
-                        params.latent_down_weight_scale,
+                        params.tma_input_desc, params.latent_down_weight_scale,
                         reinterpret_cast<Workspace*>(params.scratchpad), smem,
                         static_cast<std::uint32_t>(params.num_tokens));
         }
@@ -414,8 +483,9 @@ struct CollectiveMainloopMoE {
         Workspace* __restrict__ workspace =
             reinterpret_cast<Workspace*>(params.scratchpad);
         if (Router::is_router_cta()) {
-            Router::run(params.router_weight, params.tma_input_chunks_desc,
-                        workspace, smem, params.scoring_func);
+            Router::run(params.tma_router_weights_desc,
+                        params.tma_input_chunks_desc, workspace, smem,
+                        params.scoring_func);
         }
 
         // Router CTAs build their tables; other CTAs copy the tables published
@@ -570,6 +640,7 @@ struct CollectiveMainloopMoE {
         cute::prefetch_tma_descriptor(&params.tma_up_weights_desc);
         cute::prefetch_tma_descriptor(&params.tma_input_desc);
         cute::prefetch_tma_descriptor(&params.tma_input_chunks_desc);
+        cute::prefetch_tma_descriptor(&params.tma_router_weights_desc);
         cute::prefetch_tma_descriptor(&params.tma_down_weights_desc);
         cute::prefetch_tma_descriptor(&params.tma_down_activations_desc);
     }
@@ -609,7 +680,7 @@ struct CollectiveMainloopMoE {
         } else if (WarpRole::is_weight_loader_warp(warp_idx) &&
                    Router::is_router_cta()) {
             // The router is the prologue's critical path: start its loads now.
-            Router::start_streams(params.router_weight,
+            Router::start_streams(params.tma_router_weights_desc,
                                   params.tma_input_chunks_desc, smem);
         }
         __syncthreads();

@@ -154,7 +154,7 @@ struct LatentDownProjectionBase {
 
             smem->barriers.latent_down.input_ready.arrive(k_iter_id,
                                                           kInputTileTxBytes);
-            load_input_tile_chunks<kTileShapeN>(
+            load_input_tile<kTileShapeN>(
                 tma_input_desc, k_tile(k_iter_id), token_begin(),
                 smem->latent_down.input.data[slot],
                 smem->barriers.latent_down.input_ready.raw(slot));
@@ -377,6 +377,46 @@ struct LatentDownProjection<KernelTraits, true>
         __syncthreads();
     }
 
+    // 128 rows x K/32 blocks of natural scales -> SfAtom. Each 16-B chunk of
+    // an atom gathers rows 32*mh + ml of K/32 blocks [4*kk, 4*kk + 4).
+    static constexpr std::uint32_t kScaleKBlocks = Dims::kHiddenSize / 32u;
+    static constexpr std::uint32_t kScaleGroups = kScaleKBlocks / 16u;
+    static constexpr std::uint32_t kSfAtomBytes = 512u;
+
+    __device__ static void build_sfa_table(
+        const std::uint8_t* __restrict__ natural,
+        SharedStorage* __restrict__ smem) {
+        constexpr std::uint32_t kCalcThreads =
+            WarpRole::kCalcWarpCount * WarpRole::kThreadsPerWarp;
+        const std::uint32_t tile = Base::tile_idx();
+        const std::uint8_t* const src =
+            natural + static_cast<std::size_t>(tile) * 128u * kScaleKBlocks;
+        std::uint8_t* const dst = smem->latent_down.sfa_slab;
+        for (std::uint32_t task = threadIdx.x; task < 32u * kScaleGroups;
+             task += kCalcThreads) {
+            const std::uint32_t ml = task % 32u;
+            const std::uint32_t kg = task / 32u;
+            std::uint32_t rows[4][4];
+#pragma unroll
+            for (std::uint32_t mh = 0; mh < 4u; ++mh) {
+                const uint4 v = *reinterpret_cast<const uint4*>(
+                    src +
+                    static_cast<std::size_t>(32u * mh + ml) * kScaleKBlocks +
+                    16u * kg);
+                *reinterpret_cast<uint4*>(rows[mh]) = v;
+            }
+#pragma unroll
+            for (std::uint32_t j = 0; j < 4u; ++j) {
+                const uint4 chunk =
+                    make_uint4(rows[0][j], rows[1][j], rows[2][j], rows[3][j]);
+                *reinterpret_cast<uint4*>(dst + (4u * kg + j) * kSfAtomBytes +
+                                          ml * 16u) = chunk;
+            }
+        }
+        // The MMA reads the slab through the async proxy.
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    }
+
     __device__ static void run(
         CUtensorMap const& tma_latent_down_weight_desc,
         CUtensorMap const& tma_input_desc,
@@ -392,14 +432,18 @@ struct LatentDownProjection<KernelTraits, true>
         if (WarpRole::is_other_loader_thread()) {
             Base::run_load_input_k_loop(tma_input_desc, smem);
         } else if (WarpRole::is_weight_loader_thread()) {
-            run_load_weight_k_loop(tma_latent_down_weight_desc,
-                                   latent_down_weight_scale, smem);
+            run_load_weight_k_loop(tma_latent_down_weight_desc, smem);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
             const auto mma_span =
                 KERNEL_TIMER_BEGIN(smem->timer.get(), "latent_down_umma");
             run_mma_k_loop(smem, smem->tmem_ptr);
             KERNEL_TIMER_END(smem->timer.get(), mma_span);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
+            // Overlaps the loaders' first tiles; tile 0's input_empty arrive
+            // publishes the slab to the MMA.
+            build_sfa_table(
+                reinterpret_cast<const std::uint8_t*>(latent_down_weight_scale),
+                smem);
             const auto quant_span =
                 KERNEL_TIMER_BEGIN(smem->timer.get(), "latent_quantize_input");
 #pragma unroll 1
@@ -423,13 +467,7 @@ struct LatentDownProjection<KernelTraits, true>
 
     __device__ static void run_load_weight_k_loop(
         CUtensorMap const& tma_latent_down_weight_desc,
-        const typename LatentDownGemm::ElementScale* __restrict__ scale,
         SharedStorage* __restrict__ smem) {
-        // Weight scales are staged as 512-byte SfAtoms.
-        constexpr std::uint32_t kSfaBytes = ScaleTraits::kSfaSmemBytes;
-        constexpr std::uint32_t kSfAtomBytes = 512u;
-        constexpr std::uint32_t kSfKBlocksPerRow = Base::kNumScaleBlocksK;
-
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kTilesKPerCta;
              ++k_iter_id) {
@@ -439,17 +477,7 @@ struct LatentDownProjection<KernelTraits, true>
             smem->barriers.latent_down.wait_weight_empty(k_iter_id);
             KERNEL_TIMER_END(smem->timer.get(), empty_span);
             Base::load_weight_tile(tma_latent_down_weight_desc, smem, k_iter_id,
-                                   MmaCore::kWeightTileBytes + kSfaBytes);
-
-            const std::uint32_t slot = k_iter_id % Base::kNumWeightSlots;
-            const std::uint8_t* const src =
-                reinterpret_cast<const std::uint8_t*>(scale) +
-                (Base::tile_idx() * kSfKBlocksPerRow +
-                 Base::k_tile(k_iter_id) * LatentDownGemm::kNumStagingBlocks) *
-                    kSfAtomBytes;
-            tma_load_1d(src, kSfaBytes,
-                        smem->latent_down.w_latent_down_scale[slot],
-                        smem->barriers.latent_down.weight_ready.raw(slot));
+                                   MmaCore::kWeightTileBytes);
         }
     }
 
@@ -472,9 +500,10 @@ struct LatentDownProjection<KernelTraits, true>
                 cute::make_smem_ptr(Base::staged_block(smem, k_iter_id)),
                 SBLayout{});
             cute::Tensor tCrB = cta_mma.make_fragment_B(tCsB);
-            // SFA and SFB are staged in SfAtom layout.
+            // SFA (the prebuilt atom slab) and SFB are in SfAtom layout.
             std::uint8_t* const sfa =
-                smem->latent_down.w_latent_down_scale[w_slot];
+                smem->latent_down.sfa_slab +
+                Base::k_tile(k_iter_id) * ScaleTraits::kSfaSmemBytes;
             std::uint8_t* const sfb =
                 &smem->latent_down.quantized_input
                      .scale[k_iter_id % Base::kNumInputSlots][0];
@@ -584,19 +613,20 @@ struct LatentDownProjection<KernelTraits, true>
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         const std::uint32_t chunk_base = Base::row_base() / Base::kOutChunkK;
 
-        if (warp_idx < Base::kTileShapeN) {
+        for (std::uint32_t tok = warp_idx; tok < Base::kTileShapeN;
+             tok += WarpRole::kCalcWarpCount) {
             // Each warp reduces one token over 32-feature groups.
 #pragma unroll
             for (std::uint32_t g = 0; g < kNumGroups; ++g) {
                 const std::uint32_t f = kGroupRows * g + lane_idx;
                 const float v = __bfloat162float(
-                    smem->latent_down.act_out[f / Base::kOutChunkK][warp_idx]
+                    smem->latent_down.act_out[f / Base::kOutChunkK][tok]
                                              [f % Base::kOutChunkK]);
                 const float mag = fabsf(v);
                 const float amax = __uint_as_float(__reduce_max_sync(
                     0xffffffffu, __float_as_uint((mag == mag) ? mag : 0.0f)));
                 if (lane_idx == 0u) {
-                    smem->latent_down.token_group_amax[warp_idx][g] = amax;
+                    smem->latent_down.token_group_amax[tok][g] = amax;
                 }
             }
         }
@@ -934,22 +964,23 @@ struct LatentDownProjection<KernelTraits, false>
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         const std::uint32_t chunk_base = Base::row_base() / Base::kOutChunkK;
 
-        if (warp_idx < Base::kTileShapeN) {
+        for (std::uint32_t tok = warp_idx; tok < Base::kTileShapeN;
+             tok += WarpRole::kCalcWarpCount) {
             float amax = 0.0f;
             for (std::uint32_t i = lane_idx;
                  i < Base::kOutChunks * Base::kOutChunkK;
                  i += WarpRole::kThreadsPerWarp) {
-                amax =
-                    fmaxf(amax, fabsf(__bfloat162float(
-                                    smem->latent_down
-                                        .act_out[i / Base::kOutChunkK][warp_idx]
-                                                [i % Base::kOutChunkK])));
+                amax = fmaxf(
+                    amax,
+                    fabsf(__bfloat162float(
+                        smem->latent_down.act_out[i / Base::kOutChunkK][tok]
+                                                 [i % Base::kOutChunkK])));
             }
             // Nonnegative floats have the same ordering as their bit patterns.
             const float block_amax = __uint_as_float(
                 __reduce_max_sync(0xffffffffu, __float_as_uint(amax)));
             if (lane_idx == 0u) {
-                smem->latent_down.token_amax[warp_idx] = block_amax;
+                smem->latent_down.token_amax[tok] = block_amax;
             }
         }
 

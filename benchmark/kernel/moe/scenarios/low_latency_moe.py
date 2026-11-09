@@ -123,7 +123,7 @@ def _build_inputs(cfg: dict) -> MoeInput:
     h, n, z, e = (options[key] for key in MOE_SHAPE)
     x = normal((options["batch_size"], h))
     weights = {
-        "router_weight": normal((2, h, e), h**-0.5),
+        "router_weight": normal((2, e, h), h**-0.5),
         "expert_up_weights": normal((e, 2 * n, z), z**-0.5),
         "expert_down_weights": normal((e, z, n), n**-0.5),
         "shared_up_weight": normal((2 * n, h), h**-0.5),
@@ -168,7 +168,13 @@ def _quantize_weights(weights: dict, quant_mode: str) -> dict:
                 else "w8a8-mxfp8"
             )
             quant, scale = group_wise_quant(
-                weight.flatten(0, -2), mode=mode, use_swizzle=True
+                weight.flatten(0, -2),
+                mode=mode,
+                # The latent projection takes the natural scale rows.
+                # The latent and shared scales stay plain row-major.
+                use_swizzle=not (
+                    name == "latent_down_weight" or name.startswith("shared_")
+                ),
             )
             quant = quant.reshape(*weight.shape[:-1], quant.shape[-1])
             scale = scale.reshape(*weight.shape[:-1], weight.shape[-1] // 32)
@@ -181,22 +187,12 @@ def _quantize_weights(weights: dict, quant_mode: str) -> dict:
 
 @torch.no_grad()
 def adapt_halops(raw: MoeInput) -> dict:
-    from halops import get_workspace_for_moe, transform_weights_for_moe
+    from halops import get_workspace_for_moe
 
     quantized = raw.weights
-    packed = transform_weights_for_moe(
-        quantized["router_weight"],
-        quantized["expert_up_weights"],
-        quantized["shared_up_weight"],
-        num_tokens=raw.input.size(0),
-        num_router_gates=2,
-        expert_up_weights_scale=quantized["expert_up_weights_scale"],
-        shared_up_weight_scale=quantized["shared_up_weight_scale"],
-    )
     return {
         **raw.options,
         **quantized,
-        **packed,
         "input": raw.input,
         "out": torch.empty_like(raw.input),
         "num_router_gates": 2,
@@ -231,7 +227,11 @@ def adapt_golden(raw: MoeInput) -> dict:
             scale_name = (
                 "tail_fc2_scale" if name == "tail_fc2_weight" else name + "_scale"
             )
-            weights[name] = _dequant_weight(weight, raw.weights[scale_name])
+            weights[name] = _dequant_weight(
+                weight,
+                raw.weights[scale_name],
+                sfatom=not (name == "latent_down_weight" or name.startswith("shared_")),
+            )
     return {
         **raw.options,
         **weights,

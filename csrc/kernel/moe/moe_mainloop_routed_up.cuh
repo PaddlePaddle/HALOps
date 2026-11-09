@@ -231,7 +231,8 @@ struct RoutedUpProjection<KernelTraits, true>
                                 weight_row_base, task_id, expert_id,
                                 weight_cache_hint);
             } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
-                run_mma_k_loop(smem, tmem_base, task_id);
+                run_mma_k_loop(smem, tmem_base, task_id,
+                               weight_row_base / UpGemm::kTileShapeM);
             } else if (WarpRole::is_calc_warp(warp_idx)) {
                 Accumulator acc_gate_out;
                 Accumulator acc_up_out;
@@ -292,7 +293,8 @@ struct RoutedUpProjection<KernelTraits, true>
     // Accumulate one task's K tiles in its slot; release each consumed weight.
     __device__ static void run_mma_k_loop(SharedStorage* __restrict__ smem,
                                           std::uint32_t tmem_base,
-                                          std::uint32_t task_id) {
+                                          std::uint32_t task_id,
+                                          std::uint32_t row_tile) {
         typename UpGemm::TiledMma tiled_mma{};
         auto cta_mma = tiled_mma.get_slice(cute::_0{});
         auto tCt = Base::make_accumulator_fragment(cta_mma);
@@ -318,6 +320,10 @@ struct RoutedUpProjection<KernelTraits, true>
                 smem->timer.get(), "up_wait_mma_ready", ring_iter_id);
             smem->barriers.routed.wait_up_mma_ready(ring_iter_id);
             KERNEL_TIMER_END(smem->timer.get(), mma_ready_span);
+            if constexpr (UpGemm::kScaleLayout == ScaleLayout::kNaturalAtom) {
+                Base::permute_up_scale(
+                    smem->routed_experts.w_up_scale[weight_slot], row_tile);
+            }
             Base::mma(
                 tiled_mma, cta_mma, tCt,
                 reinterpret_cast<typename Base::WeightElement*>(

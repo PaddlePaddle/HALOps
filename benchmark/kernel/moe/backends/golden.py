@@ -21,8 +21,14 @@ import torch.nn.functional as F
 
 
 @torch.no_grad()
-def _dequant_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Decode blockwise FP8 or SfAtom-scaled MXFP8/MXFP4 weights to BF16."""
+def _dequant_weight(
+    weight: torch.Tensor, scale: torch.Tensor, sfatom: bool = True
+) -> torch.Tensor:
+    """Decode blockwise FP8 or MXFP8/MXFP4 weights to BF16.
+
+    ``sfatom`` selects the CUTLASS SfAtom scale table; the latent projection
+    takes the plain [N, K/32] rows and builds the SfAtom in-kernel.
+    """
     if scale.dtype == torch.float32:
         rows, cols = weight.shape[-2:]
         blocks = weight.float().reshape(
@@ -30,11 +36,14 @@ def _dequant_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         )
         return (blocks * scale[..., :, None, :, None]).reshape(weight.shape).bfloat16()
 
-    from halops.moe.low_latency_moe_utils import _sf_atom_offsets
-
     rows, groups = scale.shape[-2:]
-    offsets = _sf_atom_offsets(rows, groups, scale.device)
-    plain = scale.reshape(*scale.shape[:-2], -1)[..., offsets]
+    if sfatom:
+        from halops.moe.low_latency_moe_utils import _sf_atom_offsets
+
+        offsets = _sf_atom_offsets(rows, groups, scale.device)
+        plain = scale.reshape(*scale.shape[:-2], -1)[..., offsets]
+    else:
+        plain = scale
     decoded_scale = torch.exp2(plain.float() - 127.0)
     if weight.dtype == torch.uint8:
         lut = torch.tensor(
@@ -75,7 +84,7 @@ def _route(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts from the sum of both gates, breaking ties by expert ID."""
     x = inp["input_bf16"]
     # The dual router publishes FP32 scores without rounding logits to BF16.
-    logits = torch.matmul(x.float(), inp["router_weight_fp32"])
+    logits = torch.matmul(x.float(), inp["router_weight_fp32"].transpose(-1, -2))
     scores = (
         torch.sigmoid(logits)
         if inp["scoring_func"] == "sigmoid"

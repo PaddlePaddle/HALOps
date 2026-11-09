@@ -27,6 +27,13 @@
 
 namespace halops::moe {
 
+// Where a blockscaled weight's scale table comes from.
+enum class ScaleLayout : std::uint32_t {
+    kPackedAtom,   // the caller's gate/up-paired SfAtom table
+    kNaturalAtom,  // natural-row SfAtom; the kernel folds the gate/up atoms
+    kPlainRows,    // plain row-major [rows, K/32]; the kernel builds SfAtom
+};
+
 // Tile shape shared by the router Linear and the latent down-projection.
 template <std::uint32_t GemmM, std::uint32_t GemmN, std::uint32_t GemmK,
           std::uint32_t TileShapeN, std::uint32_t NumCtas, bool UseUmma>
@@ -82,7 +89,7 @@ struct LatentDownGemmTraits {
 
     static constexpr std::uint32_t kNumCtas =
         Dims::KernelConfig::kNumCtasForLatentDown;
-    static constexpr std::uint32_t kTileShapeN = 8u;
+    static constexpr std::uint32_t kTileShapeN = Dims::kNumTokens;
     static constexpr std::uint32_t kNumTilesN = kGemmN / kTileShapeN;
 
     static constexpr bool kUseSplitK = Dims::KernelConfig::kLatentDownUseSplitK;
@@ -175,6 +182,13 @@ struct RouterGemmTraits {
 
 template <typename Dims>
 struct RoutedUpGemmTraits {
+    static constexpr bool kUsePairLayout =
+        Dims::KernelConfig::kRoutedUpUsePairLayout;
+    static constexpr ScaleLayout kScaleLayout =
+        kUsePairLayout ? ScaleLayout::kPackedAtom : ScaleLayout::kNaturalAtom;
+    static constexpr std::uint32_t kPairGran = 8u;
+    static constexpr bool kWeightHasExpertDim = true;
+
     static constexpr std::uint32_t kGemmM = Dims::kIntermediateSize * 2;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = MoEInputSize<Dims>::value;
@@ -234,6 +248,7 @@ struct RoutedUpGemmTraits {
 
 template <typename Dims>
 struct RoutedDownGemmTraits {
+    static constexpr ScaleLayout kScaleLayout = ScaleLayout::kPackedAtom;
     static constexpr std::uint32_t kGemmM = MoEInputSize<Dims>::value;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = Dims::kIntermediateSize;
@@ -277,6 +292,13 @@ struct RoutedDownGemmTraits {
 // Shared-expert up projection over all tokens.
 template <typename Dims>
 struct SharedUpGemmTraits {
+    static constexpr bool kUsePairLayout =
+        Dims::KernelConfig::kSharedUpUsePairLayout;
+    static constexpr ScaleLayout kScaleLayout =
+        kUsePairLayout ? ScaleLayout::kPackedAtom : ScaleLayout::kPlainRows;
+    static constexpr std::uint32_t kPairGran = 8u;
+    static constexpr bool kWeightHasExpertDim = false;
+
     static constexpr std::uint32_t kGemmM = Dims::kIntermediateSize * 2u;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = Dims::kHiddenSize;
@@ -333,6 +355,7 @@ struct SharedUpGemmTraits {
 // The shared expert's down-projection: M hidden, N tokens, K intermediate.
 template <typename Dims>
 struct SharedDownGemmTraits {
+    static constexpr ScaleLayout kScaleLayout = ScaleLayout::kPlainRows;
     static constexpr std::uint32_t kGemmM = Dims::kHiddenSize;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = Dims::kIntermediateSize;

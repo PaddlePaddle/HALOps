@@ -39,6 +39,22 @@ __device__ __forceinline__ constexpr std::uint64_t get_tma_cache_hint(
                     : cute::TMA::CacheHintSm90::EVICT_NORMAL);
 }
 
+// Prefetch a contiguous range into L2 without staging it in shared memory.
+__device__ static __forceinline__ void tma_prefetch_l2_1d(const void* src_gmem,
+                                                          std::uint32_t bytes) {
+    cute::SM90_BULK_COPY_G2S::PREFETCH::copy(src_gmem,
+                                             static_cast<std::int32_t>(bytes));
+}
+
+// Prefetch a 3D TMA box into L2 without staging it in shared memory.
+__device__ static __forceinline__ void tma_prefetch_l2_3d(
+    CUtensorMap const& tma_desc, std::uint32_t coord0, std::uint32_t coord1,
+    std::uint32_t coord2) {
+    cute::SM90_TMA_LOAD_3D::PREFETCH::copy(
+        &tma_desc, static_cast<std::int32_t>(coord0),
+        static_cast<std::int32_t>(coord1), static_cast<std::int32_t>(coord2));
+}
+
 // Issue an mbarrier-tracked contiguous bulk copy.
 __device__ static __forceinline__ void tma_load_1d(const void* src_gmem,
                                                    std::uint32_t bytes,
@@ -46,13 +62,6 @@ __device__ static __forceinline__ void tma_load_1d(const void* src_gmem,
                                                    std::uint64_t* bar_smem) {
     cute::SM90_BULK_COPY_G2S::copy(src_gmem, bar_smem, dst_smem,
                                    static_cast<std::int32_t>(bytes));
-}
-
-// Prefetch a contiguous range into L2 without staging it in shared memory.
-__device__ static __forceinline__ void tma_prefetch_l2_1d(const void* src_gmem,
-                                                          std::uint32_t bytes) {
-    cute::SM90_BULK_COPY_G2S::PREFETCH::copy(src_gmem,
-                                             static_cast<std::int32_t>(bytes));
 }
 
 // Issue one 2D TMA bulk-tensor load, tracked by an mbarrier.
@@ -77,6 +86,33 @@ __device__ static __forceinline__ void tma_load_3d(
         static_cast<std::int32_t>(coord1), static_cast<std::int32_t>(coord2));
 }
 
+// Issue one 4D TMA bulk-tensor load, tracked by an mbarrier.
+__device__ static __forceinline__ void tma_load_4d(
+    CUtensorMap const& tma_desc, std::uint32_t coord0, std::uint32_t coord1,
+    std::uint32_t coord2, std::uint32_t coord3, void* dst_smem,
+    std::uint64_t* bar_smem,
+    std::uint64_t cache_hint =
+        static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL)) {
+    cute::SM90_TMA_LOAD_4D::copy(
+        &tma_desc, bar_smem, cache_hint, dst_smem,
+        static_cast<std::int32_t>(coord0), static_cast<std::int32_t>(coord1),
+        static_cast<std::int32_t>(coord2), static_cast<std::int32_t>(coord3));
+}
+
+// Issue one 5D TMA bulk-tensor load, tracked by an mbarrier.
+__device__ static __forceinline__ void tma_load_5d(
+    CUtensorMap const& tma_desc, std::uint32_t coord0, std::uint32_t coord1,
+    std::uint32_t coord2, std::uint32_t coord3, std::uint32_t coord4,
+    void* dst_smem, std::uint64_t* bar_smem,
+    std::uint64_t cache_hint =
+        static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL)) {
+    cute::SM90_TMA_LOAD_5D::copy(
+        &tma_desc, bar_smem, cache_hint, dst_smem,
+        static_cast<std::int32_t>(coord0), static_cast<std::int32_t>(coord1),
+        static_cast<std::int32_t>(coord2), static_cast<std::int32_t>(coord3),
+        static_cast<std::int32_t>(coord4));
+}
+
 // Input tile box: eight rows and four 128-byte chunks.
 inline constexpr std::uint32_t kInputChunksBoxRows = 8u;
 inline constexpr std::uint32_t kInputChunksBoxChunks = 4u;
@@ -89,8 +125,7 @@ __device__ __forceinline__ void load_input_tile_chunks(
     std::uint32_t token_start,
     DataType::ElementA (&dest)[NumSwizzleBoxesK][NumRows][SwizzleBoxK],
     std::uint64_t* bar_smem_ptr) {
-    static_assert(NumRows == kInputChunksBoxRows &&
-                      NumSwizzleBoxesK == kInputChunksBoxChunks &&
+    static_assert(NumSwizzleBoxesK == kInputChunksBoxChunks &&
                       SwizzleBoxK * sizeof(DataType::ElementA) == 128u,
                   "the tile must be the descriptor's box");
     tma_load_3d(tma_input_chunks_desc, /*coord0=*/0u, /*coord1=*/token_start,
@@ -123,66 +158,41 @@ __device__ __forceinline__ void load_input_tile(
     }
 }
 
-// Create a row-major TMA descriptor. FP4 dimensions count values; TMA expands
-// packed nibbles to SMEM bytes, while barriers count packed GMEM bytes.
+// The CUtensorMap element type of T. FP4 dimensions count values.
 template <typename T>
-inline CUtensorMap CreateTmaDesc2D(const char* debug_name, const T* global_ptr,
-                                   std::uint32_t rows, std::uint32_t cols,
-                                   std::uint32_t box_rows,
-                                   std::uint32_t box_cols,
-                                   bool use_swizzle = true) {
-    CUtensorMapDataType data_type = CU_TENSOR_MAP_DATA_TYPE_UINT8;
+inline constexpr CUtensorMapDataType TmaDataType() {
     if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-        data_type = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+        return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
     } else if constexpr (std::is_same_v<T, float>) {
-        data_type = CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+        return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
     } else if constexpr (std::is_same_v<T, cutlass::float_e2m1_t>) {
-        data_type = CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
+        return CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
     } else {
         static_assert(sizeof(T) == 1u, "unsupported TMA element type");
+        return CU_TENSOR_MAP_DATA_TYPE_UINT8;
     }
+}
+
+// Create a rank-R row-major tiled TMA descriptor. `shape` runs fastest to
+// slowest, `strides` are the byte strides of dimensions 1..R-1, and `box` is
+// the tile TMA copies.
+template <int Rank, typename T>
+inline CUtensorMap CreateTmaDesc(const char* debug_name, const T* global_ptr,
+                                 const std::uint64_t (&shape)[Rank],
+                                 const std::uint64_t (&strides)[Rank - 1],
+                                 const std::uint32_t (&box)[Rank],
+                                 bool use_swizzle = true) {
+    static_assert(Rank >= 2 && Rank <= 5, "TMA supports rank 2..5 here");
+    static constexpr std::uint32_t kUnitStride[5] = {1u, 1u, 1u, 1u, 1u};
     CUtensorMap desc{};
-    uint64_t global_shape[2] = {cols, rows};
-    uint64_t global_strides[1] = {static_cast<uint64_t>(cols) *
-                                  cute::sizeof_bits_v<T> / 8u};
-    uint32_t box_dim[2] = {box_cols, box_rows};
-    uint32_t element_strides[2] = {1u, 1u};
     const CUresult res = cuTensorMapEncodeTiled(
-        &desc, data_type, 2,
-        const_cast<void*>(static_cast<const void*>(global_ptr)), global_shape,
-        global_strides, box_dim, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        &desc, TmaDataType<T>(), Rank,
+        const_cast<void*>(static_cast<const void*>(global_ptr)), shape, strides,
+        box, kUnitStride, CU_TENSOR_MAP_INTERLEAVE_NONE,
         use_swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE,
         CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     TORCH_CHECK(res == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for ",
-                debug_name, ": CUresult=", static_cast<int>(res),
-                " (rows=", rows, ", cols=", cols, ", box=(", box_rows, ", ",
-                box_cols, "))");
-    return desc;
-}
-
-// SW128 view of BF16 input: (value within 128-byte chunk, row, chunk).
-inline CUtensorMap CreateTmaDescChunks3D(const char* debug_name,
-                                         const __nv_bfloat16* global_ptr,
-                                         std::uint32_t rows,
-                                         std::uint32_t cols) {
-    constexpr std::uint32_t kChunk = 128u / sizeof(__nv_bfloat16);
-    TORCH_CHECK(cols % kChunk == 0u, debug_name, ": cols=", cols,
-                " is not whole 128-B chunks");
-    CUtensorMap desc{};
-    uint64_t global_shape[3] = {kChunk, rows, cols / kChunk};
-    uint64_t global_strides[2] = {
-        static_cast<uint64_t>(cols) * sizeof(__nv_bfloat16), 128u};
-    uint32_t box_dim[3] = {kChunk, kInputChunksBoxRows, kInputChunksBoxChunks};
-    uint32_t element_strides[3] = {1u, 1u, 1u};
-    const CUresult res = cuTensorMapEncodeTiled(
-        &desc, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
-        const_cast<void*>(static_cast<const void*>(global_ptr)), global_shape,
-        global_strides, box_dim, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    TORCH_CHECK(res == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for ",
-                debug_name, ": CUresult=", static_cast<int>(res),
-                " (rows=", rows, ", cols=", cols, ")");
+                debug_name, ": CUresult=", static_cast<int>(res));
     return desc;
 }
 

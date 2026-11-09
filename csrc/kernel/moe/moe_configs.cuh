@@ -125,6 +125,8 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr std::uint32_t kBlockSize = 384;
         static constexpr std::uint32_t kNumRouterInputSlots = 16;
         static constexpr std::uint32_t kNumUpInputSlots = 8;
+        static constexpr bool kSharedUpUsePairLayout = false;
+        static constexpr bool kRoutedUpUsePairLayout = false;
         // Router configs.
         static constexpr std::uint32_t kNumRouterWeightSlots = 16;
         static constexpr std::uint32_t kNumCtasForRouter = 32;

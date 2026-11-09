@@ -29,7 +29,6 @@ from halops import (
     get_workspace_for_moe,
     group_wise_quant,
     low_latency_moe,
-    transform_weights_for_moe,
 )
 
 _FP8_MAX = 448.0  # e4m3 dynamic range
@@ -206,7 +205,7 @@ class MoEParams:
             else torch.Generator(device=dev).manual_seed(common_seed)
         )
 
-        router = (torch.randn(h, e, device=dev, generator=gc) / h**0.5).bfloat16()
+        router = (torch.randn(e, h, device=dev, generator=gc) / h**0.5).bfloat16()
         if self.num_router_gates == 2:
             router = torch.stack([router, router.flip(0)])
 
@@ -253,7 +252,8 @@ class MoEParams:
                 latent_w, latent_s = group_wise_quant(
                     raw[0].bfloat16(),
                     mode=self.mxfp8_group,
-                    use_swizzle=True,
+                    # The kernel takes the natural rows and builds the SfAtom.
+                    use_swizzle=False,
                 )
             else:
                 latent_w, latent_s = _quant_fp8_block_wise(raw)
@@ -271,12 +271,12 @@ class MoEParams:
         shared_down_raw = torch.randn(1, h, n, device=dev, generator=g) * 0.1
         if self.mxfp8_groups:
             shared_up, shared_up_s = group_wise_quant(
-                shared_up_raw[0].bfloat16(), mode=self.mxfp8_group, use_swizzle=True
+                shared_up_raw[0].bfloat16(), mode=self.mxfp8_group, use_swizzle=False
             )
             shared_down, shared_down_s = group_wise_quant(
                 shared_down_raw[0].bfloat16(),
                 mode=self.mxfp8_group,
-                use_swizzle=True,
+                use_swizzle=False,
             )
         else:
             shared_up, shared_up_s = _quant_fp8_block_wise(shared_up_raw)
@@ -328,7 +328,7 @@ class MoERef:
     def _router_scores(self, input):
         """The router's selection key: sigmoid of each gate's logits, summed."""
         router_weight = self.moe_params.router_weight
-        logits = (input.bfloat16() @ router_weight.bfloat16()).float()
+        logits = (input.bfloat16() @ router_weight.bfloat16().transpose(-1, -2)).float()
         if router_weight.dim() == 2:
             # The kernel round-trips the logits through bf16 before scoring.
             logits = logits.bfloat16()
@@ -367,14 +367,20 @@ class MoERef:
         activations = (blocks * x_scale.float().unsqueeze(-1)).reshape(x_fp8.shape)
         return (activations @ _dequant_fp8_block_wise(y_fp8, y_scale).T).bfloat16()
 
-    def matmul_mxfp8(self, x, y_fp8, y_scale):
+    def matmul_mxfp8(self, x, y_fp8, y_scale, sfatom=True):
         """Return dequantized ``x @ y.T`` in bf16 under the 1x32 MXFP8 recipe.
 
         ``x`` is [K] or [M, K] in bf16 and takes the kernel's per-token UE8M0
-        quantization; weights are [N, K] with an SfAtom scale table.
+        quantization; weights are [N, K] with an SfAtom scale table, or a plain
+        [N, K/32] one when ``sfatom`` is false (the latent projection, whose
+        kernel builds the SfAtom itself).
         """
         xq, x_scale = _quant_mxfp8_activation(x)
-        return _dequant_mxfp8(xq, x_scale) @ _dequant_mxfp8_weight(y_fp8, y_scale).T
+        if sfatom:
+            weight = _dequant_mxfp8_weight(y_fp8, y_scale)
+        else:
+            weight = _dequant_mxfp8(y_fp8, torch.exp2(y_scale.float() - 127.0))
+        return _dequant_mxfp8(xq, x_scale) @ weight.T
 
     def matmul_mxfp4(self, x, y_packed, y_scale):
         """Return dequantized ``x @ y.T`` in bf16: fp8 activations, MXFP4 weights.
@@ -391,14 +397,14 @@ class MoERef:
         p = self.moe_params
         n = p.intermediate_size
         if p.mxfp8_groups:
-            # The weight is the raw [gate | up] one; the kernel reads the
-            # pair layout transform_weights_for_moe packs it into.
+            # The weight is the raw [gate | up] one; the kernel interleaves
+            # its rows while loading, and the scales stay plain.
             up_out = self.matmul_mxfp8(
-                input, p.shared_up_weight, p.shared_up_weight_scale
+                input, p.shared_up_weight, p.shared_up_weight_scale, sfatom=False
             )
             act = self._gated_act(up_out[:, :n], up_out[:, n:], 1.0)
             return self.matmul_mxfp8(
-                act, p.shared_down_weight, p.shared_down_weight_scale
+                act, p.shared_down_weight, p.shared_down_weight_scale, sfatom=False
             )
 
         up_out = self.matmul_fp8(input, p.shared_up_weight, p.shared_up_weight_scale)
@@ -466,8 +472,12 @@ class MoERef:
         """z = x @ W_latent^T in the recipe the latent group runs."""
         p = self.moe_params
         if p.mxfp8_groups:
+            # The kernel builds the SfAtom from the natural scale rows.
             return self.matmul_mxfp8(
-                input, p.latent_down_weight, p.latent_down_weight_scale
+                input,
+                p.latent_down_weight,
+                p.latent_down_weight_scale,
+                sfatom=False,
             )
 
         return self.matmul_fp8(
@@ -516,21 +526,10 @@ class MoEFused:
         self.tp = tp
         self.grid_cap = grid_cap
         self.workspace = None
-        self.packed_weights = None
 
     def __call__(self, input, top_k):
         p = self.moe_params
         num_tokens = input.size(0)
-        if self.packed_weights is None:
-            self.packed_weights = transform_weights_for_moe(
-                p.router_weight,
-                p.expert_up_weights,
-                p.shared_up_weight,
-                num_tokens=num_tokens,
-                num_router_gates=p.num_router_gates,
-                expert_up_weights_scale=p.expert_up_weights_scale,
-                shared_up_weight_scale=p.shared_up_weight_scale,
-            )
         if self.workspace is None:
             self.workspace = get_workspace_for_moe(input, *self.tp)
         out = torch.empty(
@@ -538,13 +537,13 @@ class MoEFused:
         )
         low_latency_moe(
             input,
-            self.packed_weights["router_weight"],
-            self.packed_weights["expert_up_weights"],
-            self.packed_weights["expert_up_weights_scale"],
+            p.router_weight,
+            p.expert_up_weights,
+            p.expert_up_weights_scale,
             p.expert_down_weights,
             p.expert_down_weights_scale,
-            self.packed_weights["shared_up_weight"],
-            self.packed_weights["shared_up_weight_scale"],
+            p.shared_up_weight,
+            p.shared_up_weight_scale,
             p.shared_down_weight,
             p.shared_down_weight_scale,
             p.latent_down_weight,
@@ -566,50 +565,6 @@ class MoEFused:
             grid_cap=self.grid_cap,
         )
         return out
-
-
-@pytest.mark.parametrize("quant_mode", ["w8a8-blockwise", "w8a8-mxfp8", "w4a8-mxfp4"])
-def test_transform_weights_partial(quant_mode):
-    """Partial packing preserves weight and scale layouts for every recipe."""
-    p = MoEParams(use_latent=True, quant_mode=quant_mode)
-    full = transform_weights_for_moe(
-        p.router_weight,
-        p.expert_up_weights,
-        p.shared_up_weight,
-        num_tokens=16,
-        expert_up_weights_scale=p.expert_up_weights_scale,
-        shared_up_weight_scale=p.shared_up_weight_scale,
-    )
-    parts = [
-        transform_weights_for_moe(p.router_weight, None, None, num_tokens=16),
-        transform_weights_for_moe(
-            None,
-            p.expert_up_weights,
-            None,
-            expert_up_weights_scale=p.expert_up_weights_scale,
-        ),
-        transform_weights_for_moe(
-            None,
-            None,
-            p.shared_up_weight,
-            shared_up_weight_scale=p.shared_up_weight_scale,
-        ),
-    ]
-    assert set(full) == {
-        "router_weight",
-        "expert_up_weights",
-        "expert_up_weights_scale",
-        "shared_up_weight",
-        "shared_up_weight_scale",
-    }
-    assert [sorted(part) for part in parts] == [
-        ["router_weight"],
-        ["expert_up_weights", "expert_up_weights_scale"],
-        ["shared_up_weight", "shared_up_weight_scale"],
-    ]
-    for part in parts:
-        for key, value in part.items():
-            assert torch.equal(value, full[key]), key
 
 
 def _all_gather(t, world):

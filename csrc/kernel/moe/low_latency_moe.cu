@@ -32,6 +32,18 @@ namespace halops {
 namespace moe {
 
 template <typename MoEDims>
+void CheckRouterWeightShape(const torch::Tensor& router_weight) {
+    TORCH_CHECK(router_weight.scalar_type() == at::kBFloat16,
+                "router_weight must be bfloat16.");
+    TORCH_CHECK(router_weight.dim() == 3 &&
+                    router_weight.size(0) == MoEDims::kNumRouterGates &&
+                    router_weight.size(1) == MoEDims::kNumExperts &&
+                    router_weight.size(2) == MoEDims::kHiddenSize,
+                "router_weight must be [G, E, H] = [", MoEDims::kNumRouterGates,
+                ", ", MoEDims::kNumExperts, ", ", MoEDims::kHiddenSize, "].");
+}
+
+template <typename MoEDims>
 void CheckLatentDownShape(const torch::Tensor& latent_down_weight) {
     TORCH_CHECK(latent_down_weight.dim() == 2 &&
                     latent_down_weight.size(0) == MoEDims::kLatentSize &&
@@ -49,11 +61,22 @@ void CheckRoutedExpertShape(const torch::Tensor& expert_up_weights,
     // A 4-bit weight packs two values per byte along K.
     constexpr std::int64_t kWeightBytes =
         MoEDims::kQuantConfig.kExpertsQuant == moe::QuantMethod::kMXFP4 ? 2 : 1;
-    TORCH_CHECK(expert_up_weights.dim() == 3 &&
-                    expert_up_weights.size(0) == kExperts &&
-                    expert_up_weights.size(1) == kUpRows &&
-                    expert_up_weights.size(2) == kExpertK / kWeightBytes,
-                "expert_up_weights must be [E, 2N, K / ", kWeightBytes, "].");
+    if constexpr (moe::RoutedUpGemmTraits<MoEDims>::kUsePairLayout) {
+        TORCH_CHECK(expert_up_weights.dim() == 3 &&
+                        expert_up_weights.size(0) == kExperts &&
+                        expert_up_weights.size(1) == kUpRows &&
+                        expert_up_weights.size(2) == kExpertK / kWeightBytes,
+                    "expert_up_weights must be [E, 2N, K / ", kWeightBytes,
+                    "].");
+    } else {
+        // A flattened shape: [E, 2N, K / bytes].
+        TORCH_CHECK(expert_up_weights.dim() == 3 &&
+                        expert_up_weights.size(0) == kExperts &&
+                        expert_up_weights.size(1) == kUpRows &&
+                        expert_up_weights.size(2) == kExpertK / kWeightBytes,
+                    "expert_up_weights must be the natural [E, 2 * N, K / ",
+                    kWeightBytes, "].");
+    }
     TORCH_CHECK(expert_down_weights.dim() == 3 &&
                     expert_down_weights.size(0) == kExperts &&
                     expert_down_weights.size(1) == kExpertK &&
@@ -65,10 +88,18 @@ template <typename MoEDims>
 void CheckSharedExpertShape(const torch::Tensor& shared_up_weight,
                             const torch::Tensor& shared_down_weight) {
     constexpr std::int64_t kUpRows = 2 * MoEDims::kIntermediateSize;
-    TORCH_CHECK(shared_up_weight.dim() == 2 &&
-                    shared_up_weight.size(0) == kUpRows &&
-                    shared_up_weight.size(1) == MoEDims::kHiddenSize,
-                "shared_up_weight must be the pair-layout [2N, H].");
+    if constexpr (moe::SharedUpGemmTraits<MoEDims>::kUsePairLayout) {
+        TORCH_CHECK(shared_up_weight.dim() == 2 &&
+                        shared_up_weight.size(0) == kUpRows &&
+                        shared_up_weight.size(1) == MoEDims::kHiddenSize,
+                    "shared_up_weight must be the pair-layout [2N, H].");
+    } else {
+        // A flattened shape: [2N, H].
+        TORCH_CHECK(shared_up_weight.dim() == 2 &&
+                        shared_up_weight.size(0) == kUpRows &&
+                        shared_up_weight.size(1) == MoEDims::kHiddenSize,
+                    "shared_up_weight must be the natural [2, N, H].");
+    }
     TORCH_CHECK(shared_down_weight.dim() == 2 &&
                     shared_down_weight.size(0) == MoEDims::kHiddenSize &&
                     shared_down_weight.size(1) == MoEDims::kIntermediateSize,
@@ -164,10 +195,11 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
     TORCH_CHECK(top_k >= 1 && top_k <= kMaxTopk, "top_k must be between 1 and ",
                 kMaxTopk, ".");
 
-    CheckRoutedExpertShape<MoEDims>(expert_up_weights, expert_down_weights);
+    CheckRouterWeightShape<MoEDims>(router_weight);
     if constexpr (MoEDims::kUseLatent) {
         CheckLatentDownShape<MoEDims>(latent_down_weight);
     }
+    CheckRoutedExpertShape<MoEDims>(expert_up_weights, expert_down_weights);
     CheckSharedExpertShape<MoEDims>(shared_up_weight, shared_down_weight);
     TORCH_CHECK(tail_uc_bases.dim() == 1 &&
                     tail_uc_bases.numel() ==
@@ -432,14 +464,6 @@ int64_t MoETailRegionBytes(bool wide, int64_t tp_size) {
                       QuantBWFP8{}, true, 4>>()
                 : moe::tail_region_bytes<moe::Dims_BS8_E512_N512_K2048_SM100<
                       QuantBWFP8{}, true, 4>>();
-}
-
-int64_t RouterTileM(int64_t num_tokens = 0) {
-    using QuantBWFP8 = moe::QuantConfig<>;
-    using Bs8 = moe::Dims_BS8_E512_N512_K2048_SM100<QuantBWFP8{}>;
-    using Bs16 = moe::Dims_BS16_E512_N512_K2048_SM100<QuantBWFP8{}>;
-    return (num_tokens > 8) ? moe::RouterGemmTraits<Bs16>::kTileShapeM
-                            : moe::RouterGemmTraits<Bs8>::kTileShapeM;
 }
 
 }  // namespace halops
