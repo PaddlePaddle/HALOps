@@ -107,6 +107,9 @@ struct QuantConfig {
     static constexpr QuantMethod kExpertsActQuant =
         ExpertsQuant == QuantMethod::kMXFP4 ? QuantMethod::kMXFP8
                                             : ExpertsQuant;
+    static constexpr QuantMethod kTailQuant =
+        LatentQuant == QuantMethod::kBlockwiseFP8 ? QuantMethod::kBlockwiseFP8
+                                                  : QuantMethod::kMXFP8;
     static constexpr std::uint32_t kBlockSize = 128;
 };
 
