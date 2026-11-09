@@ -592,10 +592,9 @@ struct CollectiveMainloopMoE {
             // TMEM allocation issued by ONE fully-active warp.
             tmem_alloc(Traits::kTmemColumns, &smem->tmem_ptr);
         } else if (warp_idx == 1 && lane_idx == 0) {
-            // Only this block's prologue role's barriers.
-            if (Router::is_router_cta()) {
-                smem->barriers.init_router_ring();
-            } else if (Latent::is_latent_cta()) {
+            // Only this block's prologue role's barriers; a router block's
+            // loader warp initializes the router ring itself.
+            if (Latent::is_latent_cta()) {
                 smem->barriers.latent_down.init(
                     static_cast<int>(WarpRole::kCalcWarpCount));
             } else if (SharedUpProjectionBase<Traits>::is_shared_cta()) {
@@ -607,6 +606,11 @@ struct CollectiveMainloopMoE {
             // Every block runs the expert phases.
             smem->barriers.routed.init();
             cutlass::arch::fence_barrier_init();
+        } else if (WarpRole::is_weight_loader_warp(warp_idx) &&
+                   Router::is_router_cta()) {
+            // The router is the prologue's critical path: start its loads now.
+            Router::start_streams(params.router_weight,
+                                  params.tma_input_chunks_desc, smem);
         }
         __syncthreads();
 

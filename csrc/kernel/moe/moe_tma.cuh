@@ -48,6 +48,13 @@ __device__ static __forceinline__ void tma_load_1d(const void* src_gmem,
                                    static_cast<std::int32_t>(bytes));
 }
 
+// Prefetch a contiguous range into L2 without staging it in shared memory.
+__device__ static __forceinline__ void tma_prefetch_l2_1d(const void* src_gmem,
+                                                          std::uint32_t bytes) {
+    cute::SM90_BULK_COPY_G2S::PREFETCH::copy(src_gmem,
+                                             static_cast<std::int32_t>(bytes));
+}
+
 // Issue one 2D TMA bulk-tensor load, tracked by an mbarrier.
 __device__ static __forceinline__ void tma_load_2d(
     CUtensorMap const& tma_desc, std::uint32_t coord0, std::uint32_t coord1,

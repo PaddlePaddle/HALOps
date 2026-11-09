@@ -863,6 +863,9 @@ struct SharedDownProjection<KernelTraits, false>
     static_assert(
         !SharedDownGemm::MmaCore::kUseBlockscaled,
         "SharedDownProjection<false> requires a non-blockscaled MMA core");
+    static_assert(SharedDownGemm::MmaCore::kAtomShapeM ==
+                      SharedDownGemm::WeightQuant::kBlockSize,
+                  "each M atom reads one row of weight-scale blocks");
 
     __device__ static void run(
         CUtensorMap const& tma_down_desc,
@@ -932,7 +935,8 @@ struct SharedDownProjection<KernelTraits, false>
         smem->barriers.shared_down.accumulator_ready.wait(0u);
         KERNEL_TIMER_END(smem->timer.get(), done_span);
 #pragma unroll
-        for (std::uint32_t atom = 0; atom < 2u; ++atom) {
+        for (std::uint32_t atom = 0; atom < SharedDownGemm::MmaCore::kNumAtomMs;
+             ++atom) {
 #pragma unroll
             for (std::uint32_t group = 0;
                  group < SharedDownGemm::kTileShapeN / 8u; ++group) {
@@ -951,10 +955,12 @@ struct SharedDownProjection<KernelTraits, false>
                                     SharedDownGemm::kTileShapeN +
                                 s * SharedDownGemm::kTileShapeN + group * 8u,
                             lane_base, v);
-                        const float ws =
-                            down_scale[(Base::cta_idx() * 2u + atom) *
-                                           Base::kDownTilesK +
-                                       t];
+                        const float ws = down_scale
+                            [(Base::cta_idx() *
+                                  SharedDownGemm::MmaCore::kNumAtomMs +
+                              atom) *
+                                 Base::kDownTilesK +
+                             t];
                         Base::dequant(v,
                                       &smem->shared_expert.act_down_input
                                            .scale[t * SharedDownGemm::MmaCore::

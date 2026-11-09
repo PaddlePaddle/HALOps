@@ -107,6 +107,12 @@ struct BarrierRingBase {
         wait_parity(data[slot_idx % N], phase);
     }
 
+    // Whether `iter`'s phase has completed; never blocks.
+    __device__ __forceinline__ bool test(std::uint32_t iter) const {
+        return cutlass::arch::ClusterBarrier::test_wait(&data[slot(iter)],
+                                                        parity(iter), 1u);
+    }
+
     __device__ __forceinline__ std::uint64_t* raw(std::uint32_t slot_idx) {
         return &data[slot_idx % N];
     }
