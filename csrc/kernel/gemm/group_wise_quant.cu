@@ -235,8 +235,8 @@ void LaunchQuantKernel(const T* input, int64_t ld, void* output_quant,
                        void* output_sf, int m, int k, int kb_dim, int grid_dim,
                        int block_dim, cudaStream_t stream) {
     LaunchKernelWithPdl(group_wise_quant_kernel<T, MODE, USE_SWIZZLE, USE_PDL>,
-                        grid_dim, block_dim, 0, stream, USE_PDL, input, ld,
-                        output_quant, output_sf, m, k, kb_dim);
+                        grid_dim, block_dim, kNoCluster, 0, stream, USE_PDL,
+                        input, ld, output_quant, output_sf, m, k, kb_dim);
 }
 
 template <typename T, QuantMode MODE, bool USE_SWIZZLE>

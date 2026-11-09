@@ -72,7 +72,11 @@ def _dequant_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 def _route(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select experts from the sum of both gates, breaking ties by expert ID."""
+    """Select experts from the sum of both gates, breaking ties by expert ID.
+
+    ``correction_bias`` steers the selection only; the renormalized combine
+    weights keep the raw scores and are then scaled per selected expert.
+    """
     x = inp["input_bf16"]
     # The dual router publishes FP32 scores without rounding logits to BF16.
     logits = torch.matmul(x.float(), inp["router_weight_fp32"])
@@ -81,10 +85,17 @@ def _route(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
         if inp["scoring_func"] == "sigmoid"
         else torch.softmax(logits, dim=-1)
     ).sum(dim=0)
-    ids = torch.argsort(scores, dim=-1, descending=True, stable=True)[:, : inp["top_k"]]
+    bias = inp.get("correction_bias")
+    selection = scores + bias if bias is not None else scores
+    ids = torch.argsort(selection, dim=-1, descending=True, stable=True)[
+        :, : inp["top_k"]
+    ]
     weights = scores.gather(1, ids)
     if inp["renormalize"]:
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    scale = inp.get("per_expert_scale")
+    if scale is not None:
+        weights = weights * scale[ids]
     return weights, ids
 
 

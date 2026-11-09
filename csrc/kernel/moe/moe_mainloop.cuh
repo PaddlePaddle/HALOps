@@ -93,6 +93,8 @@ struct CollectiveMainloopMoE {
         std::uint32_t tail_rank;
         ScoringFunc scoring_func;
         bool renormalize;
+        const float* correction_bias;
+        const float* per_expert_scale;
         Activation activation;
         float situ_beta;
         float situ_linear_beta;
@@ -141,6 +143,8 @@ struct CollectiveMainloopMoE {
         std::uint32_t top_k;
         ScoringFunc scoring_func;
         bool renormalize;
+        const float* correction_bias;
+        const float* per_expert_scale;
         Activation activation;
         float situ_beta;
         float situ_linear_beta;
@@ -196,6 +200,8 @@ struct CollectiveMainloopMoE {
         params.top_k = args.top_k;
         params.scoring_func = args.scoring_func;
         params.renormalize = args.renormalize;
+        params.correction_bias = args.correction_bias;
+        params.per_expert_scale = args.per_expert_scale;
         params.activation = args.activation;
         params.situ_beta = args.situ_beta;
         params.situ_linear_beta = args.situ_linear_beta;
@@ -332,7 +338,8 @@ struct CollectiveMainloopMoE {
             if (calc_warp_idx < kTokensPerCta && tok < params.num_tokens) {
                 topk_one_token<Dims, kExpertsPerThread>(
                     tok, params.top_k, params.scoring_func, params.renormalize,
-                    workspace, smem);
+                    params.correction_bias, params.per_expert_scale, workspace,
+                    smem);
             }
         } else {
             constexpr std::uint32_t kTokensPerWarp =
@@ -346,7 +353,8 @@ struct CollectiveMainloopMoE {
                 if (tok >= params.num_tokens) break;
                 topk_one_token<Dims, kExpertsPerThread>(
                     tok, params.top_k, params.scoring_func, params.renormalize,
-                    workspace, smem);
+                    params.correction_bias, params.per_expert_scale, workspace,
+                    smem);
             }
         }
         WarpRole::sync_calc_threads();
@@ -555,13 +563,9 @@ struct CollectiveMainloopMoE {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
 
-        if (warp_idx == 3 && lane_idx == 0) {
-            // Per-CTA private launch counter.
-            smem->launch_parity = workspace->cta_comm.claim_parity();
-            // The down task queue starts empty.
-            smem->down_tasks_claimed = 0u;
-            smem->down_task_stores = 0u;
-        } else if (WarpRole::is_tmem_warp(warp_idx)) {
+        // Block-local setup (barriers, TMEM, descriptors) touches nothing the
+        // previous kernel writes, so it overlaps that kernel under PDL.
+        if (WarpRole::is_tmem_warp(warp_idx)) {
             // TMEM allocation issued by ONE fully-active warp.
             tmem_alloc(Traits::kTmemColumns, &smem->tmem_ptr);
         } else if (warp_idx == 1 && lane_idx == 0) {
@@ -580,6 +584,13 @@ struct CollectiveMainloopMoE {
             // Every block runs the expert phases.
             smem->barriers.routed.init();
             cutlass::arch::fence_barrier_init();
+        }
+
+        pdl_wait();
+        if (warp_idx == 3 && lane_idx == 0) {
+            smem->launch_parity = workspace->cta_comm.claim_parity();
+            smem->down_tasks_claimed = 0u;
+            smem->down_task_stores = 0u;
         }
         __syncthreads();
 

@@ -23,6 +23,7 @@
 
 #include "kernel/moe/mma_core.cuh"
 #include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_tail.cuh"
 #include "kernel/moe/ptx_utils.cuh"
 
 namespace halops::moe {

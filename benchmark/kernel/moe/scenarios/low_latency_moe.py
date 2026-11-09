@@ -53,6 +53,7 @@ class MoeInput:
     input: torch.Tensor
     weights: dict[str, torch.Tensor]
     options: dict
+    routing: dict[str, torch.Tensor | None]
 
 
 @dataclass
@@ -77,11 +78,17 @@ def _validate_config(cfg: dict) -> dict:
         "eps": 1e-5,
         "grid_cap": 0,
         "seed": 0,
+        "routing": "bias+perexpert",
         **cfg,
     }
     for name, value in MOE_SHAPE.items():
         if options[name] != value:
             raise ValueError(f"LowLatencyMoE requires {name}={value}")
+    parts = set(filter(None, str(options["routing"]).split("+")))
+    if not parts <= {"bias", "perexpert"}:
+        raise ValueError(
+            f"routing must combine 'bias' and 'perexpert', got {options['routing']!r}"
+        )
     if options["tp_size"] != 1:
         raise ValueError("this benchmark runs on one GPU; set tp_size=1")
     if (
@@ -132,7 +139,25 @@ def _build_inputs(cfg: dict) -> MoeInput:
         "tail_fc2_weight": normal((h, z), z**-0.5),
         "tail_norm_weight": normal((z,), 0.1).add_(1.0),
     }
-    return MoeInput(x, _quantize_weights(weights, options["quant_mode"]), options)
+    # Router steering: the bias is added to the selection scores, the per-expert
+    # scale multiplies the renormalized combine weights.
+    routing_gen = torch.Generator(device=device).manual_seed(options["seed"] + 1)
+    parts = set(filter(None, str(options["routing"]).split("+")))
+    routing = {
+        "correction_bias": (
+            torch.randn(e, device=device, generator=routing_gen) * 0.3
+            if "bias" in parts
+            else None
+        ),
+        "per_expert_scale": (
+            0.5 + torch.rand(e, device=device, generator=routing_gen)
+            if "perexpert" in parts
+            else None
+        ),
+    }
+    return MoeInput(
+        x, _quantize_weights(weights, options["quant_mode"]), options, routing
+    )
 
 
 def _quant_fp8_blockwise(weight: torch.Tensor, power_of_two=False):
@@ -197,6 +222,7 @@ def adapt_halops(raw: MoeInput) -> dict:
         **raw.options,
         **quantized,
         **packed,
+        **raw.routing,
         "input": raw.input,
         "out": torch.empty_like(raw.input),
         "num_router_gates": 2,
@@ -210,6 +236,7 @@ def _active_experts(raw: MoeInput) -> int:
         _route(
             {
                 **raw.options,
+                **raw.routing,
                 "input_bf16": raw.input,
                 "router_weight_fp32": raw.weights["router_weight"].float(),
             }
@@ -234,6 +261,7 @@ def adapt_golden(raw: MoeInput) -> dict:
             weights[name] = _dequant_weight(weight, raw.weights[scale_name])
     return {
         **raw.options,
+        **raw.routing,
         **weights,
         "input_bf16": raw.input,
         "router_weight_fp32": raw.weights["router_weight"].float(),

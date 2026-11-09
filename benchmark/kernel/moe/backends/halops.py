@@ -37,6 +37,8 @@ def run_low_latency_moe(inp: dict):
         inp["tail_fc2_weight"],
         inp["tail_fc2_scale"],
         inp["tail_norm_weight"],
+        inp.get("correction_bias"),
+        inp.get("per_expert_scale"),
         inp["out"],
         inp["workspace"],
         inp["top_k"],
