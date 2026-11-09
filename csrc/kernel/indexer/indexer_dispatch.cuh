@@ -30,9 +30,9 @@ void launch_indexer_kernel(Kernel kernel, const IndexerHostParams& host,
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
             shared_memory_bytes));
     const auto stream = GetCurrentCUDAStream(host.x);
-    HALOPS_CUDA_CHECK(LaunchKernelWithPdl(kernel, dim3(params.grid_blocks),
-                                          dim3(threads), shared_memory_bytes,
-                                          stream, host.use_pdl, params));
+    HALOPS_CUDA_CHECK(LaunchKernelWithPdl(
+        kernel, dim3(params.grid_blocks), dim3(threads), kNoCluster,
+        shared_memory_bytes, stream, host.use_pdl, params));
 }
 
 template <class KernelTraits>
