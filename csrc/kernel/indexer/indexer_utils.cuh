@@ -26,74 +26,10 @@
 #include <cutlass/detail/sm100_blockscaled_layout.hpp>
 #include <cutlass/detail/sm100_tmem_helper.hpp>
 
+#include "common/ptx.cuh"
 #include "indexer_config.cuh"
 
-#ifndef HALOPS_INDEXER_DEVICE_ASSERT
-#    define HALOPS_INDEXER_DEVICE_ASSERT(cond) \
-        do {                                   \
-            if (not(cond)) asm("trap;");       \
-        } while (0)
-#endif
-
-namespace halops::indexer {
-using transac_bar_t = cutlass::arch::ClusterTransactionBarrier;
-}
-
 namespace halops::indexer::intrinsics {
-
-CUTE_DEVICE
-void gmem_red_add1_release(int* p) {
-    asm volatile("red.release.gpu.global.add.s32 [%0], 1;" ::"l"(p) : "memory");
-}
-
-CUTE_DEVICE
-int gmem_ld_acquire(const int* p) {
-    int v;
-    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];"
-                 : "=r"(v)
-                 : "l"(p)
-                 : "memory");
-    return v;
-}
-
-CUTE_DEVICE
-int gmem_ld_relaxed(const int* p) {
-    int v;
-    asm volatile("ld.relaxed.gpu.global.s32 %0, [%1];"
-                 : "=r"(v)
-                 : "l"(p)
-                 : "memory");
-    return v;
-}
-
-CUTE_DEVICE
-int gmem_atom_add1_acq_rel(int* p) {
-    int prev;
-    asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;"
-                 : "=r"(prev)
-                 : "l"(p)
-                 : "memory");
-    return prev;
-}
-
-CUTE_DEVICE
-void gmem_st_zero_relaxed(int* p) {
-    asm volatile("st.global.s32 [%0], 0;" ::"l"(p) : "memory");
-}
-
-CUTE_DEVICE
-void umma_arrive_noelect(transac_bar_t& bar) {
-    uint32_t bar_intptr = cute::cast_smem_ptr_to_uint(&bar);
-    asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 "
-        "[%0];\n"
-        :
-        : "r"(bar_intptr));
-}
-
-CUTE_DEVICE void tcgen05_after_thread_sync() {
-    asm volatile("tcgen05.fence::after_thread_sync;");
-}
 
 template <typename TiledMMA, typename TensorA, typename TensorB,
           typename TensorFragC>
@@ -126,70 +62,9 @@ static constexpr auto make_umma_k_major_layout() {
 
 }  // namespace halops::indexer::intrinsics
 
-namespace cute {
-
-template <class a_type, class b_type, class c_type, int M, int N,
-          UMMA::Major a_major, UMMA::Major b_major,
-          UMMA::ScaleIn a_neg = UMMA::ScaleIn::One,
-          UMMA::ScaleIn b_neg = UMMA::ScaleIn::One>
-struct SM100_MMA_F16BF16_SS_NOELECT
-    : SM100_MMA_F16BF16_SS<a_type, b_type, c_type, M, N, a_major, b_major,
-                           a_neg, b_neg> {
-    CUTE_HOST_DEVICE static void fma(uint64_t const& desc_a,
-                                     uint64_t const& desc_b,
-                                     uint32_t const& tmem_c,
-                                     uint32_t const& scaleC,
-                                     uint64_t const& idescE) {
-        uint32_t mask[4] = {0, 0, 0, 0};
-        asm volatile(
-            "{\n\t"
-            ".reg .pred p;\n\t"
-            "setp.ne.b32 p, %4, 0;\n\t"
-            "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%5, %6, %7, "
-            "%8}, p; \n\t"
-            "}\n"
-            :
-            : "r"(tmem_c), "l"(desc_a), "l"(desc_b),
-              "r"(uint32_t(idescE >> 32)), "r"(scaleC), "r"(mask[0]),
-              "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
-    }
-};
-
-template <class a_type, class b_type, class c_type, int M, int N,
-          UMMA::Major a_major, UMMA::Major b_major, UMMA::ScaleIn a_neg,
-          UMMA::ScaleIn b_neg>
-struct MMA_Traits<SM100_MMA_F16BF16_SS_NOELECT<a_type, b_type, c_type, M, N,
-                                               a_major, b_major, a_neg, b_neg>>
-    : MMA_Traits<SM100_MMA_F16BF16_SS<a_type, b_type, c_type, M, N, a_major,
-                                      b_major, a_neg, b_neg>> {
-    template <class TD, class DLayout, class TA, class ALayout_, class TB,
-              class BLayout_, class TC, class CLayout_>
-    CUTE_HOST_DEVICE constexpr friend void mma_unpack(
-        MMA_Traits const& traits, Tensor<TD, DLayout>& D,
-        Tensor<TA, ALayout_> const& A, Tensor<TB, BLayout_> const& B,
-        Tensor<TC, CLayout_> const& C) {
-        static_assert(is_tmem<TD>::value, "Expected tmem in MMA_Atom::call");
-        static_assert(is_rmem<TA>::value,
-                      "Expected desc registers in MMA_Atom::call");
-        static_assert(is_rmem<TB>::value,
-                      "Expected desc registers in MMA_Atom::call");
-        static_assert(is_tmem<TC>::value, "Expected tmem in MMA_Atom::call");
-
-        uint64_t desc_a = A[0];
-        uint64_t desc_b = B[0];
-        uint32_t tmem_c = raw_pointer_cast(D.data());
-        uint64_t idesc = UMMA::make_runtime_instr_desc<>(traits.idesc_);
-        SM100_MMA_F16BF16_SS_NOELECT<a_type, b_type, c_type, M, N, a_major,
-                                     b_major, a_neg,
-                                     b_neg>::fma(desc_a, desc_b, tmem_c,
-                                                 uint32_t(traits.accumulate_),
-                                                 idesc);
-    }
-};
-
-}  // namespace cute
-
 namespace halops::indexer {
+
+using transac_bar_t = cutlass::arch::ClusterTransactionBarrier;
 
 template <class Bar>
 CUTE_DEVICE void sync_named_barrier() {
@@ -289,17 +164,16 @@ struct PartialBarrier {
 
     CUTE_DEVICE void arrive_warp() const {
         __syncwarp();
-        if (cute::elect_one_sync())
-            halops::indexer::intrinsics::gmem_red_add1_release(slot);
+        if (cute::elect_one_sync()) halops::gmem_red_add1_release(slot);
     }
 
     CUTE_DEVICE void wait(uint32_t epoch) const {
         const int target = (int)(epoch + 1) * producer_count;
         int seen;
         do {
-            seen = halops::indexer::intrinsics::gmem_ld_relaxed(slot);
+            seen = halops::gmem_ld_relaxed(slot);
         } while (seen < target);
-        seen = halops::indexer::intrinsics::gmem_ld_acquire(slot);
+        seen = halops::gmem_ld_acquire(slot);
     }
 
     CUTE_DEVICE void wait_warp(uint32_t epoch) const {
@@ -310,9 +184,8 @@ struct PartialBarrier {
     CUTE_DEVICE bool try_wait(uint32_t epoch) const {
         const int target = (int)(epoch + 1) * producer_count;
         // Poll relaxed; acquire published data only after the producers finish.
-        if (halops::indexer::intrinsics::gmem_ld_relaxed(slot) < target)
-            return false;
-        return halops::indexer::intrinsics::gmem_ld_acquire(slot) >= target;
+        if (halops::gmem_ld_relaxed(slot) < target) return false;
+        return halops::gmem_ld_acquire(slot) >= target;
     }
 
     CUTE_DEVICE bool try_wait_warp(uint32_t epoch) const {
@@ -324,7 +197,7 @@ struct PartialBarrier {
     }
 
     CUTE_DEVICE void reset_relaxed() const {
-        halops::indexer::intrinsics::gmem_st_zero_relaxed(slot);
+        halops::gmem_st_zero_relaxed(slot);
     }
 };
 

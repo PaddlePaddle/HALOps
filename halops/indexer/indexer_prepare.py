@@ -22,9 +22,6 @@ import halops.halops_kernel as halops_kernel
 
 __all__ = ["indexer_prepare"]
 
-FP8_E4M3 = torch.float8_e4m3fn
-WEIGHTS_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
-
 
 def indexer_prepare(
     x: torch.Tensor,
@@ -129,7 +126,11 @@ def indexer_prepare(
         raise ValueError(
             "out_q_sf is only accepted with out_qk_dtype_str='mxfp4' or 'mxfp8'"
         )
-    if out_weights_dtype is not None and out_weights_dtype not in WEIGHTS_DTYPES:
+    if out_weights_dtype is not None and out_weights_dtype not in (
+        torch.float32,
+        torch.bfloat16,
+        torch.float16,
+    ):
         raise ValueError(
             "out_weights_dtype must be None, torch.float32, torch.bfloat16 or "
             f"torch.float16, got {out_weights_dtype}"
@@ -147,7 +148,7 @@ def indexer_prepare(
         raise AssertionError(f"x must be bfloat16, got {x.dtype}")
     if wk_w.dtype != torch.bfloat16:
         raise AssertionError("wk_w is bf16 only")
-    if wq_b.dtype != FP8_E4M3:
+    if wq_b.dtype != torch.float8_e4m3fn:
         raise AssertionError(f"wq_b must be float8_e4m3fn, got {wq_b.dtype}")
     if wq_b_sf.dtype != torch.uint8:
         raise AssertionError(f"wq_b_sf must be uint8, got {wq_b_sf.dtype}")
@@ -165,7 +166,7 @@ def indexer_prepare(
     if out_q is None:
         out_q = torch.empty(
             (num_tokens, n_heads, head_dim // 2 if is_fp4 else head_dim),
-            dtype=torch.uint8 if is_fp4 else FP8_E4M3,
+            dtype=torch.uint8 if is_fp4 else torch.float8_e4m3fn,
             device=device,
         )
     if is_mx_sf and out_q_sf is None:

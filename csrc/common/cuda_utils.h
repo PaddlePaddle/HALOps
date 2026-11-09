@@ -31,6 +31,13 @@ extern "C" int32_t aoti_torch_get_current_cuda_stream(int32_t device_index,
 
 namespace halops {
 
+#ifndef HALOPS_DEVICE_ASSERT
+#    define HALOPS_DEVICE_ASSERT(cond)   \
+        do {                             \
+            if (not(cond)) asm("trap;"); \
+        } while (0)
+#endif
+
 class CudaDeviceGuard {
   public:
     explicit CudaDeviceGuard(c10::Device device) {

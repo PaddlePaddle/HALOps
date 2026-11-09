@@ -120,7 +120,7 @@ struct IndexerSharedStorage {
 
     CUTE_DEVICE void acquire_tmem() {
         cute::TMEM::Allocator1Sm().allocate(TMEM_COLS, tmem_start_addr.data());
-        HALOPS_INDEXER_DEVICE_ASSERT(tmem_start_addr.data()[0] == 0);
+        HALOPS_DEVICE_ASSERT(tmem_start_addr.data()[0] == 0);
         cute::TMEM::Allocator1Sm().release_allocation_lock();
     }
 
@@ -207,82 +207,44 @@ struct IndexerHostParams {
         TORCH_CHECK(tensor.stride(0) == 1, name, " must be contiguous");
     }
 
-    static void check_storage(const char* name, const torch::Tensor& tensor,
-                              const torch::Device& device, int alignment,
-                              bool contiguous = true) {
-        TORCH_CHECK(tensor.is_cuda() && tensor.device() == device, name,
-                    " must be on the same CUDA device as x");
-        TORCH_CHECK(!contiguous || tensor.is_contiguous(), name,
-                    " must be contiguous");
-        TORCH_CHECK(
-            reinterpret_cast<uintptr_t>(tensor.data_ptr()) % alignment == 0,
-            name, " must be ", alignment, " B aligned");
-    }
-
     void validate() const {
         using Dimensions = IndexerDimensions;
         TORCH_CHECK(x.is_cuda(), "x must be CUDA");
-        TORCH_CHECK(!is_fp4 || is_mx_sf, "is_fp4 requires is_mx_sf=True");
-        const auto device = x.device();
-        check_storage("x", x, device, 16, false);
-        check_storage("q_lora", q_lora, device, 8, false);
-        check_storage("wk_w", wk_w, device, 16);
-        check_storage("wq_b", wq_b, device, 16);
-        check_storage("wq_b_sf", wq_b_sf, device, 16);
-        check_storage("k_norm_weight", k_norm_weight, device, 16);
-        check_storage("k_norm_bias", k_norm_bias, device, 16);
-        check_storage("rope_cos_sin_cache", rope_cos_sin_cache, device, 8);
-        check_storage("positions", positions, device, positions.element_size());
-        check_storage("out_cache_loc", out_cache_loc, device,
-                      out_cache_loc.element_size());
-        check_storage("paged_kv_cache_with_scale", paged_kv_cache_with_scale,
-                      device, 4);
-        check_storage("out_q", out_q, device, 16);
-        if (is_mx_sf) {
-            TORCH_CHECK(out_q_sf && out_q_sf->defined(),
-                        "out_q_sf is required for MXFP4 or MXFP8 output");
-            check_storage("out_q_sf", *out_q_sf, device, 1);
-        } else {
-            TORCH_CHECK(!out_q_sf, "out_q_sf must be None for FP8 output");
-        }
-        check_storage("out_weights", out_weights, device, 16);
-        TORCH_CHECK(std::isfinite(k_norm_eps) && k_norm_eps > 0,
-                    "k_norm_eps must be finite and positive in float32");
-        TORCH_CHECK(std::isfinite(weight_scale),
-                    "weight_scale must be finite in float32");
         TORCH_CHECK(x.dim() == 2 && x.scalar_type() == torch::kBFloat16,
                     "x must be a 2-D bfloat16 [num_tokens, hidden], got ",
                     x.sizes(), " ", x.scalar_type());
-        TORCH_CHECK(x.stride(1) == 1,
-                    "x's last dim must have stride 1 (the bf16 TMA reads it "
+        TORCH_CHECK(x.size(1) == Dimensions::HIDDEN && x.stride(1) == 1,
+                    "this build compiles hidden=", Dimensions::HIDDEN, ", got ",
+                    x.size(1),
+                    " x's last dim must have stride 1 (the bf16 TMA reads it "
                     "K-major)");
         TORCH_CHECK(head_dim == Dimensions::HEAD_DIM &&
                         n_heads == Dimensions::NUM_HEADS,
                     "this build compiles head_dim=", Dimensions::HEAD_DIM,
                     ", n_heads=", Dimensions::NUM_HEADS, "; got ", head_dim,
                     ", ", n_heads);
-        TORCH_CHECK(x.size(1) == Dimensions::HIDDEN,
-                    "this build compiles hidden=", Dimensions::HIDDEN, ", got ",
-                    x.size(1));
-
-        TORCH_CHECK(
-            x.size(0) > 0 &&
-                x.size(0) <= std::numeric_limits<int>::max() -
-                                 IndexerTraits::Workspace::TokenPadRows,
-            "num_tokens must be positive and fit in int32 with padding");
+        TORCH_CHECK(!is_fp4 || is_mx_sf, "is_fp4 requires is_mx_sf=True");
         const int num_tokens = x.size(0);
-        TORCH_CHECK(x.stride(0) >= Dimensions::HIDDEN &&
-                        x.stride(0) <= std::numeric_limits<int>::max() &&
-                        x.stride(0) % 8 == 0,
-                    "x row stride must cover hidden and be 16 B aligned");
+        const auto device = x.device();
+        if (is_mx_sf) {
+            TORCH_CHECK(out_q_sf && out_q_sf->defined(),
+                        "out_q_sf is required for MXFP4 or MXFP8 output");
+            TORCH_CHECK(
+                out_q_sf->scalar_type() == torch::kByte &&
+                    out_q_sf->dim() == 3 && out_q_sf->size(0) == num_tokens &&
+                    out_q_sf->size(1) == Dimensions::NUM_HEADS &&
+                    out_q_sf->size(2) == Dimensions::MX_SCALE_BYTES &&
+                    out_q_sf->is_contiguous(),
+                "out_q_sf must be contiguous uint8 [T, n_heads, head_dim/32]");
+        } else {
+            TORCH_CHECK(!out_q_sf, "out_q_sf must be None for FP8 output");
+        }
 
         TORCH_CHECK(wk_w.dim() == 2 && wk_w.scalar_type() == torch::kBFloat16,
                     "wk_w must be 2-D bfloat16");
-        TORCH_CHECK(wk_w.size(0) == Dimensions::KEY_WEIGHT_ROWS,
-                    "wk_w must be [head_dim + n_heads, hidden] = [",
-                    Dimensions::KEY_WEIGHT_ROWS, ", ", Dimensions::HIDDEN,
-                    "], got ", wk_w.sizes());
-        TORCH_CHECK(wk_w.size(1) == Dimensions::HIDDEN && wk_w.stride(1) == 1 &&
+        TORCH_CHECK(wk_w.size(0) == Dimensions::KEY_WEIGHT_ROWS &&
+                        wk_w.size(1) == Dimensions::HIDDEN &&
+                        wk_w.stride(1) == 1 &&
                         wk_w.stride(0) == Dimensions::HIDDEN,
                     "wk_w must be contiguous K-major [",
                     Dimensions::KEY_WEIGHT_ROWS, ", ", Dimensions::HIDDEN,
@@ -296,11 +258,6 @@ struct IndexerHostParams {
                     "q_lora's last dim must have stride 1");
         TORCH_CHECK(q_lora.scalar_type() == torch::kBFloat16,
                     "q_lora must be bfloat16");
-        TORCH_CHECK(
-            q_lora.stride(0) >= Dimensions::QUERY_LORA_RANK &&
-                q_lora.stride(0) <= std::numeric_limits<int>::max() &&
-                q_lora.stride(0) % 4 == 0,
-            "q_lora row stride must cover q_lora_rank and be 8 B aligned");
 
         TORCH_CHECK(
             wq_b.dim() == 2 && wq_b.scalar_type() == torch::kFloat8_e4m3fn,
@@ -345,9 +302,6 @@ struct IndexerHostParams {
                     "] in halves layout [cos | sin]; this build compiles "
                     "rope_dim=",
                     Dimensions::ROPE_DIM, ", got ", rope_cos_sin_cache.sizes());
-        TORCH_CHECK(rope_cos_sin_cache.stride(1) == 1 &&
-                        rope_cos_sin_cache.stride(0) == Dimensions::ROPE_DIM,
-                    "rope_cos_sin_cache must be contiguous");
         check_indices("positions", positions, num_tokens);
         check_indices("out_cache_loc", out_cache_loc, num_tokens);
 
@@ -362,21 +316,6 @@ struct IndexerHostParams {
                     "mxfp4), got ",
                     paged_kv_cache_with_scale.sizes(), " ",
                     paged_kv_cache_with_scale.scalar_type());
-        const int64_t row = paged_kv_cache_with_scale.size(1);
-        TORCH_CHECK(row <= std::numeric_limits<int>::max() &&
-                        paged_kv_cache_with_scale.size(0) > 0 &&
-                        paged_kv_cache_with_scale.size(0) <=
-                            std::numeric_limits<int>::max() /
-                                std::max<int64_t>(1, row / token_bytes),
-                    "K cache capacity must be positive and fit in int32 slots");
-        TORCH_CHECK(row % token_bytes == 0,
-                    "the K cache's row must be page_size * ", token_bytes,
-                    " bytes, got ", row);
-        const int page_size = row / token_bytes;
-        TORCH_CHECK(page_size > 0 && (page_size & (page_size - 1)) == 0,
-                    "the page_size implied by the cache shape must be a power "
-                    "of two, got ",
-                    page_size);
         TORCH_CHECK(paged_kv_cache_with_scale.stride(1) == 1,
                     "paged_kv_cache_with_scale must be row-contiguous");
 
@@ -389,15 +328,6 @@ struct IndexerHostParams {
             "out_q must be contiguous ", is_fp4 ? "uint8" : "float8_e4m3fn",
             " [T, n_heads, row_bytes] = [", num_tokens, ", ",
             Dimensions::NUM_HEADS, ", ", q_row_bytes, "], got ", out_q.sizes());
-        if (is_mx_sf) {
-            TORCH_CHECK(
-                out_q_sf->scalar_type() == torch::kByte &&
-                    out_q_sf->dim() == 3 && out_q_sf->size(0) == num_tokens &&
-                    out_q_sf->size(1) == Dimensions::NUM_HEADS &&
-                    out_q_sf->size(2) == Dimensions::MX_SCALE_BYTES &&
-                    out_q_sf->is_contiguous(),
-                "out_q_sf must be contiguous uint8 [T, n_heads, head_dim/32]");
-        }
         const auto weights_type = out_weights.scalar_type();
         TORCH_CHECK(
             (weights_type == torch::kFloat ||
@@ -517,10 +447,6 @@ struct IndexerBarriers {
                   params.uses_simt_projection()
                       ? IndexerDimensions::NUM_HEADS
                       : params.key_weight_items_per_group);
-    }
-    CUTE_DEVICE Bar query_scale_ready(int group) const {
-        return of(Workspace::QUERY_SCALE_READY, group,
-                  params.query_items_per_group);
     }
     CUTE_DEVICE Bar weights_ready(int group) const {
         return of(Workspace::WEIGHTS_READY, group, valid_tokens(group));

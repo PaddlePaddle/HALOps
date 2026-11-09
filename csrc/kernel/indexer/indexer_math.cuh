@@ -14,26 +14,11 @@
 
 #pragma once
 
-#include <cuda_fp8.h>
-
+#include "common/mx_quant.cuh"
 #include "indexer_config.cuh"
 #include "indexer_utils.cuh"
 
 namespace halops::indexer {
-
-CUTE_DEVICE uint8_t to_e4m3(float x) {
-    return __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
-}
-
-CUTE_DEVICE uint32_t pack_e4m3x4(float a, float b, float c, float d,
-                                 float inverse_scale) {
-    const float2 inverse = make_float2(inverse_scale, inverse_scale);
-    const uint32_t low = __nv_cvt_float2_to_fp8x2(
-        __fmul2_rn(make_float2(a, b), inverse), __NV_SATFINITE, __NV_E4M3);
-    const uint32_t high = __nv_cvt_float2_to_fp8x2(
-        __fmul2_rn(make_float2(c, d), inverse), __NV_SATFINITE, __NV_E4M3);
-    return low | (high << 16);
-}
 
 CUTE_DEVICE float fp8_row_scale(float amax) {
     return fmaxf(amax, IndexerDimensions::FP8_AMAX_FLOOR) /
@@ -310,7 +295,8 @@ CUTE_DEVICE float group_quantize_output(
             uint32_t words[4];
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < 4; ++j)
-                words[j] = pack_e4m3x4(values[i + j * 4], values[i + j * 4 + 1],
+                words[j] =
+                    mxfp8::pack_e4m3x4(values[i + j * 4], values[i + j * 4 + 1],
                                        values[i + j * 4 + 2],
                                        values[i + j * 4 + 3], inverse_scale);
             *reinterpret_cast<uint4*>(data + group_lane * VALUES + i) =
@@ -318,16 +304,16 @@ CUTE_DEVICE float group_quantize_output(
         }
     } else if constexpr (VALUES == 8) {
         *reinterpret_cast<uint2*>(data + group_lane * VALUES) =
-            make_uint2(pack_e4m3x4(values[0], values[1], values[2], values[3],
-                                   inverse_scale),
-                       pack_e4m3x4(values[4], values[5], values[6], values[7],
-                                   inverse_scale));
+            make_uint2(mxfp8::pack_e4m3x4(values[0], values[1], values[2],
+                                          values[3], inverse_scale),
+                       mxfp8::pack_e4m3x4(values[4], values[5], values[6],
+                                          values[7], inverse_scale));
     } else {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < VALUES; i += 4)
             *reinterpret_cast<uint32_t*>(data + group_lane * VALUES + i) =
-                pack_e4m3x4(values[i], values[i + 1], values[i + 2],
-                            values[i + 3], inverse_scale);
+                mxfp8::pack_e4m3x4(values[i], values[i + 1], values[i + 2],
+                                   values[i + 3], inverse_scale);
     }
     if (!is_mx_sf && scales != nullptr && group_lane == 0)
         *reinterpret_cast<float*>(scales) = scale;
@@ -423,7 +409,7 @@ CUTE_DEVICE float thread_quantize_output(V&& values, uint8_t* data,
             uint32_t words[8];
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < IndexerDimensions::MX_GROUP_SIZE; i += 4)
-                words[i / 4] = pack_e4m3x4(
+                words[i / 4] = mxfp8::pack_e4m3x4(
                     values[group * 32 + i], values[group * 32 + i + 1],
                     values[group * 32 + i + 2], values[group * 32 + i + 3],
                     inverse_scale);
@@ -440,9 +426,9 @@ CUTE_DEVICE float thread_quantize_output(V&& values, uint8_t* data,
         uint32_t packed[8];
         CUTLASS_PRAGMA_UNROLL
         for (int j = 0; j < 8; ++j)
-            packed[j] = pack_e4m3x4(values[i + j * 4], values[i + j * 4 + 1],
-                                    values[i + j * 4 + 2],
-                                    values[i + j * 4 + 3], inverse_scale);
+            packed[j] = mxfp8::pack_e4m3x4(
+                values[i + j * 4], values[i + j * 4 + 1], values[i + j * 4 + 2],
+                values[i + j * 4 + 3], inverse_scale);
         store_output_words8(data + i, packed, use_256bit_stores);
     }
     return scale;

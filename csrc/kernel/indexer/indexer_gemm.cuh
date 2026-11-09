@@ -18,6 +18,7 @@
 
 #include <cute/tensor.hpp>
 
+#include "common/ptx.cuh"
 #include "indexer_config.cuh"
 #include "indexer_utils.cuh"
 
@@ -463,22 +464,20 @@ struct MmaOp {
 
     CUTE_DEVICE void run_k_tile(int k) {
         if (k == 0) tiled_mma.accumulate_ = cute::UMMA::ScaleOut::Zero;
-        halops::indexer::intrinsics::tcgen05_after_thread_sync();
+        halops::tcgen05_after_thread_sync();
         dispatch_stage<STAGES>(k % STAGES, stager(), k);
     }
 
     CUTE_DEVICE void commit(int k) {
         tiled_mma.accumulate_ = cute::UMMA::ScaleOut::One;
         __syncwarp();
-        if (elected)
-            halops::indexer::intrinsics::umma_arrive_noelect(
-                resources.barriers.buffer_free[k % STAGES]);
+        cutlass::arch::umma_arrive(reinterpret_cast<uint64_t const*>(
+            &resources.barriers.buffer_free[k % STAGES]));
     }
 
     CUTE_DEVICE void end_item() {
-        if (elected)
-            halops::indexer::intrinsics::umma_arrive_noelect(
-                resources.barriers.accumulator_ready[accumulator_slot]);
+        cutlass::arch::umma_arrive(reinterpret_cast<uint64_t const*>(
+            &resources.barriers.accumulator_ready[accumulator_slot]));
         ++item_sequence;
         ++accumulator_sequence;
     }
@@ -600,7 +599,7 @@ struct DrainOp {
     CUTE_DEVICE void wait_mma_and_load() {
         accumulator_slot = wait_accumulator_slot<ACC_STAGES>(
             resources.barriers, previous_accumulators, accumulator_sequence);
-        halops::indexer::intrinsics::tcgen05_after_thread_sync();
+        halops::tcgen05_after_thread_sync();
         cute::copy(
             tmem_copy,
             thread_tmem_accumulators(cute::_, cute::_, cute::_, cute::Int<0>{},
@@ -697,8 +696,9 @@ struct Bf16GemmTypes {
     static constexpr int OPERAND_B_OFFSET =
         BUFFER_STAGE_COUNT * OPERAND_A_STAGE_BYTES;
 
-    using MmaAtom = cute::SM100_MMA_F16BF16_SS_NOELECT<
-        bf16, bf16, float, BM, BN, cute::UMMA::Major::K, cute::UMMA::Major::K>;
+    using MmaAtom =
+        cute::SM100_MMA_F16BF16_SS<bf16, bf16, float, BM, BN,
+                                   cute::UMMA::Major::K, cute::UMMA::Major::K>;
     using TiledMma = decltype(cute::make_tiled_mma(MmaAtom{}));
 
     using TileA = cute::Shape<cute::Int<BM>, cute::Int<BK>>;
@@ -770,7 +770,6 @@ struct Bf16MmaOp {
 
     const Resources& resources;
     typename GemmTypes::TiledMma tiled_mma;
-    bool elected;
     uint32_t previous_stage_parities;
 
     int item_sequence;
@@ -789,8 +788,7 @@ struct Bf16MmaOp {
     }
 
     CUTE_DEVICE void run_k_tile(int k) {
-        halops::indexer::intrinsics::tcgen05_after_thread_sync();
-        if (!elected) return;
+        halops::tcgen05_after_thread_sync();
         dispatch_stage<STAGES>(k % STAGES, stager(), k);
     }
 
@@ -803,26 +801,34 @@ struct Bf16MmaOp {
                                        cute::Int<GemmConfig::BN>>{});
             tmem_frag.data().get() =
                 resources.tmem_base + (accumulator_slot * GemmConfig::BN);
-            halops::indexer::intrinsics::utcmma_ss(
-                tiled_mma,
-                bf16_smem_a<GemmConfig, s>(resources.gemm_shared_memory),
-                bf16_smem_b<GemmConfig, s>(resources.gemm_shared_memory),
-                tmem_frag,
-                /*clear_accum=*/k == 0);
+            tiled_mma.accumulate_ =
+                k == 0 ? cute::UMMA::ScaleOut::Zero : cute::UMMA::ScaleOut::One;
+            auto thr_mma = tiled_mma.get_slice(cute::_0{});
+            auto sA_frag = thr_mma.partition_fragment_A(
+                bf16_smem_a<GemmConfig, s>(resources.gemm_shared_memory));
+            auto sB_frag = thr_mma.partition_fragment_B(
+                bf16_smem_b<GemmConfig, s>(resources.gemm_shared_memory));
+            static_assert(cute::size<2>(sA_frag) == cute::size<2>(sB_frag));
+            static_assert(cute::size<1>(sA_frag) == cute::size<1>(tmem_frag));
+            static_assert(cute::size<1>(sB_frag) == cute::size<2>(tmem_frag));
+            CUTE_UNROLL
+            for (int k_inner = 0; k_inner < cute::size<2>(sA_frag); ++k_inner) {
+                cute::gemm(tiled_mma, sA_frag(cute::_, cute::_, k_inner),
+                           sB_frag(cute::_, cute::_, k_inner), tmem_frag);
+                tiled_mma.accumulate_ = cute::UMMA::ScaleOut::One;
+            }
         };
     }
 
     CUTE_DEVICE void commit(int k) {
         __syncwarp();
-        if (elected)
-            halops::indexer::intrinsics::umma_arrive_noelect(
-                resources.barriers.buffer_free[k % STAGES]);
+        cutlass::arch::umma_arrive(reinterpret_cast<uint64_t const*>(
+            &resources.barriers.buffer_free[k % STAGES]));
     }
 
     CUTE_DEVICE void end_item() {
-        if (elected)
-            halops::indexer::intrinsics::umma_arrive_noelect(
-                resources.barriers.accumulator_ready[accumulator_slot]);
+        cutlass::arch::umma_arrive(reinterpret_cast<uint64_t const*>(
+            &resources.barriers.accumulator_ready[accumulator_slot]));
         ++item_sequence;
         ++accumulator_sequence;
     }
@@ -835,7 +841,6 @@ CUTE_DEVICE auto make_bf16_mma_op(const Resources& resources,
     return Bf16MmaOp<GemmConfig, Resources>{
         resources,
         typename Bf16GemmTypes<GemmConfig>::TiledMma{},
-        cute::elect_one_sync() != 0,
         previous_stage_parities,
         0,
         previous_accumulators,
@@ -1038,7 +1043,7 @@ struct KeyWeightAccumulatorConsumer {
     CUTE_DEVICE void wait_mma_and_load() {
         accumulator_slot = wait_accumulator_slot<ACC_STAGES>(
             resources.barriers, previous_accumulators, accumulator_sequence);
-        halops::indexer::intrinsics::tcgen05_after_thread_sync();
+        halops::tcgen05_after_thread_sync();
         ThreadTmemAccumulators src = thread_tmem_accumulators;
         src.data() = src.data().get() + (accumulator_slot * GemmConfig::BN);
         cute::copy(tmem_copy, src, register_accumulators);

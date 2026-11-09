@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "common/ptx.cuh"
 #include "indexer_prepare_kernel.cuh"
 
 namespace halops::indexer {
@@ -22,7 +23,7 @@ namespace halops::indexer {
 CUTE_DEVICE void retire_small_barrier(PartialBarrier barrier, int consumers) {
     __syncwarp();
     if (cute::elect_one_sync()) {
-        const int previous = intrinsics::gmem_atom_add1_acq_rel(barrier.slot);
+        const int previous = halops::gmem_atom_add1_acq_rel(barrier.slot);
         if (previous == barrier.producer_count + consumers - 1)
             barrier.reset_relaxed();
     }

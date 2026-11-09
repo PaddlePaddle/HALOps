@@ -16,6 +16,7 @@
 
 #include <utility>
 
+#include "common/ptx.cuh"
 #include "indexer_mainloop.cuh"
 
 namespace halops::indexer {
@@ -147,10 +148,10 @@ CUTE_DEVICE void q_two_lane_row(Context const& context, float (&values)[64],
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < 2; ++j) {
                 const int begin = chunk * 16 + j * 4;
-                const uint32_t first =
-                    pack_e4m3x4(values[begin], values[begin + 1],
-                                values[begin + 2], values[begin + 3], inverse);
-                const uint32_t second = pack_e4m3x4(
+                const uint32_t first = mxfp8::pack_e4m3x4(
+                    values[begin], values[begin + 1], values[begin + 2],
+                    values[begin + 3], inverse);
+                const uint32_t second = mxfp8::pack_e4m3x4(
                     values[begin + 8], values[begin + 9], values[begin + 10],
                     values[begin + 11], inverse);
                 // Exchange only the half written by the other lane.
@@ -205,7 +206,7 @@ CUTE_DEVICE void drain_q_four_split(Context const& context) {
         const int slot = wait_accumulator_slot<KernelTraits::Query::AccStages>(
             context.query_resources.barriers, ledger.previous_accumulators(),
             sequence);
-        intrinsics::tcgen05_after_thread_sync();
+        halops::tcgen05_after_thread_sync();
         if constexpr (KernelTraits::PrefetchRope) {
             if (work_item.n_row != rope_group) {
                 ++rope_sequence;
@@ -259,7 +260,7 @@ CUTE_DEVICE void drain_q_eight(Context const& context) {
         const int group = work_item.n_row / KernelTraits::TokenTile;
         const int slot = wait_accumulator_slot<KernelTraits::Query::AccStages>(
             context.query_resources.barriers, 0, sequence);
-        intrinsics::tcgen05_after_thread_sync();
+        halops::tcgen05_after_thread_sync();
         if constexpr (KernelTraits::PrefetchRope) {
             if (work_item.n_row != rope_group) {
                 ++rope_sequence;
@@ -290,47 +291,6 @@ CUTE_DEVICE void drain_q_eight(Context const& context) {
         }
         cutlass::arch::fence_view_async_tmem_load();
         context.query_resources.barriers.accumulator_free[slot].arrive();
-    }
-}
-
-template <int N_PAD, class LayoutSFB, class Arrive>
-__device__ void quantize_x(const __nv_bfloat16* __restrict__ x_input,
-                           int x_row_stride, e4m3* __restrict__ ws_x_fp8,
-                           ue8m0* __restrict__ ws_x_sf,
-                           LayoutSFB const& layout_sfb, int num_tokens,
-                           int hidden_in, Arrive&& arrive, int cta_stride) {
-    using Roles = IndexerWarpTraits::Roles;
-    constexpr int VEC_THREADS =
-        Roles::VectorWarps * IndexerWarpTraits::WarpSize;
-
-    constexpr int GROUPS_PER_PASS = VEC_THREADS / 8;
-
-    const int vector_thread =
-        (int)threadIdx.x - Roles::VectorWarpBegin * IndexerWarpTraits::WarpSize;
-    const int first_scale_group = vector_thread / 8, j = vector_thread & 7;
-    const int token_groups = (num_tokens + N_PAD - 1) / N_PAD;
-    const int scale_groups_per_row =
-        hidden_in / GemmShapeDefaults::ScaleGroupSize;
-
-    for (int token_group = 0; token_group < token_groups; ++token_group) {
-        const int valid_tokens = min(N_PAD, num_tokens - token_group * N_PAD);
-        for (int local_token = blockIdx.x; local_token < valid_tokens;
-             local_token += cta_stride) {
-            const int token = token_group * N_PAD + local_token;
-            const auto* input_row = x_input + (int64_t)token * x_row_stride;
-            for (int g = first_scale_group; g < scale_groups_per_row;
-                 g += GROUPS_PER_PASS) {
-                __nv_bfloat16 values[4];
-                *reinterpret_cast<uint2*>(values) =
-                    *reinterpret_cast<const uint2*>(
-                        input_row + g * GemmShapeDefaults::ScaleGroupSize +
-                        j * 4);
-                quantize_group32_from_regs<N_PAD>(
-                    values, ws_x_fp8, ws_x_sf, layout_sfb, token, hidden_in, g,
-                    vector_thread & (IndexerWarpTraits::WarpSize - 1));
-            }
-            arrive(token_group);
-        }
     }
 }
 
@@ -678,14 +638,13 @@ struct CollectiveIndexerEpilogue {
         __syncwarp();
         int prev = 0;
         if (lane == 0)
-            prev = halops::indexer::intrinsics::gmem_atom_add1_acq_rel(
-                params.grid_completion_counter);
+            prev =
+                halops::gmem_atom_add1_acq_rel(params.grid_completion_counter);
         if (__shfl_sync(0xffffffffu, prev, 0) == params.num_tokens - 1) {
             context.barriers.reset_active_warp();
             __syncwarp();
             if (lane == 0)
-                halops::indexer::intrinsics::gmem_st_zero_relaxed(
-                    params.grid_completion_counter);
+                halops::gmem_st_zero_relaxed(params.grid_completion_counter);
         }
     }
 
@@ -795,19 +754,53 @@ struct CollectiveIndexerEpilogue {
     template <class Context>
     CUTE_DEVICE void quantize_query_lora(Context const& context) const {
         const auto& params = context.params;
-        auto publish_group = [&](int g) {
-            sync_named_barrier<
-                typename KernelTraits::Barriers::VectorGroupSync>();
-            if (KernelTraits::warp_idx() == Roles::VectorWarpBegin)
-                context.barriers.query_lora_ready(g).arrive_warp();
-        };
-        quantize_x<TokenTile>(
-            params.q_lora, params.query_lora_row_stride,
-            params.quantized_query_lora, params.query_lora_scales,
-            sf_layout(params.query_lora_descriptors), params.num_tokens,
-            Dimensions::QUERY_LORA_RANK, publish_group,
-            params.uses_local_query() ? params.key_weight_work_items
-                                      : params.grid_blocks);
+        constexpr int VEC_THREADS =
+            Roles::VectorWarps * IndexerWarpTraits::WarpSize;
+        constexpr int GROUPS_PER_PASS = VEC_THREADS / 8;
+        const int vector_thread =
+            (int)threadIdx.x -
+            Roles::VectorWarpBegin * IndexerWarpTraits::WarpSize;
+        const int first_scale_group = vector_thread / 8;
+        const int lane_in_group = vector_thread & 7;
+        const int token_groups =
+            (params.num_tokens + TokenTile - 1) / TokenTile;
+        const int scale_groups_per_row =
+            Dimensions::QUERY_LORA_RANK / GemmShapeDefaults::ScaleGroupSize;
+        const int cta_stride = params.uses_local_query()
+                                   ? params.key_weight_work_items
+                                   : params.grid_blocks;
+        const auto& layout_sfb = sf_layout(params.query_lora_descriptors);
+
+        for (int token_group = 0; token_group < token_groups; ++token_group) {
+            const int valid_tokens =
+                min(TokenTile, params.num_tokens - token_group * TokenTile);
+            for (int local_token = blockIdx.x; local_token < valid_tokens;
+                 local_token += cta_stride) {
+                const int token = token_group * TokenTile + local_token;
+                const auto* input_row =
+                    params.q_lora +
+                    (int64_t)token * params.query_lora_row_stride;
+                for (int group = first_scale_group;
+                     group < scale_groups_per_row; group += GROUPS_PER_PASS) {
+                    __nv_bfloat16 values[4];
+                    *reinterpret_cast<uint2*>(values) =
+                        *reinterpret_cast<const uint2*>(
+                            input_row +
+                            group * GemmShapeDefaults::ScaleGroupSize +
+                            lane_in_group * 4);
+                    quantize_group32_from_regs<TokenTile>(
+                        values, params.quantized_query_lora,
+                        params.query_lora_scales, layout_sfb, token,
+                        Dimensions::QUERY_LORA_RANK, group,
+                        vector_thread & (IndexerWarpTraits::WarpSize - 1));
+                }
+                sync_named_barrier<
+                    typename KernelTraits::Barriers::VectorGroupSync>();
+                if (KernelTraits::warp_idx() == Roles::VectorWarpBegin)
+                    context.barriers.query_lora_ready(token_group)
+                        .arrive_warp();
+            }
+        }
     }
 
     template <class Context>
@@ -837,11 +830,11 @@ struct CollectiveIndexerEpilogue {
             "the Q epilogue needs a drain thread to own exactly one "
             "token's full head_dim row");
         const int local_token = cute::get<0>(op.coord(0));
-        HALOPS_INDEXER_DEVICE_ASSERT(
-            cute::get<0>(op.coord(Dimensions::HEAD_DIM - 1)) == local_token &&
-            cute::get<1>(op.coord(0)) == 0 &&
-            cute::get<1>(op.coord(Dimensions::HEAD_DIM - 1)) ==
-                Dimensions::HEAD_DIM - 1);
+        HALOPS_DEVICE_ASSERT(cute::get<0>(op.coord(Dimensions::HEAD_DIM - 1)) ==
+                                 local_token &&
+                             cute::get<1>(op.coord(0)) == 0 &&
+                             cute::get<1>(op.coord(Dimensions::HEAD_DIM - 1)) ==
+                                 Dimensions::HEAD_DIM - 1);
         if (local_token >= work_item.valid_tokens) return;
         const int token = work_item.n_row + local_token;
         const int h = work_item.weight_tile;

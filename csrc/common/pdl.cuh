@@ -41,9 +41,10 @@ inline cudaLaunchAttribute PdlLaunchAttribute() {
 }
 
 template <typename KernelT, typename... Args>
-inline void LaunchKernelWithPdl(KernelT kernel, dim3 grid_dim, dim3 block_dim,
-                                std::size_t smem_bytes, cudaStream_t stream,
-                                bool use_pdl, Args&&... args) {
+inline cudaError_t LaunchKernelWithPdl(KernelT kernel, dim3 grid_dim,
+                                       dim3 block_dim, std::size_t smem_bytes,
+                                       cudaStream_t stream, bool use_pdl,
+                                       Args&&... args) {
     if (use_pdl) {
         cudaLaunchAttribute attr = PdlLaunchAttribute();
         cudaLaunchConfig_t config{};
@@ -53,10 +54,10 @@ inline void LaunchKernelWithPdl(KernelT kernel, dim3 grid_dim, dim3 block_dim,
         config.stream = stream;
         config.attrs = &attr;
         config.numAttrs = 1;
-        cudaLaunchKernelEx(&config, kernel, args...);
-        return;
+        return cudaLaunchKernelEx(&config, kernel, args...);
     }
     kernel<<<grid_dim, block_dim, smem_bytes, stream>>>(args...);
+    return cudaGetLastError();
 }
 
 }  // namespace halops

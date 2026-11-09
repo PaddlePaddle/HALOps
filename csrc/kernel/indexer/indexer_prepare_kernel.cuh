@@ -16,6 +16,7 @@
 
 #include <cuda_pipeline.h>
 
+#include "common/ptx.cuh"
 #include "indexer_epilogue.cuh"
 
 namespace halops::indexer {
@@ -233,14 +234,14 @@ __global__ void __launch_bounds__(SINGLE_TOKEN
             if (warp_idx == 0) {
                 int previous = 0;
                 if (KernelTraits::lane_idx() == 0)
-                    previous = intrinsics::gmem_atom_add1_acq_rel(
+                    previous = halops::gmem_atom_add1_acq_rel(
                         params.grid_completion_counter);
                 if (__shfl_sync(0xffffffffu, previous, 0) ==
                     (int)gridDim.x - 1) {
                     barriers.reset_active_warp();
                     __syncwarp();
                     if (KernelTraits::lane_idx() == 0)
-                        intrinsics::gmem_st_zero_relaxed(
+                        halops::gmem_st_zero_relaxed(
                             params.grid_completion_counter);
                 }
             }

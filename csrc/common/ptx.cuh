@@ -62,6 +62,47 @@ CUTE_DEVICE void bulk_store_wait_all() {
     asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
 }
 
+// Global-memory operations used by cross-warp and cross-CTA handoff paths.
+CUTE_DEVICE void gmem_red_add1_release(int* ptr) {
+    asm volatile("red.release.gpu.global.add.s32 [%0], 1;" ::"l"(ptr)
+                 : "memory");
+}
+
+CUTE_DEVICE int gmem_ld_acquire(const int* ptr) {
+    int value;
+    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];"
+                 : "=r"(value)
+                 : "l"(ptr)
+                 : "memory");
+    return value;
+}
+
+CUTE_DEVICE int gmem_ld_relaxed(const int* ptr) {
+    int value;
+    asm volatile("ld.relaxed.gpu.global.s32 %0, [%1];"
+                 : "=r"(value)
+                 : "l"(ptr)
+                 : "memory");
+    return value;
+}
+
+CUTE_DEVICE int gmem_atom_add1_acq_rel(int* ptr) {
+    int previous;
+    asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;"
+                 : "=r"(previous)
+                 : "l"(ptr)
+                 : "memory");
+    return previous;
+}
+
+CUTE_DEVICE void gmem_st_zero_relaxed(int* ptr) {
+    asm volatile("st.global.s32 [%0], 0;" ::"l"(ptr) : "memory");
+}
+
+CUTE_DEVICE void tcgen05_after_thread_sync() {
+    asm volatile("tcgen05.fence::after_thread_sync;");
+}
+
 namespace detail {
 template <class Op, class Src, int N, size_t... I>
 CUTE_DEVICE void copy_to_regs(const Src& src, uint32_t (&r)[N],

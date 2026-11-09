@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "common/pdl.cuh"
 #include "indexer_params.cuh"
 #include "indexer_prepare_kernel.cuh"
 #include "indexer_small_kernel.cuh"
@@ -29,23 +30,9 @@ void launch_indexer_kernel(Kernel kernel, const IndexerHostParams& host,
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
             shared_memory_bytes));
     const auto stream = GetCurrentCUDAStream(host.x);
-    if (host.use_pdl) {
-        cudaLaunchAttribute attribute{};
-        attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute.val.programmaticStreamSerializationAllowed = 1;
-        cudaLaunchConfig_t config{};
-        config.gridDim = dim3(params.grid_blocks);
-        config.blockDim = dim3(threads);
-        config.dynamicSmemBytes = shared_memory_bytes;
-        config.stream = stream;
-        config.attrs = &attribute;
-        config.numAttrs = 1;
-        HALOPS_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, params));
-    } else {
-        kernel<<<params.grid_blocks, threads, shared_memory_bytes, stream>>>(
-            params);
-    }
-    HALOPS_CUDA_CHECK(cudaGetLastError());
+    HALOPS_CUDA_CHECK(LaunchKernelWithPdl(kernel, dim3(params.grid_blocks),
+                                          dim3(threads), shared_memory_bytes,
+                                          stream, host.use_pdl, params));
 }
 
 template <class KernelTraits>

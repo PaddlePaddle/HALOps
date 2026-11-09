@@ -25,6 +25,16 @@ namespace halops::mxfp8 {
 
 using E4m3 = cutlass::float_e4m3_t;
 
+CUTE_DEVICE uint32_t pack_e4m3x4(float v0, float v1, float v2, float v3,
+                                 float scale) {
+    const float2 scale2 = make_float2(scale, scale);
+    const uint32_t low = __nv_cvt_float2_to_fp8x2(
+        __fmul2_rn(make_float2(v0, v1), scale2), __NV_SATFINITE, __NV_E4M3);
+    const uint32_t high = __nv_cvt_float2_to_fp8x2(
+        __fmul2_rn(make_float2(v2, v3), scale2), __NV_SATFINITE, __NV_E4M3);
+    return low | (high << 16);
+}
+
 constexpr int ceil_log2(double x) {
     int e = 0;
     for (; x > 1.0; x /= 2) ++e;

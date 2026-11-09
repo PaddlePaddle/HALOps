@@ -175,17 +175,16 @@ std::vector<torch::Tensor> RmsNormQuant(
     auto* sf_ptr = sf.data_ptr<uint8_t>();
     const cudaStream_t stream = GetCurrentCUDAStream(input);
     if (output_bf16.has_value()) {
-        LaunchKernelWithPdl(
+        HALOPS_CUDA_CHECK(LaunchKernelWithPdl(
             rms_norm_quant_kernel<true>, m_sf, threads, 0, stream, use_pdl, x,
             input.stride(0), w, static_cast<float>(eps), m, k, q_ptr, sf_ptr,
-            reinterpret_cast<__nv_bfloat16*>(output_bf16->data_ptr()));
+            reinterpret_cast<__nv_bfloat16*>(output_bf16->data_ptr())));
     } else {
-        LaunchKernelWithPdl(rms_norm_quant_kernel<false>, m_sf, threads, 0,
-                            stream, use_pdl, x, input.stride(0), w,
-                            static_cast<float>(eps), m, k, q_ptr, sf_ptr,
-                            static_cast<__nv_bfloat16*>(nullptr));
+        HALOPS_CUDA_CHECK(LaunchKernelWithPdl(
+            rms_norm_quant_kernel<false>, m_sf, threads, 0, stream, use_pdl, x,
+            input.stride(0), w, static_cast<float>(eps), m, k, q_ptr, sf_ptr,
+            static_cast<__nv_bfloat16*>(nullptr)));
     }
-    HALOPS_CUDA_CHECK(cudaGetLastError());
     return {q, sf};
 }
 
