@@ -330,6 +330,8 @@ capable symmetric region whose tail part is the fused tail’s mailbox.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">latent_up_weight</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">latent_up_weight_scale</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">norm_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">correction_bias</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">per_expert_scale</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">out</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">workspace</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">top_k</span></span></em>,</dd>
@@ -340,8 +342,9 @@ capable symmetric region whose tail part is the fused tail’s mailbox.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">situ_beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">4.0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">situ_linear_beta</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">25.0</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-06</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">quant_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'w8a8-blockwise'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">quant_mode</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'w4a8-mxfp4'</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">grid_cap</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="headerlink" href="#halops.low_latency_moe" title="Link to this definition">¶</a></dt>
@@ -412,9 +415,22 @@ Quantize it in this layout and pass it directly.</p></li>
 “w8a8-blockwise”, or shape [2048, 128] and dtype uint8 in the
 CUTLASS SfAtom layout (from <code class="docutils literal notranslate"><span class="pre">group_wise_quant(use_swizzle=True)</span></code>)
 for “w8a8-mxfp8”.</p></li>
-<li><p><strong>latent_up_weight</strong> (<em>Tensor</em>) – [4096, 2048] float8_e4m3fn latent up weight.</p></li>
-<li><p><strong>latent_up_weight_scale</strong> (<em>Tensor</em>) – [32, 16] float32 block scales, powers of two.</p></li>
+<li><p><strong>latent_up_weight</strong> (<em>Tensor</em>) – [4096, 2048] float8_e4m3fn latent up weight
+(the tail’s fc2).</p></li>
+<li><p><strong>latent_up_weight_scale</strong> (<em>Tensor</em>) – Scales of <code class="docutils literal notranslate"><span class="pre">latent_up_weight</span></code>,
+following the latent recipe of <code class="docutils literal notranslate"><span class="pre">quant_mode</span></code>: shape [32, 16] and
+dtype float32 (powers of two) for “w8a8-blockwise”; shape
+[4096, 64] and dtype uint8 (UE8M0, one per row per 32 columns,
+plain row-major as from <code class="docutils literal notranslate"><span class="pre">group_wise_quant(use_swizzle=False)</span></code>,
+not the SfAtom layout) for “w8a8-mxfp8” and “w4a8-mxfp4”.</p></li>
 <li><p><strong>norm_weight</strong> (<em>Tensor</em>) – [2048] bfloat16 RMSNorm weight.</p></li>
+<li><p><strong>correction_bias</strong> (<em>Tensor</em><em> or </em><em>None</em>) – [512] float32 CUDA router bias
+(<code class="docutils literal notranslate"><span class="pre">e_score_correction_bias</span></code>). It is added to each expert’s score
+only to choose the top-k; the weights and their renormalization
+use the bias-free scores. None: no bias.</p></li>
+<li><p><strong>per_expert_scale</strong> (<em>Tensor</em><em> or </em><em>None</em>) – [512] float32 CUDA routed scaling,
+multiplied into each selected weight after renormalization. None:
+no scaling.</p></li>
 <li><p><strong>out</strong> (<em>Tensor</em>) – [T, 4096] bfloat16 output, identical across ranks.</p></li>
 <li><p><strong>workspace</strong> (<em>MoEWorkspace</em>) – Scratchpad and tail communication state
 from <code class="docutils literal notranslate"><span class="pre">get_workspace_for_moe</span></code>, matching the token schedule.</p></li>
@@ -435,9 +451,13 @@ it. Must be finite. Default: 25.0.</p></li>
 <li><p><strong>quant_mode</strong> (<em>str</em><em>, </em><em>optional</em>) – Quantization recipe: “w8a8-blockwise”
 (every group block-wise), “w8a8-mxfp8” (every group MXFP8) or
 “w4a8-mxfp4” (routed experts MXFP4, latent and shared MXFP8).
-Default: “w8a8-blockwise”.</p></li>
+Default: “w4a8-mxfp4”.</p></li>
 <li><p><strong>grid_cap</strong> (<em>int</em><em>, </em><em>optional</em>) – Maximum resident CTAs; 0 uses the device
 limit. Keep this fixed for each workspace. Default: 0.</p></li>
+<li><p><strong>use_pdl</strong> (<em>bool</em><em>, </em><em>optional</em>) – Launch with Programmatic Dependent Launch, so
+the kernel’s setup overlaps the previous kernel’s tail. It waits for
+that kernel before touching shared state, and lets the next kernel
+start launching once the tail begins. Default: True.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
