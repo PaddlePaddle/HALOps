@@ -272,7 +272,7 @@
 <td><p>Allocate the workspace of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> for <code class="docutils literal notranslate"><span class="pre">input</span></code>'s token count.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#halops.get_workspace_size_for_moe" title="halops.get_workspace_size_for_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_workspace_size_for_moe</span></code></a></p></td>
-<td><p>Return the size in bytes of the workspace's symmetric region for a token count.</p></td>
+<td><p>Return the workspace region size in bytes for a token count.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#halops.transform_weights_for_moe" title="halops.transform_weights_for_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code></a></p></td>
 <td><p>Pack the router and up-projection weights for <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p></td>
@@ -290,8 +290,8 @@
 <dd><em class="sig-param"><span class="n"><span class="pre">buffer</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">uc_bases</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">epochs</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">rank</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">world</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tp_rank</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tp_size</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">wide</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">mc_base</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">_keepalive</span></span></em>,</dd>
@@ -301,8 +301,8 @@
 <dd><p>Scratchpad and tail communication state of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p>
 <p>The kernel has a narrow (1 &lt;= T &lt;= 8) and a wide (9 &lt;= T &lt;= 16)
 schedule; each has its own scratchpad and tail layout, so a workspace is
-bound to one of them.  <code class="docutils literal notranslate"><span class="pre">buffer</span></code> is the head of one NVLS multicast
-capable symmetric region whose tail part is the fused tail’s mailbox.</p>
+bound to one of them.  <code class="docutils literal notranslate"><span class="pre">buffer</span></code> is the scratchpad head of the workspace
+region whose tail part is the fused tail’s mailbox.</p>
 <dl class="field-list simple">
 </dl>
 </dd></dl>
@@ -369,8 +369,8 @@ launch):</p>
 </div>
 <p>where <code class="docutils literal notranslate"><span class="pre">routed</span></code> is this rank’s combined routed latent and <code class="docutils literal notranslate"><span class="pre">shared</span></code> its
 partial shared-expert output (computed in-kernel, kept in <code class="docutils literal notranslate"><span class="pre">workspace</span></code>).  Both
-AllReduces run over the tensor-parallel group of <code class="docutils literal notranslate"><span class="pre">workspace</span></code> (4 ranks, NVLS
-multicast).  A scratchpad must always be launched with the same grid, so
+AllReduces run over the configured tensor-parallel group.  A scratchpad must
+always be launched with the same grid, so
 keep <code class="docutils literal notranslate"><span class="pre">grid_cap</span></code> fixed per workspace; the tail needs the shared-expert
 blocks and its own CTAs inside the grid.</p>
 <dl class="field-list simple">
@@ -433,7 +433,8 @@ multiplied into each selected weight after renormalization. None:
 no scaling.</p></li>
 <li><p><strong>out</strong> (<em>Tensor</em>) – [T, 4096] bfloat16 output, identical across ranks.</p></li>
 <li><p><strong>workspace</strong> (<em>MoEWorkspace</em>) – Scratchpad and tail communication state
-from <code class="docutils literal notranslate"><span class="pre">get_workspace_for_moe</span></code>, matching the token schedule.</p></li>
+from <code class="docutils literal notranslate"><span class="pre">get_workspace_for_moe</span></code>, matching the token schedule. It
+also fixes the tensor-parallel size and rank of the launch.</p></li>
 <li><p><strong>top_k</strong> (<em>int</em>) – Experts selected per token, in [1, 10].</p></li>
 <li><p><strong>num_router_gates</strong> (<em>int</em><em>, </em><em>optional</em>) – Router gates merged into
 <code class="docutils literal notranslate"><span class="pre">router_weight</span></code>; this build requires 2. Default: 2.</p></li>
@@ -471,20 +472,20 @@ start launching once the tail begins. Default: True.</p></li>
 <h2>get_workspace_for_moe<a class="headerlink" href="#get-workspace-for-moe" title="Link to this heading">¶</a></h2>
 <dl class="py function">
 <dt class="sig sig-object py" id="halops.get_workspace_for_moe">
-<span class="sig-name descname"><span class="pre">get_workspace_for_moe</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">group_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rank</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">world</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#halops.get_workspace_for_moe" title="Link to this definition">¶</a></dt>
+<span class="sig-name descname"><span class="pre">get_workspace_for_moe</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">group_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_rank</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_size</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#halops.get_workspace_for_moe" title="Link to this definition">¶</a></dt>
 <dd><p>Allocate the workspace of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> for <code class="docutils literal notranslate"><span class="pre">input</span></code>’s token count.</p>
-<p>Collective over <code class="docutils literal notranslate"><span class="pre">group_name</span></code>.  Allocate it once, before any CUDA-graph
-capture, and reuse it across calls and graph replays; it is returned
-zero-initialized.  A workspace must always be launched with the same
-grid.</p>
+<p>For tp_size 4, allocation is collective over <code class="docutils literal notranslate"><span class="pre">group_name</span></code>. Allocate it
+once, before any CUDA-graph capture, and reuse it across calls and graph
+replays; it is returned zero-initialized. A workspace must always be
+launched with the same grid.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>input</strong> (<em>torch.Tensor</em>) – [T, 4096] bfloat16 CUDA tensor; T selects the schedule.</p></li>
 <li><p><strong>group_name</strong> (<em>str</em>) – Name of the torch process group of the tensor-parallel
-ranks.</p></li>
-<li><p><strong>rank</strong> (<em>int</em>) – Rank in that group.</p></li>
-<li><p><strong>world</strong> (<em>int</em>) – Size of that group; this build requires 4.</p></li>
+ranks. It is unused for a single-rank launch.</p></li>
+<li><p><strong>tp_rank</strong> (<em>int</em>) – Rank in that group.</p></li>
+<li><p><strong>tp_size</strong> (<em>int</em>) – Size of that group. Supported values are 1 and 4.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
@@ -501,13 +502,17 @@ ranks.</p></li>
 <h2>get_workspace_size_for_moe<a class="headerlink" href="#get-workspace-size-for-moe" title="Link to this heading">¶</a></h2>
 <dl class="py function">
 <dt class="sig sig-object py" id="halops.get_workspace_size_for_moe">
-<span class="sig-name descname"><span class="pre">get_workspace_size_for_moe</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#halops.get_workspace_size_for_moe" title="Link to this definition">¶</a></dt>
-<dd><p>Return the size in bytes of the workspace’s symmetric region for a token count.</p>
+<span class="sig-name descname"><span class="pre">get_workspace_size_for_moe</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#halops.get_workspace_size_for_moe" title="Link to this definition">¶</a></dt>
+<dd><p>Return the workspace region size in bytes for a token count.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>input</strong> (<em>Tensor</em><em>, </em><em>optional</em>) – Activations, shape [T, 4096], dtype
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>input</strong> (<em>Tensor</em><em>, </em><em>optional</em>) – Activations, shape [T, 4096], dtype
 bfloat16. Without it, the larger of the supported schedules is
-returned. Default: None.</p>
+returned. Default: None.</p></li>
+<li><p><strong>tp_size</strong> (<em>int</em><em>, </em><em>optional</em>) – Tensor-parallel size, either 1 or 4.
+Default: 1.</p></li>
+</ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
 <dd class="field-even"><p>Size in bytes of the scratchpad plus the tail mailbox.</p>
