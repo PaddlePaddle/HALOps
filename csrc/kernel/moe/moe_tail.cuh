@@ -24,7 +24,9 @@ template <typename Dims>
 struct TailGeometryT {
     using Config = typename Dims::KernelConfig;
     using WeightQuant =
-        QuantSpec<QuantMethod::kBlockwiseFP8, Dims::kQuantConfig.kBlockSize>;
+        QuantSpec<Dims::kQuantConfig.kTailQuant, Dims::kQuantConfig.kBlockSize>;
+    static constexpr bool kMxfp8 =
+        Dims::kQuantConfig.kTailQuant == QuantMethod::kMXFP8;
     using ElementWeight = typename WeightQuant::ElementType;
     using ElementScale = typename WeightQuant::ScaleType;
     static constexpr int kWorld = Config::kTailWorld;

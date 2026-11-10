@@ -71,29 +71,17 @@ struct RoutedUpProjectionBase
         return true;
     }
 
-    // Load a weight tile after arming the barrier for weight and scale bytes.
-    __device__ static void load_weight_tile(
-        SharedStorage* __restrict__ smem,
-        const CUtensorMap& tma_up_weights_desc, std::uint32_t ring_iter_id,
-        std::uint32_t expert_id, std::uint32_t k_tile,
-        std::uint32_t weight_row_base, std::uint64_t weight_cache_hint) {
-        const std::uint32_t slot = ring_iter_id % kNumWeightSlots;
-        Base::load_weight_tile(tma_up_weights_desc,
-                               reinterpret_cast<typename Base::WeightElement*>(
-                                   &smem->routed_experts.w_up[slot][0]),
-                               smem->barriers.routed.up_weight_ready.raw(slot),
-                               expert_id * UpGemm::kGemmM + weight_row_base,
-                               k_tile, weight_cache_hint);
-    }
-
     // Apply the gated activation, then quantize and publish each token.
     __device__ static void epilogue(
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t e, std::uint32_t batch_size, std::uint32_t base_feature,
-        std::uint32_t m_block_idx, Activation activation, float situ_beta,
-        float situ_linear_beta, Accumulator& acc_gate, Accumulator& acc_up) {
+        std::uint32_t e, std::uint32_t batch_size, std::uint32_t m_block_idx,
+        Activation activation, float situ_beta, float situ_linear_beta,
+        Accumulator& acc_gate, Accumulator& acc_up) {
         [[maybe_unused]] const std::uint32_t expert_id =
             smem->routing.active_experts[e];
+
+        const std::uint32_t base_feature =
+            m_block_idx * UpGemm::kTileShapeM / 2u;
 
         const auto act_span = KERNEL_TIMER_BEGIN(
             smem->timer.get(), "up_combine_gated_activation", expert_id);
@@ -199,9 +187,6 @@ struct RoutedUpProjection<KernelTraits, true>
     using Base::kNumAccSlots;
     using Base::kUpWeightTxBytes;
 
-    static_assert(RoutedBarrier<Dims>::kNumAccSlots == kNumAccSlots,
-                  "the accumulator barriers must ring over the TMEM slots");
-
     // Run up-projection over this block's expert sequence.
     __device__ static void run(
         const typename UpGemm::ElementScale* __restrict__ expert_scales_up,
@@ -212,10 +197,7 @@ struct RoutedUpProjection<KernelTraits, true>
         std::uint64_t weight_cache_hint) {
         const unsigned warp_idx = WarpRole::get_warp_idx();
 
-        const std::uint32_t m_block = sched.cta_group().cta_idx_in_group;
-        const std::uint32_t base_feature = m_block * UpGemm::kTileShapeM / 2u;
-        // Row base in the interleaved [E, 2N, K] tensor, one tile per K-step.
-        const std::uint32_t weight_row_base = m_block * UpGemm::kTileShapeM;
+        const std::uint32_t m_block_idx = sched.cta_group().cta_idx_in_group;
         const std::uint32_t tmem_base = smem->tmem_ptr;
 
         TaskInfo task;
@@ -224,32 +206,25 @@ struct RoutedUpProjection<KernelTraits, true>
                 smem->routing.active_experts[task.local_expert_idx];
             const std::uint32_t task_id = task.task_id;
 
-            const auto task_span = KERNEL_TIMER_BEGIN(
-                smem->timer.get(), "up_expert_task", expert_id);
+            KERNEL_TIMER_SCOPE(smem->timer.get(), "up_expert_task", expert_id);
             if (WarpRole::is_weight_loader_thread()) {
                 run_load_k_loop(smem, tma_up_weights_desc, expert_scales_up,
-                                weight_row_base, task_id, expert_id,
+                                m_block_idx, task_id, expert_id,
                                 weight_cache_hint);
             } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
-                run_mma_k_loop(smem, tmem_base, task_id,
-                               weight_row_base / UpGemm::kTileShapeM);
+                run_mma_k_loop(smem, tmem_base, task_id, m_block_idx);
             } else if (WarpRole::is_calc_warp(warp_idx)) {
                 Accumulator acc_gate_out;
                 Accumulator acc_up_out;
                 load_accumulators(smem, acc_gate_out, acc_up_out, tmem_base,
                                   task_id);
-                const auto epilogue_span = KERNEL_TIMER_BEGIN(
-                    smem->timer.get(), "up_epilogue", expert_id);
+                KERNEL_TIMER_SCOPE(smem->timer.get(), "up_epilogue", expert_id);
                 Base::epilogue(workspace, smem, task.local_expert_idx,
-                               batch_size, base_feature, m_block, activation,
-                               situ_beta, situ_linear_beta, acc_gate_out,
-                               acc_up_out);
-                KERNEL_TIMER_END(smem->timer.get(), epilogue_span);
+                               batch_size, m_block_idx, activation, situ_beta,
+                               situ_linear_beta, acc_gate_out, acc_up_out);
             }
-            KERNEL_TIMER_END(smem->timer.get(), task_span);
         }
 
-        // Drain aliased weights and the accumulator before entering down.
         if (sched.next_task_id() > 0u) {
             if (WarpRole::is_weight_loader_thread()) {
                 const std::uint32_t last_tile =
@@ -294,7 +269,7 @@ struct RoutedUpProjection<KernelTraits, true>
     __device__ static void run_mma_k_loop(SharedStorage* __restrict__ smem,
                                           std::uint32_t tmem_base,
                                           std::uint32_t task_id,
-                                          std::uint32_t row_tile) {
+                                          std::uint32_t m_block_idx) {
         typename UpGemm::TiledMma tiled_mma{};
         auto cta_mma = tiled_mma.get_slice(cute::_0{});
         auto tCt = Base::make_accumulator_fragment(cta_mma);
@@ -322,7 +297,7 @@ struct RoutedUpProjection<KernelTraits, true>
             KERNEL_TIMER_END(smem->timer.get(), mma_ready_span);
             if constexpr (UpGemm::kScaleLayout == ScaleLayout::kNaturalAtom) {
                 Base::permute_up_scale(
-                    smem->routed_experts.w_up_scale[weight_slot], row_tile);
+                    smem->routed_experts.w_up_scale[weight_slot], m_block_idx);
             }
             Base::mma(
                 tiled_mma, cta_mma, tCt,
@@ -357,8 +332,10 @@ struct RoutedUpProjection<KernelTraits, true>
         SharedStorage* __restrict__ smem,
         const CUtensorMap& tma_up_weights_desc,
         const typename UpGemm::ElementScale* __restrict__ up_scale,
-        std::uint32_t weight_row_base, std::uint32_t task_id,
+        std::uint32_t m_block_idx, std::uint32_t task_id,
         std::uint32_t expert_id, std::uint64_t weight_cache_hint) {
+        const std::uint32_t weight_row_base = m_block_idx * UpGemm::kTileShapeM;
+
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kNumTilesK;
              ++k_iter_id) {
@@ -368,9 +345,13 @@ struct RoutedUpProjection<KernelTraits, true>
             const std::uint32_t slot = ring_iter_id % Base::kNumWeightSlots;
             smem->barriers.routed.up_weight_ready.arrive(slot,
                                                          kUpWeightTxBytes);
-            Base::load_weight_tile(smem, tma_up_weights_desc, ring_iter_id,
-                                   expert_id, k_iter_id, weight_row_base,
-                                   weight_cache_hint);
+            Base::load_weight_tile(
+                tma_up_weights_desc,
+                reinterpret_cast<typename Base::WeightElement*>(
+                    &smem->routed_experts.w_up[slot][0]),
+                smem->barriers.routed.up_weight_ready.raw(slot),
+                expert_id * UpGemm::kGemmM + weight_row_base, k_iter_id,
+                weight_cache_hint);
             load_up_weight_scale(smem, up_scale, ring_iter_id, expert_id,
                                  weight_row_base);
         }
@@ -465,13 +446,10 @@ struct RoutedUpProjection<KernelTraits, false>
                 run_dequant_k_loop(smem, acc_gate_out, acc_up_out,
                                    cur_scale_slot, tmem_base, task_id,
                                    expert_id);
-                const auto epilogue_span = KERNEL_TIMER_BEGIN(
-                    smem->timer.get(), "up_epilogue", expert_id);
+                KERNEL_TIMER_SCOPE(smem->timer.get(), "up_epilogue", expert_id);
                 Base::epilogue(workspace, smem, task.local_expert_idx,
-                               batch_size, base_feature, m_block, activation,
-                               situ_beta, situ_linear_beta, acc_gate_out,
-                               acc_up_out);
-                KERNEL_TIMER_END(smem->timer.get(), epilogue_span);
+                               batch_size, m_block, activation, situ_beta,
+                               situ_linear_beta, acc_gate_out, acc_up_out);
             } else if (WarpRole::is_other_loader_warp(warp_idx) && has_next_e) {
                 const std::uint32_t next_expert_id =
                     smem->routing.active_experts[task.next_expert_idx];
@@ -508,9 +486,13 @@ struct RoutedUpProjection<KernelTraits, false>
             const std::uint32_t slot = ring_iter_id % Base::kNumWeightSlots;
             smem->barriers.routed.up_weight_ready.arrive(
                 slot, UpGemm::MmaCore::kWeightTileTxBytes);
-            Base::load_weight_tile(smem, tma_up_weights_desc, ring_iter_id,
-                                   expert_id, k_iter_id, weight_row_base,
-                                   weight_cache_hint);
+            Base::load_weight_tile(
+                tma_up_weights_desc,
+                reinterpret_cast<typename Base::WeightElement*>(
+                    &smem->routed_experts.w_up[slot][0]),
+                smem->barriers.routed.up_weight_ready.raw(slot),
+                expert_id * UpGemm::kGemmM + weight_row_base, k_iter_id,
+                weight_cache_hint);
         }
     }
 

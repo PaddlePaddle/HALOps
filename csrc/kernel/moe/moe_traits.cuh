@@ -23,6 +23,7 @@
 
 #include "kernel/moe/mma_core.cuh"
 #include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_tail.cuh"
 #include "kernel/moe/ptx_utils.cuh"
 
 namespace halops::moe {
@@ -435,6 +436,7 @@ struct MoEKernelTraits {
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
     using SharedUpGemm = SharedUpGemmTraits<Dims>;
     using SharedDownGemm = SharedDownGemmTraits<Dims>;
+    using TailGeometry = moe::TailGeometryT<Dims>;
 
     // Latent output and routed-up input must use the same quantization recipe.
     static_assert(std::is_same_v<typename LatentDownGemm::OutputQuant,
@@ -460,9 +462,11 @@ struct MoEKernelTraits {
     static_assert(LatentDownGemm::kNumCtas % kLatentClusterSize == 0u,
                   "the projection's groups must be whole blocks");
 
-    static constexpr std::uint32_t kMinGrid =
-        RouterGemm::kNumCtas + (kUseLatent ? 0u : LatentDownGemm::kNumCtas) +
-        cute::max(SharedUpGemm::kNumCtas, SharedDownGemm::kNumCtas);
+    static constexpr std::uint32_t kMinGrid = cute::max(
+        RouterGemm::kNumCtas + (kUseLatent ? LatentDownGemm::kNumCtas : 0u) +
+            cute::max(SharedUpGemm::kNumCtas, SharedDownGemm::kNumCtas),
+        TailGeometry::kNumCtas);
+
     static constexpr std::uint32_t kMaxGrid = kSpecMaxGrid;
     static_assert(kMinGrid <= kMaxGrid,
                   "Grid bounds must be ordered kCtasPerExpert <= kMinGrid <= "

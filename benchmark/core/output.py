@@ -299,8 +299,6 @@ def table_header_str(include_dispatch: bool = True) -> str:
         "roof_util%",
         "host(us)",
     ]
-    # One width per label, matching the fields of `_ROW_FMT` / `_FAIL_FMT`
-    # below, and one space between columns so the header lines up with them.
     widths = [20, 10, 8, 8, 8, 8, 7, 12, 10]
     if include_dispatch:
         labels.append("disp(us)")

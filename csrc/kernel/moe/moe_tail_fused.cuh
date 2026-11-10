@@ -27,94 +27,206 @@ constexpr int stage_smem_bytes() {
     return ROWS * (L + PAD);
 }
 
-template <class TC, int L, bool STAGED = false>
-__device__ __forceinline__ void shared_weight_mma_gemv_fp8(
-    const uint8_t* __restrict__ w, const float* __restrict__ scale,
-    const uint16_t* s_x, int x_stride, float* s_part, uint32_t warp,
-    uint32_t lane, const uint8_t* s_w = nullptr, int w_stride = 0) {
-    constexpr int TPG = TC::kTpg, ROWS = TC::kRows, BLKB = TC::kBlkB,
-                  SCALE_BLOCK = TC::kScaleBlock;
+template <class TC, int L>
+struct Fp8Block128 {
+    using Scale = float;
+    using Frag = uint4;
+    static constexpr int kTigStride = 16;
+    static constexpr int SCALE_BLOCK = TC::kScaleBlock;
+    static constexpr int KR = L / TC::kKSplit;
+    static constexpr int kNG = KR / SCALE_BLOCK;
+    static_assert(SCALE_BLOCK == 128, "scale group = two 64-wide super-blocks");
+    static_assert(TC::kRows <= SCALE_BLOCK,
+                  "CTA rows must fit in one scale block");
+    static_assert(KR % SCALE_BLOCK == 0 && (KR / 64) % TC::kBlkB == 0 &&
+                      TC::kBlkB % 2 == 0,
+                  "K blocks must tile into batches");
+
+    struct State {
+        float sc[kNG];
+        float4 g0, g1;
+    };
+
+    __device__ static State init(const float* scale, int /*row*/, int ks) {
+        State s;
+#pragma unroll
+        for (int g = 0; g < kNG; ++g) s.sc[g] = scale[ks * kNG + g];
+        s.g0 = s.g1 = make_float4(0.f, 0.f, 0.f, 0.f);
+        return s;
+    }
+
+    template <bool STAGED>
+    __device__ static Frag load_w(const uint8_t* p, int sb) {
+        Frag f;
+        if constexpr (STAGED) {
+            f = *reinterpret_cast<const uint4*>(p + sb * 64);
+        } else {
+            ld_global_16B(f, p + sb * 64, 0);
+        }
+        return f;
+    }
+
+    __device__ static void load_x(const uint16_t* xs, int sb, bool has_x,
+                                  uint32_t (&xb)[8]) {
+        uint4 xlo = make_uint4(0u, 0u, 0u, 0u), xhi = xlo;
+        if (has_x) {
+            xlo = *reinterpret_cast<const uint4*>(xs + sb * 64);
+            xhi = *reinterpret_cast<const uint4*>(xs + sb * 64 + 8);
+        }
+        xb[0] = xlo.x, xb[1] = xlo.y, xb[2] = xlo.z, xb[3] = xlo.w;
+        xb[4] = xhi.x, xb[5] = xhi.y, xb[6] = xhi.z, xb[7] = xhi.w;
+    }
+
+    __device__ static void step(State& s, float4& total, int sb, const Frag& A,
+                                const Frag& B, const uint32_t (&xb)[8]) {
+        const uint32_t aw[4] = {A.x, A.y, A.z, A.w},
+                       bw[4] = {B.x, B.y, B.z, B.w};
+#pragma unroll
+        for (int mm = 0; mm < 4; ++mm) {
+            uint32_t a0, a1, a2, a3;
+            e4m3x4_to_f16x2x2(aw[mm], a0, a2);
+            e4m3x4_to_f16x2x2(bw[mm], a1, a3);
+            mma_f16_m16n8k16((mm & 1) ? s.g1 : s.g0, a0, a1, a2, a3, xb[2 * mm],
+                             xb[2 * mm + 1]);
+        }
+        if (sb & 1) {
+            const float sc = s.sc[sb >> 1];
+            total.x += sc * (s.g0.x + s.g1.x);
+            total.y += sc * (s.g0.y + s.g1.y);
+            total.z += sc * (s.g0.z + s.g1.z);
+            total.w += sc * (s.g0.w + s.g1.w);
+            s.g0 = s.g1 = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    }
+};
+
+template <class TC, int L>
+struct Mxfp8 {
+    using Scale = uint8_t;
+    using Frag = uint4;
+    static constexpr int kTigStride = 8;
+    static constexpr int KR = L / TC::kKSplit;
+    static constexpr int kNG = KR / 32;
+    static constexpr int kSfVec = kNG / 16;
+    static_assert(KR % 64 == 0 && (KR / 64) % TC::kBlkB == 0,
+                  "K blocks must tile into batches");
+    static_assert(kNG % 16 == 0, "scales are read as 16-byte vectors");
+
+    struct State {
+        uint4 sfa[kSfVec], sfb[kSfVec];
+    };
+
+    __device__ static State init(const uint8_t* sf, int row, int ks) {
+        State s;
+#pragma unroll
+        for (int v = 0; v < kSfVec; ++v) {
+            s.sfa[v] = __ldg(reinterpret_cast<const uint4*>(
+                                 sf + int64_t(row) * (L / 32) + ks * kNG) +
+                             v);
+            s.sfb[v] = __ldg(reinterpret_cast<const uint4*>(
+                                 sf + int64_t(row + 8) * (L / 32) + ks * kNG) +
+                             v);
+        }
+        return s;
+    }
+
+    template <bool STAGED>
+    __device__ static Frag load_w(const uint8_t* p, int sb) {
+        const uint2 lo = *reinterpret_cast<const uint2*>(p + sb * 64);
+        const uint2 hi = *reinterpret_cast<const uint2*>(p + sb * 64 + 32);
+        return make_uint4(lo.x, lo.y, hi.x, hi.y);
+    }
+
+    __device__ static void load_x(const uint16_t* xs, int sb, bool has_x,
+                                  uint32_t (&xb)[8]) {
+        uint4 xlo = make_uint4(0u, 0u, 0u, 0u), xhi = xlo;
+        if (has_x) {
+            xlo = *reinterpret_cast<const uint4*>(xs + sb * 64);
+            xhi = *reinterpret_cast<const uint4*>(xs + sb * 64 + 32);
+        }
+        xb[0] = xlo.x, xb[1] = xlo.y, xb[2] = xlo.z, xb[3] = xlo.w;
+        xb[4] = xhi.x, xb[5] = xhi.y, xb[6] = xhi.z, xb[7] = xhi.w;
+    }
+
+    __device__ static float scale_of(const uint4 (&v)[kSfVec], int g) {
+        const uint32_t* u = reinterpret_cast<const uint32_t*>(v);
+        return __uint_as_float(((u[g >> 2] >> ((g & 3) * 8)) & 0xffu) << 23);
+    }
+
+    __device__ static void step(State& s, float4& total, int sb, const Frag& A,
+                                const Frag& B, const uint32_t (&xb)[8]) {
+        const uint32_t aw[4] = {A.x, A.y, A.z, A.w},
+                       bw[4] = {B.x, B.y, B.z, B.w};
+        float4 g[4];
+#pragma unroll
+        for (int mm = 0; mm < 4; ++mm) {
+            g[mm] = make_float4(0.f, 0.f, 0.f, 0.f);
+            uint32_t a0, a1, a2, a3;
+            e4m3x4_to_f16x2x2(aw[mm], a0, a2);
+            e4m3x4_to_f16x2x2(bw[mm], a1, a3);
+            mma_f16_m16n8k16(g[mm], a0, a1, a2, a3, xb[2 * mm], xb[2 * mm + 1]);
+        }
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const float sA = scale_of(s.sfa, 2 * sb + h);
+            const float sB = scale_of(s.sfb, 2 * sb + h);
+            total.x += sA * (g[2 * h].x + g[2 * h + 1].x);
+            total.y += sA * (g[2 * h].y + g[2 * h + 1].y);
+            total.z += sB * (g[2 * h].z + g[2 * h + 1].z);
+            total.w += sB * (g[2 * h].w + g[2 * h + 1].w);
+        }
+    }
+};
+
+template <template <class, int> class Recipe, class TC, int L,
+          bool STAGED = false>
+__device__ __forceinline__ void shared_weight_mma_gemv(
+    const uint8_t* __restrict__ w,
+    const typename Recipe<TC, L>::Scale* __restrict__ sf, const uint16_t* s_x,
+    int x_stride, float* s_part, uint32_t warp, uint32_t lane,
+    const uint8_t* s_w = nullptr, int w_stride = 0) {
+    using R = Recipe<TC, L>;
+    constexpr int TPG = TC::kTpg, ROWS = TC::kRows, BLKB = TC::kBlkB;
     constexpr int KR = L / TC::kKSplit;
     constexpr int kNSB = KR / 64;
-    constexpr int kNG = KR / SCALE_BLOCK;
     constexpr int kNC = kNSB / BLKB;
     static_assert(TPG >= 1 && TPG <= 8, "mma N is 8");
-    static_assert(SCALE_BLOCK == 128, "scale group = two 64-wide super-blocks");
-    static_assert(ROWS <= SCALE_BLOCK, "CTA rows must fit in one scale block");
-    static_assert(KR % SCALE_BLOCK == 0 && kNSB % BLKB == 0 && BLKB % 2 == 0,
-                  "K blocks must tile into batches");
     const uint32_t grp = lane >> 2, tig = lane & 3;
     const bool has_x = grp < uint32_t(TPG);
 #pragma unroll
     for (int i = 0; i < TC::kItemsPerWarp; ++i) {
         const int item = int(warp) + i * int(TC::kWarps);
         const int tile = item % TC::kTiles, ks = item / TC::kTiles;
-        const uint8_t* wa =
-            STAGED
-                ? s_w + (tile * 16 + int(grp)) * w_stride + ks * KR + tig * 16
-                : w + int64_t(tile * 16 + grp) * L + ks * KR + tig * 16;
+        const int row = tile * 16 + int(grp);
+        const uint8_t* wa = (STAGED ? s_w + row * w_stride + ks * KR
+                                    : w + int64_t(row) * L + ks * KR) +
+                            tig * R::kTigStride;
         const uint8_t* wb =
             wa + (STAGED ? int64_t(8) * w_stride : int64_t(8) * L);
         const uint16_t* xs =
-            s_x + (has_x ? grp : 0) * x_stride + ks * KR + tig * 16;
-        float sc[kNG];
-#pragma unroll
-        for (int g = 0; g < kNG; ++g) sc[g] = scale[ks * kNG + g];
+            s_x + (has_x ? grp : 0) * x_stride + ks * KR + tig * R::kTigStride;
+        typename R::State state = R::init(sf, row, ks);
         float4 total = make_float4(0.f, 0.f, 0.f, 0.f);
-        float4 g0 = total, g1 = total;
-        auto load_chunk = [&](int c, Vec16(&da)[BLKB], Vec16(&db)[BLKB]) {
+        auto load_chunk = [&](int c, typename R::Frag(&da)[BLKB],
+                              typename R::Frag(&db)[BLKB]) {
 #pragma unroll
             for (int k = 0; k < BLKB; ++k) {
-                if constexpr (STAGED) {
-                    *reinterpret_cast<uint4*>(&da[k]) =
-                        *reinterpret_cast<const uint4*>(wa +
-                                                        (c * BLKB + k) * 64);
-                    *reinterpret_cast<uint4*>(&db[k]) =
-                        *reinterpret_cast<const uint4*>(wb +
-                                                        (c * BLKB + k) * 64);
-                } else {
-                    ld_global_16B(da[k], wa + (c * BLKB + k) * 64, 0);
-                    ld_global_16B(db[k], wb + (c * BLKB + k) * 64, 0);
-                }
+                da[k] = R::template load_w<STAGED>(wa, c * BLKB + k);
+                db[k] = R::template load_w<STAGED>(wb, c * BLKB + k);
             }
         };
-        Vec16 ca[BLKB], cb[BLKB];
+        typename R::Frag ca[BLKB], cb[BLKB];
         load_chunk(0, ca, cb);
 #pragma unroll
         for (int c = 0; c < kNC; ++c) {
-            Vec16 na[BLKB], nb[BLKB];
+            typename R::Frag na[BLKB], nb[BLKB];
             if (c + 1 < kNC) load_chunk(c + 1, na, nb);
 #pragma unroll
             for (int k = 0; k < BLKB; ++k) {
                 const int sb = c * BLKB + k;
-                uint4 xlo = make_uint4(0u, 0u, 0u, 0u), xhi = xlo;
-                if (has_x) {
-                    xlo = *reinterpret_cast<const uint4*>(xs + sb * 64);
-                    xhi = *reinterpret_cast<const uint4*>(xs + sb * 64 + 8);
-                }
-                const uint32_t xb[8] = {xlo.x, xlo.y, xlo.z, xlo.w,
-                                        xhi.x, xhi.y, xhi.z, xhi.w};
-                const uint4& A = *reinterpret_cast<const uint4*>(&ca[k]);
-                const uint4& B = *reinterpret_cast<const uint4*>(&cb[k]);
-                const uint32_t aw[4] = {A.x, A.y, A.z, A.w},
-                               bw[4] = {B.x, B.y, B.z, B.w};
-#pragma unroll
-                for (int mm = 0; mm < 4; ++mm) {
-                    uint32_t a0, a1, a2, a3;
-                    e4m3x4_to_f16x2x2(aw[mm], a0, a2);
-                    e4m3x4_to_f16x2x2(bw[mm], a1, a3);
-                    mma_f16_m16n8k16((mm & 1) ? g1 : g0, a0, a1, a2, a3,
-                                     xb[2 * mm], xb[2 * mm + 1]);
-                }
-                if (sb & 1) {
-                    const float s = sc[sb >> 1];
-                    total.x += s * (g0.x + g1.x);
-                    total.y += s * (g0.y + g1.y);
-                    total.z += s * (g0.z + g1.z);
-                    total.w += s * (g0.w + g1.w);
-                    g0 = make_float4(0.f, 0.f, 0.f, 0.f);
-                    g1 = g0;
-                }
+                uint32_t xb[8];
+                R::load_x(xs, sb, has_x, xb);
+                R::step(state, total, sb, ca[k], cb[k], xb);
             }
             if (c + 1 < kNC) {
 #pragma unroll
@@ -167,7 +279,8 @@ struct TailGroup {
     static_assert(kShard % GSIZE == 0 && MAXM % TPG == 0, "group tiling");
     static_assert(TPG <= GSIZE && TPG <= 8,
                   "round A needs one CTA per token; mma N = 8");
-    static_assert(kShard % SCALE_BLOCK == 0 && kRows <= SCALE_BLOCK,
+    static_assert(TC::kMxfp8 ||
+                      (kShard % SCALE_BLOCK == 0 && kRows <= SCALE_BLOCK),
                   "FP8 weights: rows must sit inside one scale block");
     static_assert(STAGE == 0 || (STAGE == 1 &&
                                  stage_smem_bytes<kRows, L, TC::kWStagePad>() <=
@@ -399,19 +512,34 @@ struct TailGroup {
         const int64_t row0 =
             int64_t(p.tail_rank) * kShard + int64_t(c.grank) * kRows;
         const auto gemv_span = KERNEL_TIMER_BEGIN(c.timer, "tail_b_fc2_gemv");
-        if constexpr (STAGE != 0) {
-            mbar_wait_phase0(c.s_wbar);
-            shared_weight_mma_gemv_fp8<TC, L, true>(
-                nullptr,
-                p.tail_fc2_scale + (row0 / SCALE_BLOCK) * (L / SCALE_BLOCK),
-                reinterpret_cast<const uint16_t*>(c.s_x), kXStride, c.s_part,
-                c.tid >> 5, c.tid & 31, c.s_wstage, L + TC::kWStagePad);
+        // The fc2 weight format is a compile-time property of the schedule.
+        if constexpr (STAGE != 0) mbar_wait_phase0(c.s_wbar);
+        const uint16_t* s_x = reinterpret_cast<const uint16_t*>(c.s_x);
+        const uint8_t* w_global =
+            reinterpret_cast<const uint8_t*>(p.tail_fc2_w8) + row0 * L;
+        if constexpr (TC::kMxfp8) {
+            const uint8_t* sf = p.tail_fc2_scale + row0 * (L / 32);
+            if constexpr (STAGE != 0) {
+                shared_weight_mma_gemv<Mxfp8, TC, L, true>(
+                    nullptr, sf, s_x, kXStride, c.s_part, c.tid >> 5,
+                    c.tid & 31, c.s_wstage, L + TC::kWStagePad);
+            } else {
+                shared_weight_mma_gemv<Mxfp8, TC, L>(w_global, sf, s_x,
+                                                     kXStride, c.s_part,
+                                                     c.tid >> 5, c.tid & 31);
+            }
         } else {
-            shared_weight_mma_gemv_fp8<TC, L>(
-                reinterpret_cast<const uint8_t*>(p.tail_fc2_w8) + row0 * L,
-                p.tail_fc2_scale + (row0 / SCALE_BLOCK) * (L / SCALE_BLOCK),
-                reinterpret_cast<const uint16_t*>(c.s_x), kXStride, c.s_part,
-                c.tid >> 5, c.tid & 31);
+            const float* sf =
+                p.tail_fc2_scale + (row0 / SCALE_BLOCK) * (L / SCALE_BLOCK);
+            if constexpr (STAGE != 0) {
+                shared_weight_mma_gemv<Fp8Block128, TC, L, true>(
+                    nullptr, sf, s_x, kXStride, c.s_part, c.tid >> 5,
+                    c.tid & 31, c.s_wstage, L + TC::kWStagePad);
+            } else {
+                shared_weight_mma_gemv<Fp8Block128, TC, L>(
+                    w_global, sf, s_x, kXStride, c.s_part, c.tid >> 5,
+                    c.tid & 31);
+            }
         }
         KERNEL_TIMER_END(c.timer, gemv_span);
         const auto reduce_span =
@@ -463,13 +591,6 @@ struct TailGroup {
         KERNEL_TIMER_END(c.timer, span);
     }
 
-    // The fused tail runs three rounds over the latent exchange buffer:
-    //   A  AllReduce the WORLD partials of each token's routed latent,
-    //      RMSNorm the sum, and exchange the normalized rows among the TPG
-    //      CTAs that share this token group.
-    //   B  fc2 GEMV: this CTA's kRows output rows of the hidden shard.
-    //   C  Add the shared-expert partial, AllReduce the full hidden band
-    //      across WORLD, and store `tail_out`.
     __device__ static __forceinline__ void run(const P& p, uint32_t cta,
                                                uint32_t tid, uint8_t* scratch,
                                                Sync sync,

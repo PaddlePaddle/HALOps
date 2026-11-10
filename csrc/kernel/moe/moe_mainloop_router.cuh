@@ -118,25 +118,21 @@ struct RouterProjectionBase {
     }
 
     // The weight-loader warp at launch: initialize the router barriers and
-    // issue every slot's first tile, before the rest of the prologue runs.
-    __device__ static void start_streams(
+    // issue every weight slot's first tile, before the rest of the prologue
+    // runs. The weights are parameters, so this may precede pdl_wait().
+    __device__ static void prefetch_weight(
         CUtensorMap const& tma_router_weights_desc,
-        CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem) {
-        KERNEL_TIMER_SCOPE(smem->timer.get(), "router_start_streams");
+        SharedStorage* __restrict__ smem) {
+        KERNEL_TIMER_SCOPE(smem->timer.get(), "router_prefetch_weight");
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         if (lane_idx == 0u) {
             smem->barriers.init_router_ring();
             cutlass::arch::fence_barrier_init();
         }
         __syncwarp();
-        // Weights first: each block reads its own, while the input is shared.
         for (std::uint32_t j = lane_idx; j < kNumFirstWeightTiles;
              j += WarpRole::kThreadsPerWarp) {
             load_weight_tile(tma_router_weights_desc, smem, j);
-        }
-        for (std::uint32_t k = lane_idx; k < kNumFirstInputTiles;
-             k += WarpRole::kThreadsPerWarp) {
-            load_input_tile(tma_input_desc, smem, k);
         }
         if constexpr (kNumTailWeightTiles > 0u) {
             // The slot-waiting tiles then load from L2; both token windows of
@@ -150,6 +146,17 @@ struct RouterProjectionBase {
                                        /*chunk=*/j * kWeightTileChunks);
                 }
             }
+        }
+    }
+
+    // The same warp once pdl_wait() returns: the input is the previous
+    // kernel's output.
+    __device__ static void prefetch_input(CUtensorMap const& tma_input_desc,
+                                          SharedStorage* __restrict__ smem) {
+        KERNEL_TIMER_SCOPE(smem->timer.get(), "router_prefetch_input");
+        for (std::uint32_t k = WarpRole::get_lane_idx();
+             k < kNumFirstInputTiles; k += WarpRole::kThreadsPerWarp) {
+            load_input_tile(tma_input_desc, smem, k);
         }
     }
 

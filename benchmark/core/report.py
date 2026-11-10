@@ -153,8 +153,14 @@ def _format_common_config(row: dict) -> str:
         parts.append(f"mode={row['mode']}")
         return ", ".join(parts)
     elif _is_moe_scenario(row["scenario"]):
+        active = row.get("active_experts")
+        active_part = (
+            f"active_E={int(active)}, "
+            if active is not None and pd.notna(active) and str(active) != ""
+            else ""
+        )
         return (
-            f"top_k={row['top_k']}, E={row['num_experts']}, "
+            f"top_k={row['top_k']}, E={row['num_experts']}, {active_part}"
             f"H={row['hidden_size']}, N={row['intermediate_size']}, "
             f"L={row['latent_size']}, tp_size={row['tp_size']}, "
             f"{row['quant_mode']}, {row['activation']}"
@@ -166,10 +172,13 @@ def _format_common_config(row: dict) -> str:
         )
 
 
-def _speedup_summary(df: pd.DataFrame, sorted_keys: list[str]) -> list[str]:
+def _speedup_summary(
+    df: pd.DataFrame, sorted_keys: list[str], group_keys: list[str] | None = None
+) -> list[str]:
     """Markdown table summarizing halops metrics and speedup across all configs."""
     if "speedup" not in df.columns:
         return []
+    group_keys = group_keys or sorted_keys
 
     # Non-halops backends, preserve first-seen order.
     all_backends: list[str] = list(dict.fromkeys(df["backend"].tolist()))
@@ -193,9 +202,10 @@ def _speedup_summary(df: pd.DataFrame, sorted_keys: list[str]) -> list[str]:
     rule = "|" + "---|" * len(columns)
     lines += [header, rule]
 
-    grouped = df.groupby(sorted_keys, sort=True)
-    for sorted_values, sub in grouped:
-        config_str = _format_common_config(sub.iloc[0].to_dict())
+    grouped = df.groupby(group_keys, sort=True)
+    for _, sub in grouped:
+        first = sub.iloc[0]
+        config_str = _format_common_config(first.to_dict())
         rows_by_backend = {r["backend"]: r for _, r in sub.iterrows()}
 
         # halops metrics
@@ -210,7 +220,7 @@ def _speedup_summary(df: pd.DataFrame, sorted_keys: list[str]) -> list[str]:
 
         cells = [
             config_str,
-            *[str(v) for v in sorted_values],
+            *[str(first[key]) for key in sorted_keys],
             ir_median,
             ir_tflops,
             ir_bw,
@@ -330,10 +340,13 @@ def _format_issue_summary(item: dict, total: int) -> str:
     return ", ".join(parts) if parts else "-"
 
 
-def _backend_summary(df: pd.DataFrame, sorted_keys: list[str]) -> list[str]:
+def _backend_summary(
+    df: pd.DataFrame, sorted_keys: list[str], group_keys: list[str] | None = None
+) -> list[str]:
     """Summarize speedup distribution by backend for this generated report."""
     if "backend" not in df.columns or "speedup" not in df.columns:
         return []
+    group_keys = group_keys or sorted_keys
 
     all_backends: list[str] = list(dict.fromkeys(df["backend"].tolist()))
     stats = {
@@ -353,7 +366,7 @@ def _backend_summary(df: pd.DataFrame, sorted_keys: list[str]) -> list[str]:
         for backend in all_backends
     }
 
-    for _, sub in df.groupby(sorted_keys, sort=False):
+    for _, sub in df.groupby(group_keys, sort=False):
         rows_by_backend = {r["backend"]: r for _, r in sub.iterrows()}
         halops = rows_by_backend.get("halops")
         halops_correct = _is_correct_row(halops) if halops is not None else False
@@ -472,9 +485,10 @@ def generate_report(
 
     # Group within a group keep the original backend order.
     if _is_gemm_scenario(scenario):
-        sorted_keys = ["m", "n", "k"]
+        group_keys = ["m", "n", "k"]
+        sorted_keys = group_keys
     elif _is_moe_scenario(scenario):
-        sorted_keys = [
+        group_keys = [
             "tokens",
             "top_k",
             "quant_mode",
@@ -485,11 +499,18 @@ def generate_report(
             "grid_cap",
             "use_cuda_graph",
         ]
+        # top_k/quant_mode/activation ride in the config cell, not in columns.
+        sorted_keys = [
+            key
+            for key in group_keys
+            if key not in ("top_k", "quant_mode", "activation")
+        ]
     else:
-        sorted_keys = ["batch_size", "s_kv", "s_q"]
+        group_keys = ["batch_size", "s_kv", "s_q"]
+        sorted_keys = group_keys
 
-    df = df.sort_values(sorted_keys, kind="stable")
-    for _, sub in df.groupby(sorted_keys, sort=False):
+    df = df.sort_values(group_keys, kind="stable")
+    for _, sub in df.groupby(group_keys, sort=False):
         first_row = sub.iloc[0].to_dict()
         scenario_str = _format_scenario_header(
             _format_scenario_str(scenario, first_row), first_row
@@ -518,8 +539,8 @@ def generate_report(
 
     # Summary tables after the detail tables. Keep these as the final report
     # section; per-row mismatch/status are already shown in the detail tables.
-    lines += _speedup_summary(df, sorted_keys)
-    lines += _backend_summary(df, sorted_keys)
+    lines += _speedup_summary(df, sorted_keys, group_keys)
+    lines += _backend_summary(df, sorted_keys, group_keys)
 
     content = "\n".join(lines) + "\n"
     prefix = f"{ts}_" if ts else ""

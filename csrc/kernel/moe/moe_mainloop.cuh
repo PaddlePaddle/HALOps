@@ -94,6 +94,8 @@ struct CollectiveMainloopMoE {
         std::uint32_t tail_rank;
         ScoringFunc scoring_func;
         bool renormalize;
+        const float* correction_bias;
+        const float* per_expert_scale;
         Activation activation;
         float situ_beta;
         float situ_linear_beta;
@@ -141,6 +143,8 @@ struct CollectiveMainloopMoE {
         std::uint32_t top_k;
         ScoringFunc scoring_func;
         bool renormalize;
+        const float* correction_bias;
+        const float* per_expert_scale;
         Activation activation;
         float situ_beta;
         float situ_linear_beta;
@@ -152,7 +156,6 @@ struct CollectiveMainloopMoE {
         alignas(128) CUtensorMap tma_up_weights_desc;
         alignas(128) CUtensorMap tma_input_desc;
         alignas(128) CUtensorMap tma_input_chunks_desc;
-        // The router's gate-major [G, E, H] weight, in 128-B chunks.
         alignas(128) CUtensorMap tma_router_weights_desc;
         alignas(128) CUtensorMap tma_down_weights_desc;
         alignas(128) CUtensorMap tma_down_activations_desc;
@@ -197,6 +200,8 @@ struct CollectiveMainloopMoE {
         params.top_k = args.top_k;
         params.scoring_func = args.scoring_func;
         params.renormalize = args.renormalize;
+        params.correction_bias = args.correction_bias;
+        params.per_expert_scale = args.per_expert_scale;
         params.activation = args.activation;
         params.situ_beta = args.situ_beta;
         params.situ_linear_beta = args.situ_linear_beta;
@@ -221,17 +226,19 @@ struct CollectiveMainloopMoE {
         constexpr std::uint64_t kInputBytes = sizeof(DataType::ElementA);
         constexpr std::uint32_t kChunkElems =
             128u / static_cast<std::uint32_t>(kInputBytes);
-        params.tma_input_desc = CreateTmaDesc<2>(
-            "activations", args.input,
-            /*shape=*/{Dims::kHiddenSize, args.num_tokens},
-            /*strides=*/{std::uint64_t{Dims::kHiddenSize} * kInputBytes},
-            /*box=*/{64u, 8u});
+        std::uint64_t input_shape[2] = {args.hidden_size, args.num_tokens};
+        std::uint64_t input_strides[1] = {args.hidden_size * kInputBytes};
+        params.tma_input_desc =
+            CreateTmaDesc<2>("activations", args.input, input_shape,
+                             input_strides, /*box=*/{64u, 8u});
+
+        std::uint64_t input_chunk_shape[3] = {kChunkElems, args.num_tokens,
+                                              args.hidden_size / kChunkElems};
+        std::uint64_t input_chunk_strides[2] = {args.hidden_size * kInputBytes,
+                                                128u};
         params.tma_input_chunks_desc = CreateTmaDesc<3>(
-            "activations (K tiles)", args.input,
-            /*shape=*/
-            {kChunkElems, args.num_tokens, Dims::kHiddenSize / kChunkElems},
-            /*strides=*/{std::uint64_t{Dims::kHiddenSize} * kInputBytes, 128u},
-            /*box=*/{kChunkElems, 8u, 4u});
+            "activations (K tiles)", args.input, input_chunk_shape,
+            input_chunk_strides, /*box=*/{kChunkElems, 8u, 4u});
         params.tma_router_weights_desc = CreateTmaDesc<3>(
             "router weights", args.router_weight,
             /*shape=*/
@@ -241,6 +248,7 @@ struct CollectiveMainloopMoE {
             /*box=*/
             {kChunkElems, Traits::RouterGemm::kTileShapeM,
              Traits::RouterGemm::MmaCore::kNumSwizzleBoxKs});
+
         if constexpr (Traits::RoutedUpGemm::kUsePairLayout) {
             constexpr std::uint64_t kUpBytes =
                 std::uint64_t{MoEInputSize<Dims>::value} *
@@ -409,7 +417,8 @@ struct CollectiveMainloopMoE {
                     KERNEL_TIMER_BEGIN(smem->timer.get(), "topk_one_token");
                 topk_one_token<Dims, kExpertsPerThread>(
                     tok, params.top_k, params.scoring_func, params.renormalize,
-                    workspace, smem);
+                    params.correction_bias, params.per_expert_scale, workspace,
+                    smem);
                 KERNEL_TIMER_END(smem->timer.get(), topk_span);
             }
         } else {
@@ -426,7 +435,8 @@ struct CollectiveMainloopMoE {
                     KERNEL_TIMER_BEGIN(smem->timer.get(), "topk_one_token");
                 topk_one_token<Dims, kExpertsPerThread>(
                     tok, params.top_k, params.scoring_func, params.renormalize,
-                    workspace, smem);
+                    params.correction_bias, params.per_expert_scale, workspace,
+                    smem);
                 KERNEL_TIMER_END(smem->timer.get(), topk_span);
             }
         }
@@ -653,13 +663,9 @@ struct CollectiveMainloopMoE {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
 
-        if (warp_idx == 3 && lane_idx == 0) {
-            // Per-CTA private launch counter.
-            smem->launch_parity = workspace->cta_comm.claim_parity();
-            // The down task queue starts empty.
-            smem->down_tasks_claimed = 0u;
-            smem->down_task_stores = 0u;
-        } else if (WarpRole::is_tmem_warp(warp_idx)) {
+        // Block-local setup (barriers, TMEM, descriptors) touches nothing the
+        // previous kernel writes, so it overlaps that kernel under PDL.
+        if (WarpRole::is_tmem_warp(warp_idx)) {
             // TMEM allocation issued by ONE fully-active warp.
             tmem_alloc(Traits::kTmemColumns, &smem->tmem_ptr);
         } else if (warp_idx == 1 && lane_idx == 0) {
@@ -679,9 +685,18 @@ struct CollectiveMainloopMoE {
             cutlass::arch::fence_barrier_init();
         } else if (WarpRole::is_weight_loader_warp(warp_idx) &&
                    Router::is_router_cta()) {
-            // The router is the prologue's critical path: start its loads now.
-            Router::start_streams(params.tma_router_weights_desc,
-                                  params.tma_input_chunks_desc, smem);
+            Router::prefetch_weight(params.tma_router_weights_desc, smem);
+        }
+
+        pdl_wait();
+        if (WarpRole::is_weight_loader_warp(warp_idx) &&
+            Router::is_router_cta()) {
+            Router::prefetch_input(params.tma_input_chunks_desc, smem);
+        }
+        if (warp_idx == 3 && lane_idx == 0) {
+            smem->launch_parity = workspace->cta_comm.claim_parity();
+            smem->down_tasks_claimed = 0u;
+            smem->down_task_stores = 0u;
         }
         __syncthreads();
 

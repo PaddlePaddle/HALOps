@@ -33,9 +33,15 @@ from halops import (
 
 _FP8_MAX = 448.0  # e4m3 dynamic range
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_WORLD = 4
+_WORLD = 4  # the production tensor-parallel size
 _ROW = re.compile(r"\[rank (\d+)\] (\S+): [^\n]*? -> (OK|FAIL)")
 _TOL = 1.5e-1
+_TOL_ROUTING = 1e-1
+
+
+def _tp_size():
+    """The tensor-parallel size this run uses: 4 on a four-GPU box, else 1."""
+    return _WORLD if torch.cuda.device_count() >= _WORLD else 1
 
 
 def _quant_fp8_block_wise(w, block_row=128, block_col=128):
@@ -66,6 +72,16 @@ def _pow2_block_quant(w):
     s = torch.exp2(torch.ceil(torch.log2(amax / _FP8_MAX)))
     q = (blocks / s).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
     return q.reshape(r, c).contiguous(), s.reshape(r // 128, c // 128).contiguous()
+
+
+def _mxfp8_quant(w):
+    """[rows, cols] -> (fp8 e4m3, uint8 UE8M0 scales [rows, cols/32]): one scale per row per 32 columns."""
+    r, c = w.shape
+    blocks = w.float().reshape(r, c // 32, 32)
+    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    exp = torch.ceil(torch.log2(amax / _FP8_MAX)).clamp(-126, 127)
+    q = (blocks / torch.exp2(exp)).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+    return q.reshape(r, c).contiguous(), (exp + 127).squeeze(-1).to(torch.uint8)
 
 
 def _quant_fp8_group_wise(x, group_size=128):
@@ -186,6 +202,7 @@ class MoEParams:
         self.mxfp8_groups = quant_mode != "w8a8-blockwise"
         self.mxfp8_group = "w8a8-mxfp8"
         self.init_weights(**weight_kwargs)
+        self.init_routing("", device=weight_kwargs.get("device"))
 
     def init_weights(self, *, seed: int = 0, device=None, common_seed=None):
         """Random weights and buffers for the launch this instance describes.
@@ -252,7 +269,6 @@ class MoEParams:
                 latent_w, latent_s = group_wise_quant(
                     raw[0].bfloat16(),
                     mode=self.mxfp8_group,
-                    # The kernel takes the natural rows and builds the SfAtom.
                     use_swizzle=False,
                 )
             else:
@@ -289,14 +305,59 @@ class MoEParams:
         self.shared_down_weight_scale = shared_down_s
         return self
 
+    def init_routing(self, routing, *, device=None, seed=7):
+        """The router's selection bias and routed scaling, neutral unless asked.
+
+        ``routing`` joins "bias" (a random ``e_score_correction_bias``) and "perexpert"
+        (a random learnable scale) with "+"; what it leaves out stays zeros / ones.
+        "nobias" / "noscale" leave the tensor neutral and hand the kernel None instead.
+        They come from a fixed seed: every rank routes the same tokens, so every rank
+        needs the same router.
+        """
+        dev = torch.device(device or "cuda")
+        g = torch.Generator(device=dev).manual_seed(seed)
+        e = self.num_experts
+        parts = routing.split("+")
+        self.correction_bias = torch.zeros(e, device=dev)
+        self.per_expert_scale = torch.ones(e, device=dev)
+        if "bias" in parts:
+            self.correction_bias = torch.randn(e, device=dev, generator=g) * 0.3
+        if "perexpert" in parts:
+            self.per_expert_scale = 0.5 + 1.5 * torch.rand(e, device=dev, generator=g)
+        self.none_bias = "nobias" in parts
+        self.none_scale = "noscale" in parts
+        self.tol = _TOL
+        if routing:
+            self.shared_down_weight.zero_()
+            self.tol = _TOL_ROUTING
+        return self
+
     def init_tail_weights(self, *, seed: int = 1, device=None):
-        """The fused tail's operands: fc2 (e4m3, power-of-two 128x128 scales) and the RMSNorm weight."""
+        """The fused tail's operands: fc2 and the RMSNorm weight.
+
+        fc2 follows the latent recipe: e4m3 with power-of-two 128x128 scales for
+        "w8a8-blockwise", e4m3 with a UE8M0 scale per row per 32 columns for the MX
+        recipes. ``fc2_dequant`` is the fp32 weight the kernel should reproduce.
+        """
         dev = torch.device(device or "cuda")
         g = torch.Generator(device=dev).manual_seed(seed)
         h, z = self.hidden_size, self.latent_size
-        self.fc2_weight, self.fc2_scale = _pow2_block_quant(
-            torch.randn(h, z, device=dev, generator=g) * 0.05
-        )
+        w = torch.randn(h, z, device=dev, generator=g) * 0.05
+        if self.quant_mode == "w8a8-blockwise":
+            self.fc2_weight, self.fc2_scale = _pow2_block_quant(w)
+            self.fc2_dequant = (
+                self.fc2_weight.float()
+                * self.fc2_scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
+            )
+        else:
+            w = w * torch.exp2(torch.randint(-1, 2, (h, 1), device=dev, generator=g))
+            w = w * torch.exp2(
+                torch.randint(-1, 2, (1, z // 32), device=dev, generator=g)
+            ).repeat_interleave(32, 1)
+            self.fc2_weight, self.fc2_scale = _mxfp8_quant(w)
+            self.fc2_dequant = self.fc2_weight.float() * torch.exp2(
+                self.fc2_scale.float() - 127
+            ).repeat_interleave(32, 1)
         self.norm_weight = (
             1.0 + 0.1 * torch.randn(z, device=dev, generator=g)
         ).bfloat16()
@@ -328,10 +389,12 @@ class MoERef:
     def _router_scores(self, input):
         """The router's selection key: sigmoid of each gate's logits, summed."""
         router_weight = self.moe_params.router_weight
-        logits = (input.bfloat16() @ router_weight.bfloat16().transpose(-1, -2)).float()
         if router_weight.dim() == 2:
             # The kernel round-trips the logits through bf16 before scoring.
-            logits = logits.bfloat16()
+            logits = (input.bfloat16() @ router_weight.bfloat16()).float().bfloat16()
+        else:
+            # The dual-gate router scores the fp32 logits, not a bf16 image.
+            logits = input.float() @ router_weight.float().transpose(-1, -2)
         scores = torch.sigmoid(logits.float())
         return scores.sum(0) if scores.dim() == 3 else scores
 
@@ -340,14 +403,15 @@ class MoERef:
         M = scores.shape[0]
         ids = torch.zeros(M, top_k, dtype=torch.int64, device=scores.device)
         weights = torch.zeros(M, top_k, dtype=torch.float32, device=scores.device)
-        s = scores.clone()
+        p = self.moe_params
+        s = scores + p.correction_bias
         for k in range(top_k):
-            v, idx = s.max(dim=-1)
-            weights[:, k] = v
+            _, idx = s.max(dim=-1)
+            weights[:, k] = scores.gather(1, idx.unsqueeze(1)).squeeze(1)
             ids[:, k] = idx
             s.scatter_(1, idx.unsqueeze(1), float("-inf"))
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-        return weights, ids
+        return weights * p.per_expert_scale[ids], ids
 
     def matmul_fp8(self, x, y_fp8, y_scale, group_size=128):
         """Return dequantized ``x @ y.T`` in bf16.
@@ -472,7 +536,6 @@ class MoERef:
         """z = x @ W_latent^T in the recipe the latent group runs."""
         p = self.moe_params
         if p.mxfp8_groups:
-            # The kernel builds the SfAtom from the natural scale rows.
             return self.matmul_mxfp8(
                 input,
                 p.latent_down_weight,
@@ -493,9 +556,7 @@ class MoERef:
         routed = torch.stack([t.float() for t in routed_outs]).sum(0).bfloat16().float()
         rms = torch.rsqrt(routed.pow(2).mean(-1, keepdim=True) + p.eps)
         normed = (routed * rms * p.norm_weight.float()).bfloat16().float()
-        fc2 = p.fc2_weight.float() * p.fc2_scale.repeat_interleave(
-            128, 0
-        ).repeat_interleave(128, 1)
+        fc2 = p.fc2_dequant
         return normed @ fc2.t() + torch.stack([t.float() for t in shared_outs]).sum(0)
 
     def __call__(self, input, top_k):
@@ -551,6 +612,8 @@ class MoEFused:
             p.fc2_weight,
             p.fc2_scale,
             p.norm_weight,
+            None if p.none_bias else p.correction_bias,
+            None if p.none_scale else p.per_expert_scale,
             out,
             self.workspace,
             top_k,
@@ -567,17 +630,17 @@ class MoEFused:
         return out
 
 
-def _all_gather(t, world):
-    gathered = [torch.empty_like(t) for _ in range(world)]
+def _all_gather(t):
+    gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, t)
     return gathered
 
 
-def _check_outputs(ref, x, top_k, out):
+def _check_outputs(ref, x, top_k, out, tol=_TOL):
     """(ok, text) for one launch: the end-to-end output against MoERef (all ranks' routed / shared, then the tail)."""
-    expected = ref.tail(*(_all_gather(t, _WORLD) for t in ref(x, top_k)))
+    expected = ref.tail(*(_all_gather(t) for t in ref(x, top_k)))
     err = (out.float() - expected).norm(dim=-1) / expected.norm(dim=-1)
-    ok = bool((err < _TOL).all()) and bool(torch.isfinite(out).all())
+    ok = bool((err < tol).all()) and bool(torch.isfinite(out).all())
     return ok, f"max_token_rel_l2={err.max().item():.2e}"
 
 
@@ -586,7 +649,7 @@ def _run_accuracy(p, tp, grid_cap, m, top_k, seed):
     x = torch.randn(m, p.hidden_size, device="cuda", generator=g).bfloat16()
     out = MoEFused(p, tp, grid_cap)(x, top_k)
     torch.cuda.synchronize()
-    return _check_outputs(MoERef(p), x, top_k, out)
+    return _check_outputs(MoERef(p), x, top_k, out, p.tol)
 
 
 def _run_graph(p, tp, grid_cap, m, top_k, seed):
@@ -608,14 +671,14 @@ def _run_graph(p, tp, grid_cap, m, top_k, seed):
         x.copy_(torch.randn(m, p.hidden_size, device="cuda", generator=g))
         graph.replay()
         torch.cuda.synchronize()
-        good, text = _check_outputs(ref, x, top_k, out)
+        good, text = _check_outputs(ref, x, top_k, out, p.tol)
         ok &= good
         texts.append(text)
     return ok, f"replays: {' | '.join(texts)}"
 
 
 def _tail_worker():
-    """One rank of the 4-GPU run (launched by ``moe_run`` or directly under torchrun)."""
+    """One rank of the TP run (launched by ``moe_run`` or directly under torchrun)."""
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
@@ -628,8 +691,8 @@ def _tail_worker():
 
     params = {}
 
-    def get_params(activation, quant_mode):
-        key = (activation, quant_mode)
+    def get_params(activation, quant_mode, routing=""):
+        key = (activation, quant_mode, routing)
         if key not in params:
             p = MoEParams(
                 use_latent=True,
@@ -639,17 +702,20 @@ def _tail_worker():
                 common_seed=0,
                 device=dev,
             )
-            params[key] = p.init_tail_weights(device=dev)
+            params[key] = p.init_tail_weights(device=dev).init_routing(
+                routing, device=dev
+            )
         return params[key]
 
     ok = True
     for case in os.environ["MOE_CASES"].split(","):
-        kind, m_field, k_field, activation, quant_mode = case.split("-", 4)
+        kind, m_field, k_field, activation, mode_field = case.split("-", 4)
+        quant_mode, _, routing = mode_field.partition("@")
         m, top_k = int(m_field[1:]), int(k_field[1:])
         run = _run_accuracy if kind == "accuracy" else _run_graph
         seed = zlib.crc32(case.encode())
         good, text = run(
-            get_params(activation, quant_mode), tp, grid_cap, m, top_k, seed
+            get_params(activation, quant_mode, routing), tp, grid_cap, m, top_k, seed
         )
         ok &= good
         print(f"[rank {rank}] {case}: {text} -> {'OK' if good else 'FAIL'}", flush=True)
@@ -676,6 +742,8 @@ def _case_id(item):
             f"accuracy-m{p['num_tokens']}-k{p.get('top_k', 8)}-"
             f"{p['activation']}-{modes[item.originalname]}"
         )
+    if item.originalname == "test_moe_routing_params":
+        return f"accuracy-m{p['num_tokens']}-k8-silu-{p['quant_mode']}@{p['routing']}"
     if item.originalname == "test_moe_cuda_graph_replay":
         return f"graph-m{p['num_tokens']}-k8-{p['activation']}-{p['quant_mode']}"
     return None
@@ -683,16 +751,17 @@ def _case_id(item):
 
 @pytest.fixture(scope="module")
 def moe_run(request):
-    """Run the worker once under torchrun for the cases of the selected tests; return its output by (case, rank)."""
-    if torch.cuda.device_count() < _WORLD:
-        pytest.skip(f"needs {_WORLD} GPUs")
+    """Run the worker once under torchrun for the cases of the selected tests; return (status, tp, output)."""
+    tp = _tp_size()
+    if torch.cuda.device_count() < tp:
+        pytest.skip(f"needs {tp} GPU(s)")
     cases = [case for case in map(_case_id, request.session.items) if case]
     cmd = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--standalone",
-        f"--nproc_per_node={_WORLD}",
+        f"--nproc_per_node={tp}",
         os.path.abspath(__file__),
     ]
     env = dict(os.environ, MOE_CASES=",".join(cases), PYTHONPATH=_ROOT)
@@ -700,17 +769,17 @@ def moe_run(request):
         cmd, cwd=_ROOT, env=env, capture_output=True, text=True, timeout=3600
     )
     out = proc.stdout + proc.stderr
-    if "NVLS multicast" in out:
+    if tp > 1 and "NVLS multicast" in out:
         pytest.skip("the fused tail needs an NVLS multicast capable node")
     status = {}
     for rank, case, res in _ROW.findall(out):
         status[(case, int(rank))] = res == "OK"
-    return status, out
+    return status, tp, out
 
 
 def _check_case(moe_run, case):
-    status, out = moe_run
-    ranks = [status.get((case, r)) for r in range(_WORLD)]
+    status, tp, out = moe_run
+    ranks = [status.get((case, r)) for r in range(tp)]
     errors = "\n".join(line for line in out.splitlines() if "Error" in line)
     details = f"{errors[-1500:]}\n--- end of worker output ---\n{out[-1500:]}"
     assert None not in ranks, f"no result for {case} on every rank:\n{details}"
@@ -733,6 +802,24 @@ def test_mxfp8_moe_accuracy(request, moe_run, num_tokens, activation):
 @pytest.mark.parametrize("num_tokens", [1, 8, 9, 16])
 @pytest.mark.parametrize("activation", ["silu", "situ"])
 def test_w4a8_mxfp4_moe_accuracy(request, moe_run, num_tokens, activation):
+    _check_case(moe_run, _case_id(request.node))
+
+
+@pytest.mark.parametrize("num_tokens", [1, 9, 16])
+@pytest.mark.parametrize("quant_mode", ["w8a8-blockwise", "w4a8-mxfp4"])
+@pytest.mark.parametrize(
+    "routing",
+    [
+        "bias",
+        "perexpert",
+        "bias+perexpert",
+        "nobias+perexpert",
+        "bias+noscale",
+        "nobias+noscale",
+    ],
+)
+def test_moe_routing_params(request, moe_run, num_tokens, quant_mode, routing):
+    """The router bias steers the top-k; the routed scaling follows the renormalization."""
     _check_case(moe_run, _case_id(request.node))
 
 

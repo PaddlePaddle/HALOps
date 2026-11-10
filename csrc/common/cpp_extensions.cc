@@ -215,13 +215,17 @@ void LowLatencyMoE(
     const torch::Tensor& latent_down_weight,
     const torch::Tensor& latent_down_weight_scale,
     const torch::Tensor& tail_fc2_weight, const torch::Tensor& tail_fc2_scale,
-    const torch::Tensor& tail_norm_weight, const torch::Tensor& tail_epochs,
-    const torch::Tensor& tail_uc_bases, const torch::Tensor& workspace,
-    const torch::Tensor& tail_out, int64_t top_k, int64_t num_router_gates,
-    int64_t tp_rank, int64_t tail_mc_base, int64_t tail_grid_cap,
+    const torch::Tensor& tail_norm_weight,
+    const std::optional<torch::Tensor>& correction_bias,
+    const std::optional<torch::Tensor>& per_expert_scale,
+    const torch::Tensor& tail_epochs, const torch::Tensor& tail_uc_bases,
+    const torch::Tensor& workspace, const torch::Tensor& tail_out,
+    int64_t top_k, int64_t num_router_gates, int64_t tp_rank,
+    int64_t tail_mc_base, int64_t tail_grid_cap,
     const std::string& scoring_func, const std::string& activation,
     bool renormalize, double situ_beta, double situ_linear_beta,
-    double tail_eps, const std::string& quant_mode, int64_t tp_size);
+    double tail_eps, const std::string& quant_mode, int64_t tp_size,
+    bool use_pdl);
 
 int64_t MoETailRegionBytes(bool wide, int64_t tp_size);
 

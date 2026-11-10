@@ -54,9 +54,15 @@ struct TailPhase {
             prefetch_l2_bulk(w + off,
                              (kBytes - off) < kChunk ? (kBytes - off) : kChunk);
         }
-        prefetch_l2_bulk(params.tail_fc2_scale +
-                             (row0 / kScale) * (Dims::kLatentSize / kScale),
-                         (Dims::kLatentSize / kScale) * sizeof(float));
+        if constexpr (Geometry::kMxfp8) {
+            prefetch_l2_bulk(
+                params.tail_fc2_scale + row0 * (Dims::kLatentSize / 32),
+                kRows * (Dims::kLatentSize / 32));
+        } else {
+            prefetch_l2_bulk(params.tail_fc2_scale +
+                                 (row0 / kScale) * (Dims::kLatentSize / kScale),
+                             (Dims::kLatentSize / kScale) * sizeof(float));
+        }
     }
 
     template <class P>

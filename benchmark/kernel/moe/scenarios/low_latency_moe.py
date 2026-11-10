@@ -53,6 +53,7 @@ class MoeInput:
     input: torch.Tensor
     weights: dict[str, torch.Tensor]
     options: dict
+    routing: dict[str, torch.Tensor | None]
 
 
 @dataclass
@@ -77,11 +78,17 @@ def _validate_config(cfg: dict) -> dict:
         "eps": 1e-5,
         "grid_cap": 0,
         "seed": 0,
+        "routing": "bias+perexpert",
         **cfg,
     }
     for name, value in MOE_SHAPE.items():
         if options[name] != value:
             raise ValueError(f"LowLatencyMoE requires {name}={value}")
+    parts = set(filter(None, str(options["routing"]).split("+")))
+    if not parts <= {"bias", "perexpert"}:
+        raise ValueError(
+            f"routing must combine 'bias' and 'perexpert', got {options['routing']!r}"
+        )
     if options["tp_size"] != 1:
         raise ValueError("this benchmark runs on one GPU; set tp_size=1")
     if (
@@ -132,7 +139,18 @@ def _build_inputs(cfg: dict) -> MoeInput:
         "tail_fc2_weight": normal((h, z), z**-0.5),
         "tail_norm_weight": normal((z,), 0.1).add_(1.0),
     }
-    return MoeInput(x, _quantize_weights(weights, options["quant_mode"]), options)
+    # Router steering stays neutral: a zero bias keeps the selection (and the
+    # active-expert count) unchanged, a unit scale keeps the combine weights.
+    parts = set(filter(None, str(options["routing"]).split("+")))
+    routing = {
+        "correction_bias": (torch.zeros(e, device=device) if "bias" in parts else None),
+        "per_expert_scale": (
+            torch.ones(e, device=device) if "perexpert" in parts else None
+        ),
+    }
+    return MoeInput(
+        x, _quantize_weights(weights, options["quant_mode"]), options, routing
+    )
 
 
 def _quant_fp8_blockwise(weight: torch.Tensor, power_of_two=False):
@@ -157,10 +175,18 @@ def _quantize_weights(weights: dict, quant_mode: str) -> dict:
         if name in ("router_weight", "tail_norm_weight"):
             quantized[name] = weight
             continue
-        if name == "tail_fc2_weight" or quant_mode == "w8a8-blockwise":
-            quant, scale = _quant_fp8_blockwise(
-                weight, power_of_two=name == "tail_fc2_weight"
-            )
+        if name == "tail_fc2_weight":
+            # The tail's fc2 follows the latent recipe.
+            if quant_mode == "w8a8-blockwise":
+                quant, scale = _quant_fp8_blockwise(weight, power_of_two=True)
+            else:
+                quant, scale = group_wise_quant(
+                    weight.flatten(0, -2), mode="w8a8-mxfp8", use_swizzle=False
+                )
+                quant = quant.reshape(*weight.shape[:-1], quant.shape[-1])
+                scale = scale.reshape(*weight.shape[:-1], weight.shape[-1] // 32)
+        elif quant_mode == "w8a8-blockwise":
+            quant, scale = _quant_fp8_blockwise(weight)
         else:
             mode = (
                 "w4a4-mxfp4"
@@ -193,10 +219,11 @@ def adapt_halops(raw: MoeInput) -> dict:
     return {
         **raw.options,
         **quantized,
+        **raw.routing,
         "input": raw.input,
         "out": torch.empty_like(raw.input),
         "num_router_gates": 2,
-        "workspace": get_workspace_for_moe(raw.input, tp_size=raw.options["tp_size"]),
+        "workspace": get_workspace_for_moe(raw.input, None, 0, raw.options["tp_size"]),
     }
 
 
@@ -206,6 +233,7 @@ def _active_experts(raw: MoeInput) -> int:
         _route(
             {
                 **raw.options,
+                **raw.routing,
                 "input_bf16": raw.input,
                 "router_weight_fp32": raw.weights["router_weight"].float(),
             }
@@ -230,10 +258,15 @@ def adapt_golden(raw: MoeInput) -> dict:
             weights[name] = _dequant_weight(
                 weight,
                 raw.weights[scale_name],
-                sfatom=not (name == "latent_down_weight" or name.startswith("shared_")),
+                sfatom=not (
+                    name == "tail_fc2_weight"
+                    or name == "latent_down_weight"
+                    or name.startswith("shared_")
+                ),
             )
     return {
         **raw.options,
+        **raw.routing,
         **weights,
         "input_bf16": raw.input,
         "router_weight_fp32": raw.weights["router_weight"].float(),
