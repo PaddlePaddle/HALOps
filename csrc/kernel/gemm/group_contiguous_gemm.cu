@@ -106,14 +106,15 @@ void GroupContiguousGemm(const torch::Tensor& input,
                     "W4A8 'w4a8-mxfp4' (UE8M0 per 32) requires SF K = ", sf_k,
                     ", got sfa K=", sfa.size(-1), " and sfb K=", sfb.size(-1),
                     ".");
-        LaunchCfg<KernelMode::Contiguous, MmaKind::W4A8>(params,
-                                                         {.m = m / num_experts,
-                                                          .n = n,
-                                                          .k = k,
-                                                          .m_grid = m,
-                                                          .sm_count = sm,
-                                                          .has_bias = false},
-                                                         stream);
+        LaunchCfg<KernelMode::Contiguous, MmaKind::MXFP8FP4>(
+            params,
+            {.m = m / num_experts,
+             .n = n,
+             .k = k,
+             .m_grid = m,
+             .sm_count = sm,
+             .has_bias = false},
+            stream);
     } else {
         const int k = weight.size(2) * 2;  // 2 FP4 per packed byte
         TORCH_CHECK(

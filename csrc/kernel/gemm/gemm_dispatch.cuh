@@ -314,15 +314,10 @@ void LaunchTile(GemmParams& params, const GemmShape& shape,
         using T = MmaTraits<Kind>;
         using TypeD = cute::conditional_t<IsQuantOp(Op), cutlass::float_e4m3_t,
                                           typename T::Output>;
-        // SwapAB feeds the weight into the UMMA A operand and the activation
-        // into B (gemm_kernel.cuh swaps the data/scale pointers). For the
-        // asymmetric W4A8 mode the operand TYPES must swap with them so A is
-        // the fp4 weight and B the fp8 activation; symmetric modes are
-        // unaffected (OperandA == OperandB).
-        constexpr bool kSwapTypes = Kind == MmaKind::W4A8 && S.swap_ab;
-        using OpA = cute::conditional_t<kSwapTypes, typename T::OperandB,
+
+        using OpA = cute::conditional_t<S.swap_ab, typename T::OperandB,
                                         typename T::OperandA>;
-        using OpB = cute::conditional_t<kSwapTypes, typename T::OperandA,
+        using OpB = cute::conditional_t<S.swap_ab, typename T::OperandA,
                                         typename T::OperandB>;
         gemm_impl<OpA, OpB, typename T::Output, TypeD, typename T::Scale, float,
                   MakeTile<Kind, Mode, S, Op>>(params, shape.sm_count, stream);

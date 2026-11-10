@@ -100,7 +100,7 @@ enum class MmaKind : int32_t {
     MXFP8 = 1,
     MXFP4 = 2,
     NVFP4 = 3,
-    W4A8 = 4,
+    MXFP8FP4 = 4,
 };
 
 template <MmaKind Kind>
@@ -145,12 +145,8 @@ struct MmaTraits<MmaKind::MXFP4> {
     static constexpr const char* kName = "w4a4-mxfp4";
 };
 
-// W4A8: fp8 e4m3 activation (A) x packed fp4 e2m1 weight (B), both with a
-// UE8M0 group-32 scale. The mixed widths ride the MXF8F6F4 UMMA atom
-// (kFp4=false selects it and KMmaK=32); its SFVecSize is a fixed 32, matching
-// the group-32 layout, so the SF tensors use the same recipe as w4a4-mxfp4.
 template <>
-struct MmaTraits<MmaKind::W4A8> {
+struct MmaTraits<MmaKind::MXFP8FP4> {
     using Operand = cutlass::float_e2m1_t;  // packed-weight default; see below
     using OperandA = cutlass::float_e4m3_t;
     using OperandB = cutlass::float_e2m1_t;
@@ -361,9 +357,6 @@ constexpr TileSpec kFp4_256x256_pair_reg160 = {.block_m = 256,
                                                .skip_fence = true,
                                                .dense_only = true};
 
-// W4A8 (fp8 A x fp4 B through the MXF8F6F4 atom, KMmaK=32 so block_k=256).
-// Prologue stages are trimmed vs the w4a4 fp4 tiles because the fp8 A operand
-// is 2x the smem bytes; KTmemOverlapCols=48 over-provisions the SF TMEM.
 constexpr TileSpec kW4a8_256x256x256_pair = {.block_m = 256,
                                              .block_n = 256,
                                              .block_k = 256,
@@ -433,7 +426,7 @@ struct CandidateTiles<MmaKind::MXFP4> {
     static constexpr const auto& tiles = kFp4Tiles;
 };
 template <>
-struct CandidateTiles<MmaKind::W4A8> {
+struct CandidateTiles<MmaKind::MXFP8FP4> {
     static constexpr const auto& tiles = kW4a8Tiles;
 };
 

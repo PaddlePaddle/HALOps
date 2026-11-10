@@ -114,14 +114,14 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
                     "W4A8 'w4a8-mxfp4' (UE8M0 per 32) requires SF K = ", sf_k,
                     ", got sfa K=", sfa.size(-1), " and sfb K=", sfb.size(-1),
                     ".");
-        LaunchCfg<KernelMode::Masked, MmaKind::W4A8>(params,
-                                                     {.m = max_m_per_expert,
-                                                      .n = n,
-                                                      .k = k,
-                                                      .m_grid = m,
-                                                      .sm_count = sm,
-                                                      .has_bias = false},
-                                                     stream);
+        LaunchCfg<KernelMode::Masked, MmaKind::MXFP8FP4>(params,
+                                                         {.m = max_m_per_expert,
+                                                          .n = n,
+                                                          .k = k,
+                                                          .m_grid = m,
+                                                          .sm_count = sm,
+                                                          .has_bias = false},
+                                                         stream);
     } else {
         const int k = weight.size(2) * 2;  // 2 FP4 per packed byte
         TORCH_CHECK(
