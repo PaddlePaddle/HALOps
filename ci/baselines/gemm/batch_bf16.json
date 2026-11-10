@@ -15,7 +15,7 @@
         "mode": "bf16",
         "case_tag": "batch_bf16"
       },
-      "median_us": 348.236
+      "median_us": 347.946
     },
     {
       "key": {
@@ -29,7 +29,7 @@
         "mode": "bf16",
         "case_tag": "batch_bf16"
       },
-      "median_us": 1888.814
+      "median_us": 1859.059
     },
     {
       "key": {
@@ -43,7 +43,7 @@
         "mode": "bf16",
         "case_tag": "batch_bf16"
       },
-      "median_us": 912.394
+      "median_us": 900.468
     },
     {
       "key": {
@@ -57,7 +57,7 @@
         "mode": "bf16",
         "case_tag": "batch_bf16"
       },
-      "median_us": 214.245
+      "median_us": 197.99
     },
     {
       "key": {
@@ -71,7 +71,7 @@
         "mode": "bf16",
         "case_tag": "batch_bf16"
       },
-      "median_us": 107.999
+      "median_us": 105.0
     },
     {
       "key": {
@@ -85,7 +85,7 @@
         "mode": "bf16",
         "case_tag": "batch_bf16"
       },
-      "median_us": 184.657
+      "median_us": 183.725
     },
     {
       "key": {
@@ -99,7 +99,7 @@
         "mode": "bf16",
         "case_tag": "batch_bf16"
       },
-      "median_us": 64.24
+      "median_us": 64.047
     },
     {
       "key": {
@@ -113,7 +113,7 @@
         "mode": "bf16",
         "case_tag": "batch_bf16"
       },
-      "median_us": 62.082
+      "median_us": 62.184
     },
     {
       "key": {
@@ -127,7 +127,7 @@
         "mode": "bf16",
         "case_tag": "batch_bf16"
       },
-      "median_us": 170.864
+      "median_us": 170.431
     }
   ]
 }
