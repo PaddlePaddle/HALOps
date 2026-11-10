@@ -30,9 +30,10 @@ void GroupContiguousGemm(const torch::Tensor& input,
                          const std::string& mode = "w8a8-mxfp8") {
     const CudaDeviceGuard device_guard(input.device());
     TORCH_CHECK(
-        mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" || mode == "w4a4-mxfp4",
+        mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" || mode == "w4a4-mxfp4" ||
+            mode == "w4a8-mxfp4",
         "Unsupported mode: ", mode,
-        ". Expected 'w8a8-mxfp8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
+        ". Expected 'w8a8-mxfp8', 'w4a4-nvfp4', 'w4a4-mxfp4' or 'w4a8-mxfp4'.");
     TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor of shape [M, K]");
     TORCH_CHECK(weight.dim() == 3,
                 "weight must be a 3D tensor of shape [num_experts, N, K]");
@@ -85,6 +86,34 @@ void GroupContiguousGemm(const torch::Tensor& input,
              .sm_count = sm,
              .has_bias = bias.has_value()},
             stream);
+    } else if (mode == "w4a8-mxfp4") {
+        const int k = weight.size(2) * 2;  // 2 FP4 per packed byte
+        TORCH_CHECK(input.size(1) == k,
+                    "W4A8 input K (unpacked fp8) must match unpacked weight K, "
+                    "got input K=",
+                    input.size(1), ", weight K=", k);
+        params.k = k;
+        params.ptr_a = input.data_ptr();
+        params.ptr_b = weight.data_ptr();
+        params.ptr_sfa = sfa.data_ptr();
+        params.ptr_sfb = sfb.data_ptr();
+        TORCH_CHECK(!bias.has_value(), "W4A8 mode does not support bias yet.");
+        TORCH_CHECK(
+            !alpha.has_value(),
+            "W4A8 mode does not take alpha; scales are per-group UE8M0.");
+        const int sf_k = k / 32;  // UE8M0 group-32 scale on both A and B
+        TORCH_CHECK(sfa.size(-1) == sf_k && sfb.size(-1) == sf_k,
+                    "W4A8 'w4a8-mxfp4' (UE8M0 per 32) requires SF K = ", sf_k,
+                    ", got sfa K=", sfa.size(-1), " and sfb K=", sfb.size(-1),
+                    ".");
+        LaunchCfg<KernelMode::Contiguous, MmaKind::W4A8>(params,
+                                                         {.m = m / num_experts,
+                                                          .n = n,
+                                                          .k = k,
+                                                          .m_grid = m,
+                                                          .sm_count = sm,
+                                                          .has_bias = false},
+                                                         stream);
     } else {
         const int k = weight.size(2) * 2;  // 2 FP4 per packed byte
         TORCH_CHECK(

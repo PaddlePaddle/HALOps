@@ -100,6 +100,7 @@ enum class MmaKind : int32_t {
     MXFP8 = 1,
     MXFP4 = 2,
     NVFP4 = 3,
+    W4A8 = 4,
 };
 
 template <MmaKind Kind>
@@ -108,6 +109,8 @@ struct MmaTraits;
 template <>
 struct MmaTraits<MmaKind::MXFP8> {
     using Operand = cutlass::float_e4m3_t;
+    using OperandA = Operand;
+    using OperandB = Operand;
     using Output = cutlass::bfloat16_t;
     using Scale = cutlass::float_ue8m0_t;
     static constexpr bool kFp4 = false;
@@ -119,6 +122,8 @@ struct MmaTraits<MmaKind::MXFP8> {
 template <>
 struct MmaTraits<MmaKind::NVFP4> {
     using Operand = cutlass::float_e2m1_t;
+    using OperandA = Operand;
+    using OperandB = Operand;
     using Output = cutlass::bfloat16_t;
     using Scale = cutlass::float_ue4m3_t;
     static constexpr bool kFp4 = true;
@@ -130,12 +135,31 @@ struct MmaTraits<MmaKind::NVFP4> {
 template <>
 struct MmaTraits<MmaKind::MXFP4> {
     using Operand = cutlass::float_e2m1_t;
+    using OperandA = Operand;
+    using OperandB = Operand;
     using Output = cutlass::bfloat16_t;
     using Scale = cutlass::float_ue8m0_t;
     static constexpr bool kFp4 = true;
     static constexpr int kSfVecSize = 32;
     static constexpr bool kHasAlpha = false;
     static constexpr const char* kName = "w4a4-mxfp4";
+};
+
+// W4A8: fp8 e4m3 activation (A) x packed fp4 e2m1 weight (B), both with a
+// UE8M0 group-32 scale. The mixed widths ride the MXF8F6F4 UMMA atom
+// (kFp4=false selects it and KMmaK=32); its SFVecSize is a fixed 32, matching
+// the group-32 layout, so the SF tensors use the same recipe as w4a4-mxfp4.
+template <>
+struct MmaTraits<MmaKind::W4A8> {
+    using Operand = cutlass::float_e2m1_t;  // packed-weight default; see below
+    using OperandA = cutlass::float_e4m3_t;
+    using OperandB = cutlass::float_e2m1_t;
+    using Output = cutlass::bfloat16_t;
+    using Scale = cutlass::float_ue8m0_t;
+    static constexpr bool kFp4 = false;
+    static constexpr int kSfVecSize = 32;
+    static constexpr bool kHasAlpha = false;
+    static constexpr const char* kName = "w4a8-mxfp4";
 };
 
 template <MmaKind Kind, KernelMode Mode, TileSpec S,
@@ -337,6 +361,29 @@ constexpr TileSpec kFp4_256x256_pair_reg160 = {.block_m = 256,
                                                .skip_fence = true,
                                                .dense_only = true};
 
+// W4A8 (fp8 A x fp4 B through the MXF8F6F4 atom, KMmaK=32 so block_k=256).
+// Prologue stages are trimmed vs the w4a4 fp4 tiles because the fp8 A operand
+// is 2x the smem bytes; KTmemOverlapCols=48 over-provisions the SF TMEM.
+constexpr TileSpec kW4a8_256x256x256_pair = {.block_m = 256,
+                                             .block_n = 256,
+                                             .block_k = 256,
+                                             .main_stages = 2,
+                                             .epi_stages = 2,
+                                             .cluster_m = 2,
+                                             .tmem_overlap = 48};
+constexpr TileSpec kW4a8_128x256x256 = {.block_m = 128,
+                                        .block_n = 256,
+                                        .block_k = 256,
+                                        .main_stages = 2,
+                                        .epi_stages = 2,
+                                        .tmem_overlap = 48};
+constexpr TileSpec kW4a8_128x64x256_swap = {.block_m = 128,
+                                            .block_n = 64,
+                                            .block_k = 256,
+                                            .main_stages = 4,
+                                            .epi_stages = 7,
+                                            .swap_ab = true};
+
 // Candidate tiles per MmaKind.
 inline constexpr std::array<TileSpec, 16> kFp8Tiles = {
     kFp8_128x256,
@@ -365,6 +412,12 @@ inline constexpr std::array<TileSpec, 10> kFp4Tiles = {
     kFp4_256x256_pair,     kFp4_256x256_pair_reg160,
 };
 
+inline constexpr std::array<TileSpec, 3> kW4a8Tiles = {
+    kW4a8_256x256x256_pair,
+    kW4a8_128x256x256,
+    kW4a8_128x64x256_swap,
+};
+
 template <MmaKind Kind>
 struct CandidateTiles;
 template <>
@@ -378,6 +431,10 @@ struct CandidateTiles<MmaKind::NVFP4> {
 template <>
 struct CandidateTiles<MmaKind::MXFP4> {
     static constexpr const auto& tiles = kFp4Tiles;
+};
+template <>
+struct CandidateTiles<MmaKind::W4A8> {
+    static constexpr const auto& tiles = kW4a8Tiles;
 };
 
 }  // namespace halops
