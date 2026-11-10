@@ -21,6 +21,12 @@ from dataclasses import dataclass
 
 import torch
 
+from core.distributed import (
+    RankContext,
+    tensor_parallel_context,
+    tp_worker_main,
+    visible_device_count,
+)
 from core.metrics import BenchmarkMetrics, compute_moe_metrics
 from core.output import (
     MoeRowResult,
@@ -29,13 +35,15 @@ from core.output import (
     print_table_header,
     print_table_row,
 )
-from core.refcheck import run_refcheck
+from core.refcheck import RefcheckResult, _compare_to_reference
 from core.runner import run_bench_for_backend, run_refcheck_cross_backends
 from core.timing import TimingResult, bench_gpu_time, profile_kernel_timeline
 from kernel.moe.backends.golden import (
     _dequant_weight,
     _route,
+    routed_and_shared,
     run_low_latency_moe_golden,
+    tail,
 )
 from kernel.moe.backends.halops import run_low_latency_moe
 
@@ -89,8 +97,13 @@ def _validate_config(cfg: dict) -> dict:
         raise ValueError(
             f"routing must combine 'bias' and 'perexpert', got {options['routing']!r}"
         )
-    if options["tp_size"] != 1:
-        raise ValueError("this benchmark runs on one GPU; set tp_size=1")
+    if options["tp_size"] not in (1, 4):
+        raise ValueError(f"tp_size must be 1 or 4, got {options['tp_size']}")
+    if options["tp_size"] > visible_device_count():
+        raise ValueError(
+            f"tp_size={options['tp_size']} needs that many visible GPUs, "
+            f"got {visible_device_count()} (set --gpu accordingly)"
+        )
     if (
         not isinstance(options["batch_size"], int)
         or not 1 <= options["batch_size"] <= 16
@@ -116,28 +129,38 @@ def _validate_config(cfg: dict) -> dict:
 
 
 @torch.no_grad()
-def _build_inputs(cfg: dict) -> MoeInput:
+def _build_inputs(cfg: dict, tp_rank: int = 0) -> MoeInput:
+    """The launch's tensors; with tp_size > 1 the expert and shared weights are
+    the rank's own, while the router, latent and tail weights are shared."""
     options = _validate_config(cfg)
     torch.backends.cuda.matmul.allow_tf32 = False
     device = torch.device("cuda")
-    generator = torch.Generator(device=device).manual_seed(options["seed"])
+    rank_gen = torch.Generator(device=device).manual_seed(options["seed"] + tp_rank)
+    common_gen = (
+        rank_gen
+        if options["tp_size"] == 1
+        else torch.Generator(device=device).manual_seed(options["seed"])
+    )
 
-    def normal(shape, scale=1.0):
+    def normal(shape, scale=1.0, gen=None):
         return torch.randn(
-            shape, device=device, dtype=torch.bfloat16, generator=generator
+            shape,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=rank_gen if gen is None else gen,
         ).mul_(scale)
 
     h, n, z, e = (options[key] for key in MOE_SHAPE)
-    x = normal((options["batch_size"], h))
+    x = normal((options["batch_size"], h), gen=common_gen)
     weights = {
-        "router_weight": normal((2, e, h), h**-0.5),
+        "router_weight": normal((2, e, h), h**-0.5, common_gen),
         "expert_up_weights": normal((e, 2 * n, z), z**-0.5),
         "expert_down_weights": normal((e, z, n), n**-0.5),
         "shared_up_weight": normal((2 * n, h), h**-0.5),
         "shared_down_weight": normal((h, n), n**-0.5),
-        "latent_down_weight": normal((z, h), h**-0.5),
-        "tail_fc2_weight": normal((h, z), z**-0.5),
-        "tail_norm_weight": normal((z,), 0.1).add_(1.0),
+        "latent_down_weight": normal((z, h), h**-0.5, common_gen),
+        "tail_fc2_weight": normal((h, z), z**-0.5, common_gen),
+        "tail_norm_weight": normal((z,), 0.1, common_gen).add_(1.0),
     }
     # Router steering stays neutral: a zero bias keeps the selection (and the
     # active-expert count) unchanged, a unit scale keeps the combine weights.
@@ -212,7 +235,7 @@ def _quantize_weights(weights: dict, quant_mode: str) -> dict:
 
 
 @torch.no_grad()
-def adapt_halops(raw: MoeInput) -> dict:
+def adapt_halops(raw: MoeInput, tp: RankContext) -> dict:
     from halops import get_workspace_for_moe
 
     quantized = raw.weights
@@ -223,7 +246,9 @@ def adapt_halops(raw: MoeInput) -> dict:
         "input": raw.input,
         "out": torch.empty_like(raw.input),
         "num_router_gates": 2,
-        "workspace": get_workspace_for_moe(raw.input, None, 0, raw.options["tp_size"]),
+        "workspace": get_workspace_for_moe(
+            raw.input, tp.group_name, tp.rank, raw.options["tp_size"]
+        ),
     }
 
 
@@ -244,7 +269,7 @@ def _active_experts(raw: MoeInput) -> int:
 
 
 @torch.no_grad()
-def adapt_golden(raw: MoeInput) -> dict:
+def adapt_golden(raw: MoeInput, tp: RankContext) -> dict:
     weights = {}
     for name, weight in raw.weights.items():
         if name.endswith("_scale"):
@@ -284,38 +309,92 @@ def _get_backends(names):
     return {name: registry[name] for name in names}
 
 
+def _rank_body(tp: RankContext, mode: str, job: dict) -> dict | None:
+    """This rank's share of a launch; rank 0 returns the row."""
+    if mode == "refcheck":
+        return _refcheck_rank(tp, job["cfg"], job["kwargs"])
+    return _bench_rank(tp, job["cfg"], job["name"], job["kwargs"])
+
+
+@torch.no_grad()
+def _bench_rank(
+    tp: RankContext, cfg: dict, name: str, timing_kwargs: dict
+) -> dict | None:
+    raw = _build_inputs(cfg, tp.rank)
+    adapt_fn, run_fn = _get_backends([name])[name]
+    inputs = adapt_fn(raw, tp)
+    unique_experts = _active_experts(raw)
+    bytes_io = _bytes_io(inputs, cfg["num_experts"], name, unique_experts)
+    del raw
+    tp.sync()
+    timing = bench_gpu_time(run_fn, (inputs,), **timing_kwargs)
+    tp.sync()
+    timing = tp.worst_timing(timing)
+    if not tp.is_leader:
+        return None
+    return {
+        "device_us": [float(v) for v in timing.device_us],
+        "host_us": [float(v) for v in timing.host_us],
+        "dispatch_us": [float(v) for v in timing.dispatch_us],
+        "bytes_io": int(bytes_io),
+        "active_experts": int(unique_experts),
+    }
+
+
+@torch.no_grad()
+def _refcheck_rank(tp: RankContext, cfg: dict, kwargs: dict) -> dict | None:
+    atol, rtol = kwargs["atol"], kwargs["rtol"]
+    raw = _build_inputs(cfg, tp.rank)
+    golden_inputs = adapt_golden(raw, tp)
+    halops_inputs = adapt_halops(raw, tp)
+    out = run_low_latency_moe(halops_inputs)
+    del halops_inputs
+    routed, shared = routed_and_shared(golden_inputs)
+    reference = tail(
+        golden_inputs,
+        tp.sum(routed.float()),
+        tp.sum(shared.float()),
+    )
+    if not torch.isfinite(reference).all() or reference.abs().max() < atol:
+        raise RuntimeError("BF16 golden output is non-finite or degenerate")
+    result = tp.worst_refcheck(
+        _compare_to_reference(
+            "halops",
+            "golden",
+            out.float().flatten(),
+            reference.float().flatten(),
+            atol,
+            rtol,
+        )
+    )
+    if not tp.is_leader:
+        return None
+    return {
+        "halops": result._asdict(),
+        "golden": RefcheckResult(passed=True)._asdict(),
+    }
+
+
 @torch.no_grad()
 def _refcheck_entry(
     cfg, ordered_names, refcheck_reference, refcheck_atol, refcheck_rtol
 ):
-    raw = _build_inputs(cfg)
-    backends = _get_backends(ordered_names)
-    inputs = {name: pair[0](raw) for name, pair in backends.items()}
-    reference = run_low_latency_moe_golden(inputs["golden"])
-    if not torch.isfinite(reference).all() or reference.abs().max() < refcheck_atol:
-        raise RuntimeError("BF16 golden output is non-finite or degenerate")
-
-    run_fns = {name: pair[1] for name, pair in backends.items()}
-    run_fns["golden"] = lambda _: reference
-    return run_refcheck(
-        [refcheck_reference]
-        + [name for name in ordered_names if name != refcheck_reference],
-        run_fns,
-        inputs,
-        atol=refcheck_atol,
-        rtol=refcheck_rtol,
-    )
+    options = _validate_config(cfg)
+    with tensor_parallel_context(options["tp_size"], __file__) as tp:
+        payload = tp.run(
+            "refcheck",
+            {
+                "cfg": {**cfg, **options},
+                "kwargs": {"atol": refcheck_atol, "rtol": refcheck_rtol},
+            },
+            _rank_body,
+        )
+    return {name: RefcheckResult(**vals) for name, vals in payload.items()}
 
 
-@torch.no_grad()
-def _bench_entry(
-    cfg, name, dry_run_iters, repeat_iters, cold_l2_cache, use_cuda_graph, timing_method
-):
-    raw = _build_inputs(cfg)
-    unique_experts = _active_experts(raw)
-    adapt_fn, run_fn = _get_backends([name])[name]
-    inputs = adapt_fn(raw)
-    bytes_io = raw.input.numel() * raw.input.element_size() * 2
+def _bytes_io(inputs: dict, num_experts: int, name: str, unique_experts: int) -> int:
+    """Per-GPU bytes touched: the weights it reads plus the input and output."""
+    bytes_io = inputs["input"].numel() * inputs["input"].element_size() * 2
     for key, value in inputs.items():
         if not isinstance(value, torch.Tensor) or not (
             "weight" in key or key == "tail_fc2_scale"
@@ -325,23 +404,46 @@ def _bench_entry(
             continue
         count = value.numel()
         if key.startswith("expert_"):
-            count = count // raw.options["num_experts"] * unique_experts
+            count = count // num_experts * unique_experts
         bytes_io += count * value.element_size()
-    del raw
-    timing = bench_gpu_time(
-        run_fn,
-        (inputs,),
-        dry_run_iters=dry_run_iters,
-        repeat_iters=repeat_iters,
-        cold_l2_cache=cold_l2_cache,
-        use_cuda_graph=use_cuda_graph,
-        method=timing_method,
+    return bytes_io
+
+
+@torch.no_grad()
+def _bench_entry(
+    cfg, name, dry_run_iters, repeat_iters, cold_l2_cache, use_cuda_graph, timing_method
+):
+    options = _validate_config(cfg)
+    if options["tp_size"] > 1 and name != "halops":
+        raise ValueError("tp_size > 1 benchmarks the halops backend only")
+    with tensor_parallel_context(options["tp_size"], __file__) as tp:
+        payload = tp.run(
+            "bench",
+            {
+                "cfg": {**cfg, **options},
+                "name": name,
+                "kwargs": {
+                    "dry_run_iters": dry_run_iters,
+                    "repeat_iters": repeat_iters,
+                    "cold_l2_cache": cold_l2_cache,
+                    "use_cuda_graph": use_cuda_graph,
+                    "method": timing_method,
+                },
+            },
+            _rank_body,
+        )
+    timing = TimingResult(
+        device_us=payload["device_us"],
+        host_us=payload["host_us"],
+        dispatch_us=payload["dispatch_us"],
     )
-    return MoeTiming(timing, bytes_io, unique_experts)
+    return MoeTiming(timing, payload["bytes_io"], payload["active_experts"])
 
 
 @torch.no_grad()
 def _run_profile(cfg: dict) -> None:
+    if cfg.get("tp_size", 1) > 1:
+        raise ValueError("kernel timer profiling supports tp_size=1 only")
     warp_roles = {
         0: "calc tmem",
         1: "calc",
@@ -367,7 +469,7 @@ def _run_profile(cfg: dict) -> None:
         }
     )
     raw = _build_inputs(local)
-    inputs = adapt_halops(raw)
+    inputs = adapt_halops(raw, RankContext.local())
     active_experts = _active_experts(raw)
     del raw
     profile_kernel_timeline(
@@ -411,6 +513,8 @@ def run_scenario(cfg: dict) -> None:
         and cfg.get("timing_method", "profiler") != "cupti"
     ):
         raise ValueError("use_cuda_graph requires --timing-method=cupti")
+    if cfg.get("tp_size", 1) > 1 and cfg.get("use_cuda_graph", False):
+        raise ValueError("tp_size > 1 does not support CUDA graph timing")
     if cfg.get("dry_run_iters", 10) < 1 or cfg.get("repeat_iters", 50) < 1:
         raise ValueError("dry_run_iters and repeat_iters must be positive")
     failed = []
@@ -494,3 +598,7 @@ def run_scenario(cfg: dict) -> None:
             append_moe_csv(row, local.get("output_path", "results/low_latency_moe.csv"))
     if failed:
         raise RuntimeError("MoE benchmark failed: " + "; ".join(failed))
+
+
+if __name__ == "__main__":
+    tp_worker_main(_rank_body)

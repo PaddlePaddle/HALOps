@@ -165,6 +165,8 @@ inline constexpr CUtensorMapDataType TmaDataType() {
         return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
     } else if constexpr (std::is_same_v<T, float>) {
         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+    } else if constexpr (std::is_same_v<T, std::uint32_t>) {
+        return CU_TENSOR_MAP_DATA_TYPE_UINT32;
     } else if constexpr (std::is_same_v<T, cutlass::float_e2m1_t>) {
         return CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
     } else {

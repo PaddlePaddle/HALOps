@@ -335,11 +335,13 @@ __device__ static __forceinline__ void bulk_g2s(void* dst, const void* src,
         : "memory");
 }
 
-__device__ static __forceinline__ void mbar_wait_phase0(std::uint64_t* bar) {
+__device__ static __forceinline__ void mbar_wait_parity(std::uint64_t* bar,
+                                                        std::uint32_t parity) {
     asm volatile(
         "{\n.reg .pred p;\nWAIT_%=:\n"
-        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], 0;\n"
-        "@!p bra WAIT_%=;\n}" ::"r"(smem_u32(bar))
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+        "@!p bra WAIT_%=;\n}" ::"r"(smem_u32(bar)),
+        "r"(parity)
         : "memory");
 }
 

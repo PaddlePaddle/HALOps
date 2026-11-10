@@ -193,7 +193,8 @@ struct RoutedUpProjection<KernelTraits, true>
         std::uint32_t batch_size, Activation activation, float situ_beta,
         float situ_linear_beta, Workspace* __restrict__ workspace,
         SharedStorage* __restrict__ smem,
-        CUtensorMap const& tma_up_weights_desc, TaskScheduler<Traits>& sched,
+        CUtensorMap const& tma_up_weights_desc,
+        CUtensorMap const& tma_up_scale_desc, TaskScheduler<Traits>& sched,
         std::uint64_t weight_cache_hint) {
         const unsigned warp_idx = WarpRole::get_warp_idx();
 
@@ -208,16 +209,16 @@ struct RoutedUpProjection<KernelTraits, true>
 
             KERNEL_TIMER_SCOPE(smem->timer.get(), "up_expert_task", expert_id);
             if (WarpRole::is_weight_loader_thread()) {
-                run_load_k_loop(smem, tma_up_weights_desc, expert_scales_up,
-                                m_block_idx, task_id, expert_id,
-                                weight_cache_hint);
+                run_load_k_loop(smem, tma_up_weights_desc, tma_up_scale_desc,
+                                expert_scales_up, m_block_idx, task_id,
+                                expert_id, weight_cache_hint);
             } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
                 run_mma_k_loop(smem, tmem_base, task_id, m_block_idx);
             } else if (WarpRole::is_calc_warp(warp_idx)) {
                 Accumulator acc_gate_out;
                 Accumulator acc_up_out;
                 load_accumulators(smem, acc_gate_out, acc_up_out, tmem_base,
-                                  task_id);
+                                  task_id, expert_id);
                 KERNEL_TIMER_SCOPE(smem->timer.get(), "up_epilogue", expert_id);
                 Base::epilogue(workspace, smem, task.local_expert_idx,
                                batch_size, m_block_idx, activation, situ_beta,
@@ -249,9 +250,10 @@ struct RoutedUpProjection<KernelTraits, true>
                                              Accumulator& acc_gate_out,
                                              Accumulator& acc_up_out,
                                              std::uint32_t tmem_base,
-                                             std::uint32_t task_id) {
+                                             std::uint32_t task_id,
+                                             std::uint32_t expert_id) {
         const auto acc_ready_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "up_wait_accumulator_ready", task_id);
+            smem->timer.get(), "up_wait_accumulator_ready", expert_id);
         smem->barriers.routed.accumulator_ready.wait(task_id);
         KERNEL_TIMER_END(smem->timer.get(), acc_ready_span);
 
@@ -275,14 +277,12 @@ struct RoutedUpProjection<KernelTraits, true>
         auto tCt = Base::make_accumulator_fragment(cta_mma);
         const std::uint32_t acc_slot = task_id % kNumAccSlots;
 
-        // The slot is free once the calc warps read the task before it there.
-        const auto acc_empty_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "up_wait_accumulator_empty", task_id);
         if (task_id >= kNumAccSlots) {
+            KERNEL_TIMER_SCOPE(smem->timer.get(), "up_wait_accumulator_empty",
+                               task_id);
             smem->barriers.routed.accumulator_empty.wait(task_id -
                                                          kNumAccSlots);
         }
-        KERNEL_TIMER_END(smem->timer.get(), acc_empty_span);
 
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kNumTilesK;
@@ -296,6 +296,8 @@ struct RoutedUpProjection<KernelTraits, true>
             smem->barriers.routed.wait_up_mma_ready(ring_iter_id);
             KERNEL_TIMER_END(smem->timer.get(), mma_ready_span);
             if constexpr (UpGemm::kScaleLayout == ScaleLayout::kNaturalAtom) {
+                KERNEL_TIMER_SCOPE(smem->timer.get(), "permute_up_scale",
+                                   ring_iter_id);
                 Base::permute_up_scale(
                     smem->routed_experts.w_up_scale[weight_slot], m_block_idx);
             }
@@ -331,6 +333,7 @@ struct RoutedUpProjection<KernelTraits, true>
     __device__ static void run_load_k_loop(
         SharedStorage* __restrict__ smem,
         const CUtensorMap& tma_up_weights_desc,
+        const CUtensorMap& tma_up_scale_desc,
         const typename UpGemm::ElementScale* __restrict__ up_scale,
         std::uint32_t m_block_idx, std::uint32_t task_id,
         std::uint32_t expert_id, std::uint64_t weight_cache_hint) {
@@ -352,14 +355,16 @@ struct RoutedUpProjection<KernelTraits, true>
                 smem->barriers.routed.up_weight_ready.raw(slot),
                 expert_id * UpGemm::kGemmM + weight_row_base, k_iter_id,
                 weight_cache_hint);
-            load_up_weight_scale(smem, up_scale, ring_iter_id, expert_id,
-                                 weight_row_base);
+            load_up_weight_scale(smem, tma_up_scale_desc, up_scale,
+                                 ring_iter_id, expert_id, weight_row_base);
+            KERNEL_TIMER_MARK(smem->timer.get(), "up_load_weight_tile",
+                              k_iter_id);
         }
     }
 
     // Load this K tile's SFA into the weight slot's already-armed barrier.
     __device__ static void load_up_weight_scale(
-        SharedStorage* __restrict__ smem,
+        SharedStorage* __restrict__ smem, const CUtensorMap& tma_up_scale_desc,
         const typename UpGemm::ElementScale* __restrict__ up_scale,
         std::uint32_t ring_iter_id, std::uint32_t expert_id,
         std::uint32_t weight_row_base) {
@@ -369,7 +374,7 @@ struct RoutedUpProjection<KernelTraits, true>
             expert_id * (UpGemm::kGemmM / 128u) + weight_row_base / 128u;
         Base::load_weight_scale_tile(
             up_scale, row_atom, k_tile, smem->routed_experts.w_up_scale[slot],
-            smem->barriers.routed.up_weight_ready.raw(slot));
+            smem->barriers.routed.up_weight_ready.raw(slot), tma_up_scale_desc);
     }
 };
 
@@ -404,8 +409,9 @@ struct RoutedUpProjection<KernelTraits, false>
         std::uint32_t batch_size, Activation activation, float situ_beta,
         float situ_linear_beta, Workspace* __restrict__ workspace,
         SharedStorage* __restrict__ smem,
-        CUtensorMap const& tma_up_weights_desc, TaskScheduler<Traits>& sched,
-        std::uint64_t weight_cache_hint) {
+        CUtensorMap const& tma_up_weights_desc,
+        [[maybe_unused]] CUtensorMap const& tma_up_scale_desc,
+        TaskScheduler<Traits>& sched, std::uint64_t weight_cache_hint) {
         const unsigned warp_idx = WarpRole::get_warp_idx();
 
         const std::uint32_t m_block = sched.cta_group().cta_idx_in_group;

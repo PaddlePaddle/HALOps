@@ -125,7 +125,7 @@
 
 - `batch_sizes`（默认 `[1]`）：token 数，取值为 `1..16`。
 - `top_k_list`（默认 `[8]`）：选择专家数，取值为 `1..10`。
-- `tp_size`（默认 `1`）：此 benchmark 当前仅支持单卡。
+- `tp_size`（默认 `1`）：张量并行卡数，支持 `1` 或 `4`；`4` 需要单机 4 张可见 GPU（`--gpu 0,1,2,3`），benchmark 会为每个配置拉起 4 个 rank 的进程组。
 - `quant_mode`：`w8a8-blockwise`（默认）、`w8a8-mxfp8` 或 `w4a8-mxfp4`。
 - `activation`：`silu`（默认）或 `situ`。SiTU 可配置 `situ_beta`（默认 `4.0`）和 `situ_linear_beta`（默认 `25.0`）；非正值关闭对应 soft cap。
 - `scoring_func`：`sigmoid`（默认）或 `softmax`；`renormalize` 默认 `true`。

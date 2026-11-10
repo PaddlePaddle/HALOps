@@ -154,6 +154,7 @@ struct CollectiveMainloopMoE {
         std::uint32_t tail_shared_ctas;
         std::uint32_t tail_rank;
         alignas(128) CUtensorMap tma_up_weights_desc;
+        alignas(128) CUtensorMap tma_up_scale_desc;
         alignas(128) CUtensorMap tma_input_desc;
         alignas(128) CUtensorMap tma_input_chunks_desc;
         alignas(128) CUtensorMap tma_router_weights_desc;
@@ -279,6 +280,26 @@ struct CollectiveMainloopMoE {
                 /*box=*/
                 {UpGemm::MmaCore::kSwizzleBoxK, kGran, 2u,
                  UpGemm::kTileShapeM / (2u * kGran), 1u});
+        }
+        if constexpr (Traits::RoutedUpGemm::kScaleLayout ==
+                          ScaleLayout::kNaturalAtom &&
+                      Traits::RoutedUpGemm::MmaCore::kUseBlockscaled) {
+            // One box copies both the gate and the up 128-row atom halves of a
+            // weight tile: [16-byte words][K slabs][gate/up band].
+            using UpGemm = typename Traits::RoutedUpGemm;
+            constexpr std::uint64_t kSlabsPerAtomRow =
+                std::uint64_t{UpGemm::kGemmK} / 128u;
+            constexpr std::uint64_t kAtomRows =
+                std::uint64_t{Dims::kNumExperts} * (UpGemm::kGemmM / 128u);
+            params.tma_up_scale_desc = CreateTmaDesc<3>(
+                "up-projection weight scales",
+                reinterpret_cast<const std::uint32_t*>(
+                    args.expert_up_weights_scale),
+                /*shape=*/{128u, kAtomRows * kSlabsPerAtomRow, 2u},
+                /*strides=*/
+                {512u, std::uint64_t{UpGemm::kGemmM / 256u} * kSlabsPerAtomRow *
+                           512u},
+                /*box=*/{128u, 2u, 2u}, /*use_swizzle=*/false);
         }
         constexpr std::uint64_t kDownBytes =
             std::uint64_t{Dims::kIntermediateSize} *
@@ -588,10 +609,6 @@ struct CollectiveMainloopMoE {
             static_cast<std::uint32_t>(sizeof(Quantized::data));
         constexpr std::uint32_t kScaleBytes =
             static_cast<std::uint32_t>(sizeof(Quantized::scale));
-        static_assert(kFp8Bytes == Workspace::LatentOut::kDataBytes &&
-                          kScaleBytes == Workspace::LatentOut::kScaleBytes,
-                      "the projection's output must be exactly one up "
-                      "staging tile.");
         smem->barriers.routed.up_input_ready.arrive(0u,
                                                     kFp8Bytes + kScaleBytes);
         tma_load_1d(workspace->latent_down_out.data_ptr(), kFp8Bytes,
@@ -600,7 +617,6 @@ struct CollectiveMainloopMoE {
         tma_load_1d(workspace->latent_down_out.scale_ptr(), kScaleBytes,
                     &smem->routed_experts.quantized_input.scale[0][0],
                     smem->barriers.routed.up_input_ready.raw(0u));
-        smem->barriers.routed.up_input_ready.wait(0u);
     }
 
     // Phase 2: up-projection over this block's tasks, as enumerated by `sched`.
@@ -611,23 +627,19 @@ struct CollectiveMainloopMoE {
             reinterpret_cast<Workspace*>(params.scratchpad);
         if (WarpRole::is_other_loader_thread()) {
             if constexpr (Traits::kUseLatent) {
-                const auto latent_span =
-                    KERNEL_TIMER_BEGIN(smem->timer.get(), "up_wait_latent");
+                KERNEL_TIMER_SCOPE(smem->timer.get(), "up_wait_latent_down");
                 workspace->cta_comm.wait_latent_tasks(
                     smem->launch_parity, Traits::LatentDownGemm::kNumCtas);
                 // Order cross-CTA stores before TMA reads.
                 fence_proxy_async_global();
-                KERNEL_TIMER_END(smem->timer.get(), latent_span);
             }
-            const auto activation_span =
-                KERNEL_TIMER_BEGIN(smem->timer.get(), "up_load_activation");
+            KERNEL_TIMER_SCOPE(smem->timer.get(), "up_load_quantized_input");
             load_quantized_activation(workspace, smem);
-            KERNEL_TIMER_END(smem->timer.get(), activation_span);
         }
         RoutedUpProjection<KernelTraits>::run(
             params.expert_scales_up, params.num_tokens, params.activation,
             params.situ_beta, params.situ_linear_beta, workspace, smem,
-            params.tma_up_weights_desc, sched,
+            params.tma_up_weights_desc, params.tma_up_scale_desc, sched,
             get_tma_cache_hint(smem->routing.active_expert_count >
                                params.l2_expert_capacity));
     }
@@ -648,6 +660,7 @@ struct CollectiveMainloopMoE {
     // Prefetch the TMA descriptors.
     __device__ static void prefetch_tma_descriptors(Params const& params) {
         cute::prefetch_tma_descriptor(&params.tma_up_weights_desc);
+        cute::prefetch_tma_descriptor(&params.tma_up_scale_desc);
         cute::prefetch_tma_descriptor(&params.tma_input_desc);
         cute::prefetch_tma_descriptor(&params.tma_input_chunks_desc);
         cute::prefetch_tma_descriptor(&params.tma_router_weights_desc);

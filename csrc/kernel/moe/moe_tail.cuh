@@ -42,14 +42,20 @@ struct TailGeometryT {
     static constexpr int kXStride = static_cast<int>(Dims::kLatentSize) + kXPad;
     static constexpr int kShard = static_cast<int>(Dims::kHiddenSize) / kWorld;
     static constexpr int kRows = kShard / kGsize;
-    static constexpr int kTiles = kRows / 16;
+    // A staged CTA runs its rows in passes of kBlockRows through kStageBufs
+    // SMEM buffers.
+    static constexpr int kBlockRows =
+        kStage != 0 ? Config::kTailBlockRows : kRows;
+    static constexpr int kNumBlocks = kRows / kBlockRows;
+    static constexpr int kStageBufs = kNumBlocks < 2 ? kNumBlocks : 2;
+    static constexpr int kTiles = kBlockRows / 16;
     static constexpr int kKSplit = kTiles >= static_cast<int>(kWarps)
                                        ? 1
                                        : static_cast<int>(kWarps) / kTiles;
     static constexpr int kItemsPerWarp =
         kTiles * kKSplit / static_cast<int>(kWarps);
-    static_assert(kRows % 16 == 0,
-                  "rows per CTA must be a multiple of the mma M tile");
+    static_assert(kRows % kBlockRows == 0 && kBlockRows % 16 == 0,
+                  "passes must tile the CTA's rows in mma M tiles");
     static_assert(kTiles * kKSplit % static_cast<int>(kWarps) == 0,
                   "work items must tile over the warps");
     static constexpr int kMaxStageSmemBytes = Config::kTailMaxStageSmemBytes;
@@ -70,14 +76,21 @@ struct TailGeometryT {
         return (v + a - 1) / a * a;
     }
     static constexpr std::uint32_t kSmemWStage = 0;
+    static constexpr std::uint32_t kStageBufBytes = static_cast<std::uint32_t>(
+        tail::stage_smem_bytes<kBlockRows, Dims::kLatentSize, kWStagePad>());
     static constexpr std::uint32_t kSmemWStageBytes =
-        kStage == 0 ? 0u
-                    : static_cast<std::uint32_t>(
-                          tail::stage_smem_bytes<kRows, Dims::kLatentSize,
-                                                 kWStagePad>());
+        kStage == 0 ? 0u : kStageBufs * kStageBufBytes;
+    // One barrier per staging buffer.
     static constexpr std::uint32_t kSmemWBar =
         align_up(kSmemWStage + kSmemWStageBytes, 16);
-    static constexpr std::uint32_t kSmemX = align_up(kSmemWBar + 8, 16);
+    // MXFP8 stages this CTA's rows of fc2 scales after the barriers.
+    static constexpr std::uint32_t kSmemSf =
+        align_up(kSmemWBar + 8u * kStageBufs, 16);
+    static constexpr std::uint32_t kSmemSfBytes =
+        kMxfp8 ? static_cast<std::uint32_t>(kRows) * (Dims::kLatentSize / 32)
+               : 0u;
+    static constexpr std::uint32_t kSmemX =
+        align_up(kSmemSf + kSmemSfBytes, 16);
     static constexpr std::uint32_t kSmemWarp =
         align_up(kSmemX + std::uint32_t(kTpg * kXStride) * 2, 16);
     static constexpr std::uint32_t kSmemPart =

@@ -121,8 +121,11 @@ def _activate(up: torch.Tensor, inp: dict) -> torch.Tensor:
 
 
 @torch.no_grad()
-def run_low_latency_moe_golden(inp: dict) -> torch.Tensor:
-    """BF16 projections with FP32 routing, activation and normalization."""
+def routed_and_shared(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """This rank's routed latent and shared-expert partial, both bf16.
+
+    A tensor-parallel run sums these over the ranks before ``tail``.
+    """
     x = inp["input_bf16"]
     weights, ids = _route(inp)
     tokens, top_k = ids.shape
@@ -142,8 +145,21 @@ def run_low_latency_moe_golden(inp: dict) -> torch.Tensor:
     routed = routed_each.reshape(tokens, top_k, -1).float().sum(dim=1).bfloat16()
     shared_up = x @ inp["shared_up_weight"].T
     shared = _activate(shared_up, inp).bfloat16() @ inp["shared_down_weight"].T
+    return routed, shared
+
+
+@torch.no_grad()
+def tail(inp: dict, routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:
+    """RMSNorm + fc2 over the summed routed latent, plus the summed shared."""
     routed_float = routed.float()
     rms = torch.rsqrt(routed_float.square().mean(dim=-1, keepdim=True) + inp["eps"])
     normed = (routed_float * rms * inp["tail_norm_weight"].float()).bfloat16()
-    tail = normed @ inp["tail_fc2_weight"].T
-    return (tail.float() + shared.float()).bfloat16()
+    fc2 = normed @ inp["tail_fc2_weight"].T
+    return (fc2.float() + shared.float()).bfloat16()
+
+
+@torch.no_grad()
+def run_low_latency_moe_golden(inp: dict) -> torch.Tensor:
+    """BF16 projections with FP32 routing, activation and normalization."""
+    routed, shared = routed_and_shared(inp)
+    return tail(inp, routed, shared)

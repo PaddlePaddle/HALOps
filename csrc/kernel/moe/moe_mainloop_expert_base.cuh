@@ -199,42 +199,40 @@ struct UpProjectionBase {
         }
     }
 
+    // `tma_scale_desc` carries the natural-row atoms; the packed table is a
+    // flat byte image, so it needs no tensor map.
     __device__ static void load_weight_scale_tile(
         const typename UpGemm::ElementScale* scale, std::uint32_t row_atom,
-        std::uint32_t k_tile, std::uint8_t* dest, std::uint64_t* barrier) {
+        std::uint32_t k_tile, std::uint8_t* dest, std::uint64_t* barrier,
+        const CUtensorMap& tma_scale_desc = CUtensorMap{}) {
         static_assert(MmaCore::kUseBlockscaled,
                       "scale tiles are only loaded for blockscaled MMA");
-        constexpr std::uint32_t kSfAtomBytes = 512u;
-        constexpr std::uint32_t kSfKBlocksPerRow = UpGemm::kGemmK / 128u;
-        constexpr std::uint32_t kAtomsPerRowTile = UpGemm::kGemmM / 128u;
-        const auto* sfa = reinterpret_cast<const std::uint8_t*>(scale);
         if constexpr (UpGemm::kScaleLayout == ScaleLayout::kPlainRows) {
             // The issuer converts the plain rows when it consumes the tile.
             return;
         }
+        constexpr std::uint32_t kAtomsPerRowTile = UpGemm::kGemmM / 128u;
+        constexpr std::uint32_t kSfAtomBytes = 512u;
+        constexpr std::uint32_t kSlabsPerTileK = UpGemm::kTileShapeK / 128u;
         if constexpr (UpGemm::kScaleLayout == ScaleLayout::kPackedAtom) {
-            tma_load_1d(sfa + (row_atom * kSfKBlocksPerRow +
-                               k_tile * (UpGemm::kTileShapeK / 128u)) *
-                                  kSfAtomBytes,
-                        UpScaleTraits::kSfaSmemBytes, dest, barrier);
+            constexpr std::uint32_t kSfKBlocksPerRow = UpGemm::kGemmK / 128u;
+            const auto* sfa = reinterpret_cast<const std::uint8_t*>(scale);
+            tma_load_1d(
+                sfa + (row_atom * kSfKBlocksPerRow + k_tile * kSlabsPerTileK) *
+                          kSfAtomBytes,
+                UpScaleTraits::kSfaSmemBytes, dest, barrier);
             return;
         }
-        // Natural rows: the packed tile's gate and up halves are the same
-        // 64-row slice of the expert's gate and up 128-row atoms.
-        const std::uint32_t expert = row_atom / kAtomsPerRowTile;
-        const std::uint32_t gate_atom = (row_atom % kAtomsPerRowTile) / 2u;
-        const std::uint32_t atom_col = k_tile * (UpGemm::kTileShapeK / 128u);
-        const std::uint32_t gate_base =
-            (expert * kAtomsPerRowTile + gate_atom) * kSfKBlocksPerRow;
-        const std::uint32_t up_base =
-            gate_base + (kAtomsPerRowTile / 2u) * kSfKBlocksPerRow;
-#pragma unroll
-        for (std::uint32_t jj = 0; jj < 2u; ++jj) {
-            tma_load_1d(sfa + (gate_base + atom_col + jj) * kSfAtomBytes,
-                        kSfAtomBytes, dest + jj * kSfAtomBytes, barrier);
-            tma_load_1d(sfa + (up_base + atom_col + jj) * kSfAtomBytes,
-                        kSfAtomBytes, dest + (2u + jj) * kSfAtomBytes, barrier);
-        }
+        // Natural rows: one 3-D box copies the gate and the up 128-row halves
+        // of the tile, the same 64-row slice of each band's atom.
+        constexpr std::uint32_t kSlabsPerAtomRow = UpGemm::kGemmK / 128u;
+        const std::uint32_t atom_row =
+            row_atom / kAtomsPerRowTile * kAtomsPerRowTile +
+            (row_atom % kAtomsPerRowTile) / 2u;
+        tma_load_3d(
+            tma_scale_desc, /*coord0=*/0u,
+            /*coord1=*/k_tile * kSlabsPerTileK + atom_row * kSlabsPerAtomRow,
+            /*coord2=*/0u, dest, barrier);
     }
 
     // Build one K tile's interleaved SfAtom slab from the plain rows.
