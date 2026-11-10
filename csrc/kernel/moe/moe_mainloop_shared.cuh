@@ -312,6 +312,7 @@ struct SharedUpProjection<KernelTraits, true>
         }
         __syncthreads();
     }
+
     __device__ static void run(
         CUtensorMap const& tma_up_desc, CUtensorMap const& tma_input_desc,
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,

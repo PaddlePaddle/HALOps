@@ -102,7 +102,7 @@ setup(
                 "csrc/common/cpp_extensions.cc",
             ],
             include_dirs=include_dirs,
-            extra_compile_args={"nvcc": gencode_flags, "cxx": []},
+            extra_compile_args={"nvcc": gencode_flags},
             libraries=["cuda"],
         ),
     ],
