@@ -38,6 +38,8 @@ struct GemmParams {
     int *__restrict__ masked_m = nullptr;
     int *__restrict__ expert_ids = nullptr;
     bool use_pdl = false;
+    // Batch D layout: false = [M, B * N] (default), true = [B, M, N].
+    bool batch_out_bmn = false;
     void *__restrict__ ptr_sfd = nullptr;
     void const *__restrict__ ptr_gate = nullptr;
     int64_t gate_ld = 0;
