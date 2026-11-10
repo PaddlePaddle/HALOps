@@ -14,14 +14,14 @@
 # limitations under the License.
 """
 
-from .mqa_logits_fused import mqa_logits_fused_topk, warmup
+from .mqa_logits_fused_topk import mqa_logits_fused_topk, warmup
 
 __all__ = ("mqa_logits_fused_topk", "warmup", "prepare")
 
 
 def __getattr__(name):
     if name == "prepare":
-        from .mqa_logits_fused_topk.pipeline import prepare
+        from .kernels.mqa_logits_fused_topk.pipeline import prepare
 
         return prepare
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

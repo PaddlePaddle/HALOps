@@ -16,12 +16,11 @@
 
 from __future__ import annotations
 
-import functools
 from typing import Optional, Tuple
 
 import torch
 
-from halops.indexer.mqa_logits_fused_topk.config import (
+from halops.indexer.kernels.mqa_logits_fused_topk.config import (
     DEFAULT_KV_SAMPLE,
     SUPPORTED_HEAD_DIM,
     SUPPORTED_QKV_DTYPES,
@@ -92,7 +91,7 @@ def mqa_logits_fused_topk(
     validate_query_shape(q.shape, qkv_dtype)
     import tvm_ffi
 
-    from halops.indexer.mqa_logits_fused_topk.pipeline import prepare
+    from halops.indexer.kernels.mqa_logits_fused_topk.pipeline import prepare
 
     num_rows = ks.shape[0]
     weights = weights[:num_rows].contiguous()
@@ -133,6 +132,7 @@ def warmup(
     num_sms: int,
     kv_sample: tuple[int, int] = DEFAULT_KV_SAMPLE,
     ordered_bounds: bool = False,
+    max_kv_lens: int = 32768,
 ) -> None:
     """Warm all tile and offset variants for contiguous outputs on the current device.
 
@@ -146,6 +146,7 @@ def warmup(
             keys of each ``group`` keys.
         ordered_bounds: Whether end bounds are nondecreasing within every query tile
             after window trimming, including on every graph replay.
+        max_kv_lens: maximum length of kv used for warm_up, default 32768.
 
     Notes:
         Nonempty pilot samples reuse these kernels across serving row counts; empty
@@ -156,50 +157,13 @@ def warmup(
     validate_topk(top_k)
     if qkv_dtype not in SUPPORTED_QKV_DTYPES:
         raise ValueError(f"Unsupported Q/KV dtype: {qkv_dtype}")
-    SamplingConfig(*kv_sample)
-    _warmup(
-        torch.cuda.current_device(),
-        qkv_dtype,
-        scores_bf16,
-        num_heads,
-        top_k,
-        num_sms,
-        kv_sample,
-        ordered_bounds,
-    )
-
-
-@functools.lru_cache(maxsize=None)
-def _warmup(
-    device_index: int,
-    qkv_dtype: str,
-    scores_bf16: bool,
-    num_heads: int,
-    top_k: int,
-    num_sms: int,
-    kv_sample: tuple[int, int],
-    ordered_bounds: bool,
-) -> None:
-    """Compile and run the warmup matrix once per device and operator configuration.
-
-    Args:
-        device_index: CUDA device ordinal on which to allocate inputs and synchronize.
-        qkv_dtype: Input format, ``"fp8"``, ``"mxfp4"`` or ``"mxfp8"``.
-        scores_bf16: Whether score accumulation and thresholds use BF16 instead of FP32.
-        num_heads: Logical query head count: 8, 16, 32, or 64.
-        top_k: Number of indices selected per query, from 128 through 2048.
-        num_sms: Number of SMs available to the persistent launch grid.
-        kv_sample: Pilot ``(group, take)`` pair: score the first ``take`` consecutive
-            keys of each ``group`` keys.
-        ordered_bounds: Whether end bounds are nondecreasing within every query tile
-            after window trimming, including on every graph replay.
-    """
+    sampling = SamplingConfig(*kv_sample)
+    device_index = torch.cuda.current_device()
     sms = max(1, num_sms)
     row_multiples = warmup_row_multiples(num_heads)
     rows = max(row_multiples) * sms
-    sampling = SamplingConfig(*kv_sample)
     # Ensure a nonempty pilot even for sparse sampling configurations.
-    kv_rows = max(32768, rows, sampling.group * (128 // sampling.take))
+    kv_rows = max(max_kv_lens, rows, sampling.group * (128 // sampling.take))
     is_fp4 = qkv_dtype == "mxfp4"
     is_mx_sf = qkv_dtype != "fp8"
     dim = SUPPORTED_HEAD_DIM // 2 if is_fp4 else SUPPORTED_HEAD_DIM
