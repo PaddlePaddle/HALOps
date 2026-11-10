@@ -97,6 +97,8 @@ class CollectiveEpilogue {
         int rows_per_batch = 0;
         SituCoef situ{};
         int64_t gate_ld = 0;
+        // Batch D layout: false = [M, B * N] (default), true = [B, M, N].
+        bool batch_out_bmn = false;
         // Stream-K fp32 partial workspace: [slot][CtaShape_M][KBlockN]; null
         // when stream-K is off.
         TypeAccumulate* ptr_partial = nullptr;
@@ -116,6 +118,7 @@ class CollectiveEpilogue {
         TypeC const* ptr_c = nullptr;
         int64_t d_ld;
         int64_t gate_ld;
+        bool batch_out_bmn = false;
         TypeAccumulate* ptr_partial = nullptr;
     };
 
@@ -138,7 +141,10 @@ class CollectiveEpilogue {
         const bool batch = KernelTraits::KernelType == KernelMode::Batch;
         const int64_t q_n = n / KAccColsPerOut;
         const int64_t rows = batch ? args.rows_per_batch : m;
-        const int64_t d_ld = batch ? num_experts * q_n : q_n;
+        // Batch rows are B * N apart in the default layout, N when the caller
+        // asked for [B, M, N].
+        const int64_t d_ld =
+            batch ? (args.batch_out_bmn ? q_n : num_experts * q_n) : q_n;
         cute::TmaDescriptor d_desc{};
         if constexpr (KQuantD && !SwapAB) {
             EncodeTmaDesc<3>(
@@ -164,6 +170,7 @@ class CollectiveEpilogue {
                 args.ptr_c,
                 d_ld,
                 args.gate_ld,
+                args.batch_out_bmn,
                 args.ptr_partial};
     }
 
@@ -878,10 +885,12 @@ class CollectiveEpilogue {
                     (static_cast<int64_t>(partial_slot) * KNumCTA + cta_v) *
                     KPartialM * KPartialN;
             }
-            // Batch: move the stacked row b * M + r to row r, columns b * N.
+            // Batch: move the stacked row b * M + r to row r, columns b * N
+            // (already contiguous in the [B, M, N] layout).
             int64_t row_shift = 0;
             if constexpr (KernelTraits::KernelType == KernelMode::Batch) {
-                const int64_t b = scheduler.expert_idx();
+                const int64_t b =
+                    epilogue_params.batch_out_bmn ? 0 : scheduler.expert_idx();
                 row_shift = b * static_cast<int64_t>(out_n) -
                             b * scheduler.max_m_per_expert() * d_ld;
             }

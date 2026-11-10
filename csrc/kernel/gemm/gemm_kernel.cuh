@@ -620,7 +620,7 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
              KernelTraits::KernelType == KernelMode::Batch
                  ? params.max_m_per_expert
                  : params.m,
-             params.situ, params.gate_ld,
+             params.situ, params.gate_ld, params.batch_out_bmn,
              streamk_active ? streamk_ws.data_ptr<float>() : nullptr});
 
     // Two instantiations picked by pointer: data-parallel and fused

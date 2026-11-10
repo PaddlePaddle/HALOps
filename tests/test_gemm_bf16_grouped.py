@@ -76,6 +76,30 @@ def test_batch_bf16_large_m():
     _run_batch_bf16(B=4, M=1024, N=256, K=128)
 
 
+def _run_batch_bf16_bmn(B, M, N, K):
+    """Batch-major [B, M, N] output, the layout large-B callers want."""
+    print(f"[BF16 batch bmn] B={B}, M={M}, N={N}, K={K}")
+    x = torch.randn([B, M, K], dtype=torch.bfloat16)
+    w = torch.randn([B, N, K], dtype=torch.bfloat16)
+    out = torch.zeros([B, M, N], dtype=torch.bfloat16)
+
+    ref = torch.matmul(
+        x.to(torch.float32), w.to(torch.float32).transpose(1, 2)
+    ).to(torch.bfloat16)
+
+    batch_gemm(x, w, None, None, out, mode="bf16")
+
+    for b in range(B):
+        _assert_close(out[b], ref[b], f"batch-bmn {b}")
+    print(f"  [PASS] BF16 batch bmn B={B}, M={M}, N={N}, K={K}")
+
+
+def test_batch_bf16_bmn_layout():
+    # Small B (model-shaped) and a large-B / narrow-N case: B * N rows.
+    _run_batch_bf16_bmn(B=4, M=128, N=256, K=128)
+    _run_batch_bf16_bmn(B=512, M=64, N=256, K=64)
+
+
 # =====================================================================
 # Grouped masked GEMM (BF16)
 # =====================================================================
@@ -164,6 +188,7 @@ if __name__ == "__main__":
     print("=" * 60)
     test_batch_bf16_mid_m()
     test_batch_bf16_large_m()
+    test_batch_bf16_bmn_layout()
     test_masked_bf16_mid_m()
     test_contiguous_bf16_mid_m()
     print("\n" + "=" * 60)

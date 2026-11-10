@@ -38,7 +38,9 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
                 "input must be a 3D tensor of shape [B, M, K]");
     TORCH_CHECK(weight.dim() == 3,
                 "weight must be a 3D tensor of shape [B, N, K]");
-    TORCH_CHECK(output.dim() == 2,
+    // mode="bf16" also takes the batch-major [B, M, N]; every other mode keeps
+    // the 2D contract the quantized store assumes.
+    TORCH_CHECK(output.dim() == 2 || (output.dim() == 3 && mode == "bf16"),
                 "output must be a 2D tensor of shape [M, B * N]");
 
     const int batches = input.size(0);
@@ -47,8 +49,25 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
     TORCH_CHECK(weight.size(0) == batches,
                 "weight batch dim must match input batch dim, got ",
                 weight.size(0));
-    TORCH_CHECK(output.size(0) == m && output.size(1) == int64_t(batches) * n,
-                "output shape must be [M, B * N]");
+    // Native BF16 also accepts the batch-major [B, M, N] output: contiguous
+    // per item, which writes faster at large B. Every other mode keeps the
+    // default [M, B * N] (the quantized store's TMA descriptor assumes it).
+    const bool bmn_out = output.dim() == 3;
+    if (bmn_out) {
+        TORCH_CHECK(output.is_contiguous(),
+                    "the [B, M, N] output must be contiguous");
+        TORCH_CHECK(output.size(0) == batches && output.size(1) == m &&
+                        output.size(2) == n,
+                    "output shape must be [B, M, N], got [", output.size(0),
+                    ", ", output.size(1), ", ", output.size(2), "], expected [",
+                    batches, ", ", m, ", ", n, "]");
+    } else {
+        TORCH_CHECK(
+            output.size(0) == m && output.size(1) == int64_t(batches) * n,
+            "output shape must be [M, B * N], got [", output.size(0), ", ",
+            output.size(1), "], expected [", m, ", ", int64_t(batches) * n,
+            "]");
+    }
     TORCH_CHECK(
         !output_sf.has_value() || n % (mxfp8::kGroup * mxfp8::kAtomCols) == 0,
         "quantized output needs N % 128 == 0, got ", n);
@@ -67,6 +86,7 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.num_experts = batches;
     params.max_m_per_expert = m;
     params.use_pdl = use_pdl;
+    params.batch_out_bmn = bmn_out;
 
     if (mode == "bf16") {
         // Native BF16: sfa/sfb/bias/alpha are ignored; dispatch and launch

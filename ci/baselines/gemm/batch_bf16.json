@@ -57,7 +57,7 @@
         "mode": "bf16",
         "case_tag": "batch_bf16"
       },
-      "median_us": 192.414
+      "median_us": 214.245
     },
     {
       "key": {
@@ -71,7 +71,7 @@
         "mode": "bf16",
         "case_tag": "batch_bf16"
       },
-      "median_us": 100.035
+      "median_us": 107.999
     },
     {
       "key": {

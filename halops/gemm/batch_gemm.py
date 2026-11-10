@@ -66,6 +66,9 @@ def batch_gemm(
         sfb: [B, N, sf_k] scale factor for B, dtype uint8, same SfAtom layout as sfa.
         output: [M, B * N] pre-allocated output tensor, dtype bfloat16, or
             float8_e4m3fn (``w8a8-mxfp8``) for an MXFP8-quantized output.
+            ``mode="bf16"`` also accepts the contiguous batch-major
+            ``[B, M, N]`` layout, which writes faster when ``B`` is large and
+            ``N`` is narrow.
         bias: Optional [B, N] bfloat16 bias vector. Only supported in w8a8-mxfp8 mode.
         alpha: Optional float32 per-batch scaling factor with shape [B], one
             value per batch item. Required for ``w4a4-nvfp4``; not accepted for
