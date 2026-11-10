@@ -293,12 +293,14 @@ struct CollectiveMainloop {
 
         cute::Tensor tensor_a = cute::make_tensor(
             cute::make_gmem_ptr(
-                static_cast<typename TiledMma::ValTypeA const*>(args.ptr_a)),
+                reinterpret_cast<typename TiledMma::ValTypeA const*>(
+                    args.ptr_a)),
             args.layout_A);
 
         cute::Tensor tensor_b = cute::make_tensor(
             cute::make_gmem_ptr(
-                static_cast<typename TiledMma::ValTypeB const*>(args.ptr_b)),
+                reinterpret_cast<typename TiledMma::ValTypeB const*>(
+                    args.ptr_b)),
             args.layout_B);
 
         cute::Tensor tensor_sfa =

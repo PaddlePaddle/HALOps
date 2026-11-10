@@ -314,9 +314,13 @@ void LaunchTile(GemmParams& params, const GemmShape& shape,
         using T = MmaTraits<Kind>;
         using TypeD = cute::conditional_t<IsQuantOp(Op), cutlass::float_e4m3_t,
                                           typename T::Output>;
-        gemm_impl<typename T::Operand, typename T::Operand, typename T::Output,
-                  TypeD, typename T::Scale, float, MakeTile<Kind, Mode, S, Op>>(
-            params, shape.sm_count, stream);
+
+        using OpA = cute::conditional_t<S.swap_ab, typename T::OperandB,
+                                        typename T::OperandA>;
+        using OpB = cute::conditional_t<S.swap_ab, typename T::OperandA,
+                                        typename T::OperandB>;
+        gemm_impl<OpA, OpB, typename T::Output, TypeD, typename T::Scale, float,
+                  MakeTile<Kind, Mode, S, Op>>(params, shape.sm_count, stream);
     }
 }
 
