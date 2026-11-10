@@ -5,3 +5,5 @@ numpy>=1.24
 setuptools
 wheel
 pytest>=7.0
+apache-tvm-ffi>=0.1.11
+nvidia-cutlass-dsl[cu13]>=4.6.2
