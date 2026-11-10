@@ -413,6 +413,456 @@ class MqaProducerKernel(MqaMmaGeometry):
         repair_parts = self.hist_splits
         failed_groups = cutlass.Int32(0)
         sm_idx = bidz
+
+        # Math-group IDs are static for shared-memory slots and named barriers.
+        # The helper lives above every staged region: CuTe-DSL resolves names
+        # used inside staged control flow only when they are bound before the
+        # region, and it does not support closure captures, so every staged
+        # input arrives as an explicit argument at the call site.
+        def math_warpgroup(
+            _TK_WG,
+            has_work,
+            prev_q_block_idx,
+            next_q_block_idx,
+            next_num_kv,
+            sc_slot,
+            q_block_idx,
+            num_kv,
+            kv_idx,
+            self,
+            NUM_MATH_WG,
+            bidz,
+            block_kv_val,
+            block_q_val,
+            cC,
+            copy_atom_t2r,
+            epi_sub_mn,
+            failed_groups,
+            grid_size,
+            local_tidx,
+            mCuSeqLenKEnd,
+            mCuSeqLenKStart,
+            mLogits,
+            mTopkCand,
+            mTopkCandCnt,
+            mTopkCandHi,
+            mTopkIdx,
+            num_epi_subtiles,
+            num_heads,
+            num_q_blocks,
+            num_q_tokens,
+            q_cons_state,
+            q_pipeline,
+            repair_part,
+            repair_parts,
+            sSF_KV_0,
+            sSF_KV_1,
+            sW,
+            s_score_hist,
+            s_stream_counts,
+            s_stream_entries,
+            s_stream_scalars,
+            tCtAcc_base_0,
+            tCtAcc_base_1,
+            topk_indices_offset,
+            umma_cons_state_0,
+            umma_cons_state_1,
+            umma_pipeline_0,
+            umma_pipeline_1,
+        ):
+            tAcc_ref = tCtAcc_base_0[None, None, None, 0][(None, None), 0, 0]
+            tAcc_ref_epi = cute.flat_divide(tAcc_ref, epi_sub_mn)
+            tiled_copy_ref = tcgen05.make_tmem_copy(
+                copy_atom_t2r, tAcc_ref_epi[None, None, 0, 0]
+            )
+            thr_copy_ref = tiled_copy_ref.get_slice(local_tidx)
+            tTR_cC = thr_copy_ref.partition_D(cC)
+            m_coord = tTR_cC[0][0]
+            tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
+            MAX_NUM_W_IN_REG = (
+                40 if block_q_val == 4 else 56 if block_q_val == 3 else 64
+            )
+            if cutlass.const_expr(self.topk_w_in_reg > 0):
+                MAX_NUM_W_IN_REG = self.topk_w_in_reg
+            NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
+            w_cache = cute.make_rmem_tensor(
+                (NUM_W_IN_REG * block_q_val,), self.epi.dtype
+            )
+            result_arr = cute.make_rmem_tensor((block_q_val,), self.epi.dtype)
+            tau_cache = cute.make_rmem_tensor((block_q_val,), cutlass.Float32)
+            warp_counts = cute.make_rmem_tensor((block_q_val,), cutlass.Int32)
+            kv_start_cache = [cutlass.Int32(0) for _ in range(block_q_val)]
+            kv_end_cache = [cutlass.Int32(0) for _ in range(block_q_val)]
+            q_stage_local = cutlass.Int32(0)
+            kv_lo_cur = cutlass.Int32(0)
+            while has_work:
+                q_block_idx = next_q_block_idx
+                num_kv = next_num_kv
+                if q_block_idx != prev_q_block_idx:
+                    if prev_q_block_idx < num_q_blocks:
+                        q_pipeline.consumer_release(q_cons_state)
+                        q_cons_state.advance()
+                    q_pipeline.consumer_wait(q_cons_state)
+                    q_stage_local = q_cons_state.index
+                    q_base = q_block_idx * block_q_val
+                    for t_i in cutlass.range_constexpr(block_q_val):
+                        for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
+                            w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
+                                t_i * num_heads + w_j, q_stage_local
+                            ]
+                        token_idx = min(q_base + t_i, num_q_tokens - 1)
+                        kv_start_cache[t_i] = mCuSeqLenKStart[token_idx]
+                        kv_end_cache[t_i] = mCuSeqLenKEnd[token_idx]
+                        if cutlass.const_expr(self.direct_candidates):
+                            tau_cache[t_i] = cutlass.Float32(mLogits[token_idx, 0])
+                    kv_lo_cur = self.bounds.tile_start(
+                        mCuSeqLenKStart,
+                        mCuSeqLenKEnd,
+                        q_block_idx,
+                        num_q_tokens,
+                        repair_part,
+                        repair_parts,
+                        0,
+                    )
+                prev_q_block_idx = q_block_idx
+                if cutlass.const_expr(self.direct_candidates):
+                    for query in cutlass.range_constexpr(
+                        _TK_WG * self.queries_per_group,
+                        (_TK_WG + 1) * self.queries_per_group,
+                    ):
+                        warp_counts[query] = 0
+                elif cutlass.const_expr(self.repair):
+                    if local_tidx == 0:
+                        if cutlass.const_expr(not self.materialize_scores):
+                            s_stream_counts[_TK_WG] = 0
+                elif local_tidx < 4:
+                    if cutlass.const_expr(not self.materialize_scores):
+                        s_stream_counts[_TK_WG * 4 + local_tidx] = 0
+                if cutlass.const_expr(not self.materialize_scores):
+                    stream_warp_count = cutlass.Int32(0)
+                    stream_tau = (
+                        cutlass.Float32(-float("inf"))
+                        if cutlass.const_expr(self.repair)
+                        else cutlass.Float32(
+                            mLogits[
+                                min(
+                                    q_block_idx * block_q_val + _TK_WG,
+                                    num_q_tokens - 1,
+                                ),
+                                0,
+                            ]
+                        )
+                    )
+                    stream_status_row = min(
+                        q_block_idx * block_q_val + _TK_WG,
+                        num_q_tokens - 1,
+                    )
+                    if cutlass.const_expr(self.repair):
+                        stream_repair = needs_repair(
+                            mTopkCandCnt[stream_status_row, 1],
+                            kv_end_cache[_TK_WG] - kv_start_cache[_TK_WG],
+                            self.top_k,
+                            self.stream_cap,
+                        )
+                    else:
+                        stream_repair = cutlass.Boolean(True)
+                    stream_tiles = cutlass.Int32(0)
+                    cute.arch.barrier(
+                        barrier_id=_TK_BAR_WG0 + _TK_WG, number_of_threads=128
+                    )
+                kv_idx = kv_lo_cur + cutlass.Int32(0)
+                kv_go = cutlass.Boolean(True)
+                while kv_go:
+                    q_half_start = cutlass.const_expr(_TK_WG * self.queries_per_group)
+                    q_half_end = cutlass.const_expr(
+                        (_TK_WG + 1) * self.queries_per_group
+                    )
+                    # Expand both tiles at trace time; each keeps its own pipeline state.
+                    for kv_group in cutlass.range_constexpr(2):
+                        tCtAcc_base = (tCtAcc_base_0, tCtAcc_base_1)[kv_group]
+                        umma_pipeline = (umma_pipeline_0, umma_pipeline_1)[kv_group]
+                        umma_cons_state = (
+                            umma_cons_state_0,
+                            umma_cons_state_1,
+                        )[kv_group]
+                        if cutlass.const_expr(not self.is_mx_sf):
+                            sSF_KV = (sSF_KV_0, sSF_KV_1)[kv_group]
+                        kv_pos = (kv_idx + kv_group) * block_kv_val + m_coord
+                        umma_pipeline.consumer_wait(umma_cons_state)
+                        tCtAcc_c0 = tCtAcc_base[None, None, None, umma_cons_state.index]
+                        tAcc_c0 = tCtAcc_c0[(None, None), 0, 0]
+                        tAcc_c0_epi = cute.flat_divide(tAcc_c0, epi_sub_mn)
+                        tTR_0 = thr_copy_ref.partition_S(tAcc_c0_epi)
+                        cute.copy(
+                            tiled_copy_ref,
+                            tTR_0[
+                                None,
+                                None,
+                                None,
+                                0,
+                                q_half_start
+                                // self.queries_per_group
+                                * num_epi_subtiles,
+                            ],
+                            tTR_rAcc,
+                        )
+                        cute.arch.fence_view_async_tmem_load()
+                        if cutlass.const_expr(self.queries_per_group > 1):
+                            umma_pipeline.consumer_release(umma_cons_state)
+                            umma_cons_state.advance()
+                            if cutlass.const_expr(self.single_acc):
+                                umma_cons_state.advance()
+                        subtile_n = num_heads // num_epi_subtiles
+                        for t in cutlass.range_constexpr(q_half_start, q_half_end):
+                            s_acc = self.epi.zero()
+                            for i in cutlass.range_constexpr(num_epi_subtiles):
+                                if cutlass.const_expr(self.queries_per_group == 1) and (
+                                    t > q_half_start or i > 0
+                                ):
+                                    cute.copy(
+                                        tiled_copy_ref,
+                                        tTR_0[
+                                            None,
+                                            None,
+                                            None,
+                                            0,
+                                            t * num_epi_subtiles + i,
+                                        ],
+                                        tTR_rAcc,
+                                    )
+                                    cute.arch.fence_view_async_tmem_load()
+                                if (
+                                    self.queries_per_group == 1
+                                    and t == q_half_end - 1
+                                    and i == num_epi_subtiles - 1
+                                ):
+                                    umma_pipeline.consumer_release(umma_cons_state)
+                                    umma_cons_state.advance()
+                                    if cutlass.const_expr(self.single_acc):
+                                        umma_cons_state.advance()
+                                sw_col = sW[None, q_stage_local]
+                                reg_h_end = min(
+                                    subtile_n,
+                                    max(0, NUM_W_IN_REG - i * subtile_n),
+                                )
+                                for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                    n0 = h + (t - q_half_start) * num_heads
+                                    h_g = i * subtile_n + h
+                                    x4 = _subview(tTR_rAcc, n0, 4)
+                                    a4 = self.epi.relu(x4)
+                                    r0 = t * NUM_W_IN_REG + h_g
+                                    w4 = _subview(w_cache, r0, 4)
+                                    s_acc = self.epi.fma(a4, w4, s_acc)
+                                smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
+                                for h in cutlass.range_constexpr(
+                                    smem_h_start, subtile_n, 4
+                                ):
+                                    n0 = h + (t - q_half_start) * num_heads
+                                    h_g = i * subtile_n + h
+                                    x4 = _subview(tTR_rAcc, n0, 4)
+                                    a4 = self.epi.relu(x4)
+                                    w_i = t * num_heads + h_g
+                                    w4 = _subview(sw_col, w_i, 4)
+                                    s_acc = self.epi.fma(a4, w4, s_acc)
+                            if cutlass.const_expr(not self.is_mx_sf):
+                                result_arr[t] = self.epi.finish(
+                                    s_acc, sSF_KV[m_coord, sc_slot]
+                                )
+                            else:
+                                result_arr[t] = self.epi.finish(s_acc, None)
+                        for t in cutlass.range_constexpr(q_half_start, q_half_end):
+                            if cutlass.const_expr(self.repair):
+                                topk.append(
+                                    cutlass.Float32(result_arr[t]),
+                                    (
+                                        (
+                                            q_block_idx * block_q_val + t < num_q_tokens
+                                            and kv_pos >= kv_start_cache[t]
+                                            and (kv_pos < kv_end_cache[t])
+                                        )
+                                        and kv_pos < num_kv * block_kv_val
+                                    )
+                                    & (cutlass.Float32(result_arr[t]) >= stream_tau)
+                                    & stream_repair,
+                                    kv_pos - kv_start_cache[t],
+                                    t,
+                                    self.stream_cap,
+                                    s_stream_entries,
+                                    s_stream_counts,
+                                )
+                            else:
+                                if cutlass.const_expr(self.materialize_scores):
+                                    if (
+                                        q_block_idx * block_q_val + t < num_q_tokens
+                                        and kv_pos >= kv_start_cache[t]
+                                        and (kv_pos < kv_end_cache[t])
+                                    ) and kv_pos < num_kv * block_kv_val:
+                                        mLogits[
+                                            q_block_idx * block_q_val + t,
+                                            kv_pos,
+                                        ] = result_arr[t]
+                                elif cutlass.const_expr(self.direct_candidates):
+                                    warp_counts[t] = global_append(
+                                        cutlass.Float32(result_arr[t]),
+                                        (
+                                            q_block_idx * block_q_val + t < num_q_tokens
+                                            and kv_pos >= kv_start_cache[t]
+                                            and kv_pos < kv_end_cache[t]
+                                            and kv_pos < num_kv * block_kv_val
+                                        )
+                                        & (
+                                            cutlass.Float32(result_arr[t])
+                                            >= tau_cache[t]
+                                        ),
+                                        kv_pos - kv_start_cache[t],
+                                        q_block_idx * block_q_val + t,
+                                        self.stream_cap,
+                                        warp_counts[t],
+                                        mTopkCand,
+                                    )
+                                else:
+                                    stream_warp_count = bounded_append(
+                                        cutlass.Float32(result_arr[t]),
+                                        (
+                                            (
+                                                q_block_idx * block_q_val + t
+                                                < num_q_tokens
+                                                and kv_pos >= kv_start_cache[t]
+                                                and (kv_pos < kv_end_cache[t])
+                                            )
+                                            and kv_pos < num_kv * block_kv_val
+                                        )
+                                        & (cutlass.Float32(result_arr[t]) >= stream_tau)
+                                        & stream_repair,
+                                        kv_pos - kv_start_cache[t],
+                                        t,
+                                        self.stream_cap,
+                                        s_stream_entries,
+                                        stream_warp_count,
+                                    )
+                        if cutlass.const_expr(kv_group == 0):
+                            umma_cons_state_0 = umma_cons_state
+                        else:
+                            umma_cons_state_1 = umma_cons_state
+                    if cutlass.const_expr(not self.is_mx_sf):
+                        sc_slot = (sc_slot + 1) % self.num_sc_slots
+                    kv_idx = kv_idx + NUM_MATH_WG
+                    kv_go = kv_idx < num_kv
+                    if cutlass.const_expr(not self.materialize_scores):
+                        stream_tiles += 1
+                    if cutlass.const_expr(self.repair):
+                        if cutlass.const_expr(not self.materialize_scores):
+                            if (stream_tiles == self.stream_period) | (not kv_go):
+                                cute.arch.barrier(
+                                    barrier_id=_TK_BAR_WG0 + _TK_WG,
+                                    number_of_threads=128,
+                                )
+                                stream_tau = topk.compact(
+                                    local_tidx,
+                                    stream_tau,
+                                    _TK_WG,
+                                    _TK_WG,
+                                    self.top_k,
+                                    self.stream_cap,
+                                    self.stream_cap - self.stream_period * 256,
+                                    _TK_BAR_WG0 + _TK_WG,
+                                    s_stream_entries,
+                                    s_stream_counts,
+                                    s_score_hist,
+                                    s_stream_scalars,
+                                    low_registers=True,
+                                )
+                                stream_tiles = 0
+                if cutlass.const_expr(self.direct_candidates):
+                    for query in cutlass.range_constexpr(
+                        _TK_WG * self.queries_per_group,
+                        (_TK_WG + 1) * self.queries_per_group,
+                    ):
+                        if local_tidx % 32 == 0:
+                            row = q_block_idx * block_q_val + query
+                            if row < num_q_tokens:
+                                part = local_tidx // 32
+                                mTopkCand[
+                                    row, (part + 1) * (self.stream_cap // 4) - 1
+                                ] = cutlass.Int64(warp_counts[query])
+                elif cutlass.const_expr(not self.repair):
+                    if local_tidx % 32 == 0:
+                        if cutlass.const_expr(not self.materialize_scores):
+                            s_stream_counts[_TK_WG * 4 + local_tidx // 32] = (
+                                stream_warp_count
+                            )
+                if cutlass.const_expr(not self.materialize_scores):
+                    cute.arch.barrier(
+                        barrier_id=_TK_BAR_FIN,
+                        number_of_threads=self.num_math_threads,
+                    )
+                    stream_row = q_block_idx * block_q_val + _TK_WG
+                    if cutlass.const_expr(self.direct_candidates):
+                        pass
+                    elif (stream_row < num_q_tokens) & stream_repair:
+                        if cutlass.const_expr(self.repair):
+                            finish_split(
+                                local_tidx,
+                                stream_row,
+                                _TK_WG,
+                                self.top_k,
+                                self.stream_cap,
+                                _TK_BAR_WG0 + _TK_WG,
+                                s_stream_entries,
+                                s_stream_counts,
+                                s_score_hist,
+                                s_stream_scalars,
+                                mTopkIdx,
+                                mTopkCandHi,
+                                mTopkCandCnt,
+                                bidz,
+                                repair_part,
+                                repair_parts,
+                                failed_groups,
+                                topk_indices_offset,
+                            )
+                        else:
+                            partition_dump(
+                                local_tidx,
+                                stream_row,
+                                _TK_WG,
+                                self.stream_cap,
+                                s_stream_entries,
+                                s_stream_counts,
+                                mTopkCand,
+                                mTopkCandCnt,
+                            )
+                    cute.arch.barrier(
+                        barrier_id=_TK_BAR_FIN,
+                        number_of_threads=self.num_math_threads,
+                    )
+                next_q_block_idx = next_group(
+                    q_block_idx + grid_size,
+                    grid_size,
+                    mTopkCandCnt,
+                    mCuSeqLenKStart,
+                    mCuSeqLenKEnd,
+                    num_q_tokens,
+                    self.top_k,
+                    self.stream_cap,
+                    self.repair,
+                    self.block_q,
+                    repair_parts,
+                )
+                if next_q_block_idx < num_q_blocks:
+                    next_num_kv = self.bounds.tile_end(
+                        mCuSeqLenKEnd,
+                        next_q_block_idx,
+                        num_q_tokens,
+                        repair_part,
+                        repair_parts,
+                        0,
+                    )
+                has_work = next_q_block_idx < num_q_blocks
+            if q_block_idx < num_q_blocks:
+                q_pipeline.consumer_release(q_cons_state)
+                q_cons_state.advance()
+
         if cutlass.const_expr(self.repair):
             sm_idx, repair_part, repair_parts, failed_groups = schedule(
                 bidz,
@@ -1315,481 +1765,6 @@ class MqaProducerKernel(MqaMmaGeometry):
                 local_tidx = tidx % 128
                 cC = cute.make_identity_tensor(epi_sub_mn)
 
-                # Math-group IDs are static for shared-memory slots and named barriers.
-                def math_warpgroup(
-                    _TK_WG,
-                    has_work,
-                    prev_q_block_idx,
-                    next_q_block_idx,
-                    next_num_kv,
-                    sc_slot,
-                    q_block_idx,
-                    num_kv,
-                    kv_idx,
-                    # Bind staged inputs explicitly; CuTe does not support closure captures.
-                    self=self,
-                    NUM_MATH_WG=NUM_MATH_WG,
-                    bidz=bidz,
-                    block_kv_val=block_kv_val,
-                    block_q_val=block_q_val,
-                    cC=cC,
-                    copy_atom_t2r=copy_atom_t2r,
-                    epi_sub_mn=epi_sub_mn,
-                    failed_groups=failed_groups,
-                    grid_size=grid_size,
-                    local_tidx=local_tidx,
-                    mCuSeqLenKEnd=mCuSeqLenKEnd,
-                    mCuSeqLenKStart=mCuSeqLenKStart,
-                    mLogits=mLogits,
-                    mTopkCand=mTopkCand,
-                    mTopkCandCnt=mTopkCandCnt,
-                    mTopkCandHi=mTopkCandHi,
-                    mTopkIdx=mTopkIdx,
-                    num_epi_subtiles=num_epi_subtiles,
-                    num_heads=num_heads,
-                    num_q_blocks=num_q_blocks,
-                    num_q_tokens=num_q_tokens,
-                    q_cons_state=q_cons_state,
-                    q_pipeline=q_pipeline,
-                    repair_part=repair_part,
-                    repair_parts=repair_parts,
-                    sSF_KV_0=sSF_KV_0,
-                    sSF_KV_1=sSF_KV_1,
-                    sW=sW,
-                    s_score_hist=s_score_hist,
-                    s_stream_counts=s_stream_counts,
-                    s_stream_entries=s_stream_entries,
-                    s_stream_scalars=s_stream_scalars,
-                    tCtAcc_base_0=tCtAcc_base_0,
-                    tCtAcc_base_1=tCtAcc_base_1,
-                    topk_indices_offset=topk_indices_offset,
-                    umma_cons_state_0=umma_cons_state_0,
-                    umma_cons_state_1=umma_cons_state_1,
-                    umma_pipeline_0=umma_pipeline_0,
-                    umma_pipeline_1=umma_pipeline_1,
-                ):
-                    tAcc_ref = tCtAcc_base_0[None, None, None, 0][(None, None), 0, 0]
-                    tAcc_ref_epi = cute.flat_divide(tAcc_ref, epi_sub_mn)
-                    tiled_copy_ref = tcgen05.make_tmem_copy(
-                        copy_atom_t2r, tAcc_ref_epi[None, None, 0, 0]
-                    )
-                    thr_copy_ref = tiled_copy_ref.get_slice(local_tidx)
-                    tTR_cC = thr_copy_ref.partition_D(cC)
-                    m_coord = tTR_cC[0][0]
-                    tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
-                    MAX_NUM_W_IN_REG = (
-                        40 if block_q_val == 4 else 56 if block_q_val == 3 else 64
-                    )
-                    if cutlass.const_expr(self.topk_w_in_reg > 0):
-                        MAX_NUM_W_IN_REG = self.topk_w_in_reg
-                    NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
-                    w_cache = cute.make_rmem_tensor(
-                        (NUM_W_IN_REG * block_q_val,), self.epi.dtype
-                    )
-                    result_arr = cute.make_rmem_tensor((block_q_val,), self.epi.dtype)
-                    tau_cache = cute.make_rmem_tensor((block_q_val,), cutlass.Float32)
-                    warp_counts = cute.make_rmem_tensor((block_q_val,), cutlass.Int32)
-                    kv_start_cache = [cutlass.Int32(0) for _ in range(block_q_val)]
-                    kv_end_cache = [cutlass.Int32(0) for _ in range(block_q_val)]
-                    q_stage_local = cutlass.Int32(0)
-                    kv_lo_cur = cutlass.Int32(0)
-                    while has_work:
-                        q_block_idx = next_q_block_idx
-                        num_kv = next_num_kv
-                        if q_block_idx != prev_q_block_idx:
-                            if prev_q_block_idx < num_q_blocks:
-                                q_pipeline.consumer_release(q_cons_state)
-                                q_cons_state.advance()
-                            q_pipeline.consumer_wait(q_cons_state)
-                            q_stage_local = q_cons_state.index
-                            q_base = q_block_idx * block_q_val
-                            for t_i in cutlass.range_constexpr(block_q_val):
-                                for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
-                                    w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
-                                        t_i * num_heads + w_j, q_stage_local
-                                    ]
-                                token_idx = min(q_base + t_i, num_q_tokens - 1)
-                                kv_start_cache[t_i] = mCuSeqLenKStart[token_idx]
-                                kv_end_cache[t_i] = mCuSeqLenKEnd[token_idx]
-                                if cutlass.const_expr(self.direct_candidates):
-                                    tau_cache[t_i] = cutlass.Float32(
-                                        mLogits[token_idx, 0]
-                                    )
-                            kv_lo_cur = self.bounds.tile_start(
-                                mCuSeqLenKStart,
-                                mCuSeqLenKEnd,
-                                q_block_idx,
-                                num_q_tokens,
-                                repair_part,
-                                repair_parts,
-                                0,
-                            )
-                        prev_q_block_idx = q_block_idx
-                        if cutlass.const_expr(self.direct_candidates):
-                            for query in cutlass.range_constexpr(
-                                _TK_WG * self.queries_per_group,
-                                (_TK_WG + 1) * self.queries_per_group,
-                            ):
-                                warp_counts[query] = 0
-                        elif cutlass.const_expr(self.repair):
-                            if local_tidx == 0:
-                                if cutlass.const_expr(not self.materialize_scores):
-                                    s_stream_counts[_TK_WG] = 0
-                        elif local_tidx < 4:
-                            if cutlass.const_expr(not self.materialize_scores):
-                                s_stream_counts[_TK_WG * 4 + local_tidx] = 0
-                        if cutlass.const_expr(not self.materialize_scores):
-                            stream_warp_count = cutlass.Int32(0)
-                            stream_tau = (
-                                cutlass.Float32(-float("inf"))
-                                if cutlass.const_expr(self.repair)
-                                else cutlass.Float32(
-                                    mLogits[
-                                        min(
-                                            q_block_idx * block_q_val + _TK_WG,
-                                            num_q_tokens - 1,
-                                        ),
-                                        0,
-                                    ]
-                                )
-                            )
-                            stream_status_row = min(
-                                q_block_idx * block_q_val + _TK_WG,
-                                num_q_tokens - 1,
-                            )
-                            if cutlass.const_expr(self.repair):
-                                stream_repair = needs_repair(
-                                    mTopkCandCnt[stream_status_row, 1],
-                                    kv_end_cache[_TK_WG] - kv_start_cache[_TK_WG],
-                                    self.top_k,
-                                    self.stream_cap,
-                                )
-                            else:
-                                stream_repair = cutlass.Boolean(True)
-                            stream_tiles = cutlass.Int32(0)
-                            cute.arch.barrier(
-                                barrier_id=_TK_BAR_WG0 + _TK_WG, number_of_threads=128
-                            )
-                        kv_idx = kv_lo_cur + cutlass.Int32(0)
-                        kv_go = cutlass.Boolean(True)
-                        while kv_go:
-                            q_half_start = cutlass.const_expr(
-                                _TK_WG * self.queries_per_group
-                            )
-                            q_half_end = cutlass.const_expr(
-                                (_TK_WG + 1) * self.queries_per_group
-                            )
-                            # Expand both tiles at trace time; each keeps its own pipeline state.
-                            for kv_group in cutlass.range_constexpr(2):
-                                tCtAcc_base = (tCtAcc_base_0, tCtAcc_base_1)[kv_group]
-                                umma_pipeline = (umma_pipeline_0, umma_pipeline_1)[
-                                    kv_group
-                                ]
-                                umma_cons_state = (
-                                    umma_cons_state_0,
-                                    umma_cons_state_1,
-                                )[kv_group]
-                                if cutlass.const_expr(not self.is_mx_sf):
-                                    sSF_KV = (sSF_KV_0, sSF_KV_1)[kv_group]
-                                kv_pos = (kv_idx + kv_group) * block_kv_val + m_coord
-                                umma_pipeline.consumer_wait(umma_cons_state)
-                                tCtAcc_c0 = tCtAcc_base[
-                                    None, None, None, umma_cons_state.index
-                                ]
-                                tAcc_c0 = tCtAcc_c0[(None, None), 0, 0]
-                                tAcc_c0_epi = cute.flat_divide(tAcc_c0, epi_sub_mn)
-                                tTR_0 = thr_copy_ref.partition_S(tAcc_c0_epi)
-                                cute.copy(
-                                    tiled_copy_ref,
-                                    tTR_0[
-                                        None,
-                                        None,
-                                        None,
-                                        0,
-                                        q_half_start
-                                        // self.queries_per_group
-                                        * num_epi_subtiles,
-                                    ],
-                                    tTR_rAcc,
-                                )
-                                cute.arch.fence_view_async_tmem_load()
-                                if cutlass.const_expr(self.queries_per_group > 1):
-                                    umma_pipeline.consumer_release(umma_cons_state)
-                                    umma_cons_state.advance()
-                                    if cutlass.const_expr(self.single_acc):
-                                        umma_cons_state.advance()
-                                subtile_n = num_heads // num_epi_subtiles
-                                for t in cutlass.range_constexpr(
-                                    q_half_start, q_half_end
-                                ):
-                                    s_acc = self.epi.zero()
-                                    for i in cutlass.range_constexpr(num_epi_subtiles):
-                                        if cutlass.const_expr(
-                                            self.queries_per_group == 1
-                                        ) and (t > q_half_start or i > 0):
-                                            cute.copy(
-                                                tiled_copy_ref,
-                                                tTR_0[
-                                                    None,
-                                                    None,
-                                                    None,
-                                                    0,
-                                                    t * num_epi_subtiles + i,
-                                                ],
-                                                tTR_rAcc,
-                                            )
-                                            cute.arch.fence_view_async_tmem_load()
-                                        if (
-                                            self.queries_per_group == 1
-                                            and t == q_half_end - 1
-                                            and i == num_epi_subtiles - 1
-                                        ):
-                                            umma_pipeline.consumer_release(
-                                                umma_cons_state
-                                            )
-                                            umma_cons_state.advance()
-                                            if cutlass.const_expr(self.single_acc):
-                                                umma_cons_state.advance()
-                                        sw_col = sW[None, q_stage_local]
-                                        reg_h_end = min(
-                                            subtile_n,
-                                            max(0, NUM_W_IN_REG - i * subtile_n),
-                                        )
-                                        for h in cutlass.range_constexpr(
-                                            0, reg_h_end, 4
-                                        ):
-                                            n0 = h + (t - q_half_start) * num_heads
-                                            h_g = i * subtile_n + h
-                                            x4 = _subview(tTR_rAcc, n0, 4)
-                                            a4 = self.epi.relu(x4)
-                                            r0 = t * NUM_W_IN_REG + h_g
-                                            w4 = _subview(w_cache, r0, 4)
-                                            s_acc = self.epi.fma(a4, w4, s_acc)
-                                        smem_h_start = max(
-                                            0, NUM_W_IN_REG - i * subtile_n
-                                        )
-                                        for h in cutlass.range_constexpr(
-                                            smem_h_start, subtile_n, 4
-                                        ):
-                                            n0 = h + (t - q_half_start) * num_heads
-                                            h_g = i * subtile_n + h
-                                            x4 = _subview(tTR_rAcc, n0, 4)
-                                            a4 = self.epi.relu(x4)
-                                            w_i = t * num_heads + h_g
-                                            w4 = _subview(sw_col, w_i, 4)
-                                            s_acc = self.epi.fma(a4, w4, s_acc)
-                                    if cutlass.const_expr(not self.is_mx_sf):
-                                        result_arr[t] = self.epi.finish(
-                                            s_acc, sSF_KV[m_coord, sc_slot]
-                                        )
-                                    else:
-                                        result_arr[t] = self.epi.finish(s_acc, None)
-                                for t in cutlass.range_constexpr(
-                                    q_half_start, q_half_end
-                                ):
-                                    if cutlass.const_expr(self.repair):
-                                        topk.append(
-                                            cutlass.Float32(result_arr[t]),
-                                            (
-                                                (
-                                                    q_block_idx * block_q_val + t
-                                                    < num_q_tokens
-                                                    and kv_pos >= kv_start_cache[t]
-                                                    and (kv_pos < kv_end_cache[t])
-                                                )
-                                                and kv_pos < num_kv * block_kv_val
-                                            )
-                                            & (
-                                                cutlass.Float32(result_arr[t])
-                                                >= stream_tau
-                                            )
-                                            & stream_repair,
-                                            kv_pos - kv_start_cache[t],
-                                            t,
-                                            self.stream_cap,
-                                            s_stream_entries,
-                                            s_stream_counts,
-                                        )
-                                    else:
-                                        if cutlass.const_expr(self.materialize_scores):
-                                            if (
-                                                q_block_idx * block_q_val + t
-                                                < num_q_tokens
-                                                and kv_pos >= kv_start_cache[t]
-                                                and (kv_pos < kv_end_cache[t])
-                                            ) and kv_pos < num_kv * block_kv_val:
-                                                mLogits[
-                                                    q_block_idx * block_q_val + t,
-                                                    kv_pos,
-                                                ] = result_arr[t]
-                                        elif cutlass.const_expr(self.direct_candidates):
-                                            warp_counts[t] = global_append(
-                                                cutlass.Float32(result_arr[t]),
-                                                (
-                                                    q_block_idx * block_q_val + t
-                                                    < num_q_tokens
-                                                    and kv_pos >= kv_start_cache[t]
-                                                    and kv_pos < kv_end_cache[t]
-                                                    and kv_pos < num_kv * block_kv_val
-                                                )
-                                                & (
-                                                    cutlass.Float32(result_arr[t])
-                                                    >= tau_cache[t]
-                                                ),
-                                                kv_pos - kv_start_cache[t],
-                                                q_block_idx * block_q_val + t,
-                                                self.stream_cap,
-                                                warp_counts[t],
-                                                mTopkCand,
-                                            )
-                                        else:
-                                            stream_warp_count = bounded_append(
-                                                cutlass.Float32(result_arr[t]),
-                                                (
-                                                    (
-                                                        q_block_idx * block_q_val + t
-                                                        < num_q_tokens
-                                                        and kv_pos >= kv_start_cache[t]
-                                                        and (kv_pos < kv_end_cache[t])
-                                                    )
-                                                    and kv_pos < num_kv * block_kv_val
-                                                )
-                                                & (
-                                                    cutlass.Float32(result_arr[t])
-                                                    >= stream_tau
-                                                )
-                                                & stream_repair,
-                                                kv_pos - kv_start_cache[t],
-                                                t,
-                                                self.stream_cap,
-                                                s_stream_entries,
-                                                stream_warp_count,
-                                            )
-                                if cutlass.const_expr(kv_group == 0):
-                                    umma_cons_state_0 = umma_cons_state
-                                else:
-                                    umma_cons_state_1 = umma_cons_state
-                            if cutlass.const_expr(not self.is_mx_sf):
-                                sc_slot = (sc_slot + 1) % self.num_sc_slots
-                            kv_idx = kv_idx + NUM_MATH_WG
-                            kv_go = kv_idx < num_kv
-                            if cutlass.const_expr(not self.materialize_scores):
-                                stream_tiles += 1
-                            if cutlass.const_expr(self.repair):
-                                if cutlass.const_expr(not self.materialize_scores):
-                                    if (stream_tiles == self.stream_period) | (
-                                        not kv_go
-                                    ):
-                                        cute.arch.barrier(
-                                            barrier_id=_TK_BAR_WG0 + _TK_WG,
-                                            number_of_threads=128,
-                                        )
-                                        stream_tau = topk.compact(
-                                            local_tidx,
-                                            stream_tau,
-                                            _TK_WG,
-                                            _TK_WG,
-                                            self.top_k,
-                                            self.stream_cap,
-                                            self.stream_cap - self.stream_period * 256,
-                                            _TK_BAR_WG0 + _TK_WG,
-                                            s_stream_entries,
-                                            s_stream_counts,
-                                            s_score_hist,
-                                            s_stream_scalars,
-                                            low_registers=True,
-                                        )
-                                        stream_tiles = 0
-                        if cutlass.const_expr(self.direct_candidates):
-                            for query in cutlass.range_constexpr(
-                                _TK_WG * self.queries_per_group,
-                                (_TK_WG + 1) * self.queries_per_group,
-                            ):
-                                if local_tidx % 32 == 0:
-                                    row = q_block_idx * block_q_val + query
-                                    if row < num_q_tokens:
-                                        part = local_tidx // 32
-                                        mTopkCand[
-                                            row, (part + 1) * (self.stream_cap // 4) - 1
-                                        ] = cutlass.Int64(warp_counts[query])
-                        elif cutlass.const_expr(not self.repair):
-                            if local_tidx % 32 == 0:
-                                if cutlass.const_expr(not self.materialize_scores):
-                                    s_stream_counts[_TK_WG * 4 + local_tidx // 32] = (
-                                        stream_warp_count
-                                    )
-                        if cutlass.const_expr(not self.materialize_scores):
-                            cute.arch.barrier(
-                                barrier_id=_TK_BAR_FIN,
-                                number_of_threads=self.num_math_threads,
-                            )
-                            stream_row = q_block_idx * block_q_val + _TK_WG
-                            if cutlass.const_expr(self.direct_candidates):
-                                pass
-                            elif (stream_row < num_q_tokens) & stream_repair:
-                                if cutlass.const_expr(self.repair):
-                                    finish_split(
-                                        local_tidx,
-                                        stream_row,
-                                        _TK_WG,
-                                        self.top_k,
-                                        self.stream_cap,
-                                        _TK_BAR_WG0 + _TK_WG,
-                                        s_stream_entries,
-                                        s_stream_counts,
-                                        s_score_hist,
-                                        s_stream_scalars,
-                                        mTopkIdx,
-                                        mTopkCandHi,
-                                        mTopkCandCnt,
-                                        bidz,
-                                        repair_part,
-                                        repair_parts,
-                                        failed_groups,
-                                        topk_indices_offset,
-                                    )
-                                else:
-                                    partition_dump(
-                                        local_tidx,
-                                        stream_row,
-                                        _TK_WG,
-                                        self.stream_cap,
-                                        s_stream_entries,
-                                        s_stream_counts,
-                                        mTopkCand,
-                                        mTopkCandCnt,
-                                    )
-                            cute.arch.barrier(
-                                barrier_id=_TK_BAR_FIN,
-                                number_of_threads=self.num_math_threads,
-                            )
-                        next_q_block_idx = next_group(
-                            q_block_idx + grid_size,
-                            grid_size,
-                            mTopkCandCnt,
-                            mCuSeqLenKStart,
-                            mCuSeqLenKEnd,
-                            num_q_tokens,
-                            self.top_k,
-                            self.stream_cap,
-                            self.repair,
-                            self.block_q,
-                            repair_parts,
-                        )
-                        if next_q_block_idx < num_q_blocks:
-                            next_num_kv = self.bounds.tile_end(
-                                mCuSeqLenKEnd,
-                                next_q_block_idx,
-                                num_q_tokens,
-                                repair_part,
-                                repair_parts,
-                                0,
-                            )
-                        has_work = next_q_block_idx < num_q_blocks
-                    if q_block_idx < num_q_blocks:
-                        q_pipeline.consumer_release(q_cons_state)
-                        q_cons_state.advance()
-
                 for _wg in cutlass.range_constexpr(self.math_groups):
                     if warpgroup_idx == _wg:
                         math_warpgroup(
@@ -1802,6 +1777,46 @@ class MqaProducerKernel(MqaMmaGeometry):
                             q_block_idx,
                             num_kv,
                             kv_idx,
+                            self=self,
+                            NUM_MATH_WG=NUM_MATH_WG,
+                            bidz=bidz,
+                            block_kv_val=block_kv_val,
+                            block_q_val=block_q_val,
+                            cC=cC,
+                            copy_atom_t2r=copy_atom_t2r,
+                            epi_sub_mn=epi_sub_mn,
+                            failed_groups=failed_groups,
+                            grid_size=grid_size,
+                            local_tidx=local_tidx,
+                            mCuSeqLenKEnd=mCuSeqLenKEnd,
+                            mCuSeqLenKStart=mCuSeqLenKStart,
+                            mLogits=mLogits,
+                            mTopkCand=mTopkCand,
+                            mTopkCandCnt=mTopkCandCnt,
+                            mTopkCandHi=mTopkCandHi,
+                            mTopkIdx=mTopkIdx,
+                            num_epi_subtiles=num_epi_subtiles,
+                            num_heads=num_heads,
+                            num_q_blocks=num_q_blocks,
+                            num_q_tokens=num_q_tokens,
+                            q_cons_state=q_cons_state,
+                            q_pipeline=q_pipeline,
+                            repair_part=repair_part,
+                            repair_parts=repair_parts,
+                            sSF_KV_0=sSF_KV_0,
+                            sSF_KV_1=sSF_KV_1,
+                            sW=sW,
+                            s_score_hist=s_score_hist,
+                            s_stream_counts=s_stream_counts,
+                            s_stream_entries=s_stream_entries,
+                            s_stream_scalars=s_stream_scalars,
+                            tCtAcc_base_0=tCtAcc_base_0,
+                            tCtAcc_base_1=tCtAcc_base_1,
+                            topk_indices_offset=topk_indices_offset,
+                            umma_cons_state_0=umma_cons_state_0,
+                            umma_cons_state_1=umma_cons_state_1,
+                            umma_pipeline_0=umma_pipeline_0,
+                            umma_pipeline_1=umma_pipeline_1,
                         )
                 tmem.relinquish_alloc_permit()
                 tmem.free(tmem_ptr)
