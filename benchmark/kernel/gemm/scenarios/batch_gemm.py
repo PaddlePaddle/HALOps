@@ -63,8 +63,7 @@ class BatchGemmInput:
 
     x: torch.Tensor  # [B, M, K] bfloat16
     w: torch.Tensor  # [B, N, K] bfloat16
-    out: torch.Tensor  # [B, M, N] bfloat16 (torch.bmm / flashinfer layout)
-    out_halops: torch.Tensor  # [M, B * N] bfloat16 (HALOps batch_gemm layout)
+    out: torch.Tensor  # [B, M, N] bfloat16
     b: int
     m: int
     n: int
@@ -84,13 +83,11 @@ def _build_inputs(
     x = torch.randn(b, m, k, dtype=torch.bfloat16, device=dev)
     w = torch.randn(b, n, k, dtype=torch.bfloat16, device=dev)
     out = torch.empty(b, m, n, dtype=torch.bfloat16, device=dev)
-    out_halops = torch.empty(m, b * n, dtype=torch.bfloat16, device=dev)
 
     return BatchGemmInput(
         x=x,
         w=w,
         out=out,
-        out_halops=out_halops,
         b=b,
         m=m,
         n=n,
@@ -105,7 +102,7 @@ def adapt_halops(inp: BatchGemmInput) -> dict:
     return {
         "x": inp.x,
         "w": inp.w,
-        "out": inp.out_halops,
+        "out": inp.out,
         "sfa": None,
         "sfb": None,
         "bias": None,
@@ -234,9 +231,8 @@ def _refcheck_entry(
         inp["out"].zero_()
         run_fn(inp)
         torch.cuda.synchronize()
+        # Every backend writes the [B, M, N] layout.
         out = inp["out"]
-        if out.dim() == 2:  # HALOps writes [M, B * N]
-            out = out.view(m, b, n).transpose(0, 1)
         diff = (out.float() - ref_out.float()).abs()
         tol = refcheck_atol + refcheck_rtol * ref_out.float().abs()
         n_bad = (diff > tol).sum().item()
