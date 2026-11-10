@@ -24,6 +24,7 @@ import pandas as pd
 from core.output import (
     attention_scenario_str,
     gemm_scenario_str,
+    moe_scenario_str,
     table_header_str,
     format_row_str,
 )
@@ -36,6 +37,10 @@ def _is_gemm_scenario(scenario):
     return True if scenario in _GEMM_SCENARIOS else False
 
 
+def _is_moe_scenario(scenario):
+    return scenario == "low_latency_moe"
+
+
 def _format_scenario_str(scenario: str, row: dict) -> str:
     if _is_gemm_scenario(scenario):
         return gemm_scenario_str(
@@ -46,6 +51,19 @@ def _format_scenario_str(scenario: str, row: dict) -> str:
             row["mode"],
             row.get("num_experts"),
             row.get("max_m"),
+        )
+    elif _is_moe_scenario(scenario):
+        return moe_scenario_str(
+            scenario,
+            row["tokens"],
+            row["top_k"],
+            row["num_experts"],
+            row["hidden_size"],
+            row["intermediate_size"],
+            row["latent_size"],
+            row["tp_size"],
+            row["quant_mode"],
+            row.get("active_experts"),
         )
     else:
         return attention_scenario_str(
@@ -97,6 +115,7 @@ def _format_table_row(rec: dict) -> str:
         refcheck_pass=refcheck_pass,
         status=status,
         mismatch_pct=mismatch_pct,
+        include_dispatch=False,
     )
 
 
@@ -133,6 +152,13 @@ def _format_common_config(row: dict) -> str:
             parts.append(f"max_m={int(mm)}")
         parts.append(f"mode={row['mode']}")
         return ", ".join(parts)
+    elif _is_moe_scenario(row["scenario"]):
+        return (
+            f"top_k={row['top_k']}, E={row['num_experts']}, "
+            f"H={row['hidden_size']}, N={row['intermediate_size']}, "
+            f"L={row['latent_size']}, tp_size={row['tp_size']}, "
+            f"{row['quant_mode']}, {row['activation']}"
+        )
     else:
         return (
             f"H_q={row['num_q_heads']}, H_kv={row['num_kv_heads']}, D={row['head_dim']}, "
@@ -282,6 +308,8 @@ def _to_bool(value) -> bool | None:
 
 
 def _is_mismatch_row(row: pd.Series) -> bool:
+    if _is_moe_scenario(row.get("scenario")):
+        return _to_bool(row.get("refcheck_pass")) is False
     mismatch_pct = _to_float(row.get("mismatch_pct"), None)
     if mismatch_pct is not None:
         return mismatch_pct > MISMATCH_THRESHOLD_PCT
@@ -371,9 +399,14 @@ def _backend_summary(df: pd.DataFrame, sorted_keys: list[str]) -> list[str]:
                 stats[backend]["gt5"] += 1
 
     lines = ["## Summary", ""]
+    criterion = (
+        "Only OK samples passing elementwise refcheck are included."
+        if _is_moe_scenario(df.iloc[0]["scenario"])
+        else f"Only OK samples with mismatch <= {MISMATCH_THRESHOLD_PCT:.0f}% are included in statistics."
+    )
     lines.append(
         "Speedup = backend_median_us / halops_median_us (>1 means halops faster). "
-        f"Only OK samples with mismatch <= {MISMATCH_THRESHOLD_PCT:.0f}% are included in statistics."
+        + criterion
     )
     lines.append("")
     columns = [
@@ -440,6 +473,18 @@ def generate_report(
     # Group within a group keep the original backend order.
     if _is_gemm_scenario(scenario):
         sorted_keys = ["m", "n", "k"]
+    elif _is_moe_scenario(scenario):
+        sorted_keys = [
+            "tokens",
+            "top_k",
+            "quant_mode",
+            "activation",
+            "scoring_func",
+            "renormalize",
+            "tp_size",
+            "grid_cap",
+            "use_cuda_graph",
+        ]
     else:
         sorted_keys = ["batch_size", "s_kv", "s_q"]
 
@@ -449,12 +494,27 @@ def generate_report(
         scenario_str = _format_scenario_header(
             _format_scenario_str(scenario, first_row), first_row
         )
-        block = ["```", scenario_str, table_header_str()]
+        block = ["```", scenario_str, table_header_str(include_dispatch=False)]
         for _, rec in sub.iterrows():
             block.append(_format_table_row(rec.to_dict()))
         block.append("```")
         lines.extend(block)
         lines.append("")
+        if _is_moe_scenario(scenario):
+            lines += [
+                f"Accuracy criterion: elementwise atol={first_row.get('refcheck_atol')}, "
+                + f"rtol={first_row.get('refcheck_rtol')}.",
+                "",
+                "| backend | max abs error | mean abs error | refcheck |",
+                "|---|---:|---:|---|",
+            ]
+            for _, rec in sub.iterrows():
+                values = [_to_float(rec.get(key)) for key in ("max_atol", "avg_atol")]
+                cells = [f"{v:.6g}" if v is not None else "-" for v in values]
+                passed = _to_bool(rec.get("refcheck_pass"))
+                check = "PASS" if passed else ("FAIL" if passed is False else "N/A")
+                lines.append("| " + " | ".join([rec["backend"], *cells, check]) + " |")
+            lines.append("")
 
     # Summary tables after the detail tables. Keep these as the final report
     # section; per-row mismatch/status are already shown in the detail tables.

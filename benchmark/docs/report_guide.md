@@ -61,10 +61,10 @@ Backend versions:
 ```
 scenario: dense_gemm | m=4096 | n=4096 | k=4096 | mode=w8a8-mxfp8
 arithmetic intensity: 2730.667 FLOPs/byte  roofline: 4500.00 TFLOPS
-backend         median(us)  std(us)  Speedup  TFLOPS   TB/s   BW%  roof_util%  host(us)  disp(us)  mismatch%  status
+backend         median(us)  std(us)  Speedup  TFLOPS   TB/s   BW%  roof_util%  host(us)  mismatch%  status
 --------------------------------------------------------------------------------------------------------------------
-halops          53.632    7.514    1.00x  2562.63  0.939 12.2%      57.0%    56.592     0.000      0.0%      OK
-fi              61.200    8.100    1.14x  2245.10  0.822 10.7%      49.9%    64.100     0.000      0.0%      OK
+halops          53.632    7.514    1.00x  2562.63  0.939 12.2%      57.0%    56.592      0.0%      OK
+fi              61.200    8.100    1.14x  2245.10  0.822 10.7%      49.9%    64.100      0.0%      OK
 ```
 
 ## Speedup Summary

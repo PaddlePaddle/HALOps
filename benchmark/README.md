@@ -16,9 +16,12 @@ python benchmark.py --config=attention/prefill_chunked_c16_gqa14-1.yaml --gpu=0
 
 # A single backend (must be in the YAML `backends` list; one --config only)
 python benchmark.py --config=gemm/dense_w8a8.yaml --backend=halops --gpu=0
+
+# Full latent MoE: quantized HALOps accuracy and latency
+python benchmark.py --config=moe/low_latency_moe_w8a8_blockwise.yaml --gpu=0
 ```
 
-- `--config` takes a path relative to `configs/` (recommended), a file name unique across `configs/<op>/`, or an absolute path. Bundled configs live in `configs/attention/` and `configs/gemm/`.
+- `--config` takes a path relative to `configs/` (recommended), a file name unique across `configs/<op>/`, or an absolute path. Bundled configs live in `configs/attention/`, `configs/gemm/` and `configs/moe/`.
 - Common options: `--gpu` (default `0`, sets `CUDA_VISIBLE_DEVICES`), `--timing-method` (`profiler` or `cupti`, default `profiler`), `--dry-run-iters` (default `10`), `--repeat-iters` (default `50`), `--refcheck-reference`. See `python benchmark.py --help`.
 - Outputs share one timestamp `{ts}`: `results/{ts}_{config}.csv`, `reports/{ts}_{scenario}_{case_tag}.md`, `logs/{ts}_{op}_{config}.log`.
 - Speedup is `other_backend_median_us / halops_median_us`; above `1.00x` means HALOps is faster.
@@ -75,7 +78,7 @@ python benchmark.py \
 
 - `attention/decode_c16_gqa14.yaml`：相对 `configs/` 的路径，推荐使用。
 - `decode_c16_gqa14.yaml`：跨 `configs/<op>/` 唯一匹配的文件名。
-- 配置文件绝对路径；其父目录名必须是已注册的 `attention` 或 `gemm`。
+- 配置文件绝对路径；其父目录名必须是已注册的 `attention`、`gemm` 或 `moe`。
 
 仓库内置配置位于：
 
@@ -86,6 +89,7 @@ python benchmark.py \
 | `configs/attention/` | `decode_gqa` | KV length、MTP steps、GQA、BF16/FP8 cache |
 | `configs/gemm/` | `dense_gemm` | M/N/K shape、W8A8-MXFP8/W4A4、SM 数 |
 | `configs/gemm/` | `group_masked` / `group_contiguous` | expert 数、per-expert M、N/K、精度模式 |
+| `configs/moe/` | `low_latency_moe` | token 数、top-k、量化模式、激活函数 |
 
 YAML 负责 workload、backend 和 cache/CUDA Graph 策略；命令行始终覆盖 `timing_method`、`dry_run_iters`、`repeat_iters` 和 subprocess 设置。输出路径与 `case_tag` 由 CLI 根据时间戳和配置文件名生成，YAML 中的同名字段会被忽略。
 
@@ -99,7 +103,7 @@ YAML 负责 workload、backend 和 cache/CUDA Graph 策略；命令行始终覆�
 | `--repeat-iters` | `50` | 正式测量次数 |
 | `--backend` | 无 | 只测一个 YAML backend |
 | `--no-subprocess` | 关闭 | 禁用默认的 per-backend 子进程隔离 |
-| `--refcheck-reference` | YAML 值 | 覆盖正确性参考 backend，例如 `golden` |
+| `--refcheck-reference` | YAML 值 | 覆盖正确性参考 backend |
 
 查看当前 checkout 的完整参数：
 
@@ -151,6 +155,7 @@ python core/report.py \
 | `dense_gemm` | ✅ | ✅ | — | — | ✅ | ✅ | — | — |
 | `group_masked` | ✅ | ✅ | — | — | ✅ | ✅ | — | — |
 | `group_contiguous` | ✅ | ✅ | — | — | ✅ | ✅ | — | — |
+| `low_latency_moe` | ✅ | — | — | — | — | — | — | — |
 
 - `halops` 为默认基准，`golden` 为正确性参考。
 - ¹ `decode_gqa` 还提供 `fa4_paged`。

@@ -34,10 +34,12 @@ from core.runtime_info import (  # noqa: E402
 )
 from kernel.attention.scenarios import SCENARIOS as _attn_scenarios  # noqa: E402
 from kernel.gemm.scenarios import SCENARIOS as _gemm_scenarios  # noqa: E402
+from kernel.moe.scenarios import SCENARIOS as _moe_scenarios  # noqa: E402
 
 OP_REGISTRY: dict[str, dict] = {
     "attention": _attn_scenarios,
     "gemm": _gemm_scenarios,
+    "moe": _moe_scenarios,
 }
 
 
@@ -117,15 +119,16 @@ def _run_scenarios(op, cfg):
 def main(args):
     """Entry point: parse config files, set up environment, and run benchmarks."""
     configs_dir = Path(args.configs_dir).expanduser().resolve()
+
+    if args.gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+
     raw_configs = args.config or discover_configs(configs_dir)
 
     if args.backend is not None and len(raw_configs) > 1:
         raise SystemExit(
             "[ERROR] --backend can only be used with a single --config file."
         )
-
-    if args.gpu is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(args.output_dir).expanduser().resolve()
