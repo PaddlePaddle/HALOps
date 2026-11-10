@@ -15,6 +15,17 @@
 """
 
 from .mqa_logits_fused import mqa_logits_fused_topk, warmup
-from .mqa_logits_fused_topk.pipeline import prepare
 
 __all__ = ("mqa_logits_fused_topk", "warmup", "prepare")
+
+
+def __getattr__(name):
+    if name == "prepare":
+        from .mqa_logits_fused_topk.pipeline import prepare
+
+        return prepare
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))
