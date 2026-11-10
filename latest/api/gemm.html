@@ -593,31 +593,39 @@ corresponding expert weight.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>input</strong> (<em>torch.Tensor</em>) – <p>[M, K] CUDA tensor. All tokens packed contiguously.</p>
 <ul>
-<li><p><code class="docutils literal notranslate"><span class="pre">w8a8-mxfp8</span></code>: dtype float8_e4m3fn.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">w8a8-mxfp8</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a8-mxfp4</span></code>: dtype float8_e4m3fn.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">w4a4-*</span></code>: dtype uint8 (packed FP4, logical K is size(1)*2).</p></li>
 </ul>
 </p></li>
-<li><p><strong>weight</strong> (<em>torch.Tensor</em>) – [num_experts, N, K] 3D CUDA tensor. Per-expert weights.</p></li>
+<li><p><strong>weight</strong> (<em>torch.Tensor</em>) – [num_experts, N, K] 3D CUDA tensor. Per-expert weights.
+<code class="docutils literal notranslate"><span class="pre">w4a8-mxfp4</span></code> takes packed E2M1 (uint8, 2 values per byte) of
+shape [num_experts, N, K // 2].</p></li>
 <li><p><strong>sfa</strong> (<em>torch.Tensor</em>) – <p>Scale factor for A, dtype uint8, CUTLASS SfAtom 128x4 swizzled
 layout. Shape: <code class="docutils literal notranslate"><span class="pre">[ceil(M</span> <span class="pre">/</span> <span class="pre">128)</span> <span class="pre">*</span> <span class="pre">128,</span> <span class="pre">sf_k]</span></code>, where
-<code class="docutils literal notranslate"><span class="pre">sf_k</span> <span class="pre">=</span> <span class="pre">K</span> <span class="pre">//</span> <span class="pre">32</span></code> (w8a8-mxfp8, w4a4-mxfp4) or <code class="docutils literal notranslate"><span class="pre">K</span> <span class="pre">//</span> <span class="pre">16</span></code> (w4a4-nvfp4).</p>
+<code class="docutils literal notranslate"><span class="pre">sf_k</span> <span class="pre">=</span> <span class="pre">K</span> <span class="pre">//</span> <span class="pre">32</span></code> (w8a8-mxfp8, w4a4-mxfp4, w4a8-mxfp4) or
+<code class="docutils literal notranslate"><span class="pre">K</span> <span class="pre">//</span> <span class="pre">16</span></code> (w4a4-nvfp4).</p>
 <ul>
-<li><p><code class="docutils literal notranslate"><span class="pre">w8a8-mxfp8</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a4-mxfp4</span></code>: UE8M0 encoding.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">w8a8-mxfp8</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a4-mxfp4</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a8-mxfp4</span></code>: UE8M0 encoding.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">w4a4-nvfp4</span></code>: UE4M3 encoding.</p></li>
 </ul>
 </p></li>
 <li><p><strong>sfb</strong> (<em>torch.Tensor</em>) – Scale factor for B, dtype uint8, same SfAtom layout as sfa.
-shape: [num_experts, N, K // 32] (w8a8-mxfp8, w4a4-mxfp4) or
-[num_experts, N, K // 16] (w4a4-nvfp4).</p></li>
+shape: [num_experts, N, K // 32] (w8a8-mxfp8, w4a4-mxfp4,
+w4a8-mxfp4) or [num_experts, N, K // 16] (w4a4-nvfp4).</p></li>
 <li><p><strong>expert_ids</strong> (<em>torch.Tensor</em>) – [M] int32. Maps each row to an expert index in
 [0, num_experts). Must be sorted in non-decreasing order.</p></li>
 <li><p><strong>output</strong> (<em>torch.Tensor</em>) – [M, N] bfloat16 output. Written in-place.</p></li>
 <li><p><strong>bias</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional [num_experts, N] bfloat16 bias. Only supported in
 w8a8-mxfp8 mode.</p></li>
 <li><p><strong>alpha</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional float32 per-expert scale with shape [num_experts].
-Required for <code class="docutils literal notranslate"><span class="pre">w4a4-nvfp4</span></code>; not accepted for <code class="docutils literal notranslate"><span class="pre">w4a4-mxfp4</span></code>.</p></li>
+Required for <code class="docutils literal notranslate"><span class="pre">w4a4-nvfp4</span></code>; not accepted for <code class="docutils literal notranslate"><span class="pre">w4a4-mxfp4</span></code> or
+<code class="docutils literal notranslate"><span class="pre">w4a8-mxfp4</span></code>.</p></li>
 <li><p><strong>sm_count</strong> (<em>int</em>) – Number of SMs to use (-1 for all available).</p></li>
-<li><p><strong>mode</strong> (<em>str</em>) – <code class="docutils literal notranslate"><span class="pre">&quot;w8a8-mxfp8&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-mxfp4&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-nvfp4&quot;</span></code>.</p></li>
+<li><p><strong>mode</strong> (<em>str</em>) – <code class="docutils literal notranslate"><span class="pre">&quot;w8a8-mxfp8&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-mxfp4&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-nvfp4&quot;</span></code> or
+<code class="docutils literal notranslate"><span class="pre">&quot;w4a8-mxfp4&quot;</span></code> (FP8 activation x MXFP4 weight). For
+<code class="docutils literal notranslate"><span class="pre">w4a8-mxfp4</span></code> the per-expert M <code class="docutils literal notranslate"><span class="pre">M</span> <span class="pre">//</span> <span class="pre">num_experts</span></code> must be 64
+or a multiple of 128; N must be a multiple of 128 when that M is
+at most 128, else a multiple of 256, and K a multiple of 256.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
@@ -674,16 +682,19 @@ early-exit for padded rows.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>input</strong> (<em>torch.Tensor</em>) – <p>[num_experts * max_m_per_expert, K] CUDA tensor.</p>
 <ul>
-<li><p><code class="docutils literal notranslate"><span class="pre">w8a8-mxfp8</span></code>: dtype float8_e4m3fn.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">w8a8-mxfp8</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a8-mxfp4</span></code>: dtype float8_e4m3fn.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">w4a4-*</span></code>: dtype uint8 (packed FP4, logical K is size(1)*2).</p></li>
 </ul>
 </p></li>
-<li><p><strong>weight</strong> (<em>torch.Tensor</em>) – [num_experts, N, K] 3D CUDA tensor. Per-expert weights.</p></li>
+<li><p><strong>weight</strong> (<em>torch.Tensor</em>) – [num_experts, N, K] 3D CUDA tensor. Per-expert weights.
+<code class="docutils literal notranslate"><span class="pre">w4a8-mxfp4</span></code> takes packed E2M1 (uint8, 2 values per byte) of
+shape [num_experts, N, K // 2].</p></li>
 <li><p><strong>sfa</strong> (<em>torch.Tensor</em>) – <p>Scale factor for A, dtype uint8, CUTLASS SfAtom 128x4 swizzled
 layout. Shape: <code class="docutils literal notranslate"><span class="pre">[num_experts</span> <span class="pre">*</span> <span class="pre">max_m_per_expert,</span> <span class="pre">sf_k]</span></code>, where
-<code class="docutils literal notranslate"><span class="pre">sf_k</span> <span class="pre">=</span> <span class="pre">K</span> <span class="pre">//</span> <span class="pre">32</span></code> (w8a8-mxfp8, w4a4-mxfp4) or <code class="docutils literal notranslate"><span class="pre">K</span> <span class="pre">//</span> <span class="pre">16</span></code> (w4a4-nvfp4).</p>
+<code class="docutils literal notranslate"><span class="pre">sf_k</span> <span class="pre">=</span> <span class="pre">K</span> <span class="pre">//</span> <span class="pre">32</span></code> (w8a8-mxfp8, w4a4-mxfp4, w4a8-mxfp4) or
+<code class="docutils literal notranslate"><span class="pre">K</span> <span class="pre">//</span> <span class="pre">16</span></code> (w4a4-nvfp4).</p>
 <ul>
-<li><p><code class="docutils literal notranslate"><span class="pre">w8a8-mxfp8</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a4-mxfp4</span></code>: UE8M0 encoding.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">w8a8-mxfp8</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a4-mxfp4</span></code>, <code class="docutils literal notranslate"><span class="pre">w4a8-mxfp4</span></code>: UE8M0 encoding.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">w4a4-nvfp4</span></code>: UE4M3 encoding.</p></li>
 </ul>
 </p></li>
@@ -693,10 +704,15 @@ shape [num_experts, N, sf_k].</p></li>
 <li><p><strong>output</strong> (<em>torch.Tensor</em>) – [num_experts * max_m_per_expert, N] bfloat16 output. Written in-place.</p></li>
 <li><p><strong>bias</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional [num_experts, N] bfloat16 bias. Only supported in w8a8-mxfp8 mode.</p></li>
 <li><p><strong>alpha</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional float32 per-expert scale with shape [num_experts].
-Required for <code class="docutils literal notranslate"><span class="pre">w4a4-nvfp4</span></code>; not accepted for <code class="docutils literal notranslate"><span class="pre">w4a4-mxfp4</span></code>.</p></li>
-<li><p><strong>max_m_per_expert</strong> (<em>int</em>) – Maximum tokens per expert (padding bound), must be &gt; 0.</p></li>
+Required for <code class="docutils literal notranslate"><span class="pre">w4a4-nvfp4</span></code>; not accepted for <code class="docutils literal notranslate"><span class="pre">w4a4-mxfp4</span></code> or
+<code class="docutils literal notranslate"><span class="pre">w4a8-mxfp4</span></code>.</p></li>
+<li><p><strong>max_m_per_expert</strong> (<em>int</em>) – Maximum tokens per expert (padding bound), must be &gt; 0.
+For <code class="docutils literal notranslate"><span class="pre">w4a8-mxfp4</span></code> it must be 64 or a multiple of 128; N must be a
+multiple of 128 when it is at most 128, else a multiple of 256,
+and K a multiple of 256.</p></li>
 <li><p><strong>sm_count</strong> (<em>int</em>) – Number of SMs to use (-1 for all available).</p></li>
-<li><p><strong>mode</strong> (<em>str</em>) – <code class="docutils literal notranslate"><span class="pre">&quot;w8a8-mxfp8&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-mxfp4&quot;</span></code> or <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-nvfp4&quot;</span></code>.</p></li>
+<li><p><strong>mode</strong> (<em>str</em>) – <code class="docutils literal notranslate"><span class="pre">&quot;w8a8-mxfp8&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-mxfp4&quot;</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;w4a4-nvfp4&quot;</span></code> or
+<code class="docutils literal notranslate"><span class="pre">&quot;w4a8-mxfp4&quot;</span></code> (FP8 activation x MXFP4 weight).</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
