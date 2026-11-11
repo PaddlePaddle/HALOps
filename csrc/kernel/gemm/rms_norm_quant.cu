@@ -15,7 +15,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include <optional>
 #include <vector>
 
 #include "common/mx_quant.cuh"
@@ -29,7 +28,6 @@ namespace {
 constexpr int kRmsMaxThreads = 256;
 constexpr int kRmsVec = sizeof(uint4) / sizeof(__nv_bfloat16);
 
-// The mxfp8::kGroup bf16 values at src as floats.
 CUTE_DEVICE void load_group(const __nv_bfloat16* src,
                             float (&v)[mxfp8::kGroup]) {
     CUTLASS_PRAGMA_UNROLL
@@ -42,16 +40,12 @@ CUTE_DEVICE void load_group(const __nv_bfloat16* src,
     }
 }
 
-// One block per (SfAtom-padded) row, one thread per 32-element quantization
-// group: the row is read once, normalized in registers, rounded to bf16 and
-// quantized with the group_wise_quant recipe.
-template <bool kWriteY>
+template <bool kSwizzle>
 __global__ void __launch_bounds__(kRmsMaxThreads)
     rms_norm_quant_kernel(const __nv_bfloat16* __restrict__ x, int64_t ld,
                           const __nv_bfloat16* __restrict__ gamma, float eps,
                           int m, int k, uint8_t* __restrict__ q,
-                          uint8_t* __restrict__ sf,
-                          __nv_bfloat16* __restrict__ y) {
+                          uint8_t* __restrict__ sf) {
     constexpr int kG = mxfp8::kGroup;
     __shared__ float warp_sums[kRmsMaxThreads / cutlass::NumThreadsPerWarp];
 
@@ -59,7 +53,8 @@ __global__ void __launch_bounds__(kRmsMaxThreads)
     const int g = threadIdx.x;
     const int kb_dim = k / kG;
     const bool active = g < kb_dim;
-    const int64_t sf_off = mxfp8::sf_atom_offset(row, g, kb_dim);
+    const int64_t sf_off = kSwizzle ? mxfp8::sf_atom_offset(row, g, kb_dim)
+                                    : int64_t(row) * kb_dim + g;
     const bool sf_lead = g % mxfp8::kAtomCols == 0;
 
     float w[kG];
@@ -68,7 +63,7 @@ __global__ void __launch_bounds__(kRmsMaxThreads)
     pdl_wait();
     pdl_trigger();
 
-    if (row >= m) {
+    if (kSwizzle && row >= m) {
         if (active && sf_lead) *reinterpret_cast<uint32_t*>(sf + sf_off) = 0;
         return;
     }
@@ -100,33 +95,26 @@ __global__ void __launch_bounds__(kRmsMaxThreads)
     for (int i = 0; i < kG; ++i) {
         v[i] = __bfloat162float(__float2bfloat16_rn(v[i] * rrms * w[i]));
     }
-    if constexpr (kWriteY) {
-        uint4 packed[kG / kRmsVec];
-        auto* e = reinterpret_cast<__nv_bfloat16*>(packed);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < kG; ++i) e[i] = __float2bfloat16_rn(v[i]);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < kG / kRmsVec; ++i) {
-            reinterpret_cast<uint4*>(y + int64_t(row) * k + g * kG)[i] =
-                packed[i];
-        }
-    }
     uint4 codes[2];
-    const uint32_t word =
-        mxfp8::sf_quad_word(mxfp8::quant_e4m3_group(v, codes));
+    const uint8_t e = mxfp8::quant_e4m3_group(v, codes);
     uint4* out = reinterpret_cast<uint4*>(q + int64_t(row) * k + g * kG);
     out[0] = codes[0];
     out[1] = codes[1];
-    if (sf_lead) *reinterpret_cast<uint32_t*>(sf + sf_off) = word;
+    if constexpr (kSwizzle) {
+        const uint32_t word = mxfp8::sf_quad_word(e);
+        if (sf_lead) *reinterpret_cast<uint32_t*>(sf + sf_off) = word;
+    } else {
+        sf[sf_off] = e;
+    }
 }
 
 }  // namespace
 
-std::vector<torch::Tensor> RmsNormQuant(
-    const torch::Tensor& input, const torch::Tensor& weight, const double eps,
-    const bool use_pdl, const std::optional<torch::Tensor>& output_quant_opt,
-    const std::optional<torch::Tensor>& output_sf_opt,
-    const std::optional<torch::Tensor>& output_bf16) {
+std::vector<torch::Tensor> RmsNormQuant(const torch::Tensor& input,
+                                        const torch::Tensor& weight,
+                                        const double eps,
+                                        const bool use_swizzle,
+                                        const bool use_pdl) {
     const CudaDeviceGuard device_guard(input.device());
     TORCH_CHECK(input.dim() == 2 && input.scalar_type() == torch::kBFloat16,
                 "input must be a 2D bfloat16 tensor [M, K]");
@@ -142,29 +130,11 @@ std::vector<torch::Tensor> RmsNormQuant(
                     weight.scalar_type() == torch::kBFloat16 &&
                     weight.is_contiguous(),
                 "weight must be a contiguous bfloat16 [K] tensor");
-    const int m_sf = AlignSfM(m);
+    const int m_sf = use_swizzle ? AlignSfM(m) : m;
     torch::Tensor q =
-        output_quant_opt.has_value()
-            ? *output_quant_opt
-            : torch::empty({m, k},
-                           input.options().dtype(torch::kFloat8_e4m3fn));
+        torch::empty({m, k}, input.options().dtype(torch::kFloat8_e4m3fn));
     torch::Tensor sf =
-        output_sf_opt.has_value()
-            ? *output_sf_opt
-            : torch::empty({m_sf, kb_dim}, input.options().dtype(torch::kByte));
-    TORCH_CHECK(
-        q.is_contiguous() && q.scalar_type() == torch::kFloat8_e4m3fn &&
-            q.numel() == int64_t(m) * k,
-        "output_quant must be a contiguous float8_e4m3fn [M, K] tensor");
-    TORCH_CHECK(sf.is_contiguous() && sf.scalar_type() == torch::kByte &&
-                    sf.numel() == int64_t(m_sf) * kb_dim,
-                "output_sf must be a contiguous uint8 tensor of ", m_sf, " x ",
-                kb_dim, " elements");
-    TORCH_CHECK(!output_bf16.has_value() ||
-                    (output_bf16->is_contiguous() &&
-                     output_bf16->scalar_type() == torch::kBFloat16 &&
-                     output_bf16->numel() == int64_t(m) * k),
-                "output_bf16 must be a contiguous bfloat16 [M, K] tensor");
+        torch::empty({m_sf, kb_dim}, input.options().dtype(torch::kByte));
     if (m_sf == 0) {
         return {q, sf};
     }
@@ -174,19 +144,11 @@ std::vector<torch::Tensor> RmsNormQuant(
     auto* q_ptr = reinterpret_cast<uint8_t*>(q.data_ptr());
     auto* sf_ptr = sf.data_ptr<uint8_t>();
     const cudaStream_t stream = GetCurrentCUDAStream(input);
-    if (output_bf16.has_value()) {
-        LaunchKernelWithPdl(
-            rms_norm_quant_kernel<true>, m_sf, threads, kNoCluster, 0, stream,
-            use_pdl, x, input.stride(0), w, static_cast<float>(eps), m, k,
-            q_ptr, sf_ptr,
-            reinterpret_cast<__nv_bfloat16*>(output_bf16->data_ptr()));
-    } else {
-        LaunchKernelWithPdl(rms_norm_quant_kernel<false>, m_sf, threads,
-                            kNoCluster, 0, stream, use_pdl, x, input.stride(0),
-                            w, static_cast<float>(eps), m, k, q_ptr, sf_ptr,
-                            static_cast<__nv_bfloat16*>(nullptr));
-    }
-    HALOPS_CUDA_CHECK(cudaGetLastError());
+    const auto kernel = use_swizzle ? rms_norm_quant_kernel<true>
+                                    : rms_norm_quant_kernel<false>;
+    HALOPS_CUDA_CHECK(LaunchKernelWithPdl(
+        kernel, m_sf, threads, kNoCluster, 0, stream, use_pdl, x,
+        input.stride(0), w, static_cast<float>(eps), m, k, q_ptr, sf_ptr));
     return {q, sf};
 }
 

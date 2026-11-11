@@ -335,14 +335,14 @@ void LaunchVhaPostmixQuant(const torch::Tensor& o, const torch::Tensor& mix,
     const auto kernel = vha_postmix_quant_kernel<Pos>;
     HALOPS_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kVhaSmemBytes));
-    LaunchKernelWithPdl(kernel, grid, kVhaThreads, kNoCluster, kVhaSmemBytes,
-                        GetCurrentCUDAStream(o), use_pdl,
-                        reinterpret_cast<const __nv_bfloat16*>(o.data_ptr()),
-                        reinterpret_cast<const __nv_bfloat16*>(mix.data_ptr()),
-                        freqs.data_ptr<float>(), positions.data_ptr<Pos>(),
-                        tokens, groups, group_major,
-                        reinterpret_cast<uint8_t*>(q.data_ptr()),
-                        sf.data_ptr<uint8_t>());
+    HALOPS_CUDA_CHECK(LaunchKernelWithPdl(
+        kernel, grid, kVhaThreads, kNoCluster, kVhaSmemBytes,
+        GetCurrentCUDAStream(o), use_pdl,
+        reinterpret_cast<const __nv_bfloat16*>(o.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(mix.data_ptr()),
+        freqs.data_ptr<float>(), positions.data_ptr<Pos>(), tokens, groups,
+        group_major, reinterpret_cast<uint8_t*>(q.data_ptr()),
+        sf.data_ptr<uint8_t>()));
 }
 
 }  // namespace
@@ -408,7 +408,6 @@ std::vector<torch::Tensor> VhaPostmixQuant(
         LaunchVhaPostmixQuant<int64_t>(o, mix, freqs, positions, groups,
                                        group_major, q, sf, use_pdl);
     }
-    HALOPS_CUDA_CHECK(cudaGetLastError());
     return {q, sf};
 }
 

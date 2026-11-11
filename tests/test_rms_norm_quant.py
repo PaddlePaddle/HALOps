@@ -20,7 +20,12 @@ import pytest
 import torch
 
 from halops import group_wise_quant, rms_norm_quant
-from tests.utils.gemm_utils import MXFP8_BLOCK_SIZE, sfatom_rows, ulp_diff
+from tests.utils.gemm_utils import (
+    MXFP8_BLOCK_SIZE,
+    sfatom_offsets,
+    sfatom_rows,
+    ulp_diff,
+)
 
 EPS = 1e-6
 
@@ -48,6 +53,7 @@ def make_inputs(m, k):
 # =====================================================================
 
 
+@pytest.mark.parametrize("use_swizzle", [True, False], ids=["sfatom", "rowmajor"])
 @pytest.mark.parametrize("k", [1024, 4096, 8192], ids=lambda k: f"k{k}")
 @pytest.mark.parametrize(
     "m",
@@ -64,33 +70,33 @@ def make_inputs(m, k):
         pytest.param(3072, id="m3072"),
     ],
 )
-def test_rms_norm_quant(m, k):
-    """y is within 1 bf16 ulp of an fp32 RMSNorm (rsqrt and the summation
-    order differ), and the fp8 codes and scales equal group_wise_quant(y)."""
+def test_rms_norm_quant(m, k, use_swizzle):
+    """The kernel's bf16 norm may differ from an fp32 RMSNorm by 1 ulp (rsqrt
+    and the summation order differ). That moves a code by at most 1, or rarely
+    a group's amax across a power of two and with it the scale by 1: against
+    group_wise_quant of the fp32 norm, codes match within 1 where the scale
+    matches, and at most 0.1% of the scales differ, each by 1."""
     x, w = make_inputs(m, k)
-    q, sf, y = rms_norm_quant(x, w, EPS, return_bf16=True)
-    assert ulp_diff(y, ref_rms_norm(x, w)).max() <= 1
-    ref_q, ref_sf = group_wise_quant(y, mode="w8a8-mxfp8")
-    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
-    assert torch.equal(sf, ref_sf)
-
-    q2, sf2 = rms_norm_quant(x, w, EPS)
-    assert torch.equal(q2.view(torch.uint8), q.view(torch.uint8))
-    assert torch.equal(sf2, sf)
+    q, sf = rms_norm_quant(x, w, EPS, use_swizzle=use_swizzle)
+    ref_q, ref_sf = group_wise_quant(
+        ref_rms_norm(x, w), mode="w8a8-mxfp8", use_swizzle=use_swizzle
+    )
+    sf_diff = (sf.int() - ref_sf.int()).abs()
+    if use_swizzle:
+        sf_diff = sf_diff.flatten()[sfatom_offsets(m, k // MXFP8_BLOCK_SIZE)]
+    assert sf_diff.max() <= 1 and (sf_diff > 0).float().mean() <= 1e-3
+    same_scale = (sf_diff == 0).repeat_interleave(MXFP8_BLOCK_SIZE, -1)
+    assert ulp_diff(q, ref_q)[same_scale].max() <= 1
 
 
 @pytest.mark.parametrize("m", [1, 200], ids=lambda m: f"m{m}")
-def test_rms_norm_quant_strided_input_preallocated_outputs(m):
-    """A column slice of a wider tensor quantizes like its contiguous copy, into
-    the given buffers (scale padding rows are overwritten with 0)."""
+def test_rms_norm_quant_strided_input(m):
+    """A column slice of a wider tensor quantizes like its contiguous copy."""
     k = 1024
     x, w = make_inputs(m, 2 * k)
     x, w = x[:, k:], w[:k]
     ref_q, ref_sf = rms_norm_quant(x.contiguous(), w, EPS, use_pdl=False)
-    out = torch.empty_like(ref_q)
-    out_sf = torch.full_like(ref_sf, 0xFF)
-    q, sf = rms_norm_quant(x, w, EPS, output_quant=out, output_sf=out_sf)
-    assert q.data_ptr() == out.data_ptr() and sf.data_ptr() == out_sf.data_ptr()
+    q, sf = rms_norm_quant(x, w, EPS)
     assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
     assert torch.equal(sf, ref_sf)
 
