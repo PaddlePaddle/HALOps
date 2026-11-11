@@ -823,16 +823,14 @@ struct SharedDownProjection<KernelTraits, true>
                 tmem_addr(smem->tmem_ptr, 0u, kDownSfaTmemOffset);
             const auto sfb_tmem =
                 tmem_addr(smem->tmem_ptr, 0u, kDownSfbTmemOffset);
-            Base::copy_scales_to_tmem(
-                smem->shared_expert.w_down_scale[slot],
-                &smem->shared_expert.act_down_input.scale[slot][0], sfa_tmem,
-                sfb_tmem);
             // Reuse the fixed sum and scale staging in issuer order.
             Base::mma(tiled_mma, cta_mma, SBLayout{}, tCt,
                       &smem->shared_expert.w_down[slot][0][0],
                       &smem->shared_expert.act_down_input.data[slot][0][0][0],
-                      tmem_addr(smem->tmem_ptr, 0u, 0u), sfa_tmem, sfb_tmem,
-                      /*accumulate=*/k_iter_id != 0u);
+                      tmem_addr(smem->tmem_ptr, 0u, 0u),
+                      smem->shared_expert.w_down_scale[slot],
+                      &smem->shared_expert.act_down_input.scale[slot][0],
+                      sfa_tmem, sfb_tmem, /*accumulate=*/k_iter_id != 0u);
             cutlass::arch::umma_arrive(
                 smem->barriers.shared_down.weight_empty.raw(slot));
         }

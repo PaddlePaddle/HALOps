@@ -508,14 +508,15 @@ struct LatentDownProjection<KernelTraits, true>
                 &smem->latent_down.quantized_input
                      .scale[k_iter_id % Base::kNumInputSlots][0];
             if (cute::elect_one_sync()) {
-                ScaleTraits::copy_to_tmem(sfa, sfb, tmem_base + kSfaTmemOffset,
-                                          tmem_base + kSfbTmemOffset);
+                ScaleTraits::copy_sfa_to_tmem(sfa, tmem_base + kSfaTmemOffset);
+                ScaleTraits::copy_sfb_to_tmem(sfb, tmem_base + kSfbTmemOffset);
+                MmaCore::run(tiled_mma, cta_mma,
+                             &smem->latent_down.w_latent_down[w_slot][0][0][0],
+                             tCrB, tCt, tmem_addr(tmem_base, 0u, 0u),
+                             tmem_base + kSfaTmemOffset,
+                             tmem_base + kSfbTmemOffset,
+                             /*accumulate=*/k_iter_id != 0u);
             }
-            MmaCore::run(tiled_mma, cta_mma,
-                         &smem->latent_down.w_latent_down[w_slot][0][0][0],
-                         tCrB, tCt, tmem_addr(tmem_base, 0u, 0u),
-                         tmem_base + kSfaTmemOffset, tmem_base + kSfbTmemOffset,
-                         /*accumulate=*/k_iter_id != 0u);
 
             cutlass::arch::umma_arrive(
                 smem->barriers.latent_down.weight_empty.raw(k_iter_id));

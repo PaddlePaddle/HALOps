@@ -376,17 +376,15 @@ struct RoutedDownProjection<KernelTraits, true>
                 tmem_addr(tmem_base, 0u, down_sfa_tmem(step_local));
             const auto sfb_tmem =
                 tmem_addr(tmem_base, 0u, down_sfb_tmem(step_local));
-            Base::copy_scales_to_tmem(
-                smem->routed_experts.w_down_scale[w_slot],
-                smem->routed_experts.act_down_scale[w_slot], sfa_tmem,
-                sfb_tmem);
             Base::mma(tiled_mma, cta_mma, sB_layout, tCt,
                       reinterpret_cast<typename Base::WeightElement*>(
                           &smem->routed_experts.w_down[w_slot][0][0]),
                       reinterpret_cast<typename Base::ActElement*>(
                           &smem->routed_experts.act_down_input[w_slot][0]),
-                      tmem_addr(tmem_base, 0u, 0u), sfa_tmem, sfb_tmem,
-                      /*accumulate=*/k_iter_id != 0u);
+                      tmem_addr(tmem_base, 0u, 0u),
+                      smem->routed_experts.w_down_scale[w_slot],
+                      smem->routed_experts.act_down_scale[w_slot], sfa_tmem,
+                      sfb_tmem, /*accumulate=*/k_iter_id != 0u);
             // The commit covers every async tcgen05 op issued before it.
             cutlass::arch::umma_arrive(
                 smem->barriers.routed.down_weight_empty.raw(w_slot));
