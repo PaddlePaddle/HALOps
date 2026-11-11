@@ -39,8 +39,9 @@ namespace halops::moe {
 
 template <typename KernelTraits>
 struct RoutedUpProjectionBase
-    : UpProjectionBase<KernelTraits, typename KernelTraits::UpGemm> {
-    using Base = UpProjectionBase<KernelTraits, typename KernelTraits::UpGemm>;
+    : UpProjectionBase<KernelTraits, typename KernelTraits::RoutedUpGemm> {
+    using Base =
+        UpProjectionBase<KernelTraits, typename KernelTraits::RoutedUpGemm>;
     using Base::kAccColsPerThread;
     using Base::kNumTilesK;
     using Base::kNumWeightSlots;
@@ -129,7 +130,7 @@ struct RoutedUpProjectionBase
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         std::uint32_t e, std::uint32_t batch_size, std::uint32_t base_feature,
         std::uint32_t m_block_idx, std::uint32_t tok) {
-        using Quant = typename Traits::DownGemm::InputQuant;
+        using Quant = typename Traits::RoutedDownGemm::InputQuant;
         using Quantizer = GroupWiseQuantizer<Quant, UpGemm::kTileShapeM / 2u>;
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         std::uint32_t dest_row = 0u;
@@ -166,7 +167,8 @@ struct RoutedUpProjectionBase
 };
 
 template <typename KernelTraits,
-          bool UseBlockscaled = KernelTraits::UpGemm::MmaCore::kUseBlockscaled>
+          bool UseBlockscaled =
+              KernelTraits::RoutedUpGemm::MmaCore::kUseBlockscaled>
 struct RoutedUpProjection;
 
 // MXFP8/MXFP4: scales are applied by the blockscaled MMA.

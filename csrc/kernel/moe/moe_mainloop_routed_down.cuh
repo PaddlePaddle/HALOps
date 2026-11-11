@@ -38,9 +38,9 @@ namespace halops::moe {
 
 template <typename KernelTraits>
 struct RoutedDownProjectionBase
-    : DownProjectionBase<KernelTraits, typename KernelTraits::DownGemm> {
+    : DownProjectionBase<KernelTraits, typename KernelTraits::RoutedDownGemm> {
     using Base =
-        DownProjectionBase<KernelTraits, typename KernelTraits::DownGemm>;
+        DownProjectionBase<KernelTraits, typename KernelTraits::RoutedDownGemm>;
     using typename Base::Accumulator;
     using typename Base::Dims;
     using typename Base::DownGemm;
@@ -58,7 +58,7 @@ struct RoutedDownProjectionBase
 
     // The up phase's weight ring depth, which the down ring aliases at 2:1.
     static constexpr std::uint32_t kNumUpWeightSlots =
-        Traits::UpGemm::kNumWeightSlots;
+        Traits::RoutedUpGemm::kNumWeightSlots;
 
     static_assert(Traits::kUpSlotsPerDownSlot >= 1u,
                   "A w_down slot must cover at least one w_up slot: the first "
@@ -164,7 +164,7 @@ struct RoutedDownProjectionBase
 
 template <typename KernelTraits,
           bool UseBlockscaled =
-              KernelTraits::DownGemm::MmaCore::kUseBlockscaled>
+              KernelTraits::RoutedDownGemm::MmaCore::kUseBlockscaled>
 struct RoutedDownProjection;
 
 // MXFP8/MXFP4: scales are applied by the blockscaled MMA.
@@ -181,7 +181,7 @@ struct RoutedDownProjection<KernelTraits, true>
 
     static_assert(DownGemm::MmaCore::kUseBlockscaled,
                   "RoutedDownProjection<true> requires a blockscaled MMA core");
-    static_assert(Traits::UpGemm::MmaCore::kUseBlockscaled,
+    static_assert(Traits::RoutedUpGemm::MmaCore::kUseBlockscaled,
                   "blockscaled down requires up to drain its weights and "
                   "accumulator before the down phase");
     static_assert(RoutedBarrier<Dims>::kNumDownWeightSlots ==
@@ -521,9 +521,10 @@ struct RoutedDownProjection<KernelTraits, false>
         // Blockwise up and down share an accumulator ring and continue its
         // iteration count.
         const std::uint32_t id_base =
-            sched.up_task_count() * (Traits::UpGemm::MmaCore::kUseBlockscaled
-                                         ? 0u
-                                         : Traits::UpGemm::kNumTilesK);
+            sched.up_task_count() *
+            (Traits::RoutedUpGemm::MmaCore::kUseBlockscaled
+                 ? 0u
+                 : Traits::RoutedUpGemm::kNumTilesK);
         const std::uint32_t tmem_base = smem->tmem_ptr;
 
         TaskInfo task;
@@ -623,7 +624,7 @@ struct RoutedDownProjection<KernelTraits, false>
 
         const std::uint32_t nb = k_iter_id - 1u;
         const std::uint32_t a_blk =
-            (nb * 128u) / Traits::UpGemm::kOutputQuantBlock;
+            (nb * 128u) / Traits::RoutedUpGemm::kOutputQuantBlock;
         const std::uint32_t scale_idx =
             m_tile_idx * kNumDownWeightScaleBlocksK +
             ((kNumDownWeightScaleBlocksK > 1u) ? nb : 0u);

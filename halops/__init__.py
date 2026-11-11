@@ -16,7 +16,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-from halops import attention, gemm, mla, moe, indexer
+from halops import attention, gemm, indexer, mla, moe
 
 try:
     __version__ = version("halops")
@@ -24,7 +24,7 @@ except PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 del PackageNotFoundError, version
 
-_SUBPACKAGES = (attention, gemm, mla, moe, indexer)
+_SUBPACKAGES = (attention, gemm, indexer, mla, moe)
 
 
 def __dir__():

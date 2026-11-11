@@ -51,8 +51,8 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     assert(blockDim.x == Dims::KernelConfig::kBlockSize);
     assert(blockDim.y == 1 && blockDim.z == 1);
 
-    assert(gridDim.x >= MoEKernelTraits<Dims>::kMinGrid);
-    assert(gridDim.x <= MoEKernelTraits<Dims>::kMaxGrid);
+    assert(gridDim.x >= Traits::kMinGrid);
+    assert(gridDim.x <= Traits::kMaxGrid);
     assert(gridDim.y == 1 && gridDim.z == 1);
 
     assert(mainloop_params.num_tokens <= Dims::kNumTokens);
@@ -113,7 +113,7 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     pdl_trigger();
     __syncthreads();
     if (WarpRole::is_tmem_warp(warp_idx)) {
-        tmem_free(smem->tmem_ptr, MoEKernelTraits<Dims>::kTmemColumns);
+        tmem_free(smem->tmem_ptr, Traits::kTmemColumns);
     }
 }
 

@@ -1,6 +1,6 @@
 # YAML 配置说明
 
-配置文件通常位于 `configs/<op>/`，其中 `<op>` 必须是 `benchmark.py` 中已注册的算子类别。当前支持 `attention` 和 `gemm`。
+配置文件通常位于 `configs/<op>/`，其中 `<op>` 必须是 `benchmark.py` 中已注册的算子类别。当前支持 `attention`、`gemm` 和 `moe`。
 
 ## 加载规则
 
@@ -118,3 +118,20 @@
 - `sm_count`（默认 `-1`）。
 
 所有现有 GEMM 场景均要求 `K` 为 `32` 的倍数。
+
+## MoE 场景
+
+### `low_latency_moe`
+
+- `batch_sizes`（默认 `[1]`）：token 数，取值为 `1..16`。
+- `top_k_list`（默认 `[8]`）：选择专家数，取值为 `1..10`。
+- `tp_size`（默认 `1`）：此 benchmark 当前仅支持单卡。
+- `quant_mode`：`w8a8-blockwise`（默认）、`w8a8-mxfp8` 或 `w4a8-mxfp4`。
+- `activation`：`silu`（默认）或 `situ`。SiTU 可配置 `situ_beta`（默认 `4.0`）和 `situ_linear_beta`（默认 `25.0`）；非正值关闭对应 soft cap。
+- `scoring_func`：`sigmoid`（默认）或 `softmax`；`renormalize` 默认 `true`。
+- `eps`：RMSNorm epsilon，默认 `1e-5`。
+- `seed`：输入与原始 BF16 权重的随机种子，默认 `0`。
+- `grid_cap`：kernel CTA 上限，默认 `0`。
+- `backends`：`halops`。
+
+固定形状为 `hidden_size=4096`、`intermediate_size=512`、`latent_size=2048`、`num_experts=512`，配置其他形状会报错。

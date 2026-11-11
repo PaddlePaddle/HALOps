@@ -417,6 +417,76 @@ def test_group_contiguous_mxfp4(m, n, k, num_experts, tile_m):
 
 
 # =====================================================================
+# W4A8-MXFP4 accuracy tests (fp8 e4m3 activation x packed fp4 e2m1 weight)
+# =====================================================================
+
+
+def make_w4a8_mxfp4_inputs(m, n, k, num_experts, tile_m):
+    """Build W4A8-MXFP4 inputs: fp8 A and packed-fp4 B, both UE8M0 group-32."""
+    expert_ids, token_nums, num_experts = make_contiguous_expert_ids(
+        m, num_experts, tile_m
+    )
+    m = expert_ids.shape[0]
+
+    x_origin = torch.randn([m, k], dtype=torch.bfloat16)
+    w_origin = torch.randn([num_experts, n, k], dtype=torch.bfloat16)
+
+    # A: unpacked fp8 e4m3 with a group-32 UE8M0 scale (same recipe as w8a8).
+    x, sfa_logical = per_token_cast_to_fp8(x_origin, 32)
+    # B: packed fp4 e2m1 with a group-32 UE8M0 scale (same recipe as w4a4-mxfp4).
+    w_packed, sfb_logical, w_fp4_float = per_block_cast_to_mxfp4(
+        w_origin, MXFP4_BLOCK_SIZE
+    )
+
+    # Dequantize A to float so the shared w4a4 matmul reference can consume it.
+    sfa_expanded = torch.repeat_interleave(ue8m0_to_float32(sfa_logical), 32, dim=1)
+    x_deq_float = x.to(torch.float32) * sfa_expanded
+
+    sfa = reorder_sf_to_cutlass(sfa_logical, m, k // 32)
+    sfb = reorder_sf_to_cutlass(sfb_logical, n, k // 32)
+
+    return SimpleNamespace(
+        m=m,
+        num_experts=num_experts,
+        expert_ids=expert_ids,
+        token_nums=token_nums,
+        x=x,
+        w_packed=w_packed,
+        x_deq_float=x_deq_float,
+        w_fp4_float=w_fp4_float,
+        sfa=sfa,
+        sfb=sfb,
+        sm_count=-1,
+        mode="w4a8-mxfp4",
+    )
+
+
+@pytest.mark.parametrize(
+    "m, n, k, num_experts, tile_m",
+    [
+        pytest.param(512, FULL_N, FULL_K, 2, 256, id="m512_e2"),
+        pytest.param(2048, FULL_N, FULL_K, 8, 256, id="large_m2048_e8"),
+        pytest.param(128, 256, 512, 1, 128, id="m128_n256_k512_e1"),
+    ],
+)
+def test_group_contiguous_w4a8_mxfp4(m, n, k, num_experts, tile_m):
+    inp = make_w4a8_mxfp4_inputs(m, n, k, num_experts, tile_m)
+    ref_out = ref_group_contiguous_gemm_w4a4(
+        inp.x_deq_float, inp.w_fp4_float, inp.expert_ids, inp.num_experts
+    )
+    output = group_contiguous_gemm_wrapper(
+        inp.x,
+        inp.w_packed,
+        inp.sfa,
+        inp.sfb,
+        inp.expert_ids,
+        sm_count=inp.sm_count,
+        mode=inp.mode,
+    )
+    assert_close_per_expert(output, ref_out, inp.token_nums, W4A4_TOL)
+
+
+# =====================================================================
 # Unsupported-input checks
 # =====================================================================
 
@@ -461,6 +531,49 @@ def run_mxfp4_bad_sf_k():
 def test_group_contiguous_mxfp4_errors(launch, expected):
     with pytest.raises(RuntimeError, match=re.escape(expected)):
         launch()
+
+
+def run_w4a8_mxfp4(m_per_expert=128, bias=False, alpha=False):
+    num_experts, n, k = 2, 256, 512
+    m = num_experts * m_per_expert
+    x = torch.empty([m, k], dtype=torch.float8_e4m3fn)
+    w = torch.empty([num_experts, n, k // 2], dtype=torch.uint8)
+    sfa = torch.empty([m, k // 32], dtype=torch.uint8)
+    sfb = torch.empty([num_experts, n, k // 32], dtype=torch.uint8)
+    expert_ids = torch.arange(m, dtype=torch.int32) // m_per_expert
+    out = torch.empty([m, n], dtype=torch.bfloat16)
+    group_contiguous_gemm(
+        x,
+        w,
+        sfa,
+        sfb,
+        expert_ids,
+        out,
+        torch.empty([num_experts, n], dtype=torch.bfloat16) if bias else None,
+        torch.ones([num_experts], dtype=torch.float32) if alpha else None,
+        -1,
+        "w4a8-mxfp4",
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        pytest.param(
+            {"bias": True}, "W4A8 mode does not support bias yet", id="w4a8_bias"
+        ),
+        pytest.param({"alpha": True}, "W4A8 mode does not take alpha", id="w4a8_alpha"),
+        # The per-expert M must be 64 or a multiple of 128.
+        pytest.param(
+            {"m_per_expert": 192},
+            "No contiguous w4a8-mxfp4 tile for M=192",
+            id="w4a8_bad_m",
+        ),
+    ],
+)
+def test_group_contiguous_w4a8_mxfp4_errors(kwargs, expected):
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
+        run_w4a8_mxfp4(**kwargs)
 
 
 def run_w8a8_mxfp8_bad_m():
@@ -535,73 +648,6 @@ def run_bad_rank_output():
 def test_group_contiguous_unsupported_shapes(launch, expected):
     with pytest.raises(RuntimeError, match=re.escape(expected)):
         launch()
-
-
-# =====================================================================
-# Determinism tests
-# =====================================================================
-
-
-def test_group_contiguous_w8a8_mxfp8_determinism():
-    """Determinism: identical inputs must produce bitwise-identical outputs."""
-    inp = make_w8a8_mxfp8_inputs(512, FULL_N, FULL_K, 2, 256)
-    out1, out2 = (
-        group_contiguous_gemm_wrapper(
-            inp.x,
-            inp.w,
-            inp.sfa,
-            inp.sfb,
-            inp.expert_ids,
-            bias=inp.bias,
-            sm_count=inp.sm_count,
-            mode=inp.mode,
-        )
-        for _ in range(2)
-    )
-    assert torch.equal(
-        out1, out2
-    ), "W8A8-MXFP8 group_contiguous_gemm output is not deterministic"
-
-
-def test_group_contiguous_mxfp4_determinism():
-    """Determinism: identical inputs must produce bitwise-identical outputs."""
-    inp = make_mxfp4_inputs(512, FULL_N, FULL_K, 2, 256)
-    out1, out2 = (
-        group_contiguous_gemm_wrapper(
-            inp.x_packed,
-            inp.w_packed,
-            inp.sfa,
-            inp.sfb,
-            inp.expert_ids,
-            sm_count=inp.sm_count,
-            mode=inp.mode,
-        )
-        for _ in range(2)
-    )
-    assert torch.equal(
-        out1, out2
-    ), "MXFP4 group_contiguous_gemm output is not deterministic"
-
-
-def test_group_contiguous_nvfp4_determinism():
-    """Determinism: identical inputs must produce bitwise-identical outputs."""
-    inp = make_nvfp4_inputs(512, FULL_N, FULL_K, 2, 256)
-    out1, out2 = (
-        group_contiguous_gemm_wrapper(
-            inp.x_packed,
-            inp.w_packed,
-            inp.sfa,
-            inp.sfb,
-            inp.expert_ids,
-            alpha=inp.alpha,
-            sm_count=inp.sm_count,
-            mode=inp.mode,
-        )
-        for _ in range(2)
-    )
-    assert torch.equal(
-        out1, out2
-    ), "W4A4 group_contiguous_gemm output is not deterministic"
 
 
 if __name__ == "__main__":

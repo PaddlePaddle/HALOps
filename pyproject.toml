@@ -20,6 +20,8 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.13.0",
+    "apache-tvm-ffi>=0.1.11",
+    "nvidia-cutlass-dsl[cu13]>=4.6.2",
 ]
 
 [project.urls]

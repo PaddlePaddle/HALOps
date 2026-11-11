@@ -149,12 +149,13 @@ uint32_t CalculateGridSize(int device, cudaStream_t stream,
         } else {
             cudaGetLastError();
         }
-        TORCH_CHECK(grid_size >= Traits::kMinGrid,
-                    "The kernel needs at least kMinGrid (=", Traits::kMinGrid,
-                    ") co-resident blocks, but the device's ", sm_count,
-                    " SMs fit only ", grid_size, " as ", kClusterSize,
-                    "-block clusters.");
     }
+    TORCH_CHECK(grid_size >= Traits::kMinGrid, "The kernel needs at least ",
+                Traits::kMinGrid,
+                " co-resident blocks (router, latent and shared expert), but "
+                "the launch grid has only ",
+                grid_size,
+                grid_cap > 0u ? " (grid_cap is set)" : " (the device limit).");
     return grid_size;
 }
 
@@ -178,7 +179,7 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
              const torch::Tensor& tail_epochs,
              const torch::Tensor& tail_uc_bases, const torch::Tensor& workspace,
              const torch::Tensor& tail_out, int64_t top_k, int64_t scoring_func,
-             int64_t activation, int64_t tail_rank, int64_t tail_mc_base,
+             int64_t activation, int64_t tp_rank, int64_t tail_mc_base,
              int64_t tail_grid_cap, bool renormalize, double situ_beta,
              double situ_linear_beta, double tail_eps, bool use_pdl) {
     const uint32_t num_tokens = static_cast<uint32_t>(input.size(0));
@@ -291,13 +292,10 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
         tail_norm_weight.const_data_ptr());
     args.tail_out = static_cast<DataType::ElementOut*>(tail_out.data_ptr());
     args.tail_eps = static_cast<float>(tail_eps);
-    args.tail_rank = static_cast<std::uint32_t>(tail_rank);
+    args.tail_rank = static_cast<std::uint32_t>(tp_rank);
 
     const uint32_t grid_size =
         CalculateGridSize<MoEDims>(device, stream, grid_cap);
-    TORCH_CHECK(grid_size >= TailGeometry::kNumCtas,
-                "The shared expert and tail need at least ",
-                TailGeometry::kNumCtas, " resident CTAs; got ", grid_size, ".");
     const cudaError_t launch_status =
         moe::LaunchMoEKernel<MoEDims>(args, grid_size, stream, use_pdl);
     TORCH_CHECK(launch_status == cudaSuccess,
@@ -355,11 +353,12 @@ void LowLatencyMoE(
     const std::optional<torch::Tensor>& per_expert_scale,
     const torch::Tensor& tail_epochs, const torch::Tensor& tail_uc_bases,
     const torch::Tensor& workspace, const torch::Tensor& tail_out,
-    int64_t top_k, int64_t num_router_gates, int64_t tail_rank,
+    int64_t top_k, int64_t num_router_gates, int64_t tp_rank,
     int64_t tail_mc_base, int64_t tail_grid_cap,
     const std::string& scoring_func, const std::string& activation,
     bool renormalize, double situ_beta, double situ_linear_beta,
-    double tail_eps, const std::string& quant_mode, bool use_pdl) {
+    double tail_eps, const std::string& quant_mode, int64_t tp_size,
+    bool use_pdl) {
     TORCH_CHECK(
         quant_mode == "w8a8-mxfp8" || quant_mode == "w4a8-mxfp4" ||
             quant_mode == "w8a8-blockwise",
@@ -383,6 +382,8 @@ void LowLatencyMoE(
                     "situ_beta / situ_linear_beta must be finite (<= 0 "
                     "means no cap).");
     }
+    TORCH_CHECK(tp_size == 1 || tp_size == 4, "tp_size must be 1 or 4, got ",
+                tp_size, ".");
 
     const int64_t scoring_type = scoring_func == "sigmoid" ? 0 : 1;
     const int64_t activation_type = activation == "silu" ? 0 : 1;
@@ -397,8 +398,8 @@ void LowLatencyMoE(
             latent_down_weight_scale, tail_fc2_weight, tail_fc2_scale,
             tail_norm_weight, correction_bias, per_expert_scale, tail_epochs,
             tail_uc_bases, workspace, tail_out, top_k, scoring_type,
-            activation_type, tail_rank, tail_mc_base, tail_grid_cap,
-            renormalize, situ_beta, situ_linear_beta, tail_eps, use_pdl);
+            activation_type, tp_rank, tail_mc_base, tail_grid_cap, renormalize,
+            situ_beta, situ_linear_beta, tail_eps, use_pdl);
     };
 
     constexpr auto kBWFP8 = moe::QuantMethod::kBlockwiseFP8;
@@ -408,33 +409,54 @@ void LowLatencyMoE(
     using QuantMXFP8 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP8>;
     using QuantMXFP4 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP4>;
 
+    const auto launch_for_tp_size = [&](auto quant_tag) {
+        if (tp_size == 1) {
+            if (num_tokens <= 8) {
+                launch_func(
+                    moe::Dims_BS8_E512_N512_K2048_SM100<decltype(quant_tag){},
+                                                        true, 1>{});
+            } else {
+                launch_func(
+                    moe::Dims_BS16_E512_N512_K2048_SM100<decltype(quant_tag){},
+                                                         true, 1>{});
+            }
+        } else {
+            if (num_tokens <= 8) {
+                launch_func(
+                    moe::Dims_BS8_E512_N512_K2048_SM100<decltype(quant_tag){},
+                                                        true, 4>{});
+            } else {
+                launch_func(
+                    moe::Dims_BS16_E512_N512_K2048_SM100<decltype(quant_tag){},
+                                                         true, 4>{});
+            }
+        }
+    };
+
     if (quant_mode == "w4a8-mxfp4") {
-        if (num_tokens <= 8) {
-            launch_func(moe::Dims_BS8_E512_N512_K2048_SM100<QuantMXFP4{}>{});
-        } else {
-            launch_func(moe::Dims_BS16_E512_N512_K2048_SM100<QuantMXFP4{}>{});
-        }
+        launch_for_tp_size(QuantMXFP4{});
     } else if (quant_mode == "w8a8-mxfp8") {
-        if (num_tokens <= 8) {
-            launch_func(moe::Dims_BS8_E512_N512_K2048_SM100<QuantMXFP8{}>{});
-        } else {
-            launch_func(moe::Dims_BS16_E512_N512_K2048_SM100<QuantMXFP8{}>{});
-        }
+        launch_for_tp_size(QuantMXFP8{});
     } else {
-        if (num_tokens <= 8) {
-            launch_func(moe::Dims_BS8_E512_N512_K2048_SM100<QuantBWFP8{}>{});
-        } else {
-            launch_func(moe::Dims_BS16_E512_N512_K2048_SM100<QuantBWFP8{}>{});
-        }
+        launch_for_tp_size(QuantBWFP8{});
     }
 }
 
-int64_t MoETailRegionBytes(bool wide) {
+int64_t MoETailRegionBytes(bool wide, int64_t tp_size) {
     using QuantBWFP8 = moe::QuantConfig<>;
-    return wide ? moe::tail_region_bytes<
-                      moe::Dims_BS16_E512_N512_K2048_SM100<QuantBWFP8{}>>()
-                : moe::tail_region_bytes<
-                      moe::Dims_BS8_E512_N512_K2048_SM100<QuantBWFP8{}>>();
+    TORCH_CHECK(tp_size == 1 || tp_size == 4, "tp_size must be 1 or 4.");
+    if (tp_size == 1) {
+        return wide
+                   ? moe::tail_region_bytes<
+                         moe::Dims_BS16_E512_N512_K2048_SM100<QuantBWFP8{},
+                                                              true, 1>>()
+                   : moe::tail_region_bytes<moe::Dims_BS8_E512_N512_K2048_SM100<
+                         QuantBWFP8{}, true, 1>>();
+    }
+    return wide ? moe::tail_region_bytes<moe::Dims_BS16_E512_N512_K2048_SM100<
+                      QuantBWFP8{}, true, 4>>()
+                : moe::tail_region_bytes<moe::Dims_BS8_E512_N512_K2048_SM100<
+                      QuantBWFP8{}, true, 4>>();
 }
 
 int64_t RouterTileM(int64_t num_tokens = 0) {
