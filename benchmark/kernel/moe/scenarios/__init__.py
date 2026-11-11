@@ -14,6 +14,6 @@
 # limitations under the License.
 """
 
-from kernel.moe.scenarios.low_latency_moe import run_scenario
+from kernel.moe.scenarios.mega_ll_moe import run_scenario
 
-SCENARIOS = {"low_latency_moe": run_scenario}
+SCENARIOS = {"mega_ll_moe": run_scenario}

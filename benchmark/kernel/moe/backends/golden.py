@@ -38,7 +38,7 @@ def _dequant_weight(
 
     rows, groups = scale.shape[-2:]
     if sfatom:
-        from halops.moe.low_latency_moe_utils import _sf_atom_offsets
+        from halops.moe.mega_ll_moe_utils import _sf_atom_offsets
 
         offsets = _sf_atom_offsets(rows, groups, scale.device)
         plain = scale.reshape(*scale.shape[:-2], -1)[..., offsets]
@@ -159,7 +159,7 @@ def tail(inp: dict, routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def run_low_latency_moe_golden(inp: dict) -> torch.Tensor:
+def run_mega_ll_moe_golden(inp: dict) -> torch.Tensor:
     """BF16 projections with FP32 routing, activation and normalization."""
     routed, shared = routed_and_shared(inp)
     return tail(inp, routed, shared)

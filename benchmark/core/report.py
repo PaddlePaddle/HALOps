@@ -38,7 +38,7 @@ def _is_gemm_scenario(scenario):
 
 
 def _is_moe_scenario(scenario):
-    return scenario == "low_latency_moe"
+    return scenario == "mega_ll_moe"
 
 
 def _format_scenario_str(scenario: str, row: dict) -> str:

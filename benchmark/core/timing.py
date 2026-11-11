@@ -62,12 +62,15 @@ def _measure_with_event(
     runner: Callable,
     repeat_iters: int,
     cold_l2_cache: bool,
+    before_iter: Callable[[], None] | None = None,
 ) -> list[float]:
     """Return per-iteration elapsed times (us) measured with torch.cuda.Event."""
     result: list[float] = []
     for _ in range(repeat_iters):
         if cold_l2_cache:
             _flush_l2_cache()
+        if before_iter is not None:
+            before_iter()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -85,6 +88,7 @@ def bench_gpu_time_cupti(
     repeat_iters: int = 50,
     cold_l2_cache: bool = True,
     use_cuda_graph: bool = False,
+    before_iter: Callable[[], None] | None = None,
 ) -> TimingResult:
     """Benchmark GPU kernel time using CUPTI activity tracing."""
     # CUPTI buffer callbacks
@@ -131,6 +135,8 @@ def bench_gpu_time_cupti(
         if cold_l2_cache:
             _flush_l2_cache()
         torch.cuda.synchronize()
+        if before_iter is not None:
+            before_iter()
         t0 = cupti.get_timestamp()
         runner()
         t1 = cupti.get_timestamp()
@@ -184,12 +190,13 @@ def bench_gpu_time_event(
     dry_run_iters: int = 10,
     repeat_iters: int = 50,
     cold_l2_cache: bool = True,
+    before_iter: Callable[[], None] | None = None,
 ) -> TimingResult:
     """Benchmark GPU time using torch.cuda.Event only (no profiler overhead)."""
     _run_warmup(fn, input_args, dry_run_iters)
     runner = lambda: fn(*input_args)  # noqa: E731
     return TimingResult(
-        device_us=_measure_with_event(runner, repeat_iters, cold_l2_cache)
+        device_us=_measure_with_event(runner, repeat_iters, cold_l2_cache, before_iter)
     )
 
 
@@ -199,6 +206,7 @@ def bench_gpu_time_profiler(
     dry_run_iters: int = 10,
     repeat_iters: int = 50,
     cold_l2_cache: bool = True,
+    before_iter: Callable[[], None] | None = None,
 ) -> TimingResult:
     """Benchmark GPU kernel time using torch.profiler."""
     warnings.filterwarnings("ignore", message=".*Profiler clears events.*")
@@ -207,13 +215,15 @@ def bench_gpu_time_profiler(
     runner = lambda: fn(*input_args)  # noqa: E731
 
     # Pass 1: torch.cuda.Event for end-to-end (host-perceived) latency.
-    host_us = _measure_with_event(runner, repeat_iters, cold_l2_cache)
+    host_us = _measure_with_event(runner, repeat_iters, cold_l2_cache, before_iter)
 
     # Pass 2: torch.profiler for device kernel time, one profile per iteration.
     device_us: list[float] = []
     for _ in range(repeat_iters):
         if cold_l2_cache:
             _flush_l2_cache()
+        if before_iter is not None:
+            before_iter()
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CUDA],
             with_stack=False,
@@ -236,12 +246,17 @@ def bench_gpu_time(
     cold_l2_cache: bool = True,
     use_cuda_graph: bool = False,
     method: str = "profiler",
+    before_iter: Callable[[], None] | None = None,
 ) -> TimingResult:
     """Dispatch to a timing backend selected by ``method``.
 
     "event"    -> bench_gpu_time_event    (torch.cuda.Event only; fast, low overhead)
     "cupti"    -> bench_gpu_time_cupti    (CUPTI hardware clock; supports CUDA graph)
     "profiler" -> bench_gpu_time_profiler (torch.cuda.Event + torch.profiler)
+
+    ``before_iter`` runs before every measured iteration, after the L2 flush:
+    a rank barrier in a tensor-parallel run, so the per-iteration launches stay
+    aligned and the kernel duration does not carry the launch skew.
     """
     if method == "event":
         if use_cuda_graph:
@@ -254,6 +269,7 @@ def bench_gpu_time(
             dry_run_iters=dry_run_iters,
             repeat_iters=repeat_iters,
             cold_l2_cache=cold_l2_cache,
+            before_iter=before_iter,
         )
     if method == "cupti":
         return bench_gpu_time_cupti(
@@ -263,6 +279,7 @@ def bench_gpu_time(
             repeat_iters=repeat_iters,
             cold_l2_cache=cold_l2_cache,
             use_cuda_graph=use_cuda_graph,
+            before_iter=before_iter,
         )
     if method == "profiler":
         if use_cuda_graph:
@@ -276,6 +293,7 @@ def bench_gpu_time(
             dry_run_iters=dry_run_iters,
             repeat_iters=repeat_iters,
             cold_l2_cache=cold_l2_cache,
+            before_iter=before_iter,
         )
     raise ValueError(
         f"unknown timing method {method!r}; expected 'event', 'cupti', or 'profiler'"
@@ -292,8 +310,14 @@ def profile_kernel_timeline(
     launch_metadata: dict | None = None,
     do_stats: bool = True,
     cold_l2_cache: bool = True,
+    before_launch: Callable[[], None] | None = None,
 ) -> dict:
-    """Run a timer-enabled kernel once and write its Chrome trace."""
+    """Run a timer-enabled kernel once and write its Chrome trace.
+
+    ``before_launch`` runs after the L2 flush and right before the measured
+    launch: a rank barrier in a tensor-parallel profile, so the trace shows the
+    kernel's own skew and not the setup skew of the warmups in front of it.
+    """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to generate a kernel timer timeline")
     if warmup_iters < 0:
@@ -304,6 +328,8 @@ def profile_kernel_timeline(
     torch.cuda.synchronize()
     if cold_l2_cache:
         _flush_l2_cache()
+    if before_launch is not None:
+        before_launch()
     fn(*input_args)
     torch.cuda.synchronize()
 

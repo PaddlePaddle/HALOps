@@ -322,12 +322,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="Profile one MoE config with the kernel timer and write a timeline.",
+        help="Profile one MoE config with the kernel timer and write a timeline. "
+        "With tp_size=4 every rank is profiled and the per-rank exports are "
+        "merged into one multi-GPU timeline.",
     )
     parser.add_argument(
         "--profile-output",
         default="timeline.json",
-        help="Timeline JSON path used with --profile.",
+        help="Timeline JSON path used with --profile (the merged file for "
+        "tp_size=4).",
     )
     args = parser.parse_args()
     main(args)

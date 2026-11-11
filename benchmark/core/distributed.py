@@ -140,6 +140,9 @@ class RankContext:
     def worst_timing(self, timing: TimingResult) -> TimingResult:
         return worst_rank_timing(timing) if self.world > 1 else timing
 
+    def gather_timings(self, timing: TimingResult) -> list[TimingResult]:
+        return gather_rank_timings(timing) if self.world > 1 else [timing]
+
     def worst_refcheck(self, result: RefcheckResult) -> RefcheckResult:
         return worst_rank_refcheck(result) if self.world > 1 else result
 
@@ -191,11 +194,19 @@ def sum_across_ranks(tensor: torch.Tensor) -> torch.Tensor:
     return total
 
 
-def worst_rank_timing(timing: TimingResult) -> TimingResult:
-    """All ranks: the slowest rank's distribution, which the report shows."""
+def gather_rank_timings(timing: TimingResult) -> list[TimingResult]:
+    """All ranks: every rank's timing distribution, ordered by rank."""
     gathered = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(gathered, timing)
-    return max(gathered, key=lambda item: statistics.median(item.device_us))
+    return gathered
+
+
+def worst_rank_timing(timing: TimingResult) -> TimingResult:
+    """All ranks: the slowest rank's distribution, which the report shows."""
+    return max(
+        gather_rank_timings(timing),
+        key=lambda item: statistics.median(item.device_us),
+    )
 
 
 def worst_rank_refcheck(result: RefcheckResult) -> RefcheckResult:

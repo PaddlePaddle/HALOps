@@ -20,7 +20,9 @@ adding a probe is a one-line edit in the kernel.
 
 The export is one Chrome Trace Format file -- one track per (CTA, warp), spans
 from ``begin``/``end`` pairs, marks as instants -- loadable in ui.perfetto.dev
-or chrome://tracing.  Driven by ``bash profile.sh``.
+or chrome://tracing.  A tensor-parallel launch exports one such file per rank;
+``merge_traces`` stitches them into a single file, one process block per
+(rank, CTA).  Driven by ``bash profile.sh``.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
-__all__ = ["SiteMap", "collect_and_write", "write_csv"]
+__all__ = ["SiteMap", "collect_and_write", "merge_traces", "write_csv"]
 
 _KERNEL_SOURCE_SUFFIXES = (".cu", ".cuh", ".h", ".hpp")
 # A probe line, for the stale-source self-check and for finding the tag.
@@ -631,6 +633,69 @@ def collect_and_write(
     if do_stats:
         stats(rows, intervals, marks, sites, meta, stray=stray, unclosed=unclosed)
     return trace
+
+
+def merge_traces(paths, out_path):
+    """Combine per-rank traces into one Chrome Trace Format file.
+
+    A tensor-parallel launch pulls one timer buffer per rank, so a profile
+    writes one trace per GPU.  ``%globaltimer`` is NOT synchronized across
+    GPUs -- on the GB100 node measured here the four devices sit 25/53/75 us
+    apart, and the offsets are stable -- so the merge does not pretend to know
+    the ranks' common origin.  Every rank keeps its own time base (its first
+    probe is 0), which is what makes the tracks comparable; each rank's raw
+    ``t0_ns`` stays in the metadata for reference.
+
+    Ids are per-trace, so the merge stacks the ranks in ``pid`` space: rank
+    ``r``'s CTA ``n`` becomes one process named ``GPU r / CTA n``.  The merged
+    metadata keeps the first rank's fields and adds a ``ranks`` list with each
+    rank's ``t0_ns``, grid and launch metadata.
+    """
+    paths = [str(path) for path in paths]
+    traces = []
+    for path in paths:
+        with open(path) as handle:
+            traces.append(json.load(handle))
+    metas = [trace.get("metadata", {}) for trace in traces]
+
+    events: list[dict] = []
+    pid_base = 0
+    for rank, trace in enumerate(traces):
+        for event in trace["traceEvents"]:
+            event["pid"] += pid_base
+            if event.get("ph") == "M":
+                # One process block per (rank, CTA) keeps the ranks apart in
+                # the viewer while the per-CTA track names stay recognisable.
+                if event.get("name") == "process_name":
+                    event["args"]["name"] = f"GPU {rank} / {event['args']['name']}"
+                    event["args"]["rank"] = rank
+                elif event.get("name") == "process_sort_index":
+                    event["args"]["sort_index"] = event["pid"]
+            events.append(event)
+        pid_base += int(metas[rank].get("ctas", 0))
+
+    merged = {
+        "traceEvents": events,
+        "metadata": {
+            **{key: value for key, value in metas[0].items() if key != "ranks"},
+            "ranks": [
+                {
+                    "rank": rank,
+                    "t0_ns": int(meta.get("t0_ns", 0)),
+                    "ctas": int(meta.get("ctas", 0)),
+                    "launch": meta.get("launch", {}),
+                }
+                for rank, meta in enumerate(metas)
+            ],
+        },
+    }
+    with open(out_path, "w") as handle:
+        json.dump(merged, handle)
+    print(
+        f"[trace] wrote {out_path} ({len(events)} events, "
+        f"{len(traces)} ranks, each starting at its own t0_ns)"
+    )
+    return merged
 
 
 def write_csv(trace: dict, path) -> None:

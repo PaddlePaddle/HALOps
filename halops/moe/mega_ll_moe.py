@@ -20,7 +20,7 @@ from typing import Optional
 import torch
 
 import halops.halops_kernel as halops_kernel
-from halops.moe.low_latency_moe_utils import (
+from halops.moe.mega_ll_moe_utils import (
     _NARROW_TOKENS,
     _TAIL_ALIGN,
     _check_workspace,
@@ -28,7 +28,7 @@ from halops.moe.low_latency_moe_utils import (
 
 __all__ = [
     "MoEWorkspace",
-    "low_latency_moe",
+    "mega_ll_moe",
     "get_workspace_for_moe",
     "get_workspace_size_for_moe",
 ]
@@ -36,7 +36,7 @@ __all__ = [
 
 @dataclass
 class MoEWorkspace:
-    """Scratchpad and tail communication state of ``low_latency_moe``.
+    """Scratchpad and tail communication state of ``mega_ll_moe``.
 
     The kernel has a narrow (1 <= T <= 8) and a wide (9 <= T <= 16)
     schedule; each has its own scratchpad and tail layout, so a workspace is
@@ -77,7 +77,7 @@ def get_workspace_for_moe(
     tp_rank: int,
     tp_size: int,
 ) -> MoEWorkspace:
-    """Allocate the workspace of ``low_latency_moe`` for ``input``'s token count.
+    """Allocate the workspace of ``mega_ll_moe`` for ``input``'s token count.
 
     For tp_size 4, allocation is collective over ``group_name``. Allocate it
     once, before any CUDA-graph capture, and reuse it across calls and graph
@@ -92,7 +92,7 @@ def get_workspace_for_moe(
         tp_size: Size of that group. Supported values are 1 and 4.
 
     Returns:
-        The workspace to pass to ``low_latency_moe``.
+        The workspace to pass to ``mega_ll_moe``.
     """
     wide = input.size(0) > _NARROW_TOKENS
     device = input.device
@@ -145,7 +145,7 @@ def get_workspace_for_moe(
     )
 
 
-def low_latency_moe(
+def mega_ll_moe(
     input: torch.Tensor,
     router_weight: torch.Tensor,
     expert_up_weights: torch.Tensor,
@@ -301,7 +301,7 @@ def low_latency_moe(
         None. The outputs are written in place.
     """
     _check_workspace(workspace, input.size(0))
-    halops_kernel.low_latency_moe(
+    halops_kernel.mega_ll_moe(
         input,
         router_weight,
         expert_up_weights,

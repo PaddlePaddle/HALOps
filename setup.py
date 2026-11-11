@@ -105,7 +105,7 @@ setup(
                 # "csrc/kernel/mla/mla_output_proj.cu",
                 # "csrc/kernel/mla/combine_with_rope_quant.cu",
                 # "csrc/kernel/mla/vha_postmix_quant.cu",
-                "csrc/kernel/moe/low_latency_moe.cu",
+                "csrc/kernel/moe/mega_ll_moe.cu",
                 "csrc/common/kernel_timer_host.cu",
                 "csrc/common/cpp_extensions.cc",
             ],

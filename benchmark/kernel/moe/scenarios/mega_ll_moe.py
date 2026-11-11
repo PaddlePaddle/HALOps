@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -42,10 +44,10 @@ from kernel.moe.backends.golden import (
     _dequant_weight,
     _route,
     routed_and_shared,
-    run_low_latency_moe_golden,
+    run_mega_ll_moe_golden,
     tail,
 )
-from kernel.moe.backends.halops import run_low_latency_moe
+from kernel.moe.backends.halops import run_mega_ll_moe
 
 
 MOE_MODES = ("w8a8-blockwise", "w8a8-mxfp8", "w4a8-mxfp4")
@@ -69,6 +71,11 @@ class MoeTiming:
     timing: TimingResult
     bytes_io: int
     active_experts: int | None = None
+    # tp_size > 1: per-rank kernel time, ordered by rank.  The median is the
+    # rank's typical launch and still contains the wait for a late peer; the
+    # min is the same rank's best launch, i.e. its own kernel time.
+    rank_median_us: list[float] | None = None
+    rank_min_us: list[float] | None = None
 
 
 def _validate_config(cfg: dict) -> dict:
@@ -91,7 +98,7 @@ def _validate_config(cfg: dict) -> dict:
     }
     for name, value in MOE_SHAPE.items():
         if options[name] != value:
-            raise ValueError(f"LowLatencyMoE requires {name}={value}")
+            raise ValueError(f"MegaLLMoE requires {name}={value}")
     parts = set(filter(None, str(options["routing"]).split("+")))
     if not parts <= {"bias", "perexpert"}:
         raise ValueError(
@@ -300,8 +307,8 @@ def adapt_golden(raw: MoeInput, tp: RankContext) -> dict:
 
 def _get_backends(names):
     registry = {
-        "halops": (adapt_halops, run_low_latency_moe),
-        "golden": (adapt_golden, run_low_latency_moe_golden),
+        "halops": (adapt_halops, run_mega_ll_moe),
+        "golden": (adapt_golden, run_mega_ll_moe_golden),
     }
     unknown = set(names) - registry.keys()
     if unknown:
@@ -313,6 +320,8 @@ def _rank_body(tp: RankContext, mode: str, job: dict) -> dict | None:
     """This rank's share of a launch; rank 0 returns the row."""
     if mode == "refcheck":
         return _refcheck_rank(tp, job["cfg"], job["kwargs"])
+    if mode == "profile":
+        return _profile_rank(tp, job["cfg"])
     return _bench_rank(tp, job["cfg"], job["name"], job["kwargs"])
 
 
@@ -327,9 +336,20 @@ def _bench_rank(
     bytes_io = _bytes_io(inputs, cfg["num_experts"], name, unique_experts)
     del raw
     tp.sync()
-    timing = bench_gpu_time(run_fn, (inputs,), **timing_kwargs)
+    # Re-align the ranks before every measured iteration: without it the four
+    # processes drift apart and the kernel's tail AllReduce turns that drift
+    # into wait time inside the measured kernel duration.
+    timing = bench_gpu_time(
+        run_fn,
+        (inputs,),
+        before_iter=tp.sync if tp.world > 1 else None,
+        **timing_kwargs,
+    )
     tp.sync()
-    timing = tp.worst_timing(timing)
+    # The row shows the worst rank; the per-rank medians make the spread (and
+    # the launch-skew wait it carries) visible in the log.
+    timings = tp.gather_timings(timing)
+    timing = max(timings, key=lambda item: statistics.median(item.device_us))
     if not tp.is_leader:
         return None
     return {
@@ -338,6 +358,8 @@ def _bench_rank(
         "dispatch_us": [float(v) for v in timing.dispatch_us],
         "bytes_io": int(bytes_io),
         "active_experts": int(unique_experts),
+        "rank_median_us": [float(statistics.median(t.device_us)) for t in timings],
+        "rank_min_us": [float(min(t.device_us)) for t in timings],
     }
 
 
@@ -347,7 +369,7 @@ def _refcheck_rank(tp: RankContext, cfg: dict, kwargs: dict) -> dict | None:
     raw = _build_inputs(cfg, tp.rank)
     golden_inputs = adapt_golden(raw, tp)
     halops_inputs = adapt_halops(raw, tp)
-    out = run_low_latency_moe(halops_inputs)
+    out = run_mega_ll_moe(halops_inputs)
     del halops_inputs
     routed, shared = routed_and_shared(golden_inputs)
     reference = tail(
@@ -437,62 +459,113 @@ def _bench_entry(
         host_us=payload["host_us"],
         dispatch_us=payload["dispatch_us"],
     )
-    return MoeTiming(timing, payload["bytes_io"], payload["active_experts"])
+    return MoeTiming(
+        timing,
+        payload["bytes_io"],
+        payload["active_experts"],
+        payload.get("rank_median_us"),
+        payload.get("rank_min_us"),
+    )
+
+
+def _rank_profile_path(profile_output: str, rank: int, world: int) -> str:
+    """Where one rank writes its timer export.
+
+    A single-GPU profile writes the requested file; a tensor-parallel one
+    writes one file per rank next to it, which `_run_profile` then merges.
+    """
+    if world == 1:
+        return profile_output
+    path = Path(profile_output)
+    return str(path.with_name(f"{path.stem}_r{rank}{path.suffix}"))
+
+
+@torch.no_grad()
+def _profile_rank(tp: RankContext, options: dict) -> dict | None:
+    """This rank's launch under the timer; rank 0 returns the row."""
+    raw = _build_inputs(options, tp.rank)
+    inputs = adapt_halops(raw, tp)
+    active_experts = _active_experts(raw)
+    del raw
+    # The first barrier lines the ranks up for the warmups -- the fused tail's
+    # AllReduce is a rendezvous, so they then stay in lockstep; the second one
+    # (before_launch, after each rank's own L2 flush) aligns the launch itself.
+    tp.sync()
+    profile_kernel_timeline(
+        run_mega_ll_moe,
+        (inputs,),
+        _rank_profile_path(options["profile_output"], tp.rank, tp.world),
+        warmup_iters=max(0, options.get("dry_run_iters", 5)),
+        warp_roles={
+            0: "calc tmem",
+            1: "calc",
+            2: "calc",
+            3: "calc",
+            4: "calc",
+            5: "calc",
+            6: "calc",
+            7: "calc",
+            8: "mma",
+            9: "tma weight",
+            10: "tma other",
+            11: "idle",
+        },
+        cold_l2_cache=options.get("cold_l2_cache", True),
+        before_launch=tp.sync,
+        launch_metadata={
+            "config": options.get("profile_config", ""),
+            "cold_l2_cache": options.get("cold_l2_cache", True),
+            "tokens": options["batch_size"],
+            "top_k": options["top_k"],
+            "experts": options["num_experts"],
+            "active_experts": active_experts,
+            "intermediate": options["intermediate_size"],
+            "hidden": options["hidden_size"],
+            "latent": options["latent_size"],
+            "quant_mode": options["quant_mode"],
+            "activation": options["activation"],
+            "tp_size": options["tp_size"],
+            "rank": tp.rank,
+        },
+    )
+    if not tp.is_leader:
+        return None
+    return {"active_experts": active_experts}
 
 
 @torch.no_grad()
 def _run_profile(cfg: dict) -> None:
-    if cfg.get("tp_size", 1) > 1:
-        raise ValueError("kernel timer profiling supports tp_size=1 only")
-    warp_roles = {
-        0: "calc tmem",
-        1: "calc",
-        2: "calc",
-        3: "calc",
-        4: "calc",
-        5: "calc",
-        6: "calc",
-        7: "calc",
-        8: "mma",
-        9: "tma weight",
-        10: "tma other",
-        11: "idle",
-    }
+    """Profile one launch of a config.
+
+    With tp_size=4 every rank exports its own timer pull and the ranks are
+    merged into the requested file, so one timeline holds all four GPUs.
+    """
     if cfg.get("use_cuda_graph", False):
         raise ValueError("MoE kernel timer profiling does not support CUDA graph")
 
-    local = _validate_config(
+    options = _validate_config(
         {
             **cfg,
             "batch_size": max(cfg.get("batch_sizes", [cfg.get("batch_size", 1)])),
             "top_k": cfg.get("top_k_list", [cfg.get("top_k", 8)])[0],
+            # The rank workers run from benchmark/, so the path must be absolute.
+            "profile_output": str(Path(cfg["profile_output"]).expanduser().resolve()),
         }
     )
-    raw = _build_inputs(local)
-    inputs = adapt_halops(raw, RankContext.local())
-    active_experts = _active_experts(raw)
-    del raw
-    profile_kernel_timeline(
-        run_low_latency_moe,
-        (inputs,),
-        cfg["profile_output"],
-        warmup_iters=max(0, cfg.get("dry_run_iters", 5)),
-        warp_roles=warp_roles,
-        cold_l2_cache=cfg.get("cold_l2_cache", True),
-        launch_metadata={
-            "config": cfg.get("profile_config", ""),
-            "cold_l2_cache": cfg.get("cold_l2_cache", True),
-            "tokens": local["batch_size"],
-            "top_k": local["top_k"],
-            "experts": local["num_experts"],
-            "active_experts": active_experts,
-            "intermediate": local["intermediate_size"],
-            "hidden": local["hidden_size"],
-            "latent": local["latent_size"],
-            "quant_mode": local["quant_mode"],
-            "activation": local["activation"],
-        },
-    )
+    with tensor_parallel_context(options["tp_size"], __file__) as tp:
+        tp.run("profile", {"cfg": options}, _rank_body)
+    if options["tp_size"] == 1:
+        return
+
+    from halops.moe.device_timer import merge_traces
+
+    rank_paths = [
+        _rank_profile_path(options["profile_output"], rank, options["tp_size"])
+        for rank in range(options["tp_size"])
+    ]
+    merge_traces(rank_paths, options["profile_output"])
+    for path in rank_paths:
+        Path(path).unlink(missing_ok=True)
 
 
 def run_scenario(cfg: dict) -> None:
@@ -515,6 +588,13 @@ def run_scenario(cfg: dict) -> None:
         raise ValueError("use_cuda_graph requires --timing-method=cupti")
     if cfg.get("tp_size", 1) > 1 and cfg.get("use_cuda_graph", False):
         raise ValueError("tp_size > 1 does not support CUDA graph timing")
+    if cfg.get("tp_size", 1) > 1 and cfg.get("timing_method", "profiler") == "profiler":
+        print(
+            "[WARN] tp_size>1 + timing_method='profiler': torch.profiler's "
+            "per-iteration overhead perturbs the cross-rank launch cadence, so "
+            "each rank's kernel duration picks up the wait for its peers. Use "
+            "--timing-method=cupti for stable per-rank kernel times."
+        )
     if cfg.get("dry_run_iters", 10) < 1 or cfg.get("repeat_iters", 50) < 1:
         raise ValueError("dry_run_iters and repeat_iters must be positive")
     failed = []
@@ -567,7 +647,7 @@ def run_scenario(cfg: dict) -> None:
                     f"tokens={local['batch_size']}, top_k={top_k}, {name}: {status}"
                 )
             row = MoeRowResult(
-                scenario="low_latency_moe",
+                scenario="mega_ll_moe",
                 backend=name,
                 tokens=local["batch_size"],
                 top_k=top_k,
@@ -595,7 +675,24 @@ def run_scenario(cfg: dict) -> None:
                 print_scenario_header(row)
                 print_table_header()
             print_table_row(row)
-            append_moe_csv(row, local.get("output_path", "results/low_latency_moe.csv"))
+            if (
+                status == "OK"
+                and timing
+                and local["tp_size"] > 1
+                and timing.rank_median_us
+            ):
+                medians = " ".join(
+                    f"r{rank}={us:.1f}" for rank, us in enumerate(timing.rank_median_us)
+                )
+                mins = " ".join(
+                    f"r{rank}={us:.1f}" for rank, us in enumerate(timing.rank_min_us)
+                )
+                print(
+                    f"    tp={local['tp_size']} kernel time per rank:"
+                    f" median {medians} | min {mins}"
+                    " (row above: worst median; min = no peer wait)"
+                )
+            append_moe_csv(row, local.get("output_path", "results/mega_ll_moe.csv"))
     if failed:
         raise RuntimeError("MoE benchmark failed: " + "; ".join(failed))
 

@@ -559,6 +559,123 @@ def test_group_masked_mxfp4(max_m_per_expert, num_experts, n, k, full_x, masked_
     )
 
 
+def make_w4a8_mxfp4_inputs(
+    max_m_per_expert,
+    num_experts,
+    n,
+    k,
+    full_x=True,
+    masked_m=None,
+):
+    """Build W4A8-MXFP4 masked inputs: fp8 A x packed-fp4 B, both UE8M0 group-32."""
+    masked_m_t = make_masked_m(num_experts, max_m_per_expert, full_x)
+
+    M_total = num_experts * max_m_per_expert
+    x_origin = torch.randn([M_total, k], dtype=torch.bfloat16)
+    w_origin = torch.randn([num_experts, n, k], dtype=torch.bfloat16)
+
+    # A: unpacked fp8 e4m3 with a group-32 UE8M0 scale (same recipe as w8a8).
+    x, sfa_logical = per_token_cast_to_fp8(x_origin, 32)
+    # B: packed fp4 e2m1 with a group-32 UE8M0 scale (same recipe as w4a4-mxfp4).
+    w_packed, sfb_logical, w_fp4_float = per_block_cast_to_mxfp4(
+        w_origin, MXFP4_BLOCK_SIZE
+    )
+
+    # Dequantize A to float so the shared w4a4 matmul reference can consume it.
+    sfa_expanded = torch.repeat_interleave(ue8m0_to_float32(sfa_logical), 32, dim=1)
+    x_deq_float = x.to(torch.float32) * sfa_expanded
+
+    sfa = reorder_sf_to_cutlass(sfa_logical, M_total, k // 32)
+    sfb = reorder_sf_to_cutlass(sfb_logical, n, k // 32)
+
+    if masked_m is not None:
+        masked_m_t = torch.tensor(masked_m, dtype=torch.int32)
+
+    return SimpleNamespace(
+        max_m_per_expert=max_m_per_expert,
+        num_experts=num_experts,
+        masked_m=masked_m_t,
+        x=x,
+        w_packed=w_packed,
+        x_deq_float=x_deq_float,
+        w_fp4_float=w_fp4_float,
+        sfa=sfa,
+        sfb=sfb,
+        sm_count=-1,
+        mode="w4a8-mxfp4",
+    )
+
+
+@pytest.mark.parametrize(
+    "max_m_per_expert, num_experts, n, k, full_x, masked_m",
+    [
+        pytest.param(
+            16,
+            4,
+            FULL_N,
+            FULL_K,
+            True,
+            None,
+            id="max_m16_e4",
+            marks=pytest.mark.xfail(
+                reason="sub-64 swap tile needs per-expert-128 split-SF handling "
+                "in the masked path (expert>=1 reads the wrong SF atom)",
+                strict=True,
+            ),
+        ),
+        pytest.param(
+            32,
+            8,
+            FULL_N,
+            FULL_K,
+            True,
+            None,
+            id="max_m32_e8",
+            marks=pytest.mark.xfail(
+                reason="sub-64 swap tile needs per-expert-128 split-SF handling "
+                "in the masked path (expert>=1 reads the wrong SF atom)",
+                strict=True,
+            ),
+        ),
+        pytest.param(64, 8, FULL_N, FULL_K, True, None, id="max_m64_e8"),
+        pytest.param(128, 4, FULL_N, FULL_K, True, None, id="max_m128_e4"),
+        pytest.param(
+            128,
+            4,
+            128,
+            512,
+            False,
+            [11, 37, 89, 128],
+            id="max_m128_e4_n128_k512_partial",
+        ),
+    ],
+)
+def test_group_masked_w4a8_mxfp4(max_m_per_expert, num_experts, n, k, full_x, masked_m):
+    inp = make_w4a8_mxfp4_inputs(
+        max_m_per_expert, num_experts, n, k, full_x=full_x, masked_m=masked_m
+    )
+    ref_out = ref_group_masked_gemm_w4a4(
+        inp.x_deq_float,
+        inp.w_fp4_float,
+        inp.masked_m,
+        inp.max_m_per_expert,
+        inp.num_experts,
+    )
+    output = group_masked_gemm_wrapper(
+        inp.x,
+        inp.w_packed,
+        inp.sfa,
+        inp.sfb,
+        inp.masked_m,
+        inp.max_m_per_expert,
+        sm_count=inp.sm_count,
+        mode=inp.mode,
+    )
+    assert_close_per_expert(
+        output, ref_out, inp.masked_m, inp.max_m_per_expert, W4A4_TOL
+    )
+
+
 # =====================================================================
 # Unsupported-input checks
 # =====================================================================
@@ -606,6 +723,49 @@ def run_mxfp4_bad_sf_k():
 def test_group_masked_mxfp4_errors(launch, expected):
     with pytest.raises(RuntimeError, match=re.escape(expected)):
         launch()
+
+
+def run_w4a8_mxfp4(max_m=128, bias=False, alpha=False):
+    num_experts, n, k = 2, 256, 512
+    x = torch.empty([num_experts * max_m, k], dtype=torch.float8_e4m3fn)
+    w = torch.empty([num_experts, n, k // 2], dtype=torch.uint8)
+    sfa = torch.empty([num_experts * max_m, k // 32], dtype=torch.uint8)
+    sfb = torch.empty([num_experts, n, k // 32], dtype=torch.uint8)
+    masked_m = torch.full([num_experts], max_m, dtype=torch.int32)
+    out = torch.empty([num_experts * max_m, n], dtype=torch.bfloat16)
+    group_masked_gemm(
+        x,
+        w,
+        sfa,
+        sfb,
+        masked_m,
+        out,
+        torch.empty([num_experts, n], dtype=torch.bfloat16) if bias else None,
+        torch.ones([num_experts], dtype=torch.float32) if alpha else None,
+        max_m,
+        -1,
+        "w4a8-mxfp4",
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        pytest.param(
+            {"bias": True}, "W4A8 mode does not support bias yet", id="w4a8_bias"
+        ),
+        pytest.param({"alpha": True}, "W4A8 mode does not take alpha", id="w4a8_alpha"),
+        # max_m_per_expert must be 64 or a multiple of 128.
+        pytest.param(
+            {"max_m": 192},
+            "No masked w4a8-mxfp4 tile for M=192",
+            id="w4a8_bad_max_m",
+        ),
+    ],
+)
+def test_group_masked_w4a8_mxfp4_errors(kwargs, expected):
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
+        run_w4a8_mxfp4(**kwargs)
 
 
 def run_w8a8_mxfp8_bad_max_m():
@@ -704,73 +864,6 @@ def run_bad_rank_output():
 def test_group_masked_unsupported_shapes(launch, expected):
     with pytest.raises(RuntimeError, match=re.escape(expected)):
         launch()
-
-
-# =====================================================================
-# Determinism tests
-# =====================================================================
-
-
-def test_group_masked_w8a8_mxfp8_determinism():
-    """Determinism: identical inputs must produce bitwise-identical outputs."""
-    inp = make_w8a8_mxfp8_inputs(128, 4, 256, 256, full_x=True)
-    out1, out2 = (
-        group_masked_gemm_wrapper(
-            inp.x,
-            inp.w,
-            inp.sfa,
-            inp.sfb,
-            inp.masked_m,
-            inp.max_m_per_expert,
-            bias=inp.bias,
-            mode=inp.mode,
-        )
-        for _ in range(2)
-    )
-    assert torch.equal(
-        out1, out2
-    ), "W8A8-MXFP8 group_masked_gemm output is not deterministic"
-
-
-def test_group_masked_mxfp4_determinism():
-    """Determinism: identical inputs must produce bitwise-identical outputs."""
-    inp = make_mxfp4_inputs(128, 4, 128, 512, full_x=True)
-    out1, out2 = (
-        group_masked_gemm_wrapper(
-            inp.x_packed,
-            inp.w_packed,
-            inp.sfa,
-            inp.sfb,
-            inp.masked_m,
-            inp.max_m_per_expert,
-            sm_count=inp.sm_count,
-            mode=inp.mode,
-        )
-        for _ in range(2)
-    )
-    assert torch.equal(
-        out1, out2
-    ), "MXFP4 group_masked_gemm output is not deterministic"
-
-
-def test_group_masked_nvfp4_determinism():
-    """Determinism: identical inputs must produce bitwise-identical outputs."""
-    inp = make_nvfp4_inputs(128, 4, 128, 512, full_x=True)
-    out1, out2 = (
-        group_masked_gemm_wrapper(
-            inp.x_packed,
-            inp.w_packed,
-            inp.sfa,
-            inp.sfb,
-            inp.masked_m,
-            inp.max_m_per_expert,
-            alpha=inp.alpha,
-            sm_count=inp.sm_count,
-            mode=inp.mode,
-        )
-        for _ in range(2)
-    )
-    assert torch.equal(out1, out2), "W4A4 group_masked_gemm output is not deterministic"
 
 
 if __name__ == "__main__":

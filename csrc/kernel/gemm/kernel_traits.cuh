@@ -99,6 +99,18 @@ struct GemmKernelTraits {
     static constexpr bool KUsePdl = UsePdl_;
     static constexpr int KMmaK = KIsFP4 ? 64 : 32;
     static constexpr int kItersK = KBlockK / KMmaK;
+    static constexpr bool KBFp4Unpack =
+        !KIsFP4 && cute::sizeof_bits_v<TypeB> == 4;
+    using TypeB_Mma =
+        cute::conditional_t<KBFp4Unpack,
+                            cutlass::detail::float_e2m1_unpacksmem_t, TypeB>;
+    using TypeB_Smem = cute::conditional_t<KBFp4Unpack, uint8_t, TypeB>;
+    static constexpr bool KAFp4Unpack =
+        !KIsFP4 && cute::sizeof_bits_v<TypeA> == 4;
+    using TypeA_Mma =
+        cute::conditional_t<KAFp4Unpack,
+                            cutlass::detail::float_e2m1_unpacksmem_t, TypeA>;
+    using TypeA_Smem = cute::conditional_t<KAFp4Unpack, uint8_t, TypeA>;
     static constexpr EpilogueOp KEpiOp = KernelConfig_::KEpiOp;
     static constexpr bool KQuantD = IsQuantOp(KEpiOp);
     static constexpr bool KGateSigmoid =
@@ -182,22 +194,22 @@ struct GemmKernelTraits {
         KIsFP4,
         cute::conditional_t<
             KNumCTA == 1,
-            cute::SM100_MMA_MXF4_SS<TypeA, TypeB, TypeAccumulate_, TypeSF,
-                                    cute::get<0>(TileShape{}),
+            cute::SM100_MMA_MXF4_SS<TypeA_Mma, TypeB_Mma, TypeAccumulate_,
+                                    TypeSF, cute::get<0>(TileShape{}),
                                     cute::get<1>(TileShape{}), KSFVecSize,
                                     cute::UMMA::Major::K, cute::UMMA::Major::K>,
             cute::SM100_MMA_MXF4_2x1SM_SS<
-                TypeA, TypeB, TypeAccumulate_, TypeSF,
+                TypeA_Mma, TypeB_Mma, TypeAccumulate_, TypeSF,
                 cute::get<0>(TileShape{}), cute::get<1>(TileShape{}),
                 KSFVecSize, cute::UMMA::Major::K, cute::UMMA::Major::K>>,
         cute::conditional_t<
             KNumCTA == 1,
             cute::SM100_MMA_MXF8F6F4_SS<
-                TypeA, TypeB, TypeAccumulate_, TypeSF,
+                TypeA_Mma, TypeB_Mma, TypeAccumulate_, TypeSF,
                 cute::get<0>(TileShape{}), cute::get<1>(TileShape{}),
                 cute::UMMA::Major::K, cute::UMMA::Major::K>,
             cute::SM100_MMA_MXF8F6F4_2x1SM_SS<
-                TypeA, TypeB, TypeAccumulate_, TypeSF,
+                TypeA_Mma, TypeB_Mma, TypeAccumulate_, TypeSF,
                 cute::get<0>(TileShape{}), cute::get<1>(TileShape{}),
                 cute::UMMA::Major::K, cute::UMMA::Major::K>>>;
     using TiledMma = decltype(cute::make_tiled_mma(MMA_T{}));
@@ -213,12 +225,13 @@ struct GemmKernelTraits {
         SwapAB || KBlockN % 128 == 0, typename TiledMma::MMA_ScaleFactor,
         cute::conditional_t<
             KIsFP4,
-            cute::SM100_MMA_MXF4_SS<TypeA, TypeB, TypeAccumulate_, TypeSF,
-                                    KBlockM / KNumCTA, 128, KSFVecSize,
+            cute::SM100_MMA_MXF4_SS<TypeA_Mma, TypeB_Mma, TypeAccumulate_,
+                                    TypeSF, KBlockM / KNumCTA, 128, KSFVecSize,
                                     cute::UMMA::Major::K, cute::UMMA::Major::K>,
-            cute::SM100_MMA_MXF8F6F4_SS<
-                TypeA, TypeB, TypeAccumulate_, TypeSF, KBlockM / KNumCTA, 128,
-                cute::UMMA::Major::K, cute::UMMA::Major::K>>>;
+            cute::SM100_MMA_MXF8F6F4_SS<TypeA_Mma, TypeB_Mma, TypeAccumulate_,
+                                        TypeSF, KBlockM / KNumCTA, 128,
+                                        cute::UMMA::Major::K,
+                                        cute::UMMA::Major::K>>>;
     using TiledMma_SF = cute::TiledMMA<
         cute::MMA_Atom<MMA_SF_T>,
         cute::Layout<cute::Shape<cute::_1, cute::_1, cute::_1>>,
@@ -285,10 +298,12 @@ struct GemmKernelTraits {
 
     using SmemLayoutAtomA =
         decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
-                 cute::UMMA::Major::K, TypeA, BlockTileA_M, BlockTileA_K>());
+                 cute::UMMA::Major::K, TypeA_Smem, BlockTileA_M,
+                 BlockTileA_K>());
     using SmemLayoutAtomB =
         decltype(cutlass::gemm::collective::detail::sm100_smem_selector<
-                 cute::UMMA::Major::K, TypeB, BlockTileB_N, BlockTileB_K>());
+                 cute::UMMA::Major::K, TypeB_Smem, BlockTileB_N,
+                 BlockTileB_K>());
 
     using SmemLayoutA = decltype(cute::UMMA::tile_to_mma_shape(
         SmemLayoutAtomA{},
@@ -356,8 +371,10 @@ struct GemmKernelTraits {
     using BiasPipelineState = typename BiasPipeline::PipelineState;
 
     struct SharedStorage {
-        alignas(128) cute::ArrayEngine<TypeA, cute::cosize_v<SmemLayoutA>> A;
-        alignas(128) cute::ArrayEngine<TypeB, cute::cosize_v<SmemLayoutB>> B;
+        alignas(
+            128) cute::ArrayEngine<TypeA_Smem, cute::cosize_v<SmemLayoutA>> A;
+        alignas(
+            128) cute::ArrayEngine<TypeB_Smem, cute::cosize_v<SmemLayoutB>> B;
         alignas(
             128) cute::ArrayEngine<TypeSF, cute::cosize_v<SmemLayoutSFA>> SFA;
         alignas(

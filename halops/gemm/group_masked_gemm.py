@@ -45,15 +45,18 @@ def group_masked_gemm(
     Args:
         input: [num_experts * max_m_per_expert, K] CUDA tensor.
 
-            - ``w8a8-mxfp8``: dtype float8_e4m3fn.
+            - ``w8a8-mxfp8``, ``w4a8-mxfp4``: dtype float8_e4m3fn.
             - ``w4a4-*``: dtype uint8 (packed FP4, logical K is size(1)*2).
 
         weight: [num_experts, N, K] 3D CUDA tensor. Per-expert weights.
+            ``w4a8-mxfp4`` takes packed E2M1 (uint8, 2 values per byte) of
+            shape [num_experts, N, K // 2].
         sfa: Scale factor for A, dtype uint8, CUTLASS SfAtom 128x4 swizzled
             layout. Shape: ``[num_experts * max_m_per_expert, sf_k]``, where
-            ``sf_k = K // 32`` (w8a8-mxfp8, w4a4-mxfp4) or ``K // 16`` (w4a4-nvfp4).
+            ``sf_k = K // 32`` (w8a8-mxfp8, w4a4-mxfp4, w4a8-mxfp4) or
+            ``K // 16`` (w4a4-nvfp4).
 
-            - ``w8a8-mxfp8``, ``w4a4-mxfp4``: UE8M0 encoding.
+            - ``w8a8-mxfp8``, ``w4a4-mxfp4``, ``w4a8-mxfp4``: UE8M0 encoding.
             - ``w4a4-nvfp4``: UE4M3 encoding.
 
         sfb: Scale factor for B, dtype uint8, same SfAtom layout as sfa,
@@ -62,10 +65,15 @@ def group_masked_gemm(
         output: [num_experts * max_m_per_expert, N] bfloat16 output. Written in-place.
         bias: Optional [num_experts, N] bfloat16 bias. Only supported in w8a8-mxfp8 mode.
         alpha: Optional float32 per-expert scale with shape [num_experts].
-            Required for ``w4a4-nvfp4``; not accepted for ``w4a4-mxfp4``.
+            Required for ``w4a4-nvfp4``; not accepted for ``w4a4-mxfp4`` or
+            ``w4a8-mxfp4``.
         max_m_per_expert: Maximum tokens per expert (padding bound), must be > 0.
+            For ``w4a8-mxfp4`` it must be 64 or a multiple of 128; N must be a
+            multiple of 128 when it is at most 128, else a multiple of 256,
+            and K a multiple of 256.
         sm_count: Number of SMs to use (-1 for all available).
-        mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``.
+        mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"``, ``"w4a4-nvfp4"`` or
+            ``"w4a8-mxfp4"`` (FP8 activation x MXFP4 weight).
 
     Returns:
         None. The result is written in-place to output.
