@@ -289,6 +289,11 @@ __device__ static __forceinline__ void prefetch_l2_bulk(const void* ptr,
                  : "memory");
 }
 
+// Prefetch the L2 line holding `ptr`; unlike the bulk form, any alignment.
+__device__ static __forceinline__ void prefetch_l2_line(const void* ptr) {
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(ptr));
+}
+
 __device__ static __forceinline__ void mma_f16_m16n8k16(
     float4& d, std::uint32_t a0, std::uint32_t a1, std::uint32_t a2,
     std::uint32_t a3, std::uint32_t b0, std::uint32_t b1) {

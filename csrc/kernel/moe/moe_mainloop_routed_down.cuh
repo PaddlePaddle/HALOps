@@ -141,7 +141,7 @@ struct RoutedDownProjectionBase
         const CUtensorMap& tma_down_weights_desc, std::uint32_t expert_id,
         std::uint32_t base_m, std::uint32_t slot, std::uint32_t k_iter_id,
         std::uint64_t weight_cache_hint) {
-        Base::load_weight_tile(
+        Base::template load_weight_tile<DownGemm::kTileShapeM>(
             tma_down_weights_desc,
             reinterpret_cast<typename Base::WeightElement*>(
                 &smem->routed_experts.w_down[slot][0][0]),
@@ -214,6 +214,7 @@ struct RoutedDownProjection<KernelTraits, true>
         const typename DownGemm::ElementScale* __restrict__ expert_scales_down,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         CUtensorMap const& tma_down_weights_desc,
+        CUtensorMap const& tma_down_scale_desc,
         CUtensorMap const& tma_down_activations_desc,
         TaskScheduler<Traits>& sched, std::uint64_t weight_cache_hint) {
         const unsigned warp_idx = WarpRole::get_warp_idx();
@@ -262,8 +263,9 @@ struct RoutedDownProjection<KernelTraits, true>
 
             if (WarpRole::is_weight_loader_thread()) {
                 run_load_weight_k_loop(smem, tma_down_weights_desc,
-                                       expert_scales_down, local_id, expert_id,
-                                       base_m, weight_cache_hint);
+                                       tma_down_scale_desc, expert_scales_down,
+                                       local_id, expert_id, base_m,
+                                       weight_cache_hint);
             } else if (WarpRole::is_other_loader_warp(warp_idx)) {
                 run_load_input_k_loop(smem, workspace,
                                       tma_down_activations_desc, local_id,
@@ -292,6 +294,7 @@ struct RoutedDownProjection<KernelTraits, true>
     __device__ static void run_load_weight_k_loop(
         SharedStorage* __restrict__ smem,
         const CUtensorMap& tma_down_weights_desc,
+        const CUtensorMap& tma_down_scale_desc,
         const typename DownGemm::ElementScale* __restrict__ down_scale,
         std::uint32_t local_id, std::uint32_t expert_id, std::uint32_t base_m,
         std::uint64_t weight_cache_hint) {
@@ -305,8 +308,8 @@ struct RoutedDownProjection<KernelTraits, true>
                                                            kDownWeightTxBytes);
             Base::load_weight_tile(smem, tma_down_weights_desc, expert_id,
                                    base_m, slot, k_iter_id, weight_cache_hint);
-            load_weight_scale_tile(smem, down_scale, expert_id, base_m, slot,
-                                   k_iter_id);
+            load_weight_scale_tile(smem, down_scale, tma_down_scale_desc,
+                                   expert_id, base_m, slot, k_iter_id);
         }
     }
 
@@ -423,14 +426,15 @@ struct RoutedDownProjection<KernelTraits, true>
     __device__ static void load_weight_scale_tile(
         SharedStorage* __restrict__ smem,
         const typename DownGemm::ElementScale* __restrict__ down_scale,
-        std::uint32_t expert_id, std::uint32_t base_m, std::uint32_t slot,
-        std::uint32_t k_iter_id) {
+        const CUtensorMap& tma_down_scale_desc, std::uint32_t expert_id,
+        std::uint32_t base_m, std::uint32_t slot, std::uint32_t k_iter_id) {
         const std::uint32_t row_atom =
             expert_id * (DownGemm::kGemmM / 128u) + base_m / 128u;
         Base::load_weight_scale_tile(
             down_scale, row_atom, k_iter_id,
             smem->routed_experts.w_down_scale[slot],
-            smem->barriers.routed.down_weight_ready.raw(slot));
+            smem->barriers.routed.down_weight_ready.raw(slot),
+            &tma_down_scale_desc);
     }
 
     // One lane per token loads its scale word and writes it in SfAtom layout.
@@ -519,6 +523,7 @@ struct RoutedDownProjection<KernelTraits, false>
         const typename DownGemm::ElementScale* __restrict__ expert_scales_down,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         CUtensorMap const& tma_down_weights_desc,
+        CUtensorMap const& tma_down_scale_desc,
         CUtensorMap const& tma_down_activations_desc,
         TaskScheduler<Traits>& sched, std::uint64_t weight_cache_hint) {
         const unsigned warp_idx = WarpRole::get_warp_idx();

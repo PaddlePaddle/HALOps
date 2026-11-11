@@ -131,7 +131,7 @@ struct SharedUpProjectionBase
             KERNEL_TIMER_END(smem->timer.get(), empty_span);
             smem->barriers.shared_up.input_ready.arrive(k_iter_id,
                                                         kInputTileTxBytes);
-            load_input_tile<SharedUpGemm::kTileShapeN>(
+            load_input_tile_chunks<SharedUpGemm::kTileShapeN>(
                 tma_input_desc, k_tile_base + k_iter_id,
                 /*token_start=*/0u, smem->shared_expert.input.data[slot],
                 smem->barriers.shared_up.input_ready.raw(slot));

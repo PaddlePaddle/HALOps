@@ -154,7 +154,7 @@ struct LatentDownProjectionBase {
 
             smem->barriers.latent_down.input_ready.arrive(k_iter_id,
                                                           kInputTileTxBytes);
-            load_input_tile<kTileShapeN>(
+            load_input_tile_chunks<kTileShapeN>(
                 tma_input_desc, k_tile(k_iter_id), token_begin(),
                 smem->latent_down.input.data[slot],
                 smem->barriers.latent_down.input_ready.raw(slot));

@@ -540,9 +540,12 @@ struct DownProjectionBase {
         }
     }
 
+    // `tma_scale_desc` carries the whole atom table; without one, each row
+    // atom is a separate copy.
     __device__ static void load_weight_scale_tile(
         const typename DownGemm::ElementScale* scale, std::uint32_t row_atom,
-        std::uint32_t k_tile, std::uint8_t* dest, std::uint64_t* barrier) {
+        std::uint32_t k_tile, std::uint8_t* dest, std::uint64_t* barrier,
+        const CUtensorMap* tma_scale_desc = nullptr) {
         static_assert(MmaCore::kUseBlockscaled,
                       "scale tiles are only loaded for blockscaled MMA");
         static_assert(DownGemm::kTileShapeK == 128u,
@@ -553,6 +556,11 @@ struct DownProjectionBase {
         }
         constexpr std::uint32_t kSfAtomBytes = DownScaleTraits::kSfaAtomBytes;
         constexpr std::uint32_t kSfKBlocksPerRow = DownGemm::kGemmK / 128u;
+        if (tma_scale_desc != nullptr) {
+            tma_load_3d(*tma_scale_desc, /*coord0=*/0u, /*coord1=*/k_tile,
+                        /*coord2=*/row_atom, dest, barrier);
+            return;
+        }
 #pragma unroll
         for (std::uint32_t atom = 0; atom < DownScaleTraits::kNumSfaAtoms;
              ++atom) {

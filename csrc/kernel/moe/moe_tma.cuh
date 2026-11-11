@@ -113,49 +113,25 @@ __device__ static __forceinline__ void tma_load_5d(
         static_cast<std::int32_t>(coord4));
 }
 
-// Input tile box: eight rows and four 128-byte chunks.
-inline constexpr std::uint32_t kInputChunksBoxRows = 8u;
+// Input tile box: four 128-byte K chunks.
 inline constexpr std::uint32_t kInputChunksBoxChunks = 4u;
 
-// Load one BF16 K tile in chunk-major order with a single TMA copy.
+// Load one activation tile in chunk-major order with a single TMA copy.
+// The descriptor's box is the whole tile: the batch as rows, the 128-byte K
+// chunks as depth, so one swizzle atom per K chunk stays contiguous.
 template <std::size_t NumRows, std::size_t NumSwizzleBoxesK,
           std::size_t SwizzleBoxK>
 __device__ __forceinline__ void load_input_tile_chunks(
-    CUtensorMap const& tma_input_chunks_desc, std::uint32_t tile,
+    CUtensorMap const& tma_input_desc, std::uint32_t tile,
     std::uint32_t token_start,
     DataType::ElementA (&dest)[NumSwizzleBoxesK][NumRows][SwizzleBoxK],
     std::uint64_t* bar_smem_ptr) {
     static_assert(NumSwizzleBoxesK == kInputChunksBoxChunks &&
                       SwizzleBoxK * sizeof(DataType::ElementA) == 128u,
                   "the tile must be the descriptor's box");
-    tma_load_3d(tma_input_chunks_desc, /*coord0=*/0u, /*coord1=*/token_start,
+    tma_load_3d(tma_input_desc, /*coord0=*/0u, /*coord1=*/token_start,
                 /*coord2=*/tile * NumSwizzleBoxesK, &dest[0][0][0],
                 bar_smem_ptr);
-}
-
-// Load input as SW128 boxes, placing box kk in dest[kk].
-template <std::size_t NumRows, std::size_t NumSwizzleBoxesK,
-          std::size_t SwizzleBoxK>
-__device__ __forceinline__ void load_input_tile(
-    CUtensorMap const& tma_input_desc, std::uint32_t tile,
-    std::uint32_t token_start,
-    DataType::ElementA (&dest)[NumSwizzleBoxesK][NumRows][SwizzleBoxK],
-    std::uint64_t* bar_smem_ptr) {
-    // The box is one 8-row swizzle atom, so the ring's rows are whole atoms.
-    constexpr std::uint32_t kRowGroups = NumRows / 8u;
-    static_assert(NumRows % 8u == 0u, "the ring is whole swizzle atoms");
-#pragma unroll
-    for (std::uint32_t kk = 0u; kk < NumSwizzleBoxesK; ++kk) {
-#pragma unroll
-        for (std::uint32_t g = 0u; g < kRowGroups; ++g) {
-            const std::uint32_t k_start =
-                tile * (NumSwizzleBoxesK * SwizzleBoxK) + kk * SwizzleBoxK;
-            tma_load_2d(tma_input_desc, /*coord0=*/k_start,
-                        /*coord1=*/token_start + 8u * g,
-                        /*dest_smem_ptr=*/&dest[kk][8u * g][0],
-                        /*bar_smem_ptr=*/bar_smem_ptr);
-        }
-    }
 }
 
 // The CUtensorMap element type of T. FP4 dimensions count values.
@@ -175,9 +151,7 @@ inline constexpr CUtensorMapDataType TmaDataType() {
     }
 }
 
-// Create a rank-R row-major tiled TMA descriptor. `shape` runs fastest to
-// slowest, `strides` are the byte strides of dimensions 1..R-1, and `box` is
-// the tile TMA copies.
+// Create a rank-R row-major tiled TMA descriptor.
 template <int Rank, typename T>
 inline CUtensorMap CreateTmaDesc(const char* debug_name, const T* global_ptr,
                                  const std::uint64_t (&shape)[Rank],
