@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from halops import (
     get_workspace_for_moe,
     group_wise_quant,
-    low_latency_moe,
+    mega_ll_moe,
     transform_weights_for_moe,
 )
 
@@ -178,7 +178,7 @@ def _dequant_mxfp8_weight(weight, scale):
 
 
 class MoEParams:
-    """One `low_latency_moe` call: the knobs, plus the operands `init_weights` fills."""
+    """One `mega_ll_moe` call: the knobs, plus the operands `init_weights` fills."""
 
     def __init__(
         self,
@@ -598,7 +598,7 @@ class MoEFused:
         out = torch.empty(
             num_tokens, p.hidden_size, dtype=torch.bfloat16, device=input.device
         )
-        low_latency_moe(
+        mega_ll_moe(
             input,
             self.packed_weights["router_weight"],
             self.packed_weights["expert_up_weights"],

@@ -35,9 +35,9 @@ from core.timing import TimingResult, bench_gpu_time
 from kernel.moe.backends.golden import (
     _dequant_weight,
     _route,
-    run_low_latency_moe_golden,
+    run_mega_ll_moe_golden,
 )
-from kernel.moe.backends.halops import run_low_latency_moe
+from kernel.moe.backends.halops import run_mega_ll_moe
 
 
 MOE_MODES = ("w8a8-blockwise", "w8a8-mxfp8", "w4a8-mxfp4")
@@ -83,7 +83,7 @@ def _validate_config(cfg: dict) -> dict:
     }
     for name, value in MOE_SHAPE.items():
         if options[name] != value:
-            raise ValueError(f"LowLatencyMoE requires {name}={value}")
+            raise ValueError(f"MegaLLMoE requires {name}={value}")
     parts = set(filter(None, str(options["routing"]).split("+")))
     if not parts <= {"bias", "perexpert"}:
         raise ValueError(
@@ -270,8 +270,8 @@ def adapt_golden(raw: MoeInput) -> dict:
 
 def _get_backends(names):
     registry = {
-        "halops": (adapt_halops, run_low_latency_moe),
-        "golden": (adapt_golden, run_low_latency_moe_golden),
+        "halops": (adapt_halops, run_mega_ll_moe),
+        "golden": (adapt_golden, run_mega_ll_moe_golden),
     }
     unknown = set(names) - registry.keys()
     if unknown:
@@ -286,7 +286,7 @@ def _refcheck_entry(
     raw = _build_inputs(cfg)
     backends = _get_backends(ordered_names)
     inputs = {name: pair[0](raw) for name, pair in backends.items()}
-    reference = run_low_latency_moe_golden(inputs["golden"])
+    reference = run_mega_ll_moe_golden(inputs["golden"])
     if not torch.isfinite(reference).all() or reference.abs().max() < refcheck_atol:
         raise RuntimeError("BF16 golden output is non-finite or degenerate")
 
@@ -401,7 +401,7 @@ def run_scenario(cfg: dict) -> None:
                     f"tokens={local['batch_size']}, top_k={top_k}, {name}: {status}"
                 )
             row = MoeRowResult(
-                scenario="low_latency_moe",
+                scenario="mega_ll_moe",
                 backend=name,
                 tokens=local["batch_size"],
                 top_k=top_k,
@@ -429,6 +429,6 @@ def run_scenario(cfg: dict) -> None:
                 print_scenario_header(row)
                 print_table_header()
             print_table_row(row)
-            append_moe_csv(row, local.get("output_path", "results/low_latency_moe.csv"))
+            append_moe_csv(row, local.get("output_path", "results/mega_ll_moe.csv"))
     if failed:
         raise RuntimeError("MoE benchmark failed: " + "; ".join(failed))

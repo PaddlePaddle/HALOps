@@ -20,7 +20,7 @@ from typing import Optional, Sequence, Union
 import torch
 
 import halops.halops_kernel as halops_kernel
-from halops.moe.low_latency_moe_utils import (
+from halops.moe.mega_ll_moe_utils import (
     _NARROW_TOKENS,
     _TAIL_ALIGN,
     _check_workspace,
@@ -33,7 +33,7 @@ from halops.moe.low_latency_moe_utils import (
 
 __all__ = [
     "MoEWorkspace",
-    "low_latency_moe",
+    "mega_ll_moe",
     "get_workspace_for_moe",
     "get_workspace_size_for_moe",
     "transform_weights_for_moe",
@@ -42,7 +42,7 @@ __all__ = [
 
 @dataclass
 class MoEWorkspace:
-    """Scratchpad and tail communication state of ``low_latency_moe``.
+    """Scratchpad and tail communication state of ``mega_ll_moe``.
 
     The kernel has a narrow (1 <= T <= 8) and a wide (9 <= T <= 16)
     schedule; each has its own scratchpad and tail layout, so a workspace is
@@ -83,7 +83,7 @@ def get_workspace_for_moe(
     tp_rank: int,
     tp_size: int,
 ) -> MoEWorkspace:
-    """Allocate the workspace of ``low_latency_moe`` for ``input``'s token count.
+    """Allocate the workspace of ``mega_ll_moe`` for ``input``'s token count.
 
     For tp_size 4, allocation is collective over ``group_name``. Allocate it
     once, before any CUDA-graph capture, and reuse it across calls and graph
@@ -98,7 +98,7 @@ def get_workspace_for_moe(
         tp_size: Size of that group. Supported values are 1 and 4.
 
     Returns:
-        The workspace to pass to ``low_latency_moe``.
+        The workspace to pass to ``mega_ll_moe``.
     """
     wide = input.size(0) > _NARROW_TOKENS
     device = input.device
@@ -151,7 +151,7 @@ def get_workspace_for_moe(
     )
 
 
-def low_latency_moe(
+def mega_ll_moe(
     input: torch.Tensor,
     router_weight: torch.Tensor,
     expert_up_weights: torch.Tensor,
@@ -301,7 +301,7 @@ def low_latency_moe(
         None. The outputs are written in place.
     """
     _check_workspace(workspace, input.size(0))
-    halops_kernel.low_latency_moe(
+    halops_kernel.mega_ll_moe(
         input,
         router_weight,
         expert_up_weights,
@@ -367,10 +367,10 @@ def transform_weights_for_moe(
     expert_up_weights_scale: Optional[torch.Tensor] = None,
     shared_up_weight_scale: Optional[torch.Tensor] = None,
 ) -> dict:
-    """Pack the router and up-projection weights for ``low_latency_moe``.
+    """Pack the router and up-projection weights for ``mega_ll_moe``.
 
     The down-projection and latent-down weights, and the scales, already follow
-    the layout the kernel reads and are passed to ``low_latency_moe`` as-is.
+    the layout the kernel reads and are passed to ``mega_ll_moe`` as-is.
     This repacks the operands whose layout differs:
 
     * ``router_weight`` -- the router's SW128 swizzle, one packed blob per
@@ -381,7 +381,7 @@ def transform_weights_for_moe(
     Only the layout changes: quantize every weight first, then convert it
     here.
 
-    ``num_tokens`` selects the router schedule and must match the ``low_latency_moe``
+    ``num_tokens`` selects the router schedule and must match the ``mega_ll_moe``
     call.  Every operand is optional: only the ones that are given are packed (and
     returned), e.g. to pack the experts as soon as they are loaded and the router once
     per schedule.
@@ -394,7 +394,7 @@ def transform_weights_for_moe(
             float8_e4m3fn; rows [0, N) are gate and [N, 2N) up.
         shared_up_weight (Tensor, optional): Shared-expert weights, shape [2N, H],
             dtype float8_e4m3fn, same gate/up split.
-        num_tokens (int, optional): Token count of the ``low_latency_moe``
+        num_tokens (int, optional): Token count of the ``mega_ll_moe``
             call, which picks the router tile M. Default: 1.
         num_router_gates (int, optional): Gates to merge; this build requires
             2. Default: 2.
