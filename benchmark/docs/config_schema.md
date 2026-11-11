@@ -121,7 +121,7 @@
 
 ## MoE 场景
 
-### `low_latency_moe`
+### `mega_ll_moe`
 
 - `batch_sizes`（默认 `[1]`）：token 数，取值为 `1..16`。
 - `top_k_list`（默认 `[8]`）：选择专家数，取值为 `1..10`。

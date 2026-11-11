@@ -30,7 +30,7 @@ def _dequant_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         )
         return (blocks * scale[..., :, None, :, None]).reshape(weight.shape).bfloat16()
 
-    from halops.moe.low_latency_moe_utils import _sf_atom_offsets
+    from halops.moe.mega_ll_moe_utils import _sf_atom_offsets
 
     rows, groups = scale.shape[-2:]
     offsets = _sf_atom_offsets(rows, groups, scale.device)
@@ -112,7 +112,7 @@ def _activate(up: torch.Tensor, inp: dict) -> torch.Tensor:
 
 
 @torch.no_grad()
-def run_low_latency_moe_golden(inp: dict) -> torch.Tensor:
+def run_mega_ll_moe_golden(inp: dict) -> torch.Tensor:
     """BF16 projections with FP32 routing, activation and normalization."""
     x = inp["input_bf16"]
     weights, ids = _route(inp)

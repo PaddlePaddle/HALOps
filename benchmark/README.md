@@ -18,7 +18,7 @@ python benchmark.py --config=attention/prefill_chunked_c16_gqa14-1.yaml --gpu=0
 python benchmark.py --config=gemm/dense_w8a8.yaml --backend=halops --gpu=0
 
 # Full latent MoE: quantized HALOps accuracy and latency
-python benchmark.py --config=moe/low_latency_moe_w8a8_blockwise.yaml --gpu=0
+python benchmark.py --config=moe/mega_ll_moe_w8a8_blockwise.yaml --gpu=0
 ```
 
 - `--config` takes a path relative to `configs/` (recommended), a file name unique across `configs/<op>/`, or an absolute path. Bundled configs live in `configs/attention/`, `configs/gemm/` and `configs/moe/`.
@@ -89,7 +89,7 @@ python benchmark.py \
 | `configs/attention/` | `decode_gqa` | KV length、MTP steps、GQA、BF16/FP8 cache |
 | `configs/gemm/` | `dense_gemm` | M/N/K shape、W8A8-MXFP8/W4A4、SM 数 |
 | `configs/gemm/` | `group_masked` / `group_contiguous` | expert 数、per-expert M、N/K、精度模式 |
-| `configs/moe/` | `low_latency_moe` | token 数、top-k、量化模式、激活函数 |
+| `configs/moe/` | `mega_ll_moe` | token 数、top-k、量化模式、激活函数 |
 
 YAML 负责 workload、backend 和 cache/CUDA Graph 策略；命令行始终覆盖 `timing_method`、`dry_run_iters`、`repeat_iters` 和 subprocess 设置。输出路径与 `case_tag` 由 CLI 根据时间戳和配置文件名生成，YAML 中的同名字段会被忽略。
 
@@ -155,7 +155,7 @@ python core/report.py \
 | `dense_gemm` | ✅ | ✅ | — | — | ✅ | ✅ | — | — |
 | `group_masked` | ✅ | ✅ | — | — | ✅ | ✅ | — | — |
 | `group_contiguous` | ✅ | ✅ | — | — | ✅ | ✅ | — | — |
-| `low_latency_moe` | ✅ | — | — | — | — | — | — | — |
+| `mega_ll_moe` | ✅ | — | — | — | — | — | — | — |
 
 - `halops` 为默认基准，`golden` 为正确性参考。
 - ¹ `decode_gqa` 还提供 `fa4_paged`。

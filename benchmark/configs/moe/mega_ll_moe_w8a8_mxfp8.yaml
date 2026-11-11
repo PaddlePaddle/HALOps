@@ -1,8 +1,8 @@
-scenario: low_latency_moe
+scenario: mega_ll_moe
 batch_sizes: [1, 5, 8, 9, 16]
 top_k_list: [10]
 tp_size: 1
-quant_mode: w8a8-blockwise
+quant_mode: w8a8-mxfp8
 activation: situ
 scoring_func: sigmoid
 renormalize: true

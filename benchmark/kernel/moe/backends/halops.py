@@ -16,12 +16,12 @@
 
 from __future__ import annotations
 
-from halops import low_latency_moe
+from halops import mega_ll_moe
 
 
-def run_low_latency_moe(inp: dict):
+def run_mega_ll_moe(inp: dict):
     """Run the quantized HALOps latent MoE kernel."""
-    low_latency_moe(
+    mega_ll_moe(
         inp["input"],
         inp["router_weight"],
         inp["expert_up_weights"],
