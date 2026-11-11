@@ -139,18 +139,17 @@ struct IndexerHostParams {
     torch::Tensor wq_b;
     torch::Tensor wq_b_sf;
     torch::Tensor k_norm_weight;
-    torch::Tensor k_norm_bias;
+    std::optional<torch::Tensor> k_norm_bias;
     float k_norm_eps;
     torch::Tensor rope_cos_sin_cache;
     torch::Tensor positions;
     torch::Tensor paged_kv_cache_with_scale;
-    torch::Tensor out_cache_loc;
+    torch::Tensor kv_cache_loc;
     torch::Tensor out_q;
     std::optional<torch::Tensor> out_q_sf;
     torch::Tensor out_weights;
     float weight_scale;
     int64_t n_heads;
-    int64_t head_dim;
     bool is_neox_style;
     bool apply_hadamard;
     bool use_pdl;
@@ -161,14 +160,13 @@ struct IndexerHostParams {
         const torch::Tensor& x, const torch::Tensor& q_lora,
         const torch::Tensor& wk_w, const torch::Tensor& wq_b,
         const torch::Tensor& wq_b_sf, const torch::Tensor& k_norm_weight,
-        const torch::Tensor& k_norm_bias, double k_norm_eps,
+        const std::optional<torch::Tensor>& k_norm_bias, double k_norm_eps,
         const torch::Tensor& rope_cos_sin_cache, const torch::Tensor& positions,
         const torch::Tensor& paged_kv_cache_with_scale,
-        const torch::Tensor& out_cache_loc, const torch::Tensor& out_q,
+        const torch::Tensor& kv_cache_loc, const torch::Tensor& out_q,
         const std::optional<torch::Tensor>& out_q_sf,
-        const torch::Tensor& out_weights, double weight_scale, int64_t n_heads,
-        int64_t head_dim, bool is_neox_style, bool apply_hadamard, bool use_pdl,
-        bool is_mx_sf, bool is_fp4)
+        const torch::Tensor& out_weights, double weight_scale,
+        bool is_neox_style, bool apply_hadamard, bool use_pdl)
         : x(x),
           q_lora(q_lora),
           wk_w(wk_w),
@@ -180,18 +178,19 @@ struct IndexerHostParams {
           rope_cos_sin_cache(rope_cos_sin_cache),
           positions(positions),
           paged_kv_cache_with_scale(paged_kv_cache_with_scale),
-          out_cache_loc(out_cache_loc),
+          kv_cache_loc(kv_cache_loc),
           out_q(out_q),
           out_q_sf(out_q_sf),
           out_weights(out_weights),
           weight_scale(weight_scale),
-          n_heads(n_heads),
-          head_dim(head_dim),
+          n_heads(0),
           is_neox_style(is_neox_style),
           apply_hadamard(apply_hadamard),
           use_pdl(use_pdl),
-          is_mx_sf(is_mx_sf),
-          is_fp4(is_fp4) {
+          is_mx_sf(out_q_sf.has_value()),
+          is_fp4(out_q.scalar_type() == torch::kInt8) {
+        // Zero head count for malformed Q buffers; validate() reports it.
+        if (out_q.dim() == 3) n_heads = out_q.size(1);
         validate();
     }
 
@@ -218,17 +217,20 @@ struct IndexerHostParams {
                     x.size(1),
                     " x's last dim must have stride 1 (the bf16 TMA reads it "
                     "K-major)");
+        const int64_t head_dim =
+            k_norm_weight.dim() == 1 ? k_norm_weight.size(0) : 0;
         TORCH_CHECK(head_dim == Dimensions::HEAD_DIM &&
                         n_heads == Dimensions::NUM_HEADS,
                     "this build compiles head_dim=", Dimensions::HEAD_DIM,
                     ", n_heads=", Dimensions::NUM_HEADS, "; got ", head_dim,
                     ", ", n_heads);
-        TORCH_CHECK(!is_fp4 || is_mx_sf, "is_fp4 requires is_mx_sf=True");
+        TORCH_CHECK(!is_fp4 || is_mx_sf,
+                    "an int8 out_q selects packed MXFP4 and requires a uint8 "
+                    "out_q_sf scale buffer");
         const int num_tokens = x.size(0);
-        const auto device = x.device();
         if (is_mx_sf) {
-            TORCH_CHECK(out_q_sf && out_q_sf->defined(),
-                        "out_q_sf is required for MXFP4 or MXFP8 output");
+            TORCH_CHECK(out_q_sf->defined(),
+                        "out_q_sf must be a defined tensor when provided");
             TORCH_CHECK(
                 out_q_sf->scalar_type() == torch::kByte &&
                     out_q_sf->dim() == 3 && out_q_sf->size(0) == num_tokens &&
@@ -237,7 +239,8 @@ struct IndexerHostParams {
                     out_q_sf->is_contiguous(),
                 "out_q_sf must be contiguous uint8 [T, n_heads, head_dim/32]");
         } else {
-            TORCH_CHECK(!out_q_sf, "out_q_sf must be None for FP8 output");
+            TORCH_CHECK(!out_q_sf.has_value(),
+                        "out_q_sf must be None for FP8 output");
         }
 
         TORCH_CHECK(wk_w.dim() == 2 && wk_w.scalar_type() == torch::kBFloat16,
@@ -285,13 +288,14 @@ struct IndexerHostParams {
                 k_norm_weight.dim() == 1 &&
                 k_norm_weight.numel() == Dimensions::HEAD_DIM,
             "k_norm_weight must be float32 [head_dim]=", Dimensions::HEAD_DIM);
-        const bool use_layernorm = k_norm_bias.numel() > 0;
+        const bool use_layernorm = k_norm_bias.has_value();
         TORCH_CHECK(
-            !use_layernorm || (k_norm_bias.scalar_type() == torch::kFloat &&
-                               k_norm_bias.dim() == 1 &&
-                               k_norm_bias.numel() == Dimensions::HEAD_DIM),
-            "k_norm_bias must be float32 [head_dim] or empty (empty "
-            "selects RMSNorm, which has no bias by definition)");
+            !use_layernorm || (k_norm_bias->defined() &&
+                               k_norm_bias->scalar_type() == torch::kFloat &&
+                               k_norm_bias->dim() == 1 &&
+                               k_norm_bias->numel() == Dimensions::HEAD_DIM),
+            "k_norm_bias must be float32 [head_dim] or None (None selects "
+            "RMSNorm, which has no bias by definition)");
 
         TORCH_CHECK(rope_cos_sin_cache.scalar_type() == torch::kFloat &&
                         rope_cos_sin_cache.dim() == 2 &&
@@ -303,10 +307,8 @@ struct IndexerHostParams {
                     "rope_dim=",
                     Dimensions::ROPE_DIM, ", got ", rope_cos_sin_cache.sizes());
         check_indices("positions", positions, num_tokens);
-        check_indices("out_cache_loc", out_cache_loc, num_tokens);
+        check_indices("kv_cache_loc", kv_cache_loc, num_tokens);
 
-        const int token_bytes = is_fp4 ? Dimensions::FP4_CACHE_TOKEN_BYTES
-                                       : Dimensions::FP8_CACHE_TOKEN_BYTES;
         const int q_row_bytes =
             is_fp4 ? Dimensions::HEAD_DIM / 2 : Dimensions::HEAD_DIM;
         TORCH_CHECK(paged_kv_cache_with_scale.scalar_type() == torch::kByte &&
@@ -321,11 +323,11 @@ struct IndexerHostParams {
 
         TORCH_CHECK(
             out_q.scalar_type() ==
-                    (is_fp4 ? torch::kByte : torch::kFloat8_e4m3fn) &&
+                    (is_fp4 ? torch::kInt8 : torch::kFloat8_e4m3fn) &&
                 out_q.dim() == 3 && out_q.size(0) == num_tokens &&
                 out_q.size(1) == Dimensions::NUM_HEADS &&
                 out_q.size(2) == q_row_bytes && out_q.is_contiguous(),
-            "out_q must be contiguous ", is_fp4 ? "uint8" : "float8_e4m3fn",
+            "out_q must be contiguous ", is_fp4 ? "int8" : "float8_e4m3fn",
             " [T, n_heads, row_bytes] = [", num_tokens, ", ",
             Dimensions::NUM_HEADS, ", ", q_row_bytes, "], got ", out_q.sizes());
         const auto weights_type = out_weights.scalar_type();
@@ -555,7 +557,7 @@ struct IndexerDeviceParams {
     const float* __restrict__ k_norm_bias;
     const float* __restrict__ rope;
     const void* __restrict__ positions;
-    const void* __restrict__ out_cache_loc;
+    const void* __restrict__ kv_cache_loc;
     uint8_t* __restrict__ key_cache;
     uint8_t* __restrict__ q_output;
     uint8_t* __restrict__ q_scale;
@@ -604,9 +606,9 @@ struct IndexerDeviceParams {
     }
     CUTE_DEVICE int cache_loc_of(int token) const {
         return cache_slots_are_int64
-                   ? (int)__ldg(static_cast<const int64_t*>(out_cache_loc) +
+                   ? (int)__ldg(static_cast<const int64_t*>(kv_cache_loc) +
                                 token)
-                   : __ldg(static_cast<const int*>(out_cache_loc) + token);
+                   : __ldg(static_cast<const int*>(kv_cache_loc) + token);
     }
 
     // Store consecutive heads with round-to-nearest-even conversion.
@@ -749,10 +751,10 @@ auto make_indexer_device_params(const IndexerHostParams& host, int sm_count,
     params.query_lora_row_stride = host.q_lora.stride(0);
     params.k_norm_eps = host.k_norm_eps;
     params.weight_scale = host.weight_scale;
-    params.use_layernorm = host.k_norm_bias.numel() > 0;
+    params.use_layernorm = host.k_norm_bias.has_value();
     params.positions_are_int64 = host.positions.scalar_type() == torch::kLong;
     params.cache_slots_are_int64 =
-        host.out_cache_loc.scalar_type() == torch::kLong;
+        host.kv_cache_loc.scalar_type() == torch::kLong;
     params.cache_row_bytes = host.paged_kv_cache_with_scale.size(1);
     const int token_bytes = host.is_fp4 ? Dimensions::FP4_CACHE_TOKEN_BYTES
                                         : Dimensions::FP8_CACHE_TOKEN_BYTES;
@@ -802,12 +804,12 @@ auto make_indexer_device_params(const IndexerHostParams& host, int sm_count,
         static_cast<const __nv_bfloat16*>(host.wk_w.data_ptr());
     params.q_lora = static_cast<const __nv_bfloat16*>(host.q_lora.data_ptr());
     params.k_norm_weight = host.k_norm_weight.data_ptr<float>();
-    params.k_norm_bias = params.use_layernorm
-                             ? host.k_norm_bias.data_ptr<float>()
-                             : host.k_norm_weight.data_ptr<float>();
+    // RMSNorm passes no bias; the norm prefetch skips this null pointer.
+    params.k_norm_bias =
+        host.k_norm_bias ? host.k_norm_bias->data_ptr<float>() : nullptr;
     params.rope = host.rope_cos_sin_cache.data_ptr<float>();
     params.positions = host.positions.data_ptr();
-    params.out_cache_loc = host.out_cache_loc.data_ptr();
+    params.kv_cache_loc = host.kv_cache_loc.data_ptr();
     params.key_cache = host.paged_kv_cache_with_scale.data_ptr<uint8_t>();
     params.q_output = static_cast<uint8_t*>(host.out_q.data_ptr());
     params.q_scale =

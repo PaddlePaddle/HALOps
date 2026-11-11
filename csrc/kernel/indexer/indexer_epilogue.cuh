@@ -373,10 +373,13 @@ struct CollectiveIndexerEpilogue {
             (params.prefetch_norm ? context.plan.norm_weight
                                   : params.k_norm_weight) +
             lane * VALUES_PER_LANE);
-        const float4 bias_vector = *reinterpret_cast<const float4*>(
-            (params.prefetch_norm ? context.plan.norm_bias
-                                  : params.k_norm_bias) +
-            lane * VALUES_PER_LANE);
+        const float4 bias_vector =
+            params.use_layernorm
+                ? *reinterpret_cast<const float4*>((params.prefetch_norm
+                                                        ? context.plan.norm_bias
+                                                        : params.k_norm_bias) +
+                                                   lane * VALUES_PER_LANE)
+                : make_float4(0.f, 0.f, 0.f, 0.f);
         const float norm_weights[VALUES_PER_LANE] = {
             weight_vector.x, weight_vector.y, weight_vector.z, weight_vector.w};
         const float norm_biases[VALUES_PER_LANE] = {
@@ -495,10 +498,13 @@ struct CollectiveIndexerEpilogue {
             (params.prefetch_norm ? context.plan.norm_weight
                                   : params.k_norm_weight) +
             lane * VALUES_PER_LANE);
-        const float4 bias = *reinterpret_cast<const float4*>(
-            (params.prefetch_norm ? context.plan.norm_bias
-                                  : params.k_norm_bias) +
-            lane * VALUES_PER_LANE);
+        const float4 bias =
+            params.use_layernorm
+                ? *reinterpret_cast<const float4*>((params.prefetch_norm
+                                                        ? context.plan.norm_bias
+                                                        : params.k_norm_bias) +
+                                                   lane * VALUES_PER_LANE)
+                : make_float4(0.f, 0.f, 0.f, 0.f);
         float values[VALUES_PER_LANE] = {key.x, key.y, key.z, key.w};
         const float weight_values[VALUES_PER_LANE] = {weight.x, weight.y,
                                                       weight.z, weight.w};
@@ -595,10 +601,13 @@ struct CollectiveIndexerEpilogue {
             (params.prefetch_norm ? context.plan.norm_weight
                                   : params.k_norm_weight) +
             lane * VALUES_PER_LANE);
-        const float4 bias = *reinterpret_cast<const float4*>(
-            (params.prefetch_norm ? context.plan.norm_bias
-                                  : params.k_norm_bias) +
-            lane * VALUES_PER_LANE);
+        const float4 bias =
+            params.use_layernorm
+                ? *reinterpret_cast<const float4*>((params.prefetch_norm
+                                                        ? context.plan.norm_bias
+                                                        : params.k_norm_bias) +
+                                                   lane * VALUES_PER_LANE)
+                : make_float4(0.f, 0.f, 0.f, 0.f);
         const float weight_values[VALUES_PER_LANE] = {weight.x, weight.y,
                                                       weight.z, weight.w};
         const float bias_values[VALUES_PER_LANE] = {bias.x, bias.y, bias.z,

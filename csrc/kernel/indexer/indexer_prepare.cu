@@ -16,18 +16,20 @@
 
 namespace halops {
 
-void IndexerPrepare(
-    const torch::Tensor& x, const torch::Tensor& q_lora,
-    const torch::Tensor& wk_w, const torch::Tensor& wq_b,
-    const torch::Tensor& wq_b_sf, const torch::Tensor& k_norm_weight,
-    const torch::Tensor& k_norm_bias, double k_norm_eps,
-    const torch::Tensor& rope_cos_sin_cache, const torch::Tensor& positions,
-    const torch::Tensor& paged_kv_cache_with_scale,
-    const torch::Tensor& out_cache_loc, const torch::Tensor& out_q,
-    const std::optional<torch::Tensor>& out_q_sf,
-    const torch::Tensor& out_weights, double weight_scale, int64_t n_heads,
-    int64_t head_dim, bool is_neox_style, bool apply_hadamard, bool use_pdl,
-    bool is_mx_sf, bool is_fp4) {
+void IndexerPrepare(const torch::Tensor& x, const torch::Tensor& q_lora,
+                    const torch::Tensor& wk_w, const torch::Tensor& wq_b,
+                    const torch::Tensor& wq_b_sf,
+                    const torch::Tensor& k_norm_weight,
+                    const std::optional<torch::Tensor>& k_norm_bias,
+                    double k_norm_eps, const torch::Tensor& rope_cos_sin_cache,
+                    const torch::Tensor& positions,
+                    const torch::Tensor& paged_kv_cache_with_scale,
+                    const torch::Tensor& kv_cache_loc,
+                    const torch::Tensor& out_q,
+                    const std::optional<torch::Tensor>& out_q_sf,
+                    const torch::Tensor& out_weights, double weight_scale,
+                    bool is_neox_style, bool apply_hadamard, bool use_pdl) {
+    // The output buffers select the Q/K format on the host side.
     const indexer::IndexerHostParams host{x,
                                           q_lora,
                                           wk_w,
@@ -39,18 +41,14 @@ void IndexerPrepare(
                                           rope_cos_sin_cache,
                                           positions,
                                           paged_kv_cache_with_scale,
-                                          out_cache_loc,
+                                          kv_cache_loc,
                                           out_q,
                                           out_q_sf,
                                           out_weights,
                                           weight_scale,
-                                          n_heads,
-                                          head_dim,
                                           is_neox_style,
                                           apply_hadamard,
-                                          use_pdl,
-                                          is_mx_sf,
-                                          is_fp4};
+                                          use_pdl};
     const CudaDeviceGuard device_guard(host.x.device());
     indexer::dispatch_indexer(host, indexer::indexer_sm_count());
 }

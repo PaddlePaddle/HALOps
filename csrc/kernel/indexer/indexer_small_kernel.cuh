@@ -68,8 +68,10 @@ CUTE_DEVICE void three_way_key_consumer(Context const& context) {
     context.plan.norm_ready.wait(0);
     const float4 w =
         *reinterpret_cast<const float4*>(context.plan.norm_weight + lane * 4);
-    const float4 b =
-        *reinterpret_cast<const float4*>(context.plan.norm_bias + lane * 4);
+    const float4 b = params.use_layernorm
+                         ? *reinterpret_cast<const float4*>(
+                               context.plan.norm_bias + lane * 4)
+                         : make_float4(0.f, 0.f, 0.f, 0.f);
     const float weights[4] = {w.x, w.y, w.z, w.w};
     const float biases[4] = {b.x, b.y, b.z, b.w};
     for (int token = blockIdx.x; token < params.num_tokens;
@@ -106,8 +108,9 @@ __global__ void __launch_bounds__(KernelTraits::NumThreads, 1, 1)
         const int offset = KernelTraits::lane_idx() * 4;
         __pipeline_memcpy_async(plan.norm_weight + offset,
                                 params.k_norm_weight + offset, 16);
-        __pipeline_memcpy_async(plan.norm_bias + offset,
-                                params.k_norm_bias + offset, 16);
+        if (params.use_layernorm)
+            __pipeline_memcpy_async(plan.norm_bias + offset,
+                                    params.k_norm_bias + offset, 16);
         __pipeline_arrive_on(reinterpret_cast<uint64_t*>(&plan.norm_ready));
         plan.norm_ready.arrive();
     }

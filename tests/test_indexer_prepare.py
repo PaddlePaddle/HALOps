@@ -112,6 +112,8 @@ def quantize_blocks(x, group_size):
 
 
 def dequantize_mxfp4(packed, scales):
+    if packed.dtype == torch.int8:
+        packed = packed.view(torch.uint8)
     codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
     values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=packed.device)
     decoded = values[(codes & 7).long()] * torch.where(codes & 8 != 0, -1.0, 1.0)
@@ -130,14 +132,20 @@ class Case:
 
     @property
     def is_fp4(self):
-        return self.kwargs.get("out_qk_dtype_str", "fp8") == "mxfp4"
+        return self.kwargs["out_q"].dtype == torch.int8
+
+    @property
+    def output_dtype(self):
+        if self.is_fp4:
+            return "mxfp4"
+        return "mxfp8" if self.kwargs["out_q_sf"] is not None else "fp8"
 
     @property
     def data_bytes(self):
         return HEAD_DIM // 2 if self.is_fp4 else HEAD_DIM
 
     def read_cache(self):
-        loc = self.kwargs["out_cache_loc"].long()
+        loc = self.kwargs["kv_cache_loc"].long()
         valid = loc >= 0
         loc = loc[valid]
         page, slot = loc // self.page_size, loc % self.page_size
@@ -153,12 +161,12 @@ class Case:
             + torch.arange(4, device=self.cache.device)
         )
         scales = self.cache[page[:, None], offsets].contiguous()
-        if self.kwargs.get("out_qk_dtype_str", "fp8") == "fp8":
+        if self.output_dtype == "fp8":
             scales = scales.view(torch.float32).flatten()
         return codes, scales, valid
 
     def written_bytes(self):
-        loc = self.kwargs["out_cache_loc"].long()
+        loc = self.kwargs["kv_cache_loc"].long()
         loc = loc[loc >= 0]
         page, slot = loc // self.page_size, loc % self.page_size
         mask = torch.zeros_like(self.cache, dtype=torch.bool)
@@ -187,7 +195,7 @@ def make_case(
     varied_groups=False,
     device="cuda",
     is_neox_style=True,
-    out_qk_dtype_str="fp8",
+    output_dtype="fp8",
 ):
     def randn(*shape, dtype=torch.bfloat16):
         return torch.randn(*shape, dtype=dtype, device=device)
@@ -202,7 +210,7 @@ def make_case(
     wq, exponents, wq_dequantized = quantize_blocks(wq, 32)
     scale_input = sfatom_scales(exponents)
     pages = max(2, (tokens + page_size - 1) // page_size + 1)
-    data_bytes = HEAD_DIM // 2 if out_qk_dtype_str == "mxfp4" else HEAD_DIM
+    data_bytes = HEAD_DIM // 2 if output_dtype == "mxfp4" else HEAD_DIM
     cache = torch.full(
         (pages, page_size * (data_bytes + 4)), 0xA5, dtype=torch.uint8, device=device
     )
@@ -226,10 +234,23 @@ def make_case(
         rope_cos_sin_cache=torch.cat((angles.cos(), angles.sin()), -1),
         positions=torch.randperm(tokens + 17, device=device)[:tokens].to(index_dtype),
         paged_kv_cache_with_scale=cache,
-        out_cache_loc=loc,
+        kv_cache_loc=loc,
+        out_q=torch.empty(
+            (tokens, HEADS, HEAD_DIM // 2 if output_dtype == "mxfp4" else HEAD_DIM),
+            dtype=torch.int8 if output_dtype == "mxfp4" else FP8,
+            device=device,
+        ),
+        out_q_sf=(
+            None
+            if output_dtype == "fp8"
+            else torch.empty(
+                (tokens, HEADS, HEAD_DIM // 32), dtype=torch.uint8, device=device
+            )
+        ),
+        out_weights=torch.empty((tokens, HEADS), dtype=torch.float32, device=device),
+        weight_scale=DEFAULT_WEIGHT_SCALE,
         apply_hadamard=apply_hadamard,
         is_neox_style=is_neox_style,
-        out_qk_dtype_str=out_qk_dtype_str,
     )
     return Case(kwargs, wq_dequantized, page_size)
 
@@ -257,11 +278,16 @@ def reference(case):
     weight_scale = inp.get("weight_scale")
     if weight_scale is None:
         weight_scale = DEFAULT_WEIGHT_SCALE
-    if inp.get("out_qk_dtype_str", "fp8") == "mxfp4":
+    output_dtype = (
+        "mxfp4"
+        if inp["out_q"].dtype == torch.int8
+        else ("mxfp8" if inp["out_q_sf"] is not None else "fp8")
+    )
+    if output_dtype == "mxfp4":
         key_codes, key_scales = quantize_mx(key, fp4=True)
         q_codes, q_scales = quantize_mx(q, fp4=True)
         weights = raw_weights * weight_scale
-    elif inp.get("out_qk_dtype_str", "fp8") == "mxfp8":
+    elif output_dtype == "mxfp8":
         key_codes, key_scales = quantize_mx(key)
         q_codes, q_scales = quantize_mx(q)
         weights = raw_weights * weight_scale
@@ -326,13 +352,11 @@ def native_call(case, query, scales, weights, **options):
         inp["rope_cos_sin_cache"],
         inp["positions"],
         case.cache,
-        inp["out_cache_loc"],
+        inp["kv_cache_loc"],
         out_q=query,
         out_q_sf=scales,
         out_weights=weights,
-        weight_scale=DEFAULT_WEIGHT_SCALE,
-        n_heads=HEADS,
-        head_dim=HEAD_DIM,
+        weight_scale=inp["weight_scale"],
         apply_hadamard=inp["apply_hadamard"],
         **options,
     )
@@ -340,18 +364,24 @@ def native_call(case, query, scales, weights, **options):
 
 def check(case, result=None):
     expected = reference(case)
-    (query, scales), weights = (
-        indexer_prepare(**case.kwargs) if result is None else result
-    )
+    if result is None:
+        assert indexer_prepare(**case.kwargs) is None
+        query, scales, weights = (
+            case.kwargs["out_q"],
+            case.kwargs["out_q_sf"],
+            case.kwargs["out_weights"],
+        )
+    else:
+        (query, scales), weights = result
     key, key_scales, valid = case.read_cache()
     key_ref, key_scales_ref = expected["key"][valid], expected["key_scales"][valid]
-    output_dtype = case.kwargs.get("out_qk_dtype_str", "fp8")
+    output_dtype = case.output_dtype
     fp4 = output_dtype == "mxfp4"
     tolerance = 2e-2 if fp4 else FP8_RMS_TOL
     if output_dtype != "fp8":
         decode = dequantize_mxfp4 if fp4 else dequantize_mxfp8
         maximum = 6 if fp4 else 448
-        assert query.dtype == (torch.uint8 if fp4 else FP8)
+        assert query.dtype == (torch.int8 if fp4 else FP8)
         assert scales.dtype == torch.uint8
         assert query.shape == (
             case.kwargs["x"].shape[0],
@@ -412,7 +442,7 @@ def test_formats_and_dispatch(tokens, output_dtype):
     """Cover every output format and the dispatch boundaries used in production."""
     case = make_case(
         tokens,
-        out_qk_dtype_str=output_dtype,
+        output_dtype=output_dtype,
         shuffle=tokens > 1,
         sentinels=tokens > 1,
         is_neox_style=tokens % 2 == 0,
@@ -436,11 +466,15 @@ def test_supported_options(options):
 
 @pytest.mark.parametrize("output_dtype", ["fp8", "mxfp4", "mxfp8"])
 def test_cuda_graph_replay(output_dtype):
-    case = make_case(129, out_qk_dtype_str=output_dtype, shuffle=True, sentinels=True)
+    case = make_case(129, output_dtype=output_dtype, shuffle=True, sentinels=True)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        result = indexer_prepare(**case.kwargs)
+        assert indexer_prepare(**case.kwargs) is None
+    result = (
+        (case.kwargs["out_q"], case.kwargs["out_q_sf"]),
+        case.kwargs["out_weights"],
+    )
     for _ in range(2):
         case.kwargs["x"].normal_()
         case.kwargs["q_lora"].normal_()
@@ -450,41 +484,49 @@ def test_cuda_graph_replay(output_dtype):
 
 
 def test_native_binding_matches_python_api():
-    case = make_case(8, out_qk_dtype_str="mxfp4", is_neox_style=False)
-    expected = indexer_prepare(**case.kwargs)
-    query = torch.empty_like(expected[0][0])
-    scales = torch.empty_like(expected[0][1])
-    weights = torch.empty_like(expected[1])
+    case = make_case(8, output_dtype="mxfp4", is_neox_style=False)
+    expected_kwargs = {
+        **case.kwargs,
+        "paged_kv_cache_with_scale": case.cache.clone(),
+        "out_q": torch.empty_like(case.kwargs["out_q"]),
+        "out_q_sf": torch.empty_like(case.kwargs["out_q_sf"]),
+        "out_weights": torch.empty_like(case.kwargs["out_weights"]),
+    }
+    assert indexer_prepare(**expected_kwargs) is None
+    expected = (
+        (expected_kwargs["out_q"], expected_kwargs["out_q_sf"]),
+        expected_kwargs["out_weights"],
+    )
+    query = torch.empty_like(case.kwargs["out_q"])
+    scales = torch.empty_like(case.kwargs["out_q_sf"])
+    weights = torch.empty_like(case.kwargs["out_weights"])
     native_call(
         case,
         query,
         scales,
         weights,
         is_neox_style=False,
-        is_mx_sf=True,
-        is_fp4=True,
     )
     assert_same_outputs(((query, scales), weights), expected)
 
 
-def test_output_format_validation():
-    case = make_case(4)
-    for value in ("fp4", "fp16", "MXFP4", ""):
-        with pytest.raises(ValueError, match="out_qk_dtype_str"):
-            indexer_prepare(**{**case.kwargs, "out_qk_dtype_str": value})
-
-
 def test_invalid_output_buffers_are_rejected():
-    case = make_case(4, out_qk_dtype_str="mxfp8")
+    case = make_case(4, output_dtype="mxfp8")
     with pytest.raises(RuntimeError, match="out_q"):
         indexer_prepare(
-            **case.kwargs,
-            out_q=torch.empty((3, HEADS, HEAD_DIM), dtype=FP8, device="cuda"),
+            **{
+                **case.kwargs,
+                "out_q": torch.empty((3, HEADS, HEAD_DIM), dtype=FP8, device="cuda"),
+            }
         )
     with pytest.raises(RuntimeError, match="out_q_sf"):
         indexer_prepare(
-            **case.kwargs,
-            out_q_sf=torch.empty((4, HEADS, 2), dtype=torch.uint8, device="cuda"),
+            **{
+                **case.kwargs,
+                "out_q_sf": torch.empty(
+                    (4, HEADS, 2), dtype=torch.uint8, device="cuda"
+                ),
+            }
         )
 
 

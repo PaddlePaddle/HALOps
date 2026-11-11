@@ -271,8 +271,9 @@ __global__ void __launch_bounds__(SINGLE_TOKEN
         const int offset = KernelTraits::lane_idx() * 4;
         __pipeline_memcpy_async(plan.norm_weight + offset,
                                 params.k_norm_weight + offset, 16);
-        __pipeline_memcpy_async(plan.norm_bias + offset,
-                                params.k_norm_bias + offset, 16);
+        if (params.use_layernorm)
+            __pipeline_memcpy_async(plan.norm_bias + offset,
+                                    params.k_norm_bias + offset, 16);
         __pipeline_arrive_on(reinterpret_cast<uint64_t*>(&plan.norm_ready));
         plan.norm_ready.arrive();
     }
