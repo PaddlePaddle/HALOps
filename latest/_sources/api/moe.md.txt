@@ -7,7 +7,7 @@
    :nosignatures:
 
    MoEWorkspace
-   low_latency_moe
+   mega_ll_moe
    get_workspace_for_moe
    get_workspace_size_for_moe
    transform_weights_for_moe
@@ -27,12 +27,12 @@
 ```{rst-class} api-entry
 ```
 
-## low_latency_moe
+## mega_ll_moe
 
 ```{eval-rst}
 .. currentmodule:: halops
 
-.. autofunction:: low_latency_moe
+.. autofunction:: mega_ll_moe
 ```
 
 ```{rst-class} api-entry

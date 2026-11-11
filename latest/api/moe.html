@@ -263,19 +263,19 @@
 <table class="autosummary longtable docutils align-default">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#halops.MoEWorkspace" title="halops.MoEWorkspace"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MoEWorkspace</span></code></a></p></td>
-<td><p>Scratchpad and tail communication state of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p></td>
+<td><p>Scratchpad and tail communication state of <code class="docutils literal notranslate"><span class="pre">mega_ll_moe</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#halops.low_latency_moe" title="halops.low_latency_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">low_latency_moe</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.mega_ll_moe" title="halops.mega_ll_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mega_ll_moe</span></code></a></p></td>
 <td><p>MoE forward pass on Blackwell SM100, support latent.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#halops.get_workspace_for_moe" title="halops.get_workspace_for_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_workspace_for_moe</span></code></a></p></td>
-<td><p>Allocate the workspace of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> for <code class="docutils literal notranslate"><span class="pre">input</span></code>'s token count.</p></td>
+<td><p>Allocate the workspace of <code class="docutils literal notranslate"><span class="pre">mega_ll_moe</span></code> for <code class="docutils literal notranslate"><span class="pre">input</span></code>'s token count.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#halops.get_workspace_size_for_moe" title="halops.get_workspace_size_for_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_workspace_size_for_moe</span></code></a></p></td>
 <td><p>Return the workspace region size in bytes for a token count.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#halops.transform_weights_for_moe" title="halops.transform_weights_for_moe"><code class="xref py py-obj docutils literal notranslate"><span class="pre">transform_weights_for_moe</span></code></a></p></td>
-<td><p>Pack the router and up-projection weights for <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p></td>
+<td><p>Pack the router and up-projection weights for <code class="docutils literal notranslate"><span class="pre">mega_ll_moe</span></code>.</p></td>
 </tr>
 </tbody>
 </table>
@@ -298,7 +298,7 @@
 </dl>
 
 <span class="sig-paren">)</span><a class="headerlink" href="#halops.MoEWorkspace" title="Link to this definition">¶</a></dt>
-<dd><p>Scratchpad and tail communication state of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p>
+<dd><p>Scratchpad and tail communication state of <code class="docutils literal notranslate"><span class="pre">mega_ll_moe</span></code>.</p>
 <p>The kernel has a narrow (1 &lt;= T &lt;= 8) and a wide (9 &lt;= T &lt;= 16)
 schedule; each has its own scratchpad and tail layout, so a workspace is
 bound to one of them.  <code class="docutils literal notranslate"><span class="pre">buffer</span></code> is the scratchpad head of the workspace
@@ -308,11 +308,11 @@ region whose tail part is the fused tail’s mailbox.</p>
 </dd></dl>
 
 </section>
-<section class="api-entry" id="low-latency-moe">
-<h2>low_latency_moe<a class="headerlink" href="#low-latency-moe" title="Link to this heading">¶</a></h2>
+<section class="api-entry" id="mega-ll-moe">
+<h2>mega_ll_moe<a class="headerlink" href="#mega-ll-moe" title="Link to this heading">¶</a></h2>
 <dl class="py function">
-<dt class="sig sig-object py" id="halops.low_latency_moe">
-<span class="sig-name descname"><span class="pre">low_latency_moe</span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object py" id="halops.mega_ll_moe">
+<span class="sig-name descname"><span class="pre">mega_ll_moe</span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><span class="n"><span class="pre">input</span></span></em>,</dd>
@@ -347,7 +347,7 @@ region whose tail part is the fused tail’s mailbox.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><a class="headerlink" href="#halops.low_latency_moe" title="Link to this definition">¶</a></dt>
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.mega_ll_moe" title="Link to this definition">¶</a></dt>
 <dd><p>MoE forward pass on Blackwell SM100, support latent.</p>
 <p>Runs the router, the latent down-projection, the routed experts’ fused
 up/down projections and the shared expert for 1..16 tokens, writing
@@ -473,7 +473,7 @@ start launching once the tail begins. Default: True.</p></li>
 <dl class="py function">
 <dt class="sig sig-object py" id="halops.get_workspace_for_moe">
 <span class="sig-name descname"><span class="pre">get_workspace_for_moe</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">input</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">group_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_rank</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_size</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#halops.get_workspace_for_moe" title="Link to this definition">¶</a></dt>
-<dd><p>Allocate the workspace of <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> for <code class="docutils literal notranslate"><span class="pre">input</span></code>’s token count.</p>
+<dd><p>Allocate the workspace of <code class="docutils literal notranslate"><span class="pre">mega_ll_moe</span></code> for <code class="docutils literal notranslate"><span class="pre">input</span></code>’s token count.</p>
 <p>For tp_size 4, allocation is collective over <code class="docutils literal notranslate"><span class="pre">group_name</span></code>. Allocate it
 once, before any CUDA-graph capture, and reuse it across calls and graph
 replays; it is returned zero-initialized. A workspace must always be
@@ -489,7 +489,7 @@ ranks. It is unused for a single-rank launch.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>The workspace to pass to <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p>
+<dd class="field-even"><p>The workspace to pass to <code class="docutils literal notranslate"><span class="pre">mega_ll_moe</span></code>.</p>
 </dd>
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><em>MoEWorkspace</em></p>
@@ -541,9 +541,9 @@ Default: 1.</p></li>
 </dl>
 
 <span class="sig-paren">)</span><a class="headerlink" href="#halops.transform_weights_for_moe" title="Link to this definition">¶</a></dt>
-<dd><p>Pack the router and up-projection weights for <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>.</p>
+<dd><p>Pack the router and up-projection weights for <code class="docutils literal notranslate"><span class="pre">mega_ll_moe</span></code>.</p>
 <p>The down-projection and latent-down weights, and the scales, already follow
-the layout the kernel reads and are passed to <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code> as-is.
+the layout the kernel reads and are passed to <code class="docutils literal notranslate"><span class="pre">mega_ll_moe</span></code> as-is.
 This repacks the operands whose layout differs:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">router_weight</span></code> – the router’s SW128 swizzle, one packed blob per
@@ -553,7 +553,7 @@ layout.</p></li>
 </ul>
 <p>Only the layout changes: quantize every weight first, then convert it
 here.</p>
-<p><code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> selects the router schedule and must match the <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>
+<p><code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> selects the router schedule and must match the <code class="docutils literal notranslate"><span class="pre">mega_ll_moe</span></code>
 call.  Every operand is optional: only the ones that are given are packed (and
 returned), e.g. to pack the experts as soon as they are loaded and the router once
 per schedule.</p>
@@ -567,7 +567,7 @@ accepted, and a single [K, E] weight is reused for every gate.</p></li>
 float8_e4m3fn; rows [0, N) are gate and [N, 2N) up.</p></li>
 <li><p><strong>shared_up_weight</strong> (<em>Tensor</em><em>, </em><em>optional</em>) – Shared-expert weights, shape [2N, H],
 dtype float8_e4m3fn, same gate/up split.</p></li>
-<li><p><strong>num_tokens</strong> (<em>int</em><em>, </em><em>optional</em>) – Token count of the <code class="docutils literal notranslate"><span class="pre">low_latency_moe</span></code>
+<li><p><strong>num_tokens</strong> (<em>int</em><em>, </em><em>optional</em>) – Token count of the <code class="docutils literal notranslate"><span class="pre">mega_ll_moe</span></code>
 call, which picks the router tile M. Default: 1.</p></li>
 <li><p><strong>num_router_gates</strong> (<em>int</em><em>, </em><em>optional</em>) – Gates to merge; this build requires
 2. Default: 2.</p></li>
@@ -673,7 +673,7 @@ when <code class="docutils literal notranslate"><span class="pre">shared_up_weig
             <ul>
 <li><a class="reference internal" href="#">MOE</a><ul>
 <li><a class="reference internal" href="#moeworkspace">MoEWorkspace</a></li>
-<li><a class="reference internal" href="#low-latency-moe">low_latency_moe</a></li>
+<li><a class="reference internal" href="#mega-ll-moe">mega_ll_moe</a></li>
 <li><a class="reference internal" href="#get-workspace-for-moe">get_workspace_for_moe</a></li>
 <li><a class="reference internal" href="#get-workspace-size-for-moe">get_workspace_size_for_moe</a></li>
 <li><a class="reference internal" href="#transform-weights-for-moe">transform_weights_for_moe</a></li>

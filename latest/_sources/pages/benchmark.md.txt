@@ -14,7 +14,7 @@ python benchmark.py --config=attention/prefill_chunked_c16_gqa14-1.yaml --gpu=0
 python benchmark.py --config=gemm/dense_w8a8.yaml --backend=halops --gpu=0
 
 # Full latent MoE: quantized HALOps accuracy and latency
-python benchmark.py --config=moe/low_latency_moe_w8a8_blockwise.yaml --gpu=0
+python benchmark.py --config=moe/mega_ll_moe_w8a8_blockwise.yaml --gpu=0
 ```
 
 - `--config` takes a path relative to `configs/` (recommended), a file name unique across `configs/<op>/`, or an absolute path. Bundled configs live in `configs/attention/`, `configs/gemm/` and `configs/moe/`.
