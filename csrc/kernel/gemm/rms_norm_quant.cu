@@ -186,6 +186,7 @@ std::vector<torch::Tensor> RmsNormQuant(
                             w, static_cast<float>(eps), m, k, q_ptr, sf_ptr,
                             static_cast<__nv_bfloat16*>(nullptr));
     }
+    HALOPS_CUDA_CHECK(cudaGetLastError());
     return {q, sf};
 }
 
