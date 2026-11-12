@@ -179,10 +179,9 @@ struct IndexerGemmConfig {
 using GemmShapeDefaults = IndexerGemmConfig<128>;
 
 struct IndexerDimensions {
-    static constexpr int HIDDEN = 4096;
+    static constexpr int DEFAULT_HIDDEN = 4096;
     static constexpr int HEAD_DIM = 128;
     static constexpr int NUM_HEADS = 64;
-    static constexpr int QUERY_LORA_RANK = 1024;
     static constexpr int ROPE_DIM = 64;
 
     static constexpr int KEY_WEIGHT_ROWS = HEAD_DIM + NUM_HEADS;
@@ -319,16 +318,25 @@ inline int select_grid_blocks(int num_tokens, int available_sms,
 }
 
 inline int select_key_weight_splits(int tokens, int grid_blocks,
+                                    int key_weight_k_tiles,
                                     bool fp8_schedule = false) {
-    if (fp8_schedule && tokens >= 240 && tokens <= 256) return 4;
-    if (tokens > 128 && tokens <= 256) return 8;
-    if (tokens > 256 && tokens < 512 && tokens % 128 != 0) return 8;
-    if (tokens > 256 && tokens <= 1024) return 4;
+    auto fixed_split = [key_weight_k_tiles](int split) {
+        return key_weight_k_tiles % split == 0 ? split : 0;
+    };
+    if (fp8_schedule && tokens >= 240 && tokens <= 256)
+        if (const int split = fixed_split(4)) return split;
+    if (tokens > 128 && tokens <= 256)
+        if (const int split = fixed_split(8)) return split;
+    if (tokens > 256 && tokens < 512 && tokens % 128 != 0)
+        if (const int split = fixed_split(8)) return split;
+    if (tokens > 256 && tokens <= 1024)
+        if (const int split = fixed_split(4)) return split;
     constexpr int weight_tiles =
         IndexerDimensions::PADDED_KEY_WEIGHT_ROWS / IndexerTraits::GemmBase::BM;
     const int groups = token_group_count(tokens);
     int splits = 1;
     while (splits * 2 <= IndexerTraits::KeyWeight::KSplitMax &&
+           key_weight_k_tiles % (splits * 2) == 0 &&
            (int64_t)weight_tiles * groups * (splits * 2) <= grid_blocks)
         splits *= 2;
     return splits;
@@ -357,9 +365,14 @@ void configure_indexer_schedule(Parameters& params, int sm_count,
         "indexer_prepare: the tile ladder and the instantiated tile disagree (",
         select_token_tile(params.num_tokens), " vs ", KernelTraits::TokenTile,
         ")");
-    params.key_weight_splits = select_key_weight_splits(
-        params.num_tokens, params.grid_blocks, !KernelTraits::is_mx_sf);
-    const int key_weight_k_tiles = Dimensions::HIDDEN / KeyWeightConfig::BK;
+    TORCH_CHECK(params.input_hidden_size % KeyWeightConfig::BK == 0,
+                "hidden_size must be divisible by the key projection tile ",
+                KeyWeightConfig::BK, ", got ", params.input_hidden_size);
+    const int key_weight_k_tiles =
+        params.input_hidden_size / KeyWeightConfig::BK;
+    params.key_weight_splits =
+        select_key_weight_splits(params.num_tokens, params.grid_blocks,
+                                 key_weight_k_tiles, !KernelTraits::is_mx_sf);
     TORCH_CHECK(key_weight_k_tiles % params.key_weight_splits == 0,
                 "the kw K-split must divide the k-tile count; got ",
                 key_weight_k_tiles,
@@ -372,12 +385,16 @@ void configure_indexer_schedule(Parameters& params, int sm_count,
                 " stages=", KeyWeightConfig::TmaStages);
 
     static_assert(Dimensions::QUERY_ROWS % QueryConfig::BM == 0);
-    static_assert(Dimensions::QUERY_LORA_RANK %
-                      (QueryConfig::BK * QueryConfig::KSplit) ==
-                  0);
-    constexpr int query_tiles_per_split =
-        Dimensions::QUERY_LORA_RANK / (QueryConfig::BK * QueryConfig::KSplit);
-    static_assert(query_tiles_per_split >= QueryConfig::TmaStages);
+    TORCH_CHECK(
+        params.query_lora_rank % (QueryConfig::BK * QueryConfig::KSplit) == 0,
+        "q_lora_rank must be divisible by the query projection tile ",
+        QueryConfig::BK * QueryConfig::KSplit, ", got ",
+        params.query_lora_rank);
+    const int query_tiles_per_split =
+        params.query_lora_rank / (QueryConfig::BK * QueryConfig::KSplit);
+    TORCH_CHECK(query_tiles_per_split >= QueryConfig::TmaStages,
+                "q_lora_rank must provide at least ", QueryConfig::TmaStages,
+                " query K tiles, got ", params.query_lora_rank);
     params.key_weight_tiles_per_split = key_weight_tiles_per_split;
     params.query_tiles_per_split = query_tiles_per_split;
 
@@ -400,8 +417,7 @@ void configure_indexer_schedule(Parameters& params, int sm_count,
         params.key_weight_items_per_group = params.key_weight_splits;
         params.key_weight_work_items = params.key_weight_splits;
     }
-    params.query_items_per_group =
-        Dimensions::QUERY_ROWS / KernelTraits::Query::BM;
+    params.query_items_per_group = params.query_rows / KernelTraits::Query::BM;
     params.query_work_items =
         params.query_items_per_group * params.token_groups;
     params.use_256bit_stores = query_aligned_32;

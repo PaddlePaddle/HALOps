@@ -212,11 +212,13 @@ struct IndexerHostParams {
         TORCH_CHECK(x.dim() == 2 && x.scalar_type() == torch::kBFloat16,
                     "x must be a 2-D bfloat16 [num_tokens, hidden], got ",
                     x.sizes(), " ", x.scalar_type());
-        TORCH_CHECK(x.size(1) == Dimensions::HIDDEN && x.stride(1) == 1,
-                    "this build compiles hidden=", Dimensions::HIDDEN, ", got ",
-                    x.size(1),
-                    " x's last dim must have stride 1 (the bf16 TMA reads it "
-                    "K-major)");
+        const int64_t hidden_size =
+            x.dim() == 2 && x.size(1) > 0 ? x.size(1) : 0;
+        TORCH_CHECK(hidden_size > 0 && x.stride(1) == 1,
+                    "x's hidden dimension must be positive and its last "
+                    "dimension must have stride 1 (the bf16 TMA reads it "
+                    "K-major), got ",
+                    x.sizes(), " strides ", x.strides());
         const int64_t head_dim =
             k_norm_weight.dim() == 1 ? k_norm_weight.size(0) : 0;
         TORCH_CHECK(head_dim == Dimensions::HEAD_DIM &&
@@ -246,40 +248,43 @@ struct IndexerHostParams {
         TORCH_CHECK(wk_w.dim() == 2 && wk_w.scalar_type() == torch::kBFloat16,
                     "wk_w must be 2-D bfloat16");
         TORCH_CHECK(wk_w.size(0) == Dimensions::KEY_WEIGHT_ROWS &&
-                        wk_w.size(1) == Dimensions::HIDDEN &&
-                        wk_w.stride(1) == 1 &&
-                        wk_w.stride(0) == Dimensions::HIDDEN,
+                        wk_w.size(1) == hidden_size && wk_w.stride(1) == 1 &&
+                        wk_w.stride(0) == hidden_size,
                     "wk_w must be contiguous K-major [",
-                    Dimensions::KEY_WEIGHT_ROWS, ", ", Dimensions::HIDDEN,
+                    Dimensions::KEY_WEIGHT_ROWS, ", hidden_size=", hidden_size,
                     "], got ", wk_w.sizes(), " strides ", wk_w.strides());
 
         TORCH_CHECK(q_lora.dim() == 2 && q_lora.size(0) == num_tokens &&
-                        q_lora.size(1) == Dimensions::QUERY_LORA_RANK,
+                        q_lora.size(1) > 0,
                     "q_lora must be [T, q_lora_rank] = [", num_tokens, ", ",
-                    Dimensions::QUERY_LORA_RANK, "], got ", q_lora.sizes());
+                    "q_lora_rank], got ", q_lora.sizes());
         TORCH_CHECK(q_lora.stride(1) == 1,
                     "q_lora's last dim must have stride 1");
         TORCH_CHECK(q_lora.scalar_type() == torch::kBFloat16,
                     "q_lora must be bfloat16");
+        const int64_t q_lora_rank = q_lora.size(1);
+        const int64_t q_lora_scale_cols =
+            (q_lora_rank + Dimensions::MX_GROUP_SIZE - 1) /
+            Dimensions::MX_GROUP_SIZE;
 
         TORCH_CHECK(
             wq_b.dim() == 2 && wq_b.scalar_type() == torch::kFloat8_e4m3fn,
             "wq_b must be 2-D float8_e4m3fn, got ", wq_b.sizes(), " ",
             wq_b.scalar_type());
         TORCH_CHECK(wq_b.size(0) == Dimensions::QUERY_ROWS &&
-                        wq_b.size(1) == Dimensions::QUERY_LORA_RANK &&
-                        wq_b.stride(1) == 1 &&
-                        wq_b.stride(0) == Dimensions::QUERY_LORA_RANK,
+                        wq_b.size(1) == q_lora_rank && wq_b.stride(1) == 1 &&
+                        wq_b.stride(0) == q_lora_rank,
                     "wq_b must be contiguous K-major [", Dimensions::QUERY_ROWS,
-                    ", ", Dimensions::QUERY_LORA_RANK, "], got ", wq_b.sizes());
+                    ", q_lora_rank=", q_lora_rank, "], got ", wq_b.sizes());
+        TORCH_CHECK(q_lora_rank % Dimensions::MX_GROUP_SIZE == 0,
+                    "q_lora_rank must be divisible by the MX group size ",
+                    Dimensions::MX_GROUP_SIZE, ", got ", q_lora_rank);
         TORCH_CHECK(wq_b_sf.scalar_type() == torch::kByte &&
                         wq_b_sf.dim() == 2 &&
                         wq_b_sf.size(0) == Dimensions::QUERY_ROWS &&
-                        wq_b_sf.size(1) == Dimensions::QUERY_LORA_RANK /
-                                               Dimensions::MX_GROUP_SIZE,
+                        wq_b_sf.size(1) == q_lora_scale_cols,
                     "wq_b_sf must be the SfAtom-swizzled uint8 [N, K/32] = [",
-                    Dimensions::QUERY_ROWS, ", ",
-                    (Dimensions::QUERY_LORA_RANK / Dimensions::MX_GROUP_SIZE),
+                    Dimensions::QUERY_ROWS, ", ", q_lora_scale_cols,
                     "] the block-scaled UMMA reads directly, got ",
                     wq_b_sf.sizes(), " ", wq_b_sf.scalar_type());
 
@@ -410,13 +415,13 @@ struct IndexerPrepareWorkspace {
         result.activation_rows = params.num_tokens;
         result.query_lora_offset =
             reserve(result.has_query_lora ? (int64_t)result.activation_rows *
-                                                Dimensions::QUERY_LORA_RANK
+                                                params.query_lora_rank
                                           : 0);
         // SfAtom requires full 128-row scale tiles even for a partial tile.
         result.query_scale_offset =
             reserve(result.has_query_lora
                         ? (int64_t)padded_token_count(params.num_tokens) *
-                              (Dimensions::QUERY_LORA_RANK /
+                              (params.query_lora_rank /
                                KernelTraits::GemmBase::ScaleGroupSize)
                         : 0);
         result.total_bytes = cursor;
@@ -488,7 +493,7 @@ struct IndexerDeviceParams {
         query_items_per_group;
     int key_weight_tiles_per_split, query_tiles_per_split;
     int key_weight_splits;
-    int padded_key_weight_rows, input_hidden_size, query_rows;
+    int padded_key_weight_rows, input_hidden_size, query_lora_rank, query_rows;
     int page_size, page_shift, cache_row_bytes;
     int x_row_stride, query_lora_row_stride;
     bool positions_are_int64, cache_slots_are_int64;
@@ -767,12 +772,13 @@ auto make_indexer_device_params(const IndexerHostParams& host, int sm_count,
                                          : IndexerWeightsDtype::Float32;
     params.apply_hadamard = host.apply_hadamard;
     params.use_pdl = host.use_pdl;
+    params.padded_key_weight_rows = Dimensions::PADDED_KEY_WEIGHT_ROWS;
+    params.input_hidden_size = host.x.size(1);
+    params.query_lora_rank = host.q_lora.size(1);
+    params.query_rows = Dimensions::QUERY_ROWS;
     configure_indexer_schedule<KernelTraits>(
         params, sm_count,
         (reinterpret_cast<uintptr_t>(host.out_q.data_ptr()) & 31) == 0);
-    params.padded_key_weight_rows = Dimensions::PADDED_KEY_WEIGHT_ROWS;
-    params.input_hidden_size = Dimensions::HIDDEN;
-    params.query_rows = Dimensions::QUERY_ROWS;
 
     using Workspace = IndexerPrepareWorkspace<KernelTraits>;
     const auto layout = Workspace::layout(params);
@@ -794,10 +800,11 @@ auto make_indexer_device_params(const IndexerHostParams& host, int sm_count,
         reinterpret_cast<ue8m0*>(base + layout.query_scale_offset);
 
     params.key_weight_tma = make_bf16_weight_tma<KeyWeightConfig>(
-        host.wk_w.data_ptr(), Dimensions::KEY_WEIGHT_ROWS, Dimensions::HIDDEN);
+        host.wk_w.data_ptr(), Dimensions::KEY_WEIGHT_ROWS,
+        params.input_hidden_size);
     params.input_tma = make_bf16_activation_tma<KeyWeightConfig>(
         host.x.data_ptr(), params.num_tokens, params.x_row_stride,
-        Dimensions::HIDDEN);
+        params.input_hidden_size);
 
     params.x = static_cast<const __nv_bfloat16*>(host.x.data_ptr());
     params.key_weight_projection =
@@ -817,13 +824,13 @@ auto make_indexer_device_params(const IndexerHostParams& host, int sm_count,
     params.weights = host.out_weights.data_ptr();
 
     params.query_weight_descriptors = make_weight_descriptors<TokenTile>(
-        host.wq_b.data_ptr(), host.wq_b_sf.data_ptr(), Dimensions::QUERY_ROWS,
-        Dimensions::QUERY_LORA_RANK);
+        host.wq_b.data_ptr(), host.wq_b_sf.data_ptr(), params.query_rows,
+        params.query_lora_rank);
     if (layout.has_query_lora)
         params.query_lora_descriptors = make_activation_descriptors<TokenTile>(
             params.quantized_query_lora, params.query_lora_scales,
-            params.padded_tokens, Dimensions::QUERY_LORA_RANK,
-            params.padded_tokens, layout.activation_rows);
+            params.padded_tokens, params.query_lora_rank, params.padded_tokens,
+            layout.activation_rows);
     return params;
 }
 

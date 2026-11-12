@@ -44,65 +44,73 @@ def indexer_prepare(
     apply_hadamard: bool = True,
     use_pdl: bool = True,
 ) -> None:
-    """Project, normalize, rotate and quantize indexer Q/K in one CUDA launch.
+    """Fuse indexer Q/K preparation into one CUDA launch.
 
-    This entry point writes into caller-owned CUDA buffers and returns ``None``.
-    All tensors must be contiguous where stated, reside on the same CUDA
-    device, and satisfy the alignment requirements of the SM100 kernel. The
-    build requires an SM100 GPU with at least 128 SMs.
+    The operator projects ``x`` to K and raw per-head weights, quantizes
+    ``q_lora`` before the Q projection, then applies normalization, RoPE and
+    the optional Hadamard transform. It writes the selected FP8, MXFP8 or
+    packed MXFP4 Q/K representation to the caller-owned output buffers and
+    updates the paged K cache in place.
+
+    The current CUDA specialization uses 64 heads, head dimension 128 and
+    rotary dimension 64. ``hidden_size`` and ``q_lora_rank`` are runtime
+    dimensions; the supported projection configurations include
+    ``(4096, 1024)`` and ``(7168, 1536)``. The kernel requires an SM100-family
+    GPU with at least 128 available SMs. It validates the remaining shape,
+    dtype and layout requirements at the native boundary.
 
     Args:
-        x: Contiguous [T, 4096] bfloat16 input for K and Q projection. Row
-            starts must meet the kernel's 16-byte alignment requirement.
-        q_lora: Contiguous [T, 1024] bfloat16 input for Q projection. Row
-            starts must meet the kernel's 8-byte alignment requirement.
-        wk_w: Contiguous [192, 4096] bfloat16 weights for K and Q's weights.
-        wq_b: Contiguous [8192, 1024] float8_e4m3fn Q projection weight.
-        wq_b_sf: Contiguous [8192, 32] uint8 group-32 UE8M0 scales in
-            CUTLASS SfAtom layout, as returned by
-            ``group_wise_quant(..., mode="w8a8-mxfp8", use_swizzle=True)``.
-        k_norm_weight: Contiguous [128] float32 normalization gain.
-        k_norm_bias: Contiguous [128] float32 bias; a tensor selects
-            LayerNorm, while None selects RMSNorm.
-        k_norm_eps: Normalization epsilon.
-        rope_cos_sin_cache: Contiguous [max_position, 64] float32, stored as
-            [cos(32) | sin(32)]. RoPE rotates the first 64 Q/K elements.
-        positions: Contiguous [T] int32/int64 RoPE positions. Values must fit
-            int32 and index the supplied table.
+        x: Contiguous [T, hidden_size] bfloat16 input. ``hidden_size`` must
+            be positive and divisible by 128.
+        q_lora: Contiguous [T, q_lora_rank] bfloat16 input. ``q_lora_rank``
+            must be divisible by 256 and therefore by the group size 32.
+        wk_w: Contiguous [head_dim + num_heads, hidden_size] bfloat16
+            projection weights. The first ``head_dim`` rows project K and the
+            last ``num_heads`` rows produce the raw per-head weights.
+        wq_b: Contiguous [num_heads * head_dim, q_lora_rank]
+            float8_e4m3fn Q projection weights.
+        wq_b_sf: Contiguous [num_heads * head_dim, q_lora_rank // 32]
+            uint8 group-32 UE8M0 scales in CUTLASS SfAtom layout, as returned
+            by ``group_wise_quant(..., mode="w8a8-mxfp8", use_swizzle=True)``.
+        k_norm_weight: Contiguous [head_dim] float32 normalization gain.
+        k_norm_bias: Optional contiguous [head_dim] float32 bias. A tensor
+            selects LayerNorm, while ``None`` selects RMSNorm.
+        k_norm_eps: Positive normalization epsilon.
+        rope_cos_sin_cache: Contiguous [max_position, rope_dim] float32
+            table in ``[cos | sin]`` layout. For this build, ``rope_dim=64``
+            and the first 64 Q/K values are rotated.
+        positions: Contiguous [T] int32 or int64 RoPE positions. Values must
+            fit int32 and index the supplied table.
         paged_kv_cache_with_scale: Row-contiguous uint8 page pool. In fp8 mode,
-            [num_pages, page_size * 132], with all 128-byte FP8 rows followed
-            by one float32 scale per row. In mxfp8 mode the shape is the same,
-            with four uint8 UE8M0 group scales per row. In mxfp4 mode,
-            [num_pages, page_size * 68], with all 64-byte packed E2M1 rows
-            followed by four uint8 UE8M0 scales per row (group size 32).
-            page_size must be a power of two. The buffer is written in place.
-        kv_cache_loc: Contiguous [T] int32/int64 cache slots. Negative slots
-            skip K writes. Nonnegative slots must be in range and unique within
-            a launch; all values must fit int32. Slots are independent of
-            positions.
-        out_q: Contiguous output buffer whose dtype selects the Q/K format.
-            float8_e4m3fn with ``out_q_sf=None`` is [T, 64, 128] FP8;
-            float8_e4m3fn with ``out_q_sf`` is [T, 64, 128] MXFP8; and int8
-            with ``out_q_sf`` is [T, 64, 64] packed MXFP4. Even elements
-            occupy the low nibble. The buffer must be preallocated.
-        out_q_sf: Optional contiguous [T, 64, 4] uint8 UE8M0 scale output for
-            MXFP4/MXFP8, in linear group order. Each scale covers 32 Q
-            elements. It must be None for FP8, whose Q scale is folded into
-            weights.
-        out_weights: Contiguous [T, 64] float32, bfloat16 or float16 output.
-            Weights are computed in FP32 and rounded to its dtype. The buffer
-            must be preallocated.
-        weight_scale: Scalar folded into weights.
+            ``[num_pages, page_size * 132]`` for FP8/MXFP8 or
+            ``[num_pages, page_size * 68]`` for MXFP4. Data rows precede
+            four scale bytes per row. The buffer is written in place.
+        kv_cache_loc: Contiguous [T] int32 or int64 cache slots. Negative
+            slots skip K writes. Nonnegative slots are independent of
+            ``positions`` and must be valid for the allocated page pool.
+        out_q: Contiguous preallocated output buffer. FP8 and MXFP8 use
+            float8_e4m3fn [T, num_heads, head_dim]; MXFP4 uses int8
+            [T, num_heads, head_dim // 2] with two packed E2M1 values per
+            byte. ``out_q_sf`` selects MXFP8 or MXFP4.
+        out_q_sf: Optional contiguous preallocated uint8
+            [T, num_heads, head_dim // 32] UE8M0 scale output for MXFP8 or
+            MXFP4. Each scale covers 32 values. It must be ``None`` for FP8,
+            whose Q scale is folded into ``out_weights``.
+        out_weights: Contiguous preallocated [T, num_heads] float32,
+            bfloat16 or float16 output. Weights are computed in FP32 and
+            rounded when stored.
+        weight_scale: Scalar multiplied into the raw per-head weights. For
+            FP8 output, the per-row Q scale is folded into the same weights.
         is_neox_style: True (default) pairs dimensions i and i+32 in the
             rotary prefix. False selects adjacent pairs (2*i, 2*i+1).
-        apply_hadamard: Apply the normalized 128-point Hadamard to Q and K.
-        use_pdl: Enable Programmatic Dependent Launch. Successors may initialize
-            early; their dependency wait observes complete outputs.
+        apply_hadamard: Apply the normalized 128-point Hadamard transform to
+            Q and K.
+        use_pdl: Enable CUDA Programmatic Dependent Launch. Successors may
+            initialize early; their dependency wait observes completed outputs.
 
     Returns:
-        None. ``out_q``, ``out_q_sf`` and ``out_weights`` are modified in
-        place. The cache is also updated in place at nonnegative
-        ``kv_cache_loc`` slots.
+        None. ``out_q``, ``out_q_sf``, ``out_weights`` and the selected cache
+        slots are modified in place.
     """
 
     halops_kernel.indexer_prepare(
@@ -122,7 +130,7 @@ def indexer_prepare(
         out_q_sf,
         out_weights,
         weight_scale,
-        is_neox_style,
-        apply_hadamard,
-        use_pdl,
+        is_neox_style=is_neox_style,
+        apply_hadamard=apply_hadamard,
+        use_pdl=use_pdl,
     )

@@ -254,7 +254,7 @@ struct CollectiveIndexer {
             const int group_lane = lane & 7;
             const unsigned mask = 0xffu << (lane & ~7);
             for (int k = SPLIT_STAGES ? w : (WARPS == 4 ? w / 2 : 0);
-                 k < Dimensions::QUERY_LORA_RANK / QueryConfig::BK;
+                 k < params.query_lora_rank / QueryConfig::BK;
                  k += SPLIT_STAGES ? WARPS : (WARPS == 4 ? 2 : 1)) {
                 wait_stage_free<STAGES>(context.query_resources.barriers, 0,
                                         ~0u, 0, params.query_tiles_per_split,

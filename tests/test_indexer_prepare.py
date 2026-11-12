@@ -186,6 +186,8 @@ class Case:
 def make_case(
     tokens,
     *,
+    hidden_size=HIDDEN,
+    q_lora_rank=RANK,
     page_size=64,
     bias=True,
     apply_hadamard=True,
@@ -200,11 +202,13 @@ def make_case(
     def randn(*shape, dtype=torch.bfloat16):
         return torch.randn(*shape, dtype=dtype, device=device)
 
-    x = randn(tokens, HIDDEN)
-    q_lora = randn(tokens, RANK)
-    wq = randn(HEADS * HEAD_DIM, RANK)
+    x = randn(tokens, hidden_size)
+    q_lora = randn(tokens, q_lora_rank)
+    wq = randn(HEADS * HEAD_DIM, q_lora_rank)
     if varied_groups:
-        scales = torch.logspace(-2, 2, RANK // 32, device=device).repeat_interleave(32)
+        scales = torch.logspace(
+            -2, 2, q_lora_rank // 32, device=device
+        ).repeat_interleave(32)
         q_lora = (q_lora.float() * scales).to(torch.bfloat16)
         wq = (wq.float() * scales.flip(0)).to(torch.bfloat16)
     wq, exponents, wq_dequantized = quantize_blocks(wq, 32)
@@ -225,7 +229,7 @@ def make_case(
     kwargs = dict(
         x=x,
         q_lora=q_lora,
-        wk_w=randn(HEAD_DIM + HEADS, HIDDEN),
+        wk_w=randn(HEAD_DIM + HEADS, hidden_size),
         wq_b=wq,
         wq_b_sf=scale_input,
         k_norm_weight=randn(HEAD_DIM, dtype=torch.float32),
@@ -448,6 +452,22 @@ def test_formats_and_dispatch(tokens, output_dtype):
         is_neox_style=tokens % 2 == 0,
     )
     check(case)
+
+
+@pytest.mark.parametrize("tokens", [1, 17])
+@pytest.mark.parametrize("output_dtype", ["fp8", "mxfp4", "mxfp8"])
+def test_non_default_projection_shapes(tokens, output_dtype):
+    """Exercise dynamic hidden_size and q_lora_rank in every output format."""
+    check(
+        make_case(
+            tokens,
+            hidden_size=7168,
+            q_lora_rank=1536,
+            output_dtype=output_dtype,
+            shuffle=tokens > 1,
+            sentinels=tokens > 1,
+        )
+    )
 
 
 @pytest.mark.parametrize(

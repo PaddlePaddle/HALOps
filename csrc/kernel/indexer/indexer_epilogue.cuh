@@ -521,7 +521,7 @@ struct CollectiveIndexerEpilogue {
         }
     }
 
-    template <bool DRAIN = false, class Context>
+    template <bool DRAIN = false, bool DEFAULT_HIDDEN = false, class Context>
     CUTE_DEVICE void compute_simt_key_weights(Context const& context) const {
         const auto& params = context.params;
         const int lane = KernelTraits::lane_idx();
@@ -532,11 +532,16 @@ struct CollectiveIndexerEpilogue {
         if (vector_warp < 3) {
             const int row = vector_warp < 2 ? 2 * head + vector_warp
                                             : Dimensions::HEAD_DIM + head;
-            const __nv_bfloat16* w = params.key_weight_projection +
-                                     (int64_t)row * Dimensions::HIDDEN;
+            const __nv_bfloat16* w =
+                params.key_weight_projection +
+                (int64_t)row * (DEFAULT_HIDDEN ? Dimensions::DEFAULT_HIDDEN
+                                               : params.input_hidden_size);
             float2 sum[4] = {};
             CUTLASS_PRAGMA_UNROLL
-            for (int k = lane * 8; k < Dimensions::HIDDEN; k += 32 * 8) {
+            for (int k = lane * 8;
+                 k < (DEFAULT_HIDDEN ? Dimensions::DEFAULT_HIDDEN
+                                     : params.input_hidden_size);
+                 k += 32 * 8) {
                 __nv_bfloat16 input_values[8], weight_values[8];
                 *reinterpret_cast<uint4*>(input_values) =
                     *reinterpret_cast<const uint4*>(params.x + k);
@@ -579,7 +584,11 @@ struct CollectiveIndexerEpilogue {
 
     template <class Context>
     CUTE_DEVICE void drain_decode(Context const& context) const {
-        compute_simt_key_weights<true>(context);
+        if (context.params.input_hidden_size ==
+            KernelTraits::Dimensions::DEFAULT_HIDDEN)
+            compute_simt_key_weights<true, true>(context);
+        else
+            compute_simt_key_weights<true, false>(context);
         auto op = make_drain_op<QueryConfig>(context.query_resources, 0);
         const int item = blockIdx.x;
         const auto work_item =
@@ -657,7 +666,7 @@ struct CollectiveIndexerEpilogue {
         }
     }
 
-    template <class Context>
+    template <bool DEFAULT_HIDDEN = false, class Context>
     CUTE_DEVICE void drain_small_q(Context const& context) const {
         const auto& params = context.params;
         const int lane = KernelTraits::lane_idx();
@@ -706,12 +715,16 @@ struct CollectiveIndexerEpilogue {
             for (int token = consumer_warp; token < params.num_tokens;
                  token += Roles::DrainWarps) {
                 const auto* x = params.x + (int64_t)token * params.x_row_stride;
-                const auto* w =
-                    params.key_weight_projection +
-                    (int64_t)(Dimensions::HEAD_DIM + head) * Dimensions::HIDDEN;
+                const auto* w = params.key_weight_projection +
+                                (int64_t)(Dimensions::HEAD_DIM + head) *
+                                    (DEFAULT_HIDDEN ? Dimensions::DEFAULT_HIDDEN
+                                                    : params.input_hidden_size);
                 float2 sum[4] = {};
                 CUTLASS_PRAGMA_UNROLL
-                for (int k = lane * 8; k < Dimensions::HIDDEN; k += 32 * 8) {
+                for (int k = lane * 8;
+                     k < (DEFAULT_HIDDEN ? Dimensions::DEFAULT_HIDDEN
+                                         : params.input_hidden_size);
+                     k += 32 * 8) {
                     __nv_bfloat16 input_values[8], weight_values[8];
                     *reinterpret_cast<uint4*>(input_values) =
                         *reinterpret_cast<const uint4*>(x + k);
@@ -774,7 +787,7 @@ struct CollectiveIndexerEpilogue {
         const int token_groups =
             (params.num_tokens + TokenTile - 1) / TokenTile;
         const int scale_groups_per_row =
-            Dimensions::QUERY_LORA_RANK / GemmShapeDefaults::ScaleGroupSize;
+            params.query_lora_rank / GemmShapeDefaults::ScaleGroupSize;
         const int cta_stride = params.uses_local_query()
                                    ? params.key_weight_work_items
                                    : params.grid_blocks;
@@ -800,7 +813,7 @@ struct CollectiveIndexerEpilogue {
                     quantize_group32_from_regs<TokenTile>(
                         values, params.quantized_query_lora,
                         params.query_lora_scales, layout_sfb, token,
-                        Dimensions::QUERY_LORA_RANK, group,
+                        params.query_lora_rank, group,
                         vector_thread & (IndexerWarpTraits::WarpSize - 1));
                 }
                 sync_named_barrier<
@@ -821,7 +834,10 @@ struct CollectiveIndexerEpilogue {
         if (params.all_warps_process_keys || blockIdx.x >= params.vector_blocks)
             return;
         if (params.uses_simt_projection()) {
-            compute_simt_key_weights(context);
+            if (params.input_hidden_size == Dimensions::DEFAULT_HIDDEN)
+                compute_simt_key_weights<false, true>(context);
+            else
+                compute_simt_key_weights<false, false>(context);
         } else {
             k_epilogue(context);
         }

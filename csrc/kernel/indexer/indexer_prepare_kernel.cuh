@@ -212,8 +212,11 @@ struct IndexerPrepareDispatch<KernelTraits, false, true> {
         } else if (Roles::is_drain(warp_idx)) {
             if (has_key_weight_work)
                 epilogue.template consume_accumulators<true>(context);
+            else if (context.params.input_hidden_size ==
+                     KernelTraits::Dimensions::DEFAULT_HIDDEN)
+                epilogue.template drain_small_q<true>(context);
             else
-                epilogue.drain_small_q(context);
+                epilogue.template drain_small_q<false>(context);
         } else if (Roles::is_vector(warp_idx)) {
             if (has_key_weight_work) {
                 if (context.params.num_tokens > 4)
