@@ -993,18 +993,15 @@ of bounds (illegal memory access). Size it with headroom above
 <dd><em class="sig-param"><span class="n"><span class="pre">input</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">weight</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-06</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">return_bf16</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_swizzle</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">output_quant</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">output_sf</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">output_bf16</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 </dl>
 
 <span class="sig-paren">)</span><a class="headerlink" href="#halops.rms_norm_quant" title="Link to this definition">¶</a></dt>
 <dd><p>RMSNorm fused with W8A8-MXFP8 quantization.</p>
 <p>Computes <code class="docutils literal notranslate"><span class="pre">y</span> <span class="pre">=</span> <span class="pre">bf16(x</span> <span class="pre">*</span> <span class="pre">rsqrt(mean(x^2)</span> <span class="pre">+</span> <span class="pre">eps)</span> <span class="pre">*</span> <span class="pre">weight)</span></code> in fp32 and
-quantizes it exactly as <code class="docutils literal notranslate"><span class="pre">group_wise_quant(y,</span> <span class="pre">&quot;w8a8-mxfp8&quot;)</span></code> does, reading
-<code class="docutils literal notranslate"><span class="pre">x</span></code> once.</p>
+quantizes it exactly as <code class="docutils literal notranslate"><span class="pre">group_wise_quant(y,</span> <span class="pre">&quot;w8a8-mxfp8&quot;,</span> <span class="pre">use_swizzle)</span></code>
+does, reading <code class="docutils literal notranslate"><span class="pre">x</span></code> once.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1013,25 +1010,23 @@ quantizes it exactly as <code class="docutils literal notranslate"><span class="
 multiple of 128 and at most 8192.</p></li>
 <li><p><strong>weight</strong> (<em>torch.Tensor</em>) – [K] bfloat16 RMSNorm gamma.</p></li>
 <li><p><strong>eps</strong> (<em>float</em>) – RMSNorm epsilon.</p></li>
-<li><p><strong>return_bf16</strong> (<em>bool</em>) – Also return the bfloat16 <code class="docutils literal notranslate"><span class="pre">y</span></code>.</p></li>
+<li><p><strong>use_swizzle</strong> (<em>bool</em>) – Write the scales in the CUTLASS SfAtom layout (default),
+or row-major as <code class="docutils literal notranslate"><span class="pre">low_latency_mma_gemm</span></code> reads them.</p></li>
 <li><p><strong>use_pdl</strong> (<em>bool</em>) – Enable Programmatic Dependent Launch (on by default).</p></li>
-<li><p><strong>output_quant</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional pre-allocated contiguous [M, K] float8_e4m3fn.</p></li>
-<li><p><strong>output_sf</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional pre-allocated contiguous scale buffer.</p></li>
-<li><p><strong>output_bf16</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional pre-allocated contiguous [M, K] bfloat16 <code class="docutils literal notranslate"><span class="pre">y</span></code>;
-implies <code class="docutils literal notranslate"><span class="pre">return_bf16</span></code>.</p></li>
 </ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p><p><code class="docutils literal notranslate"><span class="pre">(output_quant,</span> <span class="pre">output_sf)</span></code>, plus the bfloat16 <code class="docutils literal notranslate"><span class="pre">y</span></code> when requested –</p>
+<dd class="field-even"><p><p><code class="docutils literal notranslate"><span class="pre">(q,</span> <span class="pre">sf)</span></code> –</p>
 <ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">output_quant</span></code>: [M, K] float8_e4m3fn</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">output_sf</span></code>: [ceil(M / 128) * 128, K / 32] uint8 UE8M0 scales in
-the CUTLASS SfAtom layout (padding rows hold 0)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">q</span></code>: [M, K] float8_e4m3fn</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">sf</span></code>: uint8 UE8M0 scales, [ceil(M / 128) * 128, K / 32] in
+the CUTLASS SfAtom layout (padding rows hold 0) with <code class="docutils literal notranslate"><span class="pre">use_swizzle</span></code>,
+else row-major [M, K / 32]</p></li>
 </ul>
 </p>
 </dd>
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><em>Tuple</em>[torch.Tensor, torch.Tensor] | <em>Tuple</em>[torch.Tensor, torch.Tensor, torch.Tensor]</p>
+<dd class="field-odd"><p><em>Tuple</em>[torch.Tensor, torch.Tensor]</p>
 </dd>
 </dl>
 <p class="rubric">Example</p>
