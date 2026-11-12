@@ -24,11 +24,14 @@ from halops.moe.mega_ll_moe_utils import (
     _NARROW_TOKENS,
     _TAIL_ALIGN,
     _check_workspace,
+    _interleave_gate_up_weight,
+    _interleave_gate_up_scale,
 )
 
 __all__ = [
     "MoEWorkspace",
     "mega_ll_moe",
+    "transform_weights_for_moe",
     "get_workspace_for_moe",
     "get_workspace_size_for_moe",
 ]
@@ -145,6 +148,82 @@ def get_workspace_for_moe(
     )
 
 
+def transform_weights_for_moe(
+    expert_up_weights: torch.Tensor,
+    expert_up_weights_scale: torch.Tensor,
+    shared_up_weight: torch.Tensor,
+    shared_up_weight_scale: torch.Tensor,
+    routed_use_interleaved: bool = True,
+    shared_use_interleaved: bool = True,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Repack the up projections' weights (and MX scale tables) for ``mega_ll_moe``.
+
+    The up projections can interleave their gate/up rows in 8-row groups; the
+    caller selects that layout per projection with ``routed_use_interleaved``
+    and ``shared_use_interleaved`` on ``mega_ll_moe``.  This rewrites the
+    natural ``[..., 2N, K]`` weights, and the ``uint8`` tables from
+    ``group_wise_quant(use_swizzle=True)``, into that order.  Block-wise f32
+    scale tables are returned unchanged.
+
+    Args:
+        expert_up_weights (Tensor): Fused gate/up weights of the routed
+            experts, shape [E, 2N, K], in the natural [gate | up] row order.
+        expert_up_weights_scale (Tensor): Scales of ``expert_up_weights``: the
+            uint8 table in the natural SfAtom layout, or the block-wise f32
+            table.
+        shared_up_weight (Tensor): Fused gate/up weight of the shared expert,
+            shape [2N, K], in the natural row order.
+        shared_up_weight_scale (Tensor): Scales of ``shared_up_weight``, same
+            layout as the routed ones.
+        routed_use_interleaved (bool, optional): Repack the routed rows.
+            Default: True.
+        shared_use_interleaved (bool, optional): Repack the shared rows.
+            Default: True.
+
+    Returns:
+        (Tensor, Tensor, Tensor, Tensor): the routed weight/scale and the
+        shared weight/scale to pass to ``mega_ll_moe``.  Interleaved rows keep
+        the weight's shape; the scale table stays in its SfAtom layout.
+    """
+
+    def pack(weight, scale, interleaved, name):
+        if not interleaved:
+            return weight, scale
+        if scale is None:
+            raise ValueError(
+                f"interleaving {name} needs its scale table: the weight and "
+                "its scale rows move together."
+            )
+        return (
+            _interleave_gate_up_weight(weight).reshape(weight.shape),
+            _interleave_gate_up_scale(scale),
+        )
+
+    expert_up_weights, expert_up_weights_scale = pack(
+        expert_up_weights,
+        expert_up_weights_scale,
+        routed_use_interleaved,
+        "expert_up_weights",
+    )
+    shared_up_weight, shared_up_weight_scale = pack(
+        shared_up_weight,
+        shared_up_weight_scale,
+        shared_use_interleaved,
+        "shared_up_weight",
+    )
+    return (
+        expert_up_weights,
+        expert_up_weights_scale,
+        shared_up_weight,
+        shared_up_weight_scale,
+    )
+
+
 def mega_ll_moe(
     input: torch.Tensor,
     router_weight: torch.Tensor,
@@ -176,6 +255,11 @@ def mega_ll_moe(
     quant_mode: str = "w4a8-mxfp4",
     grid_cap: int = 0,
     use_pdl: bool = True,
+    routed_use_interleaved: bool = True,
+    shared_use_interleaved: bool = True,
+    routed_use_swizzle: bool = True,
+    shared_use_swizzle: bool = True,
+    latent_use_swizzle: bool = False,
 ) -> None:
     """MoE forward pass on Blackwell SM100, support latent.
 
@@ -185,10 +269,10 @@ def mega_ll_moe(
     and latent size 2048 now.
 
     Weights are quantized by the caller (``group_wise_quant`` for MX
-    recipes) and passed in their natural layouts; the kernel interleaves the
-    up-projection gate/up rows while it loads them, and reads the natural
-    SfAtom scale tables itself.  The down-projection and latent-down weights
-    are quantized directly in the kernel layout and passed as-is.
+    recipes); the up-projection gate/up rows are either passed pre-interleaved
+    or interleaved by the TMA while loading, and the scale tables are either
+    the caller's SfAtom tables or plain rows the kernel converts.  The layout
+    flags below select which form each operand is in.
 
     The whole forward pass runs in a single kernel launch::
 
@@ -214,12 +298,15 @@ def mega_ll_moe(
             float8_e4m3fn, in the natural [512, 2 * 512, 2048] layout. Under
             "w4a8-mxfp4" the dtype is uint8 and K is halved: two 4-bit values
             per byte, as ``group_wise_quant(mode="w4a4-mxfp4")`` packs them.
+            Pass the output of ``transform_weights_for_moe`` ([E, N/8, 2, 8,
+            K]) instead to run the 8-row pair layout.
         expert_up_weights_scale (Tensor): Block scales of
             ``expert_up_weights``: shape [512, 1024, 64] and dtype uint8 in
             the CUTLASS SfAtom layout for "w8a8-mxfp8" and "w4a8-mxfp4", or
             shape [512, 8, 16] and dtype float32 for "w8a8-blockwise".  The
             MX scales are the natural SfAtom tables from
-            ``group_wise_quant(use_swizzle=True)``.
+            ``group_wise_quant(use_swizzle=True)``; ``transform_weights_for_moe``
+            moves them with the weight.
         expert_down_weights (Tensor): Down weights, shape [512, 2048, 512],
             dtype float8_e4m3fn; under "w4a8-mxfp4" uint8 of shape [512,
             2048, 256], packed the same way.
@@ -296,6 +383,22 @@ def mega_ll_moe(
             the kernel's setup overlaps the previous kernel's tail. It waits for
             that kernel before touching shared state, and lets the next kernel
             start launching once the tail begins. Default: True.
+        routed_use_interleaved (bool, optional): The routed experts' fused
+            gate/up weights are in the 8-row interleaved order from
+            ``transform_weights_for_moe``. Default: True.
+        shared_use_interleaved (bool, optional): The shared expert's fused
+            gate/up weight is in the 8-row interleaved order from
+            ``transform_weights_for_moe``. Default: True.
+        routed_use_swizzle (bool, optional): The routed up and down scale
+            tables are the caller's SfAtom tables
+            (``group_wise_quant(use_swizzle=True)``) rather than plain rows.
+            Interleaved rows imply it. Default: True.
+        shared_use_swizzle (bool, optional): The shared up and down scale
+            tables are the caller's SfAtom tables rather than plain rows.
+            Interleaved rows imply it. Default: True.
+        latent_use_swizzle (bool, optional): The latent down-projection's
+            scale table is the caller's SfAtom table rather than plain rows.
+            Default: False.
 
     Returns:
         None. The outputs are written in place.
@@ -337,6 +440,11 @@ def mega_ll_moe(
         quant_mode,
         workspace.tp_size,
         use_pdl,
+        routed_use_interleaved,
+        shared_use_interleaved,
+        routed_use_swizzle,
+        shared_use_swizzle,
+        latent_use_swizzle,
     )
 
 

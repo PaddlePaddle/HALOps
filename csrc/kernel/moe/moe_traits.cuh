@@ -28,13 +28,6 @@
 
 namespace halops::moe {
 
-// Where a blockscaled weight's scale table comes from.
-enum class ScaleLayout : std::uint32_t {
-    kPackedAtom,   // the caller's gate/up-paired SfAtom table
-    kNaturalAtom,  // natural-row SfAtom; the kernel folds the gate/up atoms
-    kPlainRows,    // plain row-major [rows, K/32]; the kernel builds SfAtom
-};
-
 // Tile shape shared by the router Linear and the latent down-projection.
 template <std::uint32_t GemmM, std::uint32_t GemmN, std::uint32_t GemmK,
           std::uint32_t TileShapeN, std::uint32_t NumCtas, bool UseUmma>
@@ -114,9 +107,6 @@ struct LatentDownGemmTraits {
     static constexpr std::uint32_t kNumTilesM = kGemmM / kTileShapeM;
     static constexpr std::uint32_t kNumTilesK = GemmShape::kNumTilesK;
 
-    // A K tile spans this many 128-K staging blocks.
-    static constexpr std::uint32_t kNumStagingBlocks = kTileShapeK / 128u;
-
     static constexpr std::uint32_t kClusterSize = cute::max(
         (OutputQuant::kBlockSize + kTileShapeM - 1) / kTileShapeM, kNumSplits);
 
@@ -183,10 +173,6 @@ struct RouterGemmTraits {
 
 template <typename Dims>
 struct RoutedUpGemmTraits {
-    static constexpr bool kUsePairLayout =
-        Dims::KernelConfig::kRoutedUpUsePairLayout;
-    static constexpr ScaleLayout kScaleLayout =
-        kUsePairLayout ? ScaleLayout::kPackedAtom : ScaleLayout::kNaturalAtom;
     static constexpr std::uint32_t kPairGran = 8u;
     static constexpr bool kWeightHasExpertDim = true;
 
@@ -224,7 +210,6 @@ struct RoutedUpGemmTraits {
 
     static constexpr std::uint32_t kNumTilesK = kGemmK / kTileShapeK;
     static constexpr std::uint32_t kNumSplits = 1u;
-    static constexpr std::uint32_t kNumStagingBlocks = kTileShapeK / 128u;
 
     // The output's (the down's input) scale block.
     static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
@@ -249,7 +234,6 @@ struct RoutedUpGemmTraits {
 
 template <typename Dims>
 struct RoutedDownGemmTraits {
-    static constexpr ScaleLayout kScaleLayout = ScaleLayout::kPackedAtom;
     static constexpr std::uint32_t kGemmM = MoEInputSize<Dims>::value;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = Dims::kIntermediateSize;
@@ -293,10 +277,6 @@ struct RoutedDownGemmTraits {
 // Shared-expert up projection over all tokens.
 template <typename Dims>
 struct SharedUpGemmTraits {
-    static constexpr bool kUsePairLayout =
-        Dims::KernelConfig::kSharedUpUsePairLayout;
-    static constexpr ScaleLayout kScaleLayout =
-        kUsePairLayout ? ScaleLayout::kPackedAtom : ScaleLayout::kPlainRows;
     static constexpr std::uint32_t kPairGran = 8u;
     static constexpr bool kWeightHasExpertDim = false;
 
@@ -335,9 +315,6 @@ struct SharedUpGemmTraits {
 
     static constexpr std::uint32_t kNumTilesK = kGemmK / kTileShapeK;
 
-    // A K tile spans this many 128-K staging blocks.
-    static constexpr std::uint32_t kNumStagingBlocks = kTileShapeK / 128u;
-
     // The output's (the down's input) scale block.
     static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
 
@@ -356,7 +333,6 @@ struct SharedUpGemmTraits {
 // The shared expert's down-projection: M hidden, N tokens, K intermediate.
 template <typename Dims>
 struct SharedDownGemmTraits {
-    static constexpr ScaleLayout kScaleLayout = ScaleLayout::kPlainRows;
     static constexpr std::uint32_t kGemmM = Dims::kHiddenSize;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = Dims::kIntermediateSize;

@@ -61,22 +61,11 @@ void CheckRoutedExpertShape(const torch::Tensor& expert_up_weights,
     // A 4-bit weight packs two values per byte along K.
     constexpr std::int64_t kWeightBytes =
         MoEDims::kQuantConfig.kExpertsQuant == moe::QuantMethod::kMXFP4 ? 2 : 1;
-    if constexpr (moe::RoutedUpGemmTraits<MoEDims>::kUsePairLayout) {
-        TORCH_CHECK(expert_up_weights.dim() == 3 &&
-                        expert_up_weights.size(0) == kExperts &&
-                        expert_up_weights.size(1) == kUpRows &&
-                        expert_up_weights.size(2) == kExpertK / kWeightBytes,
-                    "expert_up_weights must be [E, 2N, K / ", kWeightBytes,
-                    "].");
-    } else {
-        // A flattened shape: [E, 2N, K / bytes].
-        TORCH_CHECK(expert_up_weights.dim() == 3 &&
-                        expert_up_weights.size(0) == kExperts &&
-                        expert_up_weights.size(1) == kUpRows &&
-                        expert_up_weights.size(2) == kExpertK / kWeightBytes,
-                    "expert_up_weights must be the natural [E, 2 * N, K / ",
-                    kWeightBytes, "].");
-    }
+    TORCH_CHECK(expert_up_weights.dim() == 3 &&
+                    expert_up_weights.size(0) == kExperts &&
+                    expert_up_weights.size(1) == kUpRows &&
+                    expert_up_weights.size(2) == kExpertK / kWeightBytes,
+                "expert_up_weights must be [E, 2N, K / ", kWeightBytes, "].");
     TORCH_CHECK(expert_down_weights.dim() == 3 &&
                     expert_down_weights.size(0) == kExperts &&
                     expert_down_weights.size(1) == kExpertK &&
@@ -88,18 +77,11 @@ template <typename MoEDims>
 void CheckSharedExpertShape(const torch::Tensor& shared_up_weight,
                             const torch::Tensor& shared_down_weight) {
     constexpr std::int64_t kUpRows = 2 * MoEDims::kIntermediateSize;
-    if constexpr (moe::SharedUpGemmTraits<MoEDims>::kUsePairLayout) {
-        TORCH_CHECK(shared_up_weight.dim() == 2 &&
-                        shared_up_weight.size(0) == kUpRows &&
-                        shared_up_weight.size(1) == MoEDims::kHiddenSize,
-                    "shared_up_weight must be the pair-layout [2N, H].");
-    } else {
-        // A flattened shape: [2N, H].
-        TORCH_CHECK(shared_up_weight.dim() == 2 &&
-                        shared_up_weight.size(0) == kUpRows &&
-                        shared_up_weight.size(1) == MoEDims::kHiddenSize,
-                    "shared_up_weight must be the natural [2, N, H].");
-    }
+    // Both the natural and the gate/up-paired row order are [2N, H].
+    TORCH_CHECK(shared_up_weight.dim() == 2 &&
+                    shared_up_weight.size(0) == kUpRows &&
+                    shared_up_weight.size(1) == MoEDims::kHiddenSize,
+                "shared_up_weight must be [2N, H].");
     TORCH_CHECK(shared_down_weight.dim() == 2 &&
                     shared_down_weight.size(0) == MoEDims::kHiddenSize &&
                     shared_down_weight.size(1) == MoEDims::kIntermediateSize,
@@ -213,7 +195,10 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
              const torch::Tensor& tail_out, int64_t top_k, int64_t scoring_func,
              int64_t activation, int64_t tp_rank, int64_t tail_mc_base,
              int64_t tail_grid_cap, bool renormalize, double situ_beta,
-             double situ_linear_beta, double tail_eps, bool use_pdl) {
+             double situ_linear_beta, double tail_eps, bool use_pdl,
+             bool routed_use_interleaved, bool shared_use_interleaved,
+             bool routed_use_swizzle, bool shared_use_swizzle,
+             bool latent_use_swizzle) {
     const uint32_t num_tokens = static_cast<uint32_t>(input.size(0));
     TORCH_CHECK(num_tokens >= 1 && num_tokens <= MoEDims::kNumTokens,
                 "token count M=", num_tokens,
@@ -245,6 +230,9 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
                            ? static_cast<uint32_t>(latent_down_weight.size(0))
                            : 0u;
     args.intermediate_size = static_cast<uint32_t>(shared_down_weight.size(1));
+    args.layouts = moe::make_moe_layouts(
+        routed_use_interleaved, routed_use_swizzle, shared_use_interleaved,
+        shared_use_swizzle, latent_use_swizzle);
     args.top_k = static_cast<uint32_t>(top_k);
     args.scoring_func = static_cast<ScoringFunc>(scoring_func);
     args.renormalize = renormalize;
@@ -396,7 +384,9 @@ void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,
                const std::string& scoring_func, const std::string& activation,
                bool renormalize, double situ_beta, double situ_linear_beta,
                double tail_eps, const std::string& quant_mode, int64_t tp_size,
-               bool use_pdl) {
+               bool use_pdl, bool routed_use_interleaved,
+               bool shared_use_interleaved, bool routed_use_swizzle,
+               bool shared_use_swizzle, bool latent_use_swizzle) {
     TORCH_CHECK(
         quant_mode == "w8a8-mxfp8" || quant_mode == "w4a8-mxfp4" ||
             quant_mode == "w8a8-blockwise",
@@ -437,7 +427,9 @@ void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,
             tail_norm_weight, correction_bias, per_expert_scale, tail_epochs,
             tail_uc_bases, workspace, tail_out, top_k, scoring_type,
             activation_type, tp_rank, tail_mc_base, tail_grid_cap, renormalize,
-            situ_beta, situ_linear_beta, tail_eps, use_pdl);
+            situ_beta, situ_linear_beta, tail_eps, use_pdl,
+            routed_use_interleaved, shared_use_interleaved, routed_use_swizzle,
+            shared_use_swizzle, latent_use_swizzle);
     };
 
     constexpr auto kBWFP8 = moe::QuantMethod::kBlockwiseFP8;

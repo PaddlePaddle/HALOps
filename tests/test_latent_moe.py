@@ -29,6 +29,7 @@ from halops import (
     get_workspace_for_moe,
     group_wise_quant,
     mega_ll_moe,
+    transform_weights_for_moe,
 )
 
 _FP8_MAX = 448.0  # e4m3 dynamic range
@@ -276,8 +277,8 @@ class MoEParams:
                 latent_w, latent_s = latent_w[0], latent_s[0]
 
         self.router_weight = router
-        self.expert_up_weights = w13
-        self.expert_up_weights_scale = s13
+        # The MX recipes pass the up weights in the 8-row interleaved order.
+        self.interleaved = self.mxfp8_groups
         self.expert_down_weights = w2
         self.expert_down_weights_scale = s2
         self.latent_down_weight = latent_w
@@ -287,20 +288,37 @@ class MoEParams:
         shared_down_raw = torch.randn(1, h, n, device=dev, generator=g) * 0.1
         if self.mxfp8_groups:
             shared_up, shared_up_s = group_wise_quant(
-                shared_up_raw[0].bfloat16(), mode=self.mxfp8_group, use_swizzle=False
+                shared_up_raw[0].bfloat16(), mode=self.mxfp8_group, use_swizzle=True
             )
             shared_down, shared_down_s = group_wise_quant(
                 shared_down_raw[0].bfloat16(),
                 mode=self.mxfp8_group,
-                use_swizzle=False,
+                use_swizzle=True,
             )
         else:
             shared_up, shared_up_s = _quant_fp8_block_wise(shared_up_raw)
             shared_down, shared_down_s = _quant_fp8_block_wise(shared_down_raw)
             shared_up, shared_up_s = shared_up[0], shared_up_s[0]
             shared_down, shared_down_s = shared_down[0], shared_down_s[0]
-        self.shared_up_weight = shared_up
-        self.shared_up_weight_scale = shared_up_s
+        # The reference keeps the natural row order; only the kernel reads the
+        # packed up weights.
+        self.expert_up_weights_ref = w13
+        self.expert_up_weights_scale_ref = s13
+        self.shared_up_weight_ref = shared_up
+        self.shared_up_weight_scale_ref = shared_up_s
+        (
+            self.expert_up_weights,
+            self.expert_up_weights_scale,
+            self.shared_up_weight,
+            self.shared_up_weight_scale,
+        ) = transform_weights_for_moe(
+            w13,
+            s13,
+            shared_up,
+            shared_up_s,
+            routed_use_interleaved=self.interleaved,
+            shared_use_interleaved=self.interleaved,
+        )
         self.shared_down_weight = shared_down
         self.shared_down_weight_scale = shared_down_s
         return self
@@ -461,17 +479,21 @@ class MoERef:
         p = self.moe_params
         n = p.intermediate_size
         if p.mxfp8_groups:
-            # The weight is the raw [gate | up] one; the kernel interleaves
-            # its rows while loading, and the scales stay plain.
+            # The natural [gate | up] rows and their SfAtom tables; the kernel
+            # reads the packed copy instead.
             up_out = self.matmul_mxfp8(
-                input, p.shared_up_weight, p.shared_up_weight_scale, sfatom=False
+                input,
+                p.shared_up_weight_ref,
+                p.shared_up_weight_scale_ref,
             )
             act = self._gated_act(up_out[:, :n], up_out[:, n:], 1.0)
             return self.matmul_mxfp8(
-                act, p.shared_down_weight, p.shared_down_weight_scale, sfatom=False
+                act, p.shared_down_weight, p.shared_down_weight_scale
             )
 
-        up_out = self.matmul_fp8(input, p.shared_up_weight, p.shared_up_weight_scale)
+        up_out = self.matmul_fp8(
+            input, p.shared_up_weight_ref, p.shared_up_weight_scale_ref
+        )
         act = self._gated_act(up_out[:, :n], up_out[:, n:], 1.0)
 
         return self.matmul_fp8(
@@ -568,8 +590,8 @@ class MoERef:
 
         routed_out = self.routed_experts(
             latent_out,
-            self.moe_params.expert_up_weights,
-            self.moe_params.expert_up_weights_scale,
+            self.moe_params.expert_up_weights_ref,
+            self.moe_params.expert_up_weights_scale_ref,
             self.moe_params.expert_down_weights,
             self.moe_params.expert_down_weights_scale,
             topk_w,
@@ -626,6 +648,11 @@ class MoEFused:
             eps=p.eps,
             quant_mode=p.quant_mode,
             grid_cap=self.grid_cap,
+            routed_use_interleaved=p.interleaved,
+            routed_use_swizzle=p.interleaved,
+            shared_use_interleaved=p.interleaved,
+            shared_use_swizzle=p.interleaved,
+            latent_use_swizzle=False,
         )
         return out
 

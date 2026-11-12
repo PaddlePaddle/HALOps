@@ -168,16 +168,13 @@ struct LatentDownProjectionBase {
         const std::uint32_t slot = k_iter_id % kNumWeightSlots;
         smem->barriers.latent_down.weight_ready.arrive(k_iter_id,
                                                        transaction_bytes);
+        constexpr std::uint32_t kChunkK = LatentDownGemm::MmaCore::kSwizzleBoxK;
         const std::uint32_t k_start =
             k_tile(k_iter_id) * LatentDownGemm::kTileShapeK;
-#pragma unroll 1
-        for (std::uint32_t h = 0; h < LatentDownGemm::kNumStagingBlocks; ++h) {
-            tma_load_2d(tma_latent_down_weight_desc,
-                        /*coord0=*/k_start + h * 128u,
-                        /*coord1=*/row_base(),
-                        &smem->latent_down.w_latent_down[slot][h][0][0],
-                        smem->barriers.latent_down.weight_ready.raw(slot));
-        }
+        tma_load_3d(tma_latent_down_weight_desc, /*coord0=*/0u,
+                    /*coord1=*/row_base(), /*coord2=*/k_start / kChunkK,
+                    &smem->latent_down.w_latent_down[slot][0][0][0],
+                    smem->barriers.latent_down.weight_ready.raw(slot));
     }
 
     template <typename CtaMma>
@@ -417,13 +414,31 @@ struct LatentDownProjection<KernelTraits, true>
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
 
+    // A packed table is already in SfAtom order: copy this CTA's tile image.
+    __device__ static void copy_packed_sfa_table(
+        const std::uint8_t* __restrict__ packed,
+        SharedStorage* __restrict__ smem) {
+        constexpr std::uint32_t kTileBytes =
+            ScaleTraits::kSfaSmemBytes * Base::kNumTilesK;
+        const auto* src = reinterpret_cast<const std::uint32_t*>(
+            packed + static_cast<std::size_t>(Base::tile_idx()) * kTileBytes);
+        auto* dst =
+            reinterpret_cast<std::uint32_t*>(smem->latent_down.sfa_slab);
+        for (std::uint32_t i = threadIdx.x; i < kTileBytes / 4u;
+             i += static_cast<std::uint32_t>(blockDim.x)) {
+            dst[i] = src[i];
+        }
+        // The MMA reads the slab through the async proxy.
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    }
+
     __device__ static void run(
         CUtensorMap const& tma_latent_down_weight_desc,
         CUtensorMap const& tma_input_desc,
         const typename LatentDownGemm::
             ElementScale* __restrict__ latent_down_weight_scale,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t batch_size) {
+        ScaleLayout latent_scale_layout, std::uint32_t batch_size) {
         if (!Base::is_latent_cta()) return;
 
         zero_sf_slots(smem);
@@ -441,9 +456,13 @@ struct LatentDownProjection<KernelTraits, true>
         } else if (WarpRole::is_calc_warp(warp_idx)) {
             // Overlaps the loaders' first tiles; tile 0's input_empty arrive
             // publishes the slab to the MMA.
-            build_sfa_table(
-                reinterpret_cast<const std::uint8_t*>(latent_down_weight_scale),
-                smem);
+            const auto* packed_scale =
+                reinterpret_cast<const std::uint8_t*>(latent_down_weight_scale);
+            if (latent_scale_layout == ScaleLayout::kPlain) {
+                build_sfa_table(packed_scale, smem);
+            } else {
+                copy_packed_sfa_table(packed_scale, smem);
+            }
             const auto quant_span =
                 KERNEL_TIMER_BEGIN(smem->timer.get(), "latent_quantize_input");
 #pragma unroll 1
@@ -541,12 +560,12 @@ struct LatentDownProjection<KernelTraits, true>
         const auto quantize_span =
             KERNEL_TIMER_BEGIN(smem->timer.get(), "quantize_fp8_blockwise_128");
         const QuantizeTile tile(
-            slot, Base::k_tile(k_iter_id) * LatentDownGemm::kNumStagingBlocks,
+            slot, Base::k_tile(k_iter_id) * MmaCore::kNumSwizzleBoxKs,
             Base::token_begin(), batch_size);
         quantize_mxfp8_groupwise_1x32<
             /*Staged=*/true, Base::kTileShapeN, LatentDownGemm::kTileShapeK,
             128u, SwizzleBoxK<DataType::ElementA>::value,
-            LatentDownGemm::kNumStagingBlocks>(
+            MmaCore::kNumSwizzleBoxKs>(
             reinterpret_cast<const DataType::ElementA*>(
                 &smem->latent_down.input.data[slot][0][0][0]),
             Base::k_tile(k_iter_id) * LatentDownGemm::kTileShapeK,
@@ -732,6 +751,7 @@ struct LatentDownProjection<KernelTraits, false>
         const typename LatentDownGemm::
             ElementScale* __restrict__ latent_down_weight_scale,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
+        [[maybe_unused]] ScaleLayout latent_scale_layout,
         std::uint32_t batch_size) {
         if (!Base::is_latent_cta()) return;
 
@@ -790,7 +810,7 @@ struct LatentDownProjection<KernelTraits, false>
                 cute::make_smem_ptr(Base::staged_block(smem, k_iter_id)),
                 SBLayout{});
             cute::Tensor tCrB = cta_mma.make_fragment_B(tCsB);
-            MmaCore::run<LatentDownGemm::kNumStagingBlocks>(
+            MmaCore::run<MmaCore::kNumSwizzleBoxKs>(
                 tiled_mma, cta_mma,
                 &smem->latent_down.w_latent_down[w_slot][0][0][0], tCrB, tCt,
                 tmem_addr(tmem_base, 0u, acc_slot * kAccColumns));
@@ -813,13 +833,12 @@ struct LatentDownProjection<KernelTraits, false>
         KERNEL_TIMER_END(smem->timer.get(), ready_span);
 
         const QuantizeTile tile(
-            slot, Base::k_tile(k_iter_id) * LatentDownGemm::kNumStagingBlocks,
+            slot, Base::k_tile(k_iter_id) * MmaCore::kNumSwizzleBoxKs,
             Base::token_begin(), batch_size);
         quantize_fp8_groupwise_128<
             /*Staged=*/true, Base::kTileShapeN, LatentDownGemm::kTileShapeK,
             Base::kGemmN, LatentDownGemm::InputQuant::kBlockSize,
-            SwizzleBoxK<DataType::ElementA>::value,
-            LatentDownGemm::kNumStagingBlocks>(
+            SwizzleBoxK<DataType::ElementA>::value, MmaCore::kNumSwizzleBoxKs>(
             reinterpret_cast<const DataType::ElementA*>(
                 &smem->latent_down.input.data[slot][0][0][0]),
             Base::k_tile(k_iter_id) * LatentDownGemm::kTileShapeK,
@@ -901,13 +920,12 @@ struct LatentDownProjection<KernelTraits, false>
         smem->barriers.latent_down.accumulator_ready.wait(k_iter_id);
         KERNEL_TIMER_END(smem->timer.get(), acc_ready_span);
 #pragma unroll
-        for (std::uint32_t sub = 0; sub < LatentDownGemm::kNumStagingBlocks;
-             ++sub) {
+        for (std::uint32_t sub = 0; sub < MmaCore::kNumSwizzleBoxKs; ++sub) {
             // Each split owns kNumScaleBlocksK / kNumSplits scale columns.
             constexpr std::uint32_t kBlocksPerSplit =
                 Base::kNumScaleBlocksK / Base::kNumSplits;
             const std::uint32_t ws_block =
-                k_iter_id * LatentDownGemm::kNumStagingBlocks + sub;
+                k_iter_id * MmaCore::kNumSwizzleBoxKs + sub;
             const float ws =
                 w_scale[Base::tile_idx() * Base::kNumScaleBlocksK +
                         Base::split_idx() * kBlocksPerSplit + ws_block];
@@ -926,9 +944,7 @@ struct LatentDownProjection<KernelTraits, false>
                 }
                 // Value i is (row t1 + 8*(i/2), token 8*g + 2*t0 + i%2).
                 const std::uint32_t block =
-                    Base::k_tile(k_iter_id) *
-                        LatentDownGemm::kNumStagingBlocks +
-                    sub;
+                    Base::k_tile(k_iter_id) * MmaCore::kNumSwizzleBoxKs + sub;
                 as[0] = smem->latent_down.quantized_input
                             .scale[block][token_base + 8u * g + 2u * t0];
                 as[1] = smem->latent_down.quantized_input

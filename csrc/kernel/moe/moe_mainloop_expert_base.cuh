@@ -89,14 +89,26 @@ struct UpProjectionBase {
         kNumAccSlots * kAccColumns;
     static constexpr std::uint32_t kUpSfbTmemOffset =
         kUpSfaTmemOffset + UpScaleTraits::kSfaTmemColumns;
-    static constexpr std::uint32_t kUpScaleTxBytes =
-        UpGemm::kScaleLayout == ScaleLayout::kPlainRows
-            ? 0u
-            : UpScaleTraits::kSfaSmemBytes *
-                  (UpGemm::kScaleLayout == ScaleLayout::kNaturalAtom ? 2u : 1u);
-    static constexpr std::uint32_t kUpWeightTxBytes =
-        MmaCore::kWeightTileTxBytes +
-        (MmaCore::kUseBlockscaled ? kUpScaleTxBytes : 0u);
+
+    // SFA bytes this launch's weight loader copies for `layout`.
+    __device__ static constexpr std::uint32_t up_scale_tx_bytes(
+        ScaleLayout layout) {
+        return layout == ScaleLayout::kPlain
+                   ? 0u
+                   : UpScaleTraits::kSfaSmemBytes *
+                         (layout == ScaleLayout::kSfAtom ? 2u : 1u);
+    }
+
+    // The up weight rows are packed exactly when the table is packed atoms.
+    __device__ static constexpr bool shared_up_interleaved(ScaleLayout layout) {
+        return layout == ScaleLayout::kPackedAtom;
+    }
+
+    __device__ static constexpr std::uint32_t up_weight_tx_bytes(
+        ScaleLayout layout) {
+        return MmaCore::kWeightTileTxBytes +
+               (MmaCore::kUseBlockscaled ? up_scale_tx_bytes(layout) : 0u);
+    }
 
     static constexpr std::uint32_t kOutputFeatureBlock =
         UpGemm::kTileShapeM / 2u;
@@ -175,7 +187,7 @@ struct UpProjectionBase {
     // The caller owns the ring slot and arms its transaction barrier.
     __device__ static void load_weight_tile(
         CUtensorMap const& desc, WeightElement* weight, std::uint64_t* barrier,
-        std::uint32_t row, std::uint32_t k_tile,
+        std::uint32_t row, std::uint32_t k_tile, bool pair_layout,
         std::uint64_t cache_hint = static_cast<std::uint64_t>(
             cute::TMA::CacheHintSm90::EVICT_NORMAL)) {
 #pragma unroll 1
@@ -184,7 +196,7 @@ struct UpProjectionBase {
                 k_tile * UpGemm::kTileShapeK + h * MmaCore::kSwizzleBoxK;
             WeightElement* const dest =
                 weight + h * UpGemm::kTileShapeM * MmaCore::kSwizzleBoxK;
-            if constexpr (UpGemm::kUsePairLayout) {
+            if (pair_layout) {
                 tma_load_2d(desc, k, row, dest, barrier, cache_hint);
             } else if constexpr (UpGemm::kWeightHasExpertDim) {
                 tma_load_5d(
@@ -204,17 +216,17 @@ struct UpProjectionBase {
     __device__ static void load_weight_scale_tile(
         const typename UpGemm::ElementScale* scale, std::uint32_t row_atom,
         std::uint32_t k_tile, std::uint8_t* dest, std::uint64_t* barrier,
-        const CUtensorMap& tma_scale_desc = CUtensorMap{}) {
+        ScaleLayout scale_layout, const CUtensorMap* tma_scale_desc = nullptr) {
         static_assert(MmaCore::kUseBlockscaled,
                       "scale tiles are only loaded for blockscaled MMA");
-        if constexpr (UpGemm::kScaleLayout == ScaleLayout::kPlainRows) {
+        if (scale_layout == ScaleLayout::kPlain) {
             // The issuer converts the plain rows when it consumes the tile.
             return;
         }
         constexpr std::uint32_t kAtomsPerRowTile = UpGemm::kGemmM / 128u;
         constexpr std::uint32_t kSfAtomBytes = 512u;
         constexpr std::uint32_t kSlabsPerTileK = UpGemm::kTileShapeK / 128u;
-        if constexpr (UpGemm::kScaleLayout == ScaleLayout::kPackedAtom) {
+        if (scale_layout == ScaleLayout::kPackedAtom) {
             constexpr std::uint32_t kSfKBlocksPerRow = UpGemm::kGemmK / 128u;
             const auto* sfa = reinterpret_cast<const std::uint8_t*>(scale);
             tma_load_1d(
@@ -230,7 +242,7 @@ struct UpProjectionBase {
             row_atom / kAtomsPerRowTile * kAtomsPerRowTile +
             (row_atom % kAtomsPerRowTile) / 2u;
         tma_load_3d(
-            tma_scale_desc, /*coord0=*/0u,
+            *tma_scale_desc, /*coord0=*/0u,
             /*coord1=*/k_tile * kSlabsPerTileK + atom_row * kSlabsPerAtomRow,
             /*coord2=*/0u, dest, barrier);
     }
@@ -507,12 +519,15 @@ struct DownProjectionBase {
     static constexpr std::uint32_t kAccColumns =
         get_gemm_acc_columns<DownGemm>();
     static constexpr std::uint32_t kTokenGroups = DownGemm::kTileShapeN / 8u;
-    static constexpr std::uint32_t kDownWeightTxBytes =
-        MmaCore::kWeightTileTxBytes +
-        (MmaCore::kUseBlockscaled &&
-                 DownGemm::kScaleLayout != ScaleLayout::kPlainRows
-             ? DownScaleTraits::kSfaSmemBytes
-             : 0u);
+
+    // SFA bytes this launch's weight loader copies for `layout`.
+    __device__ static constexpr std::uint32_t down_weight_tx_bytes(
+        ScaleLayout layout) {
+        return MmaCore::kWeightTileTxBytes +
+               (MmaCore::kUseBlockscaled && layout != ScaleLayout::kPlain
+                    ? DownScaleTraits::kSfaSmemBytes
+                    : 0u);
+    }
 
     template <typename CtaMma>
     __device__ static auto make_accumulator_fragment(CtaMma& cta_mma) {
@@ -545,12 +560,12 @@ struct DownProjectionBase {
     __device__ static void load_weight_scale_tile(
         const typename DownGemm::ElementScale* scale, std::uint32_t row_atom,
         std::uint32_t k_tile, std::uint8_t* dest, std::uint64_t* barrier,
-        const CUtensorMap* tma_scale_desc = nullptr) {
+        ScaleLayout scale_layout, const CUtensorMap* tma_scale_desc = nullptr) {
         static_assert(MmaCore::kUseBlockscaled,
                       "scale tiles are only loaded for blockscaled MMA");
         static_assert(DownGemm::kTileShapeK == 128u,
                       "each down K tile loads one SfAtom per row atom");
-        if constexpr (DownGemm::kScaleLayout == ScaleLayout::kPlainRows) {
+        if (scale_layout == ScaleLayout::kPlain) {
             // The issuer converts the plain rows when it consumes the tile.
             return;
         }

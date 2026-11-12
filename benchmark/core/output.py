@@ -77,7 +77,6 @@ class MoeRowResult:
     hidden_size: int
     intermediate_size: int
     latent_size: int
-    tp_size: int
     quant_mode: str
     dtype: str
     metrics: BenchmarkMetrics
@@ -151,7 +150,6 @@ _MOE_CSV_FIELDS = [
     "hidden_size",
     "intermediate_size",
     "latent_size",
-    "tp_size",
     "quant_mode",
     "dtype",
     "activation",
@@ -220,7 +218,6 @@ def moe_scenario_str(
     hidden_size: int,
     intermediate_size: int,
     latent_size: int,
-    tp_size: int,
     quant_mode: str,
     active_experts: int | None = None,
 ) -> str:
@@ -229,7 +226,7 @@ def moe_scenario_str(
     return (
         f"scenario: {scenario} | tokens={tokens} | top_k={top_k}"
         f" | E={num_experts}{active} | H={hidden_size} | N={intermediate_size}"
-        f" | L={latent_size} | tp_size={tp_size} | mode={quant_mode}"
+        f" | L={latent_size} | mode={quant_mode}"
     )
 
 
@@ -256,7 +253,6 @@ def scenario_header_str(
             row.hidden_size,
             row.intermediate_size,
             row.latent_size,
-            row.tp_size,
             row.quant_mode,
             row.active_experts,
         )

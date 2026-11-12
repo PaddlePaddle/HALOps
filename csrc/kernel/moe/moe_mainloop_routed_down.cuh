@@ -207,13 +207,11 @@ struct RoutedDownProjection<KernelTraits, true>
         return down_sfa_tmem(step_local) + DownScaleTraits::kSfaTmemColumns;
     }
 
-    using Base::kDownWeightTxBytes;
-
     // Run down-projection over this block's dynamically claimed tasks.
     __device__ static void run(
         const typename DownGemm::ElementScale* __restrict__ expert_scales_down,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        CUtensorMap const& tma_down_weights_desc,
+        ScaleLayout down_scale_layout, CUtensorMap const& tma_down_weights_desc,
         CUtensorMap const& tma_down_scale_desc,
         CUtensorMap const& tma_down_activations_desc,
         TaskScheduler<Traits>& sched, std::uint64_t weight_cache_hint) {
@@ -265,14 +263,15 @@ struct RoutedDownProjection<KernelTraits, true>
                 run_load_weight_k_loop(smem, tma_down_weights_desc,
                                        tma_down_scale_desc, expert_scales_down,
                                        local_id, expert_id, base_m,
-                                       weight_cache_hint);
+                                       down_scale_layout, weight_cache_hint);
             } else if (WarpRole::is_other_loader_warp(warp_idx)) {
                 run_load_input_k_loop(smem, workspace,
                                       tma_down_activations_desc, local_id,
                                       expert_id, expert_start, routed_count);
             } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
                 run_mma_k_loop(smem, tmem_base, task_id, acc_task_id,
-                               routed_count);
+                               routed_count, expert_scales_down, expert_id,
+                               base_m, down_scale_layout);
             } else if (WarpRole::is_calc_warp(warp_idx)) {
                 WarpRole::sync_calc_threads();
 
@@ -297,19 +296,21 @@ struct RoutedDownProjection<KernelTraits, true>
         const CUtensorMap& tma_down_scale_desc,
         const typename DownGemm::ElementScale* __restrict__ down_scale,
         std::uint32_t local_id, std::uint32_t expert_id, std::uint32_t base_m,
-        std::uint64_t weight_cache_hint) {
+        ScaleLayout down_scale_layout, std::uint64_t weight_cache_hint) {
+        const std::uint32_t tx_bytes =
+            Base::down_weight_tx_bytes(down_scale_layout);
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kNumTilesK;
              ++k_iter_id) {
             const std::uint32_t slot =
                 (local_id + k_iter_id) % Base::kNumWeightSlots;
             wait_down_weight_empty(smem, local_id + k_iter_id);
-            smem->barriers.routed.down_weight_ready.arrive(slot,
-                                                           kDownWeightTxBytes);
+            smem->barriers.routed.down_weight_ready.arrive(slot, tx_bytes);
             Base::load_weight_tile(smem, tma_down_weights_desc, expert_id,
                                    base_m, slot, k_iter_id, weight_cache_hint);
             load_weight_scale_tile(smem, down_scale, tma_down_scale_desc,
-                                   expert_id, base_m, slot, k_iter_id);
+                                   expert_id, base_m, slot, k_iter_id,
+                                   down_scale_layout);
         }
     }
 
@@ -348,11 +349,13 @@ struct RoutedDownProjection<KernelTraits, true>
     }
 
     // Accumulate all K tiles in TMEM and release each consumed input tile.
-    __device__ static void run_mma_k_loop(SharedStorage* __restrict__ smem,
-                                          std::uint32_t tmem_base,
-                                          std::uint32_t task_id,
-                                          std::uint32_t acc_task_id,
-                                          std::uint32_t routed_count) {
+    __device__ static void run_mma_k_loop(
+        SharedStorage* __restrict__ smem, std::uint32_t tmem_base,
+        std::uint32_t task_id, std::uint32_t acc_task_id,
+        std::uint32_t routed_count,
+        const typename DownGemm::ElementScale* __restrict__ down_scale,
+        std::uint32_t expert_id, std::uint32_t base_m,
+        ScaleLayout down_scale_layout) {
         typename DownGemm::TiledMma tiled_mma{};
         auto cta_mma = tiled_mma.get_slice(cute::_0{});
         typename Base::SBLayout sB_layout{};
@@ -375,6 +378,13 @@ struct RoutedDownProjection<KernelTraits, true>
                 smem->timer.get(), "down_wait_mma_ready", step_local);
             smem->barriers.routed.wait_down_mma_ready(step_local);
             KERNEL_TIMER_END(smem->timer.get(), mma_ready_span);
+            if (down_scale_layout == ScaleLayout::kPlain) {
+                Base::build_plain_scale(
+                    smem->routed_experts.w_down_scale[w_slot],
+                    reinterpret_cast<const std::uint8_t*>(down_scale),
+                    expert_id * DownGemm::kGemmM + base_m, k_iter_id,
+                    DownGemm::kGemmK / 32u);
+            }
             const auto sfa_tmem =
                 tmem_addr(tmem_base, 0u, down_sfa_tmem(step_local));
             const auto sfb_tmem =
@@ -427,14 +437,15 @@ struct RoutedDownProjection<KernelTraits, true>
         SharedStorage* __restrict__ smem,
         const typename DownGemm::ElementScale* __restrict__ down_scale,
         const CUtensorMap& tma_down_scale_desc, std::uint32_t expert_id,
-        std::uint32_t base_m, std::uint32_t slot, std::uint32_t k_iter_id) {
+        std::uint32_t base_m, std::uint32_t slot, std::uint32_t k_iter_id,
+        ScaleLayout down_scale_layout) {
         const std::uint32_t row_atom =
             expert_id * (DownGemm::kGemmM / 128u) + base_m / 128u;
         Base::load_weight_scale_tile(
             down_scale, row_atom, k_iter_id,
             smem->routed_experts.w_down_scale[slot],
             smem->barriers.routed.down_weight_ready.raw(slot),
-            &tma_down_scale_desc);
+            down_scale_layout, &tma_down_scale_desc);
     }
 
     // One lane per token loads its scale word and writes it in SfAtom layout.
@@ -522,6 +533,7 @@ struct RoutedDownProjection<KernelTraits, false>
     __device__ static void run(
         const typename DownGemm::ElementScale* __restrict__ expert_scales_down,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
+        [[maybe_unused]] ScaleLayout down_scale_layout,
         CUtensorMap const& tma_down_weights_desc,
         CUtensorMap const& tma_down_scale_desc,
         CUtensorMap const& tma_down_activations_desc,

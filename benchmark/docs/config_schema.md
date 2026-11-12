@@ -125,13 +125,13 @@
 
 - `batch_sizes`（默认 `[1]`）：token 数，取值为 `1..16`。
 - `top_k_list`（默认 `[8]`）：选择专家数，取值为 `1..10`。
-- `tp_size`（默认 `1`）：张量并行卡数，支持 `1` 或 `4`；`4` 需要单机 4 张可见 GPU（`--gpu 0,1,2,3`），benchmark 会为每个配置拉起 4 个 rank 的进程组。
 - `quant_mode`：`w8a8-blockwise`（默认）、`w8a8-mxfp8` 或 `w4a8-mxfp4`。
 - `activation`：`silu`（默认）或 `situ`。SiTU 可配置 `situ_beta`（默认 `4.0`）和 `situ_linear_beta`（默认 `25.0`）；非正值关闭对应 soft cap。
 - `scoring_func`：`sigmoid`（默认）或 `softmax`；`renormalize` 默认 `true`。
 - `eps`：RMSNorm epsilon，默认 `1e-5`。
 - `seed`：输入与原始 BF16 权重的随机种子，默认 `0`。
 - `grid_cap`：kernel CTA 上限，默认 `0`。
+- `routed_use_interleaved` / `shared_use_interleaved`（默认 `true`）：对应 up 投影的 gate/up 权重是否按 8 行交织传入（`transform_weights_for_moe`）；`false` 时传自然行序，由 TMA box 交织。interleaved 优先于 swizzle。scale 表固定按 SfAtom 传入（latent down 用 plain 行），无需配置。
 - `backends`：`halops`。
 
 固定形状为 `hidden_size=4096`、`intermediate_size=512`、`latent_size=2048`、`num_experts=512`，配置其他形状会报错。

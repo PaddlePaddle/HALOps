@@ -61,7 +61,6 @@ def _format_scenario_str(scenario: str, row: dict) -> str:
             row["hidden_size"],
             row["intermediate_size"],
             row["latent_size"],
-            row["tp_size"],
             row["quant_mode"],
             row.get("active_experts"),
         )
@@ -162,7 +161,7 @@ def _format_common_config(row: dict) -> str:
         return (
             f"top_k={row['top_k']}, E={row['num_experts']}, {active_part}"
             f"H={row['hidden_size']}, N={row['intermediate_size']}, "
-            f"L={row['latent_size']}, tp_size={row['tp_size']}, "
+            f"L={row['latent_size']}, "
             f"{row['quant_mode']}, {row['activation']}"
         )
     else:
@@ -495,7 +494,6 @@ def generate_report(
             "activation",
             "scoring_func",
             "renormalize",
-            "tp_size",
             "grid_cap",
             "use_cuda_graph",
         ]

@@ -8,6 +8,8 @@ scoring_func: sigmoid
 renormalize: true
 seed: 0
 grid_cap: 0
+routed_use_interleaved: true
+shared_use_interleaved: true
 
 backends: [halops]
 cold_l2_cache: true

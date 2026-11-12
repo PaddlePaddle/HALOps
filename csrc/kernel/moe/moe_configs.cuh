@@ -36,6 +36,24 @@ enum class QuantMethod : uint32_t {
     kNone = 3,
 };
 
+// Where a blockscaled weight's scale table comes from.
+enum class ScaleLayout : std::uint32_t {
+    kPackedAtom,  // packed with the gate/up pair-layout weights
+    kSfAtom,      // natural-row SfAtom from group_wise_quant(use_swizzle=True)
+    kPlain,       // plain row-major from group_wise_quant(use_swizzle=False)
+};
+
+struct MoELayouts {
+    // Gate/up rows interleaved in 8-row groups instead of natural [2, N, H].
+    bool routed_up_interleaved = false;
+    bool shared_up_interleaved = false;
+    ScaleLayout routed_up_scale = ScaleLayout::kSfAtom;
+    ScaleLayout routed_down_scale = ScaleLayout::kSfAtom;
+    ScaleLayout shared_up_scale = ScaleLayout::kPlain;
+    ScaleLayout shared_down_scale = ScaleLayout::kPlain;
+    ScaleLayout latent_down_scale = ScaleLayout::kPlain;
+};
+
 // Operand quantization types and group width. MXFP8/MXFP4 use fixed 32-element
 // groups.
 template <QuantMethod Method,
@@ -128,8 +146,6 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr std::uint32_t kBlockSize = 384;
         static constexpr std::uint32_t kNumRouterInputSlots = 16;
         static constexpr std::uint32_t kNumUpInputSlots = 8;
-        static constexpr bool kSharedUpUsePairLayout = false;
-        static constexpr bool kRoutedUpUsePairLayout = false;
         // Router configs.
         static constexpr std::uint32_t kNumRouterWeightSlots = 16;
         static constexpr std::uint32_t kNumCtasForRouter = 32;
@@ -213,6 +229,31 @@ struct MoEInputSize {
     static constexpr std::uint32_t value =
         Dims::kUseLatent ? Dims::kLatentSize : Dims::kHiddenSize;
 };
+
+constexpr MoELayouts make_moe_layouts(bool routed_use_interleaved,
+                                      bool routed_use_swizzle,
+                                      bool shared_use_interleaved,
+                                      bool shared_use_swizzle,
+                                      bool latent_use_swizzle) {
+    MoELayouts layouts{};
+    layouts.routed_up_interleaved = routed_use_interleaved;
+    layouts.routed_up_scale =
+        routed_use_interleaved
+            ? ScaleLayout::kPackedAtom
+            : (routed_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain);
+    layouts.shared_up_interleaved = shared_use_interleaved;
+    layouts.shared_up_scale =
+        shared_use_interleaved
+            ? ScaleLayout::kPackedAtom
+            : (shared_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain);
+    layouts.routed_down_scale =
+        routed_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain;
+    layouts.shared_down_scale =
+        shared_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain;
+    layouts.latent_down_scale =
+        latent_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain;
+    return layouts;
+}
 
 // Byte offset of a scale in a 128-row, four-group SfAtom.
 __host__ __device__ static constexpr std::uint32_t sf_atom_offset(

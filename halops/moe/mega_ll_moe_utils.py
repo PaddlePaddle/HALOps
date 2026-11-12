@@ -48,6 +48,49 @@ def _sf_atom_offsets(rows: int, cols: int, device) -> torch.Tensor:
     )
 
 
+def _interleave_gate_up_weight(w: torch.Tensor, gran: int = 8) -> torch.Tensor:
+    """Repack ``[..., 2N, K]`` rows from ``[gate | up]`` into ``gran``-row pairs.
+
+    Returns ``[..., N/gran, 2, gran, K]``: the row group stays a dimension, so
+    the row order reads as a gate group, then the matching up group.
+    """
+    rows, k = int(w.shape[-2]), int(w.shape[-1])
+    if rows % 2 != 0:
+        raise ValueError(f"expected rows = 2*N, got rows={rows}")
+    half = rows // 2
+    if half % gran != 0:
+        raise ValueError(f"N (half of rows) must be a multiple of {gran}; got N={half}")
+    lead = w.shape[:-2]
+    gate = w[..., :half, :].reshape(*lead, half // gran, gran, k)
+    up = w[..., half:, :].reshape(*lead, half // gran, gran, k)
+    return torch.stack([gate, up], dim=-3).contiguous()
+
+
+def _interleave_gate_up_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Move an MX up-weight SfAtom table onto the packed pair rows.
+
+    ``scale`` is ``[..., 2N, K/32]``: one table per expert, in the natural
+    row order.  The table is indexed by raw row, so the gate/up pairing the
+    weight packing applies has to be applied here as well.  Block-wise f32
+    tables stay on the raw ``[gate | up]`` layout and are returned untouched.
+    """
+    if scale.dtype != torch.uint8:
+        return scale
+    rows, cols = int(scale.shape[-2]), int(scale.shape[-1])
+    if rows % _SF_ATOM_ROWS or cols % _SF_ATOM_COLS:
+        raise ValueError(
+            "an MX SfAtom table packs whole 128-rows-x-4-blocks atoms; got "
+            f"{tuple(scale.shape)}."
+        )
+    offsets = _sf_atom_offsets(rows, cols, scale.device).reshape(-1)
+    tables = scale.reshape(-1, rows * cols)
+    plain = tables[:, offsets]
+    packed = _interleave_gate_up_weight(plain.reshape(*scale.shape[:-2], rows, cols))
+    out = torch.empty_like(tables)
+    out[:, offsets] = packed.reshape(-1, rows * cols)
+    return out.reshape(scale.shape)
+
+
 def _check_workspace(workspace, num_tokens: int) -> None:
     """Check that ``workspace`` is the one bound to the schedule that ``num_tokens`` runs."""
     if not 1 <= num_tokens <= _MAX_TOKENS:

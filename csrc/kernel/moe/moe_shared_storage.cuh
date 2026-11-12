@@ -444,10 +444,10 @@ struct WeightScaleStorage<GemmTraits, false> {
 template <typename GemmTraits>
 struct WeightScaleStorage<GemmTraits, true> {
     static constexpr std::uint32_t kNumSlots = GemmTraits::kNumWeightSlots;
-    // A natural-scale slot stages the gate and up atoms side by side.
+    // The slot must hold the largest layout a launch can select: a natural-row
+    // slot stages the gate and up atoms side by side.
     static constexpr std::uint32_t kScaleCols =
-        GemmTraits::MmaCore::ScaleTraits::kSfaSmemBytes *
-        (GemmTraits::kScaleLayout == ScaleLayout::kNaturalAtom ? 2u : 1u);
+        2u * GemmTraits::MmaCore::ScaleTraits::kSfaSmemBytes;
     alignas(128) std::uint8_t scale[kNumSlots][kScaleCols];
 
     __device__ auto& operator[](std::uint32_t slot) { return scale[slot]; }
@@ -539,10 +539,9 @@ struct RouterSmem {
 
 template <typename GemmTraits>
 struct LatentDownSmem {
-    alignas(1024) typename GemmTraits::MmaElement
-        w_latent_down[GemmTraits::kNumWeightSlots]
-                     [GemmTraits::kNumStagingBlocks][GemmTraits::kTileShapeM]
-                     [128u];
+    alignas(1024) typename GemmTraits::MmaElement w_latent_down
+        [GemmTraits::kNumWeightSlots][GemmTraits::MmaCore::kNumSwizzleBoxKs]
+        [GemmTraits::kTileShapeM][GemmTraits::MmaCore::kSwizzleBoxK];
 
     ActivationSmem<GemmTraits::kNumInputSlots, GemmTraits::kTileShapeN,
                    GemmTraits::kTileShapeK>

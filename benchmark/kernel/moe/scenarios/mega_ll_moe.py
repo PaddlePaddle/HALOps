@@ -17,18 +17,11 @@
 from __future__ import annotations
 
 import math
-import statistics
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
-from core.distributed import (
-    RankContext,
-    tensor_parallel_context,
-    tp_worker_main,
-    visible_device_count,
-)
 from core.metrics import BenchmarkMetrics, compute_moe_metrics
 from core.output import (
     MoeRowResult,
@@ -71,11 +64,6 @@ class MoeTiming:
     timing: TimingResult
     bytes_io: int
     active_experts: int | None = None
-    # tp_size > 1: per-rank kernel time, ordered by rank.  The median is the
-    # rank's typical launch and still contains the wait for a late peer; the
-    # min is the same rank's best launch, i.e. its own kernel time.
-    rank_median_us: list[float] | None = None
-    rank_min_us: list[float] | None = None
 
 
 def _validate_config(cfg: dict) -> dict:
@@ -87,6 +75,11 @@ def _validate_config(cfg: dict) -> dict:
         "quant_mode": "w8a8-blockwise",
         "scoring_func": "sigmoid",
         "renormalize": True,
+        "routed_use_interleaved": True,
+        "routed_use_swizzle": True,
+        "shared_use_interleaved": True,
+        "shared_use_swizzle": True,
+        "latent_use_swizzle": False,
         "activation": "silu",
         "situ_beta": 4.0,
         "situ_linear_beta": 25.0,
@@ -104,12 +97,10 @@ def _validate_config(cfg: dict) -> dict:
         raise ValueError(
             f"routing must combine 'bias' and 'perexpert', got {options['routing']!r}"
         )
-    if options["tp_size"] not in (1, 4):
-        raise ValueError(f"tp_size must be 1 or 4, got {options['tp_size']}")
-    if options["tp_size"] > visible_device_count():
+    if options["tp_size"] != 1:
         raise ValueError(
-            f"tp_size={options['tp_size']} needs that many visible GPUs, "
-            f"got {visible_device_count()} (set --gpu accordingly)"
+            f"tp_size must be 1: the benchmark runs one GPU, got "
+            f"{options['tp_size']}"
         )
     if (
         not isinstance(options["batch_size"], int)
@@ -126,6 +117,15 @@ def _validate_config(cfg: dict) -> dict:
         raise ValueError("activation must be silu or situ")
     if not isinstance(options["renormalize"], bool):
         raise ValueError("renormalize must be a boolean")
+    for name in (
+        "routed_use_interleaved",
+        "routed_use_swizzle",
+        "shared_use_interleaved",
+        "shared_use_swizzle",
+        "latent_use_swizzle",
+    ):
+        if not isinstance(options[name], bool):
+            raise ValueError(f"{name} must be a boolean")
     if not all(
         math.isfinite(options[key]) for key in ("eps", "situ_beta", "situ_linear_beta")
     ):
@@ -136,38 +136,32 @@ def _validate_config(cfg: dict) -> dict:
 
 
 @torch.no_grad()
-def _build_inputs(cfg: dict, tp_rank: int = 0) -> MoeInput:
-    """The launch's tensors; with tp_size > 1 the expert and shared weights are
-    the rank's own, while the router, latent and tail weights are shared."""
+def _build_inputs(cfg: dict) -> MoeInput:
+    """The launch's tensors."""
     options = _validate_config(cfg)
     torch.backends.cuda.matmul.allow_tf32 = False
     device = torch.device("cuda")
-    rank_gen = torch.Generator(device=device).manual_seed(options["seed"] + tp_rank)
-    common_gen = (
-        rank_gen
-        if options["tp_size"] == 1
-        else torch.Generator(device=device).manual_seed(options["seed"])
-    )
+    generator = torch.Generator(device=device).manual_seed(options["seed"])
 
     def normal(shape, scale=1.0, gen=None):
         return torch.randn(
             shape,
             device=device,
             dtype=torch.bfloat16,
-            generator=rank_gen if gen is None else gen,
+            generator=generator if gen is None else gen,
         ).mul_(scale)
 
     h, n, z, e = (options[key] for key in MOE_SHAPE)
-    x = normal((options["batch_size"], h), gen=common_gen)
+    x = normal((options["batch_size"], h))
     weights = {
-        "router_weight": normal((2, e, h), h**-0.5, common_gen),
+        "router_weight": normal((2, e, h), h**-0.5),
         "expert_up_weights": normal((e, 2 * n, z), z**-0.5),
         "expert_down_weights": normal((e, z, n), n**-0.5),
         "shared_up_weight": normal((2 * n, h), h**-0.5),
         "shared_down_weight": normal((h, n), n**-0.5),
-        "latent_down_weight": normal((z, h), h**-0.5, common_gen),
-        "tail_fc2_weight": normal((h, z), z**-0.5, common_gen),
-        "tail_norm_weight": normal((z,), 0.1, common_gen).add_(1.0),
+        "latent_down_weight": normal((z, h), h**-0.5),
+        "tail_fc2_weight": normal((h, z), z**-0.5),
+        "tail_norm_weight": normal((z,), 0.1).add_(1.0),
     }
     # Router steering stays neutral: a zero bias keeps the selection (and the
     # active-expert count) unchanged, a unit scale keeps the combine weights.
@@ -178,9 +172,7 @@ def _build_inputs(cfg: dict, tp_rank: int = 0) -> MoeInput:
             torch.ones(e, device=device) if "perexpert" in parts else None
         ),
     }
-    return MoeInput(
-        x, _quantize_weights(weights, options["quant_mode"]), options, routing
-    )
+    return MoeInput(x, _quantize_weights(weights, options), options, routing)
 
 
 def _quant_fp8_blockwise(weight: torch.Tensor, power_of_two=False):
@@ -197,8 +189,10 @@ def _quant_fp8_blockwise(weight: torch.Tensor, power_of_two=False):
 
 
 @torch.no_grad()
-def _quantize_weights(weights: dict, quant_mode: str) -> dict:
+def _quantize_weights(weights: dict, options: dict) -> dict:
     from halops import group_wise_quant
+
+    quant_mode = options["quant_mode"]
 
     quantized = {}
     for name, weight in weights.items():
@@ -223,14 +217,22 @@ def _quantize_weights(weights: dict, quant_mode: str) -> dict:
                 if name.startswith("expert_") and quant_mode == "w4a8-mxfp4"
                 else "w8a8-mxfp8"
             )
+            if name == "latent_down_weight":
+                use_swizzle = options["latent_use_swizzle"]
+            elif name == "shared_up_weight":
+                use_swizzle = (
+                    options["shared_use_swizzle"] or options["shared_use_interleaved"]
+                )
+            elif name.startswith("shared_"):  # shared_down_weight
+                use_swizzle = options["shared_use_swizzle"]
+            elif name == "expert_up_weights":
+                use_swizzle = (
+                    options["routed_use_swizzle"] or options["routed_use_interleaved"]
+                )
+            else:  # expert_down_weights
+                use_swizzle = options["routed_use_swizzle"]
             quant, scale = group_wise_quant(
-                weight.flatten(0, -2),
-                mode=mode,
-                # The latent projection takes the natural scale rows.
-                # The latent and shared scales stay plain row-major.
-                use_swizzle=not (
-                    name == "latent_down_weight" or name.startswith("shared_")
-                ),
+                weight.flatten(0, -2), mode=mode, use_swizzle=use_swizzle
             )
             quant = quant.reshape(*weight.shape[:-1], quant.shape[-1])
             scale = scale.reshape(*weight.shape[:-1], weight.shape[-1] // 32)
@@ -242,10 +244,23 @@ def _quantize_weights(weights: dict, quant_mode: str) -> dict:
 
 
 @torch.no_grad()
-def adapt_halops(raw: MoeInput, tp: RankContext) -> dict:
-    from halops import get_workspace_for_moe
+def adapt_halops(raw: MoeInput) -> dict:
+    from halops import get_workspace_for_moe, transform_weights_for_moe
 
-    quantized = raw.weights
+    quantized = dict(raw.weights)
+    (
+        quantized["expert_up_weights"],
+        quantized["expert_up_weights_scale"],
+        quantized["shared_up_weight"],
+        quantized["shared_up_weight_scale"],
+    ) = transform_weights_for_moe(
+        quantized["expert_up_weights"],
+        quantized["expert_up_weights_scale"],
+        quantized["shared_up_weight"],
+        quantized["shared_up_weight_scale"],
+        routed_use_interleaved=raw.options["routed_use_interleaved"],
+        shared_use_interleaved=raw.options["shared_use_interleaved"],
+    )
     return {
         **raw.options,
         **quantized,
@@ -253,9 +268,7 @@ def adapt_halops(raw: MoeInput, tp: RankContext) -> dict:
         "input": raw.input,
         "out": torch.empty_like(raw.input),
         "num_router_gates": 2,
-        "workspace": get_workspace_for_moe(
-            raw.input, tp.group_name, tp.rank, raw.options["tp_size"]
-        ),
+        "workspace": get_workspace_for_moe(raw.input, None, 0, 1),
     }
 
 
@@ -276,7 +289,7 @@ def _active_experts(raw: MoeInput) -> int:
 
 
 @torch.no_grad()
-def adapt_golden(raw: MoeInput, tp: RankContext) -> dict:
+def adapt_golden(raw: MoeInput) -> dict:
     weights = {}
     for name, weight in raw.weights.items():
         if name.endswith("_scale"):
@@ -287,14 +300,18 @@ def adapt_golden(raw: MoeInput, tp: RankContext) -> dict:
             scale_name = (
                 "tail_fc2_scale" if name == "tail_fc2_weight" else name + "_scale"
             )
+            if name == "tail_fc2_weight":
+                sfatom = False
+            elif name == "latent_down_weight":
+                sfatom = raw.options["latent_use_swizzle"]
+            elif name.startswith("shared_"):
+                sfatom = raw.options["shared_use_swizzle"]
+            elif name == "expert_up_weights":
+                sfatom = raw.options["routed_use_swizzle"]
+            else:  # expert_down_weights
+                sfatom = raw.options["routed_use_swizzle"]
             weights[name] = _dequant_weight(
-                weight,
-                raw.weights[scale_name],
-                sfatom=not (
-                    name == "tail_fc2_weight"
-                    or name == "latent_down_weight"
-                    or name.startswith("shared_")
-                ),
+                weight, raw.weights[scale_name], sfatom=sfatom
             )
     return {
         **raw.options,
@@ -316,81 +333,44 @@ def _get_backends(names):
     return {name: registry[name] for name in names}
 
 
-def _rank_body(tp: RankContext, mode: str, job: dict) -> dict | None:
-    """This rank's share of a launch; rank 0 returns the row."""
-    if mode == "refcheck":
-        return _refcheck_rank(tp, job["cfg"], job["kwargs"])
-    if mode == "profile":
-        return _profile_rank(tp, job["cfg"])
-    return _bench_rank(tp, job["cfg"], job["name"], job["kwargs"])
-
-
 @torch.no_grad()
-def _bench_rank(
-    tp: RankContext, cfg: dict, name: str, timing_kwargs: dict
-) -> dict | None:
-    raw = _build_inputs(cfg, tp.rank)
+def _bench(cfg: dict, name: str, timing_kwargs: dict) -> dict:
+    raw = _build_inputs(cfg)
     adapt_fn, run_fn = _get_backends([name])[name]
-    inputs = adapt_fn(raw, tp)
+    inputs = adapt_fn(raw)
     unique_experts = _active_experts(raw)
     bytes_io = _bytes_io(inputs, cfg["num_experts"], name, unique_experts)
     del raw
-    tp.sync()
-    # Re-align the ranks before every measured iteration: without it the four
-    # processes drift apart and the kernel's tail AllReduce turns that drift
-    # into wait time inside the measured kernel duration.
-    timing = bench_gpu_time(
-        run_fn,
-        (inputs,),
-        before_iter=tp.sync if tp.world > 1 else None,
-        **timing_kwargs,
-    )
-    tp.sync()
-    # The row shows the worst rank; the per-rank medians make the spread (and
-    # the launch-skew wait it carries) visible in the log.
-    timings = tp.gather_timings(timing)
-    timing = max(timings, key=lambda item: statistics.median(item.device_us))
-    if not tp.is_leader:
-        return None
+    timing = bench_gpu_time(run_fn, (inputs,), **timing_kwargs)
     return {
         "device_us": [float(v) for v in timing.device_us],
         "host_us": [float(v) for v in timing.host_us],
         "dispatch_us": [float(v) for v in timing.dispatch_us],
         "bytes_io": int(bytes_io),
         "active_experts": int(unique_experts),
-        "rank_median_us": [float(statistics.median(t.device_us)) for t in timings],
-        "rank_min_us": [float(min(t.device_us)) for t in timings],
     }
 
 
 @torch.no_grad()
-def _refcheck_rank(tp: RankContext, cfg: dict, kwargs: dict) -> dict | None:
+def _refcheck(cfg: dict, kwargs: dict) -> dict:
     atol, rtol = kwargs["atol"], kwargs["rtol"]
-    raw = _build_inputs(cfg, tp.rank)
-    golden_inputs = adapt_golden(raw, tp)
-    halops_inputs = adapt_halops(raw, tp)
+    raw = _build_inputs(cfg)
+    golden_inputs = adapt_golden(raw)
+    halops_inputs = adapt_halops(raw)
     out = run_mega_ll_moe(halops_inputs)
     del halops_inputs
     routed, shared = routed_and_shared(golden_inputs)
-    reference = tail(
-        golden_inputs,
-        tp.sum(routed.float()),
-        tp.sum(shared.float()),
-    )
+    reference = tail(golden_inputs, routed.float(), shared.float())
     if not torch.isfinite(reference).all() or reference.abs().max() < atol:
         raise RuntimeError("BF16 golden output is non-finite or degenerate")
-    result = tp.worst_refcheck(
-        _compare_to_reference(
-            "halops",
-            "golden",
-            out.float().flatten(),
-            reference.float().flatten(),
-            atol,
-            rtol,
-        )
+    result = _compare_to_reference(
+        "halops",
+        "golden",
+        out.float().flatten(),
+        reference.float().flatten(),
+        atol,
+        rtol,
     )
-    if not tp.is_leader:
-        return None
     return {
         "halops": result._asdict(),
         "golden": RefcheckResult(passed=True)._asdict(),
@@ -402,15 +382,9 @@ def _refcheck_entry(
     cfg, ordered_names, refcheck_reference, refcheck_atol, refcheck_rtol
 ):
     options = _validate_config(cfg)
-    with tensor_parallel_context(options["tp_size"], __file__) as tp:
-        payload = tp.run(
-            "refcheck",
-            {
-                "cfg": {**cfg, **options},
-                "kwargs": {"atol": refcheck_atol, "rtol": refcheck_rtol},
-            },
-            _rank_body,
-        )
+    payload = _refcheck(
+        {**cfg, **options}, {"atol": refcheck_atol, "rtol": refcheck_rtol}
+    )
     return {name: RefcheckResult(**vals) for name, vals in payload.items()}
 
 
@@ -436,65 +410,36 @@ def _bench_entry(
     cfg, name, dry_run_iters, repeat_iters, cold_l2_cache, use_cuda_graph, timing_method
 ):
     options = _validate_config(cfg)
-    if options["tp_size"] > 1 and name != "halops":
-        raise ValueError("tp_size > 1 benchmarks the halops backend only")
-    with tensor_parallel_context(options["tp_size"], __file__) as tp:
-        payload = tp.run(
-            "bench",
-            {
-                "cfg": {**cfg, **options},
-                "name": name,
-                "kwargs": {
-                    "dry_run_iters": dry_run_iters,
-                    "repeat_iters": repeat_iters,
-                    "cold_l2_cache": cold_l2_cache,
-                    "use_cuda_graph": use_cuda_graph,
-                    "method": timing_method,
-                },
-            },
-            _rank_body,
-        )
+    payload = _bench(
+        {**cfg, **options},
+        name,
+        {
+            "dry_run_iters": dry_run_iters,
+            "repeat_iters": repeat_iters,
+            "cold_l2_cache": cold_l2_cache,
+            "use_cuda_graph": use_cuda_graph,
+            "method": timing_method,
+        },
+    )
     timing = TimingResult(
         device_us=payload["device_us"],
         host_us=payload["host_us"],
         dispatch_us=payload["dispatch_us"],
     )
-    return MoeTiming(
-        timing,
-        payload["bytes_io"],
-        payload["active_experts"],
-        payload.get("rank_median_us"),
-        payload.get("rank_min_us"),
-    )
-
-
-def _rank_profile_path(profile_output: str, rank: int, world: int) -> str:
-    """Where one rank writes its timer export.
-
-    A single-GPU profile writes the requested file; a tensor-parallel one
-    writes one file per rank next to it, which `_run_profile` then merges.
-    """
-    if world == 1:
-        return profile_output
-    path = Path(profile_output)
-    return str(path.with_name(f"{path.stem}_r{rank}{path.suffix}"))
+    return MoeTiming(timing, payload["bytes_io"], payload["active_experts"])
 
 
 @torch.no_grad()
-def _profile_rank(tp: RankContext, options: dict) -> dict | None:
-    """This rank's launch under the timer; rank 0 returns the row."""
-    raw = _build_inputs(options, tp.rank)
-    inputs = adapt_halops(raw, tp)
+def _profile(options: dict) -> dict:
+    """One launch of a config under the kernel timer."""
+    raw = _build_inputs(options)
+    inputs = adapt_halops(raw)
     active_experts = _active_experts(raw)
     del raw
-    # The first barrier lines the ranks up for the warmups -- the fused tail's
-    # AllReduce is a rendezvous, so they then stay in lockstep; the second one
-    # (before_launch, after each rank's own L2 flush) aligns the launch itself.
-    tp.sync()
     profile_kernel_timeline(
         run_mega_ll_moe,
         (inputs,),
-        _rank_profile_path(options["profile_output"], tp.rank, tp.world),
+        options["profile_output"],
         warmup_iters=max(0, options.get("dry_run_iters", 5)),
         warp_roles={
             0: "calc tmem",
@@ -511,7 +456,6 @@ def _profile_rank(tp: RankContext, options: dict) -> dict | None:
             11: "idle",
         },
         cold_l2_cache=options.get("cold_l2_cache", True),
-        before_launch=tp.sync,
         launch_metadata={
             "config": options.get("profile_config", ""),
             "cold_l2_cache": options.get("cold_l2_cache", True),
@@ -524,22 +468,14 @@ def _profile_rank(tp: RankContext, options: dict) -> dict | None:
             "latent": options["latent_size"],
             "quant_mode": options["quant_mode"],
             "activation": options["activation"],
-            "tp_size": options["tp_size"],
-            "rank": tp.rank,
         },
     )
-    if not tp.is_leader:
-        return None
     return {"active_experts": active_experts}
 
 
 @torch.no_grad()
 def _run_profile(cfg: dict) -> None:
-    """Profile one launch of a config.
-
-    With tp_size=4 every rank exports its own timer pull and the ranks are
-    merged into the requested file, so one timeline holds all four GPUs.
-    """
+    """Profile one launch of a config."""
     if cfg.get("use_cuda_graph", False):
         raise ValueError("MoE kernel timer profiling does not support CUDA graph")
 
@@ -548,24 +484,10 @@ def _run_profile(cfg: dict) -> None:
             **cfg,
             "batch_size": max(cfg.get("batch_sizes", [cfg.get("batch_size", 1)])),
             "top_k": cfg.get("top_k_list", [cfg.get("top_k", 8)])[0],
-            # The rank workers run from benchmark/, so the path must be absolute.
             "profile_output": str(Path(cfg["profile_output"]).expanduser().resolve()),
         }
     )
-    with tensor_parallel_context(options["tp_size"], __file__) as tp:
-        tp.run("profile", {"cfg": options}, _rank_body)
-    if options["tp_size"] == 1:
-        return
-
-    from halops.moe.device_timer import merge_traces
-
-    rank_paths = [
-        _rank_profile_path(options["profile_output"], rank, options["tp_size"])
-        for rank in range(options["tp_size"])
-    ]
-    merge_traces(rank_paths, options["profile_output"])
-    for path in rank_paths:
-        Path(path).unlink(missing_ok=True)
+    _profile(options)
 
 
 def run_scenario(cfg: dict) -> None:
@@ -586,15 +508,6 @@ def run_scenario(cfg: dict) -> None:
         and cfg.get("timing_method", "profiler") != "cupti"
     ):
         raise ValueError("use_cuda_graph requires --timing-method=cupti")
-    if cfg.get("tp_size", 1) > 1 and cfg.get("use_cuda_graph", False):
-        raise ValueError("tp_size > 1 does not support CUDA graph timing")
-    if cfg.get("tp_size", 1) > 1 and cfg.get("timing_method", "profiler") == "profiler":
-        print(
-            "[WARN] tp_size>1 + timing_method='profiler': torch.profiler's "
-            "per-iteration overhead perturbs the cross-rank launch cadence, so "
-            "each rank's kernel duration picks up the wait for its peers. Use "
-            "--timing-method=cupti for stable per-rank kernel times."
-        )
     if cfg.get("dry_run_iters", 10) < 1 or cfg.get("repeat_iters", 50) < 1:
         raise ValueError("dry_run_iters and repeat_iters must be positive")
     failed = []
@@ -653,7 +566,6 @@ def run_scenario(cfg: dict) -> None:
                 top_k=top_k,
                 **MOE_SHAPE,
                 active_experts=timing.active_experts if timing else None,
-                tp_size=local["tp_size"],
                 quant_mode=local["quant_mode"],
                 dtype="bfloat16" if name == "golden" else local["quant_mode"],
                 activation=local["activation"],
@@ -675,27 +587,6 @@ def run_scenario(cfg: dict) -> None:
                 print_scenario_header(row)
                 print_table_header()
             print_table_row(row)
-            if (
-                status == "OK"
-                and timing
-                and local["tp_size"] > 1
-                and timing.rank_median_us
-            ):
-                medians = " ".join(
-                    f"r{rank}={us:.1f}" for rank, us in enumerate(timing.rank_median_us)
-                )
-                mins = " ".join(
-                    f"r{rank}={us:.1f}" for rank, us in enumerate(timing.rank_min_us)
-                )
-                print(
-                    f"    tp={local['tp_size']} kernel time per rank:"
-                    f" median {medians} | min {mins}"
-                    " (row above: worst median; min = no peer wait)"
-                )
             append_moe_csv(row, local.get("output_path", "results/mega_ll_moe.csv"))
     if failed:
         raise RuntimeError("MoE benchmark failed: " + "; ".join(failed))
-
-
-if __name__ == "__main__":
-    tp_worker_main(_rank_body)

@@ -260,7 +260,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gpu",
         default="0",
-        help="CUDA device id(s), e.g. --gpu=0 or --gpu=0,1,2,3 for tp_size=4",
+        help="CUDA device id, e.g. --gpu=0",
     )
     parser.add_argument(
         "--output-dir",
@@ -322,15 +322,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="Profile one MoE config with the kernel timer and write a timeline. "
-        "With tp_size=4 every rank is profiled and the per-rank exports are "
-        "merged into one multi-GPU timeline.",
+        help="Profile one MoE config with the kernel timer and write a timeline.",
     )
     parser.add_argument(
         "--profile-output",
         default="timeline.json",
-        help="Timeline JSON path used with --profile (the merged file for "
-        "tp_size=4).",
+        help="Timeline JSON path used with --profile.",
     )
     args = parser.parse_args()
     main(args)
