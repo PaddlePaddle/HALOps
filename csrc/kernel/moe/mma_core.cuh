@@ -31,8 +31,7 @@
 
 namespace halops::moe {
 
-// SM100_MMA_MXF8F6F4_SS without the election in fma, so one elected lane can
-// issue a whole tile.
+// SM100_MMA_MXF8F6F4_SS without the election in fma.
 template <class a_type, class b_type, class c_type, class sf_type, int M, int N,
           cute::UMMA::Major a_major, cute::UMMA::Major b_major>
 struct SM100_MMA_MXF8F6F4_SS_NOELECT
@@ -71,7 +70,7 @@ struct IsNoElectUmma<SM100_MMA_MXF8F6F4_SS_NOELECT<
 }  // namespace halops::moe
 
 namespace cute {
-// cute's traits, with with() and mma_unpack dispatching to the NOELECT fma.
+
 template <class a_type, class b_type, class c_type, class sf_type, int M, int N,
           UMMA::Major a_major, UMMA::Major b_major>
 struct MMA_Traits<halops::moe::SM100_MMA_MXF8F6F4_SS_NOELECT<
@@ -419,8 +418,7 @@ struct UmmaCore {
         });
     }
 
-    // Run blockscaled GEMM with SFA/SFB scale addresses in TMEM. One elected
-    // lane issues the whole tile.
+    // Run blockscaled GEMM with SFA/SFB scale addresses in TMEM.
     template <class CtaMma, class TensorB, class TensorC>
     __device__ static void run(TiledMma& tiled_mma, CtaMma& cta_mma,
                                SmemElementA* sA, TensorB const& tCrB,

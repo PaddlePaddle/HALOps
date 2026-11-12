@@ -125,14 +125,14 @@
 
 - `batch_sizes`（默认 `[1]`）：token 数，取值为 `1..16`。
 - `top_k_list`（默认 `[8]`）：选择专家数，取值为 `1..10`。
+- `tp_size`（默认 `1`）：此 benchmark 当前仅支持单卡。
 - `quant_mode`：`w8a8-blockwise`（默认）、`w8a8-mxfp8` 或 `w4a8-mxfp4`。
-- `activation`：`silu`（默认）或 `situ`。SiTU 可配置 `situ_beta`（默认 `4.0`）和 `situ_linear_beta`（默认 `25.0`）；非正值关闭对应 soft cap。
+- `activation`：`silu`（默认）或 `situ`。SiTU 可配置 `situ_beta`（默认 `4.0`）和 `situ_linear_beta`（默认 `25.0`）。
 - `scoring_func`：`sigmoid`（默认）或 `softmax`；`renormalize` 默认 `true`。
 - `eps`：RMSNorm epsilon，默认 `1e-5`。
 - `seed`：输入与原始 BF16 权重的随机种子，默认 `0`。
 - `grid_cap`：kernel CTA 上限，默认 `0`。
-- `routed_use_interleaved` / `shared_use_interleaved`（默认 `true`）：对应 up 投影的 gate/up 权重是否按 8 行交织传入（`transform_weights_for_moe`）；`false` 时传自然行序，由 TMA box 交织。interleaved 优先于 swizzle。scale 表固定按 SfAtom 传入，无需配置。
-- `latent_use_swizzle`（默认 `false`）：latent down 与 tail fc2 的 scale 表是否为 SfAtom 格式（`group_wise_quant(use_swizzle=True)`）；`false` 时传 plain 行主序，由 kernel 现场处理。
+- `routed_use_interleaved` / `shared_use_interleaved`（默认 `true`）：对应 up 投影的 gate/up 权重是否按 8 行交织传入（`transform_weights_for_moe`）。
 - `backends`：`halops`。
 
 固定形状为 `hidden_size=4096`、`intermediate_size=512`、`latent_size=2048`、`num_experts=512`，配置其他形状会报错。

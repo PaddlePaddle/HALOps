@@ -319,7 +319,7 @@ struct SharedUpProjection<KernelTraits, true>
         CUtensorMap const& tma_input_desc,
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        ScaleLayout up_scale_layout, std::uint32_t batch_size,
+        ScaleLayout up_scale_layout, bool interleaved, std::uint32_t batch_size,
         Activation activation, float situ_beta, float situ_linear_beta) {
         zero_sf_slots(smem);
 
@@ -331,7 +331,7 @@ struct SharedUpProjection<KernelTraits, true>
             Base::run_load_input_k_loop(tma_input_desc, smem);
         } else if (WarpRole::is_weight_loader_thread()) {
             run_load_weight_k_loop(tma_up_desc, tma_up_scale_desc, up_scale,
-                                   smem, up_scale_layout);
+                                   smem, up_scale_layout, interleaved);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
             run_mma_k_loop(smem, up_scale, up_scale_layout);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
@@ -358,10 +358,10 @@ struct SharedUpProjection<KernelTraits, true>
     __device__ static void run_load_weight_k_loop(
         CUtensorMap const& tma_up_desc, CUtensorMap const& tma_up_scale_desc,
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
-        SharedStorage* __restrict__ smem, ScaleLayout up_scale_layout) {
+        SharedStorage* __restrict__ smem, ScaleLayout up_scale_layout,
+        bool interleaved) {
         const std::uint32_t tx_bytes =
             Base::up_weight_tx_bytes(up_scale_layout);
-        const bool interleaved = Base::shared_up_interleaved(up_scale_layout);
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kUpTilesK;
              ++k_iter_id) {
@@ -534,15 +534,16 @@ struct SharedUpProjection<KernelTraits, false>
         CUtensorMap const& tma_input_desc,
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        ScaleLayout up_scale_layout, std::uint32_t batch_size,
-        Activation activation, float situ_beta, float situ_linear_beta) {
+        [[maybe_unused]] ScaleLayout up_scale_layout, bool interleaved,
+        std::uint32_t batch_size, Activation activation, float situ_beta,
+        float situ_linear_beta) {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         Accumulator gate{};
         Accumulator up{};
         if (WarpRole::is_other_loader_thread()) {
             Base::run_load_input_k_loop(tma_input_desc, smem);
         } else if (WarpRole::is_weight_loader_thread()) {
-            run_load_weight_k_loop(tma_up_desc, smem, up_scale_layout);
+            run_load_weight_k_loop(tma_up_desc, smem, interleaved);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
             run_mma_k_loop(smem);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
@@ -564,8 +565,7 @@ struct SharedUpProjection<KernelTraits, false>
 
     __device__ static void run_load_weight_k_loop(
         CUtensorMap const& tma_up_desc, SharedStorage* __restrict__ smem,
-        ScaleLayout up_scale_layout) {
-        const bool interleaved = Base::shared_up_interleaved(up_scale_layout);
+        bool interleaved) {
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kUpTilesK;
              ++k_iter_id) {

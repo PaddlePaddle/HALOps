@@ -99,11 +99,6 @@ struct UpProjectionBase {
                          (layout == ScaleLayout::kSfAtom ? 2u : 1u);
     }
 
-    // The up weight rows are packed exactly when the table is packed atoms.
-    __device__ static constexpr bool shared_up_interleaved(ScaleLayout layout) {
-        return layout == ScaleLayout::kPackedAtom;
-    }
-
     __device__ static constexpr std::uint32_t up_weight_tx_bytes(
         ScaleLayout layout) {
         return MmaCore::kWeightTileTxBytes +

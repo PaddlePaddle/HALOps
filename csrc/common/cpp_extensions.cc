@@ -18,7 +18,6 @@
 
 namespace halops {
 
-#if 0  // TEMP: only group_wise_quant and the MoE kernel are built.
 void WriteCacheKVEncoder(
     const torch::Tensor& qkv_input, const torch::Tensor& cu_seq_q,
     const torch::Tensor& cu_seq_k, const torch::Tensor& rotary_embs,
@@ -116,8 +115,6 @@ void LowLatencyMmaGemm(const torch::Tensor& input, const torch::Tensor& weight,
                        const int sm_count, const bool use_pdl,
                        const bool use_sigmoid);
 
-#endif
-
 std::vector<torch::Tensor> GroupWiseQuant(
     const torch::Tensor& input, const std::string& mode, const bool use_swizzle,
     const bool use_pdl, const std::optional<torch::Tensor>& output_quant,
@@ -135,7 +132,6 @@ std::vector<torch::Tensor> VhaPostmixQuant(
     const int64_t groups, const bool group_major, const bool use_pdl,
     const std::optional<torch::Tensor>& output_quant,
     const std::optional<torch::Tensor>& output_sf);
-#if 0
 
 std::vector<torch::Tensor> PrefillPermuteToMaskedGemm(
     const torch::Tensor& x, const torch::Tensor& scale,
@@ -199,8 +195,6 @@ void MlaOutputProj(const torch::Tensor& wo_a_weight,
                    const torch::Tensor& wo_b_sf, torch::Tensor& out,
                    const torch::Tensor& workspace);
 
-#endif
-
 void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,
                const torch::Tensor& expert_up_weights,
                const torch::Tensor& expert_up_weights_scale,
@@ -236,14 +230,11 @@ int64_t GetWorkspaceSize(const std::optional<torch::Tensor>& input);
 }  // namespace halops
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-#if 0
     m.def("write_cache_kv_encoder", &halops::WriteCacheKVEncoder);
     m.def("write_cache_kv_decoder", &halops::WriteCacheKVDecoder);
     m.def("get_qk_token", &halops::GetQKToken);
     m.def("encoder_attention", &halops::EncoderAttention);
     m.def("decoder_attention", &halops::DecoderAttention);
-
-#endif
 
     py::enum_<halops::EpilogueOp>(m, "EpilogueOp")
         .value("Identity", halops::EpilogueOp::Identity)
@@ -252,7 +243,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .value("Sigmoid", halops::EpilogueOp::Sigmoid)
         .value("SituQuant", halops::EpilogueOp::SituQuant)
         .value("SigmoidGateMulQuant", halops::EpilogueOp::SigmoidGateMulQuant);
-#if 0
     m.def("dense_gemm", &halops::DenseGemm, py::arg("input"), py::arg("weight"),
           py::arg("sfa"), py::arg("sfb"), py::arg("output"), py::arg("bias"),
           py::arg("alpha"), py::arg("sm_count"), py::arg("mode"),
@@ -273,13 +263,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("input2"), py::arg("weight2"), py::arg("sfa2"),
           py::arg("sfb2"), py::arg("output2"), py::arg("sm_count"),
           py::arg("use_pdl") = true, py::arg("use_sigmoid") = false);
-#endif
 
     m.def("group_wise_quant", &halops::GroupWiseQuant, py::arg("input"),
           py::arg("mode"), py::arg("use_swizzle") = true,
           py::arg("use_pdl") = true, py::arg("output_quant") = py::none(),
           py::arg("output_sf") = py::none());
-#if 0
     m.def("rms_norm_quant", &halops::RmsNormQuant, py::arg("input"),
           py::arg("weight"), py::arg("eps"), py::arg("use_pdl") = true,
           py::arg("output_quant") = py::none(),
@@ -299,8 +287,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("groups"), py::arg("group_major") = true,
           py::arg("use_pdl") = true, py::arg("output_quant") = py::none(),
           py::arg("output_sf") = py::none());
-
-#endif
 
     m.def("mega_ll_moe", &halops::MegaLLMoE);
     m.def("moe_tail_region_bytes", &halops::MoETailRegionBytes, py::arg("wide"),

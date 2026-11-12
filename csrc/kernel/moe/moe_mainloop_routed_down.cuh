@@ -49,10 +49,13 @@ struct RoutedDownProjectionBase
     using typename Base::Workspace;
     using RoutingTables = MoERoutingTables<Dims>;
 
-    static constexpr std::uint32_t kDownActTxBytes =
-        DownGemm::kTileShapeN * DownGemm::kTileShapeK *
-        static_cast<std::uint32_t>(
-            sizeof(typename DownGemm::InputQuant::ElementType));
+    // The loader's box covers the launch's tokens, not the schedule's capacity.
+    __device__ static constexpr std::uint32_t down_act_tx_bytes(
+        std::uint32_t num_tokens) {
+        return DownGemm::kTileShapeK * num_tokens *
+               static_cast<std::uint32_t>(
+                   sizeof(typename DownGemm::InputQuant::ElementType));
+    }
     static constexpr std::uint64_t kBLbo = 16ULL;
     static constexpr std::uint64_t kBSbo = 128ULL;
 
@@ -151,10 +154,12 @@ struct RoutedDownProjectionBase
         SharedStorage* __restrict__ smem,
         const CUtensorMap& tma_down_activations_desc,
         std::uint32_t expert_start, std::uint32_t routed_count,
-        std::uint32_t step_local, std::uint32_t k_iter_id) {
+        std::uint32_t num_tokens, std::uint32_t step_local,
+        std::uint32_t k_iter_id) {
         if (routed_count == 0u) return;
         const std::uint32_t slot = step_local % Base::kNumWeightSlots;
-        smem->barriers.routed.down_input_ready.arrive(slot, kDownActTxBytes);
+        smem->barriers.routed.down_input_ready.arrive(
+            slot, down_act_tx_bytes(num_tokens));
         tma_load_2d(tma_down_activations_desc, /*coord0=*/k_iter_id * 128u,
                     /*coord1=*/expert_start,
                     &smem->routed_experts.act_down_input[slot][0],
@@ -209,7 +214,7 @@ struct RoutedDownProjection<KernelTraits, true>
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         ScaleLayout down_scale_layout, CUtensorMap const& tma_down_weights_desc,
         CUtensorMap const& tma_down_scale_desc,
-        CUtensorMap const& tma_down_activations_desc,
+        CUtensorMap const& tma_down_activations_desc, std::uint32_t num_tokens,
         TaskScheduler<Traits>& sched, std::uint64_t weight_cache_hint) {
         const unsigned warp_idx = WarpRole::get_warp_idx();
         const unsigned lane_idx = WarpRole::get_lane_idx();
@@ -259,9 +264,9 @@ struct RoutedDownProjection<KernelTraits, true>
                                        local_id, expert_id, base_m,
                                        down_scale_layout, weight_cache_hint);
             } else if (WarpRole::is_other_loader_warp(warp_idx)) {
-                run_load_input_k_loop(smem, workspace,
-                                      tma_down_activations_desc, local_id,
-                                      expert_id, expert_start, routed_count);
+                run_load_input_k_loop(
+                    smem, workspace, tma_down_activations_desc, local_id,
+                    expert_id, expert_start, routed_count, num_tokens);
             } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
                 run_mma_k_loop(smem, tmem_base, task_id, acc_task_id,
                                routed_count, expert_scales_down, expert_id,
@@ -308,7 +313,7 @@ struct RoutedDownProjection<KernelTraits, true>
         SharedStorage* __restrict__ smem, Workspace* __restrict__ workspace,
         const CUtensorMap& tma_down_activations_desc, std::uint32_t local_id,
         std::uint32_t expert_id, std::uint32_t expert_start,
-        std::uint32_t routed_count) {
+        std::uint32_t routed_count, std::uint32_t num_tokens) {
         const unsigned lane_idx = WarpRole::get_lane_idx();
         workspace->cta_comm.wait_up_out(smem->launch_parity, expert_start,
                                         routed_count,
@@ -327,8 +332,8 @@ struct RoutedDownProjection<KernelTraits, true>
                                   step_local, k_iter_id);
             if (lane_idx == 0u) {
                 Base::load_input_tile(smem, tma_down_activations_desc,
-                                      expert_start, routed_count, step_local,
-                                      k_iter_id);
+                                      expert_start, routed_count, num_tokens,
+                                      step_local, k_iter_id);
             }
         }
     }
@@ -510,7 +515,7 @@ struct RoutedDownProjection<KernelTraits, false>
         [[maybe_unused]] ScaleLayout down_scale_layout,
         CUtensorMap const& tma_down_weights_desc,
         CUtensorMap const& tma_down_scale_desc,
-        CUtensorMap const& tma_down_activations_desc,
+        CUtensorMap const& tma_down_activations_desc, std::uint32_t num_tokens,
         TaskScheduler<Traits>& sched, std::uint64_t weight_cache_hint) {
         const unsigned warp_idx = WarpRole::get_warp_idx();
         const unsigned lane_idx = WarpRole::get_lane_idx();
@@ -572,9 +577,10 @@ struct RoutedDownProjection<KernelTraits, false>
                                        local_id, expert_id, base_m,
                                        weight_cache_hint);
             } else if (WarpRole::is_other_loader_warp(warp_idx)) {
-                run_load_input_k_loop(
-                    smem, workspace, tma_down_activations_desc, id_base,
-                    local_id, expert_id, expert_start, routed_count);
+                run_load_input_k_loop(smem, workspace,
+                                      tma_down_activations_desc, id_base,
+                                      local_id, expert_id, expert_start,
+                                      routed_count, num_tokens);
             } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
                 run_mma_k_loop(smem, tmem_base, ring_iter_id, local_id,
                                routed_count);
@@ -670,7 +676,8 @@ struct RoutedDownProjection<KernelTraits, false>
         SharedStorage* __restrict__ smem, Workspace* __restrict__ workspace,
         const CUtensorMap& tma_down_activations_desc, std::uint32_t id_base,
         std::uint32_t local_id, std::uint32_t expert_id,
-        std::uint32_t expert_start, std::uint32_t routed_count) {
+        std::uint32_t expert_start, std::uint32_t routed_count,
+        std::uint32_t num_tokens) {
         workspace->cta_comm.wait_up_out(smem->launch_parity, expert_start,
                                         routed_count,
                                         Workspace::kUpOutReadyFull);
@@ -682,8 +689,8 @@ struct RoutedDownProjection<KernelTraits, false>
              ++k_iter_id) {
             wait_input_empty(smem, id_base + local_id + k_iter_id);
             Base::load_input_tile(smem, tma_down_activations_desc, expert_start,
-                                  routed_count, local_id + k_iter_id,
-                                  k_iter_id);
+                                  routed_count, num_tokens,
+                                  local_id + k_iter_id, k_iter_id);
         }
     }
 

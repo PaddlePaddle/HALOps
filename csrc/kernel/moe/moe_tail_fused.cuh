@@ -386,9 +386,13 @@ struct TailGroup {
     // One thread: expect pass `blk`'s bytes on `buf`'s barrier.
     __device__ static __forceinline__ void arm_block(const Ctx& c, int blk,
                                                      int buf) {
-        mbar_expect_tx(c.s_wbar + buf,
-                       (STAGE != 0 ? uint32_t(kBlockRows) * L : 0u) +
-                           (kStageSf && blk == 0 ? TC::kSmemSfBytes : 0u));
+        const bool gather_sf =
+            kStageSf && blk == 0 &&
+            c.p.layouts.tail_fc2_scale == ScaleLayout::kSfAtom;
+        mbar_expect_tx(
+            c.s_wbar + buf,
+            (STAGE != 0 ? uint32_t(kBlockRows) * L : 0u) +
+                (kStageSf && blk == 0 && !gather_sf ? TC::kSmemSfBytes : 0u));
     }
 
     // All calc threads, once the pass is armed: bulk-load pass `blk` into
@@ -406,9 +410,25 @@ struct TailGroup {
                              (row0(c) + int64_t(blk) * kBlockRows + r) * L,
                          L, bar);
         }
-        if (with_sf && c.tid == 0u)
+        if (!with_sf) return;
+        if (c.p.layouts.tail_fc2_scale == ScaleLayout::kSfAtom) {
+            // The caller's table packs the rows an atom at a time; gather this
+            // CTA's rows into the plain block the GEMV reads.
+            constexpr int kGroups = L / 32;
+            constexpr int kAtomBytes = (kGroups / 4) * 512;
+            const auto* sf =
+                reinterpret_cast<const uint8_t*>(c.p.tail_fc2_scale);
+#pragma unroll 1
+            for (int i = int(c.tid); i < kRows * kGroups; i += int(kThreads)) {
+                const int64_t row = row0(c) + i / kGroups;
+                c.s_sf[i] = sf[(row / 128) * kAtomBytes +
+                               sf_atom_offset(uint32_t(row % 128),
+                                              uint32_t(i % kGroups))];
+            }
+        } else if (c.tid == 0u) {
             bulk_g2s(c.s_sf, c.p.tail_fc2_scale + row0(c) * (L / 32),
                      TC::kSmemSfBytes, bar);
+        }
     }
 
     __device__ static __forceinline__ void stage_weights(const Ctx& c) {
@@ -420,6 +440,10 @@ struct TailGroup {
             c.sync();
 #pragma unroll
             for (int b = 0; b < kStageBufs; ++b) load_block(c, b, b);
+            if (kStageSf &&
+                c.p.layouts.tail_fc2_scale == ScaleLayout::kSfAtom) {
+                c.sync();
+            }
         }
     }
 

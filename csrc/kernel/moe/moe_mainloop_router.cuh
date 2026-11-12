@@ -65,7 +65,7 @@ struct RouterProjectionBase {
                RouterGemm::kTileShapeN;
     }
 
-    // This block's first weight row in the gate-major [G, E, H] tensor.
+    // This block's first weight row in the gate-stacked [G * E, H] tensor.
     __device__ static std::uint32_t weight_row_begin() {
         return router_gate() * RouterGemm::kGemmM + router_tile() * kTileShapeM;
     }

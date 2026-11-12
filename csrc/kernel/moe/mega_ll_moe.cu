@@ -34,12 +34,13 @@ template <typename MoEDims>
 void CheckRouterWeightShape(const torch::Tensor& router_weight) {
     TORCH_CHECK(router_weight.scalar_type() == at::kBFloat16,
                 "router_weight must be bfloat16.");
-    TORCH_CHECK(router_weight.dim() == 3 &&
-                    router_weight.size(0) == MoEDims::kNumRouterGates &&
-                    router_weight.size(1) == MoEDims::kNumExperts &&
-                    router_weight.size(2) == MoEDims::kHiddenSize,
-                "router_weight must be [G, E, H] = [", MoEDims::kNumRouterGates,
-                ", ", MoEDims::kNumExperts, ", ", MoEDims::kHiddenSize, "].");
+    TORCH_CHECK(router_weight.dim() == 2 &&
+                    router_weight.size(0) ==
+                        MoEDims::kNumRouterGates * MoEDims::kNumExperts &&
+                    router_weight.size(1) == MoEDims::kHiddenSize,
+                "router_weight must be [G * E, H] = [",
+                MoEDims::kNumRouterGates * MoEDims::kNumExperts, ", ",
+                MoEDims::kHiddenSize, "].");
 }
 
 template <typename MoEDims>
@@ -76,7 +77,6 @@ template <typename MoEDims>
 void CheckSharedExpertShape(const torch::Tensor& shared_up_weight,
                             const torch::Tensor& shared_down_weight) {
     constexpr std::int64_t kUpRows = 2 * MoEDims::kIntermediateSize;
-    // Both the natural and the gate/up-paired row order are [2N, H].
     TORCH_CHECK(shared_up_weight.dim() == 2 &&
                     shared_up_weight.size(0) == kUpRows &&
                     shared_up_weight.size(1) == MoEDims::kHiddenSize,
@@ -210,10 +210,10 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
                 kMaxTopk, ".");
 
     CheckRouterWeightShape<MoEDims>(router_weight);
+    CheckRoutedExpertShape<MoEDims>(expert_up_weights, expert_down_weights);
     if constexpr (MoEDims::kUseLatent) {
         CheckLatentDownShape<MoEDims>(latent_down_weight);
     }
-    CheckRoutedExpertShape<MoEDims>(expert_up_weights, expert_down_weights);
     CheckSharedExpertShape<MoEDims>(shared_up_weight, shared_down_weight);
     CheckTailFc2Shape<MoEDims>(tail_fc2_weight, tail_fc2_scale);
     CheckRoutingVectors<MoEDims>(correction_bias, per_expert_scale);

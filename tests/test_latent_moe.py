@@ -117,18 +117,30 @@ def _dequant_fp8_block_wise(weight, scale):
     return weight.float() * expanded[:rows, :cols]
 
 
-def _sf_to_plain(scale, rows, cols):
-    """CUTLASS SfAtom scale [ceil(rows/128)*128, cols] -> plain [rows, cols]."""
-    m = torch.arange(rows, device=scale.device)
-    g = torch.arange(cols, device=scale.device)
-    offset = (
+def _sf_offsets(rows, cols, device):
+    """Byte offset of every (row, group) in the CUTLASS SfAtom table."""
+    m = torch.arange(rows, device=device)
+    g = torch.arange(cols, device=device)
+    return (
         (m[:, None] // 128) * (cols // 4) * 512
         + (g[None, :] // 4) * 512
         + (m[:, None] % 32) * 16
         + ((m[:, None] % 128) // 32) * 4
         + (g[None, :] % 4)
     )
-    return scale.reshape(-1)[offset]
+
+
+def _sf_to_plain(scale, rows, cols):
+    """CUTLASS SfAtom scale [ceil(rows/128)*128, cols] -> plain [rows, cols]."""
+    return scale.reshape(-1)[_sf_offsets(rows, cols, scale.device)]
+
+
+def _plain_to_sf(plain):
+    """Plain [rows, cols] scale rows -> the CUTLASS SfAtom table."""
+    rows, cols = plain.shape
+    table = torch.empty_like(plain)
+    table.reshape(-1)[_sf_offsets(rows, cols, plain.device)] = plain
+    return table
 
 
 def _dequant_mxfp8(q, scale, group_size=32):
@@ -185,6 +197,7 @@ class MoEParams:
         use_latent=True,
         activation="silu",
         quant_mode="w8a8-blockwise",
+        latent_use_swizzle=False,
         **weight_kwargs,
     ):
         self.hidden_size = 4096
@@ -202,6 +215,8 @@ class MoEParams:
         # The latent and shared groups are MXFP8 under both MX recipes.
         self.mxfp8_groups = quant_mode != "w8a8-blockwise"
         self.mxfp8_group = "w8a8-mxfp8"
+        # The latent down and the tail fc2 read the caller's SfAtom tables.
+        self.latent_use_swizzle = latent_use_swizzle
         self.init_weights(**weight_kwargs)
         self.init_routing("", device=weight_kwargs.get("device"))
 
@@ -225,7 +240,7 @@ class MoEParams:
 
         router = (torch.randn(e, h, device=dev, generator=gc) / h**0.5).bfloat16()
         if self.num_router_gates == 2:
-            router = torch.stack([router, router.flip(0)])
+            router = torch.cat([router, router.flip(0)], dim=0)
 
         w13_raw = torch.randn(e, 2 * n, z, device=dev, generator=g) * 0.1
         w2_raw = torch.randn(e, z, n, device=dev, generator=g) * 0.1
@@ -270,7 +285,7 @@ class MoEParams:
                 latent_w, latent_s = group_wise_quant(
                     raw[0].bfloat16(),
                     mode=self.mxfp8_group,
-                    use_swizzle=False,
+                    use_swizzle=self.latent_use_swizzle,
                 )
             else:
                 latent_w, latent_s = _quant_fp8_block_wise(raw)
@@ -372,9 +387,11 @@ class MoEParams:
             w = w * torch.exp2(
                 torch.randint(-1, 2, (1, z // 32), device=dev, generator=g)
             ).repeat_interleave(32, 1)
-            self.fc2_weight, self.fc2_scale = _mxfp8_quant(w)
-            self.fc2_dequant = self.fc2_weight.float() * torch.exp2(
-                self.fc2_scale.float() - 127
+            fc2_w8, plain = _mxfp8_quant(w)
+            self.fc2_weight = fc2_w8
+            self.fc2_scale = _plain_to_sf(plain) if self.latent_use_swizzle else plain
+            self.fc2_dequant = fc2_w8.float() * torch.exp2(
+                plain.float() - 127
             ).repeat_interleave(32, 1)
         self.norm_weight = (
             1.0 + 0.1 * torch.randn(z, device=dev, generator=g)
@@ -407,14 +424,10 @@ class MoERef:
     def _router_scores(self, input):
         """The router's selection key: sigmoid of each gate's logits, summed."""
         router_weight = self.moe_params.router_weight
-        if router_weight.dim() == 2:
-            # The kernel round-trips the logits through bf16 before scoring.
-            logits = (input.bfloat16() @ router_weight.bfloat16()).float().bfloat16()
-        else:
-            # The dual-gate router scores the fp32 logits, not a bf16 image.
-            logits = input.float() @ router_weight.float().transpose(-1, -2)
-        scores = torch.sigmoid(logits.float())
-        return scores.sum(0) if scores.dim() == 3 else scores
+        # The gates are stacked along the weight's rows; score each and sum.
+        logits = input.float() @ router_weight.float().transpose(-1, -2)
+        logits = logits.view(input.shape[0], self.moe_params.num_router_gates, -1)
+        return torch.sigmoid(logits).sum(1)
 
     def _routing_sigmoid_topk_from_scores(self, scores, top_k):
         """The greedy topk->renormalize over already-scored rows."""
@@ -562,7 +575,7 @@ class MoERef:
                 input,
                 p.latent_down_weight,
                 p.latent_down_weight_scale,
-                sfatom=False,
+                sfatom=p.latent_use_swizzle,
             )
 
         return self.matmul_fp8(
@@ -652,7 +665,7 @@ class MoEFused:
             routed_use_swizzle=p.interleaved,
             shared_use_interleaved=p.interleaved,
             shared_use_swizzle=p.interleaved,
-            latent_use_swizzle=False,
+            latent_use_swizzle=p.latent_use_swizzle,
         )
         return out
 
@@ -725,6 +738,8 @@ def _tail_worker():
                 use_latent=True,
                 activation=activation,
                 quant_mode=quant_mode,
+                # The MXFP8 accuracy cases also cover the SfAtom latent tables.
+                latent_use_swizzle=quant_mode == "w8a8-mxfp8",
                 seed=100 + rank,
                 common_seed=0,
                 device=dev,

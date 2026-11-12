@@ -44,7 +44,6 @@ enum class ScaleLayout : std::uint32_t {
 };
 
 struct MoELayouts {
-    // Gate/up rows interleaved in 8-row groups instead of natural [2, N, H].
     bool routed_up_interleaved = false;
     bool shared_up_interleaved = false;
     ScaleLayout routed_up_scale = ScaleLayout::kSfAtom;
@@ -52,6 +51,7 @@ struct MoELayouts {
     ScaleLayout shared_up_scale = ScaleLayout::kPlain;
     ScaleLayout shared_down_scale = ScaleLayout::kPlain;
     ScaleLayout latent_down_scale = ScaleLayout::kPlain;
+    ScaleLayout tail_fc2_scale = ScaleLayout::kPlain;
 };
 
 // Operand quantization types and group width. MXFP8/MXFP4 use fixed 32-element
@@ -171,7 +171,6 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr int kTailGsize = 32;
         static constexpr int kTailThreads = 256;
         static constexpr int kTailStage = 1;
-        // Rows a staged CTA bulk-loads and multiplies per pass.
         static constexpr int kTailBlockRows = 32;
         static constexpr int kTailBlkB = 4;
         static constexpr int kTailWStagePad = 64;
@@ -251,6 +250,8 @@ constexpr MoELayouts make_moe_layouts(bool routed_use_interleaved,
     layouts.shared_down_scale =
         shared_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain;
     layouts.latent_down_scale =
+        latent_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain;
+    layouts.tail_fc2_scale =
         latent_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain;
     return layouts;
 }

@@ -292,8 +292,8 @@ def mega_ll_moe(
         input (Tensor): Activations, shape [T, 4096], dtype bfloat16, with
             1 <= T <= 16.
         router_weight (Tensor): Router weight, dtype bfloat16, shape
-            [G, E, H] = [2, 512, 4096], contiguous; gate ``g`` holds every
-            expert's row.
+            [G * E, H] = [1024, 4096], contiguous; the gates are stacked, so
+            gate ``g`` owns rows [g * E, (g + 1) * E).
         expert_up_weights (Tensor): Fused gate/up weights, dtype
             float8_e4m3fn, in the natural [512, 2 * 512, 2048] layout. Under
             "w4a8-mxfp4" the dtype is uint8 and K is halved: two 4-bit values
@@ -333,20 +333,19 @@ def mega_ll_moe(
             Quantize it in this layout and pass it directly.
         latent_down_weight_scale (Tensor): Scales of
             ``latent_down_weight``: shape [16, 32] and dtype float32 for
-            "w8a8-blockwise", or the natural [2048, 128] uint8 rows (from
-            ``group_wise_quant(use_swizzle=False)``) for "w8a8-mxfp8" and
-            "w4a8-mxfp4"; the kernel rewrites them into the MMA's SfAtom
-            order.
-        latent_up_weight (Tensor): [4096, 2048] float8_e4m3fn latent up weight.
-        latent_up_weight_scale (Tensor): [32, 16] float32 block scales, powers of two.
-        latent_up_weight (Tensor): [4096, 2048] float8_e4m3fn latent up weight
-            (the tail's fc2).
+            "w8a8-blockwise", or a [2048, 128] uint8 table for "w8a8-mxfp8"
+            and "w4a8-mxfp4" — plain rows from
+            ``group_wise_quant(use_swizzle=False)``, or the SfAtom table from
+            ``use_swizzle=True`` when ``latent_use_swizzle`` is set.
+        latent_up_weight (Tensor): [4096, 2048] float8_e4m3fn latent up
+            weight.
         latent_up_weight_scale (Tensor): Scales of ``latent_up_weight``,
             following the latent recipe of ``quant_mode``: shape [32, 16] and
             dtype float32 (powers of two) for "w8a8-blockwise"; shape
-            [4096, 64] and dtype uint8 (UE8M0, one per row per 32 columns,
-            plain row-major as from ``group_wise_quant(use_swizzle=False)``,
-            not the SfAtom layout) for "w8a8-mxfp8" and "w4a8-mxfp4".
+            [4096, 64] and dtype uint8 (UE8M0, one per row per 32 columns) for
+            "w8a8-mxfp8" and "w4a8-mxfp4", plain row-major as from
+            ``group_wise_quant(use_swizzle=False)`` or the SfAtom table when
+            ``latent_use_swizzle`` is set.
         norm_weight (Tensor): [2048] bfloat16 RMSNorm weight.
         correction_bias (Tensor or None): [512] float32 CUDA router bias
             (``e_score_correction_bias``). It is added to each expert's score
@@ -360,8 +359,8 @@ def mega_ll_moe(
             from ``get_workspace_for_moe``, matching the token schedule. It
             also fixes the tensor-parallel size and rank of the launch.
         top_k (int): Experts selected per token, in [1, 10].
-        num_router_gates (int, optional): Gates in ``router_weight``'s leading
-            dimension; this build requires 2. Default: 2.
+        num_router_gates (int, optional): Gates stacked in
+            ``router_weight``'s rows; this build requires 2. Default: 2.
         scoring_func (str, optional): Router scoring, either "sigmoid" or
             "softmax". Default: "sigmoid".
         renormalize (bool, optional): Renormalize the top-k weights to sum to
@@ -396,9 +395,9 @@ def mega_ll_moe(
         shared_use_swizzle (bool, optional): The shared up and down scale
             tables are the caller's SfAtom tables rather than plain rows.
             Interleaved rows imply it. Default: True.
-        latent_use_swizzle (bool, optional): The latent down-projection's
-            scale table is the caller's SfAtom table rather than plain rows.
-            Default: False.
+        latent_use_swizzle (bool, optional): The latent down- and
+            up-projection's scale tables are the caller's SfAtom tables rather
+            than plain rows. Default: False.
 
     Returns:
         None. The outputs are written in place.

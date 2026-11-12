@@ -88,12 +88,15 @@ def _route(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
     """
     x = inp["input_bf16"]
     # The dual router publishes FP32 scores without rounding logits to BF16.
+    # Its gates are stacked along the weight's rows: [T, G * E] -> [T, G, E].
+    tokens = x.shape[0]
     logits = torch.matmul(x.float(), inp["router_weight_fp32"].transpose(-1, -2))
+    logits = logits.view(tokens, inp["num_router_gates"], -1)
     scores = (
         torch.sigmoid(logits)
         if inp["scoring_func"] == "sigmoid"
         else torch.softmax(logits, dim=-1)
-    ).sum(dim=0)
+    ).sum(dim=1)
     bias = inp.get("correction_bias")
     selection = scores + bias if bias is not None else scores
     ids = torch.argsort(selection, dim=-1, descending=True, stable=True)[

@@ -414,12 +414,14 @@ struct LatentDownProjection<KernelTraits, true>
         SharedStorage* __restrict__ smem) {
         constexpr std::uint32_t kTileBytes =
             ScaleTraits::kSfaSmemBytes * Base::kNumTilesK;
+        constexpr std::uint32_t kCalcThreads =
+            WarpRole::kCalcWarpCount * WarpRole::kThreadsPerWarp;
         const auto* src = reinterpret_cast<const std::uint32_t*>(
             packed + static_cast<std::size_t>(Base::tile_idx()) * kTileBytes);
         auto* dst =
             reinterpret_cast<std::uint32_t*>(smem->latent_down.sfa_slab);
         for (std::uint32_t i = threadIdx.x; i < kTileBytes / 4u;
-             i += static_cast<std::uint32_t>(blockDim.x)) {
+             i += kCalcThreads) {
             dst[i] = src[i];
         }
         // The MMA reads the slab through the async proxy.

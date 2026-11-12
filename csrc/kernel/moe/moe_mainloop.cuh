@@ -98,7 +98,6 @@ struct CollectiveMainloopMoE {
         Activation activation;
         float situ_beta;
         float situ_linear_beta;
-        // Weight and scale table layouts of this launch.
         MoELayouts layouts;
         std::uint32_t l2_cached_bytes;
         float tail_eps;
@@ -150,7 +149,6 @@ struct CollectiveMainloopMoE {
         float situ_linear_beta;
         // Evict weights first when their working set exceeds L2 capacity.
         std::uint32_t l2_expert_capacity;
-        // Weight and scale table layouts of this launch.
         MoELayouts layouts;
         float tail_eps;
         std::uint32_t tail_shared_ctas;
@@ -327,20 +325,23 @@ struct CollectiveMainloopMoE {
             /*box=*/{128u, Traits::RoutedDownGemm::kTileShapeM});
         if constexpr (Traits::RoutedDownGemm::MmaCore::kUseBlockscaled) {
             if (args.layouts.routed_down_scale != ScaleLayout::kPlain) {
-                // One box carries every row atom of a K tile: [16-byte
-                // words][K slab][row atom].
+                // One box carries every row atom of a K tile: [16-byte words][K
+                // slab][row atom].
                 using DownGemm = typename Traits::RoutedDownGemm;
                 constexpr std::uint64_t kSfKBlocksPerRow =
                     std::uint64_t{DownGemm::kGemmK} / 128u;
                 constexpr std::uint64_t kAtomRows =
                     std::uint64_t{Dims::kNumExperts} *
                     (DownGemm::kGemmM / 128u);
+                std::uint64_t down_scale_shape[3] = {128u, kSfKBlocksPerRow,
+                                                     kAtomRows};
+                std::uint64_t down_scale_strides[2] = {512u,
+                                                       kSfKBlocksPerRow * 512u};
                 params.tma_down_scale_desc = CreateTmaDesc<3>(
                     "routed_down weight_scales",
                     reinterpret_cast<const std::uint32_t*>(
                         args.expert_down_weights_scale),
-                    /*shape=*/{128u, kSfKBlocksPerRow, kAtomRows},
-                    /*strides=*/{512u, kSfKBlocksPerRow * 512u},
+                    down_scale_shape, down_scale_strides,
                     /*box=*/{128u, 1u, DownGemm::ScaleTraits::kNumSfaAtoms},
                     /*use_swizzle=*/false);
             }
@@ -353,7 +354,7 @@ struct CollectiveMainloopMoE {
                 static_cast<const char*>(args.workspace) +
                 Workspace::kUpOutFp8Offset),
             down_x_shape, /*strides=*/{std::uint64_t{Dims::kIntermediateSize}},
-            /*box=*/{128u, Dims::kNumTokens});
+            /*box=*/{128u, args.num_tokens});
 
         using SharedUp = typename Traits::SharedUpGemm;
         constexpr std::uint64_t kSharedUpElemBytes =
@@ -412,12 +413,12 @@ struct CollectiveMainloopMoE {
             constexpr std::uint64_t kSharedDownAtomRows =
                 Dims::kHiddenSize / 128u;
             if (args.layouts.shared_down_scale == ScaleLayout::kSfAtom) {
-                using DownScaleTraits =
-                    typename Traits::SharedDownGemm::ScaleTraits;
                 std::uint64_t shared_down_scale_shape[3] = {
                     128u, kSharedDownSlabs, kSharedDownAtomRows};
                 std::uint64_t shared_down_scale_strides[2] = {
                     512u, kSharedDownSlabs * 512u};
+                using DownScaleTraits =
+                    typename Traits::SharedDownGemm::ScaleTraits;
                 params.tma_shared_down_scale_desc = CreateTmaDesc<3>(
                     "shared_down weight_scales",
                     reinterpret_cast<const std::uint32_t*>(
@@ -479,7 +480,8 @@ struct CollectiveMainloopMoE {
         if (Shared::cta_idx() < Shared::kNumUpCtas) {
             Up::run(params.tma_shared_up_desc, params.tma_shared_up_scale_desc,
                     params.tma_input_desc, params.shared_up_scale, workspace,
-                    smem, params.layouts.shared_up_scale, batch_size,
+                    smem, params.layouts.shared_up_scale,
+                    params.layouts.shared_up_interleaved, batch_size,
                     params.activation, params.situ_beta,
                     params.situ_linear_beta);
         }
@@ -710,7 +712,8 @@ struct CollectiveMainloopMoE {
             params.expert_scales_down,
             reinterpret_cast<Workspace*>(params.scratchpad), smem,
             params.layouts.routed_down_scale, params.tma_down_weights_desc,
-            params.tma_down_scale_desc, params.tma_down_activations_desc, sched,
+            params.tma_down_scale_desc, params.tma_down_activations_desc,
+            params.num_tokens, sched,
             get_tma_cache_hint(smem->routing.active_expert_count >
                                params.l2_expert_capacity));
     }

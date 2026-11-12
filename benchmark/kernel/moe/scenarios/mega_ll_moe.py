@@ -153,7 +153,7 @@ def _build_inputs(cfg: dict) -> MoeInput:
     h, n, z, e = (options[key] for key in MOE_SHAPE)
     x = normal((options["batch_size"], h))
     weights = {
-        "router_weight": normal((2, e, h), h**-0.5),
+        "router_weight": normal((2 * e, h), h**-0.5),
         "expert_up_weights": normal((e, 2 * n, z), z**-0.5),
         "expert_down_weights": normal((e, z, n), n**-0.5),
         "shared_up_weight": normal((2 * n, h), h**-0.5),
@@ -282,6 +282,7 @@ def _active_experts(raw: MoeInput) -> int:
                 **raw.routing,
                 "input_bf16": raw.input,
                 "router_weight_fp32": raw.weights["router_weight"].float(),
+                "num_router_gates": 2,
             }
         )[1]
         .unique()
@@ -320,6 +321,7 @@ def adapt_golden(raw: MoeInput) -> dict:
         **weights,
         "input_bf16": raw.input,
         "router_weight_fp32": raw.weights["router_weight"].float(),
+        "num_router_gates": 2,
     }
 
 
@@ -502,6 +504,7 @@ def run_scenario(cfg: dict) -> None:
                 top_k=top_k,
                 **MOE_SHAPE,
                 active_experts=timing.active_experts if timing else None,
+                tp_size=local["tp_size"],
                 quant_mode=local["quant_mode"],
                 dtype="bfloat16" if name == "golden" else local["quant_mode"],
                 activation=local["activation"],
