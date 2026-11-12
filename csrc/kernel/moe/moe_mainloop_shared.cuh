@@ -97,7 +97,6 @@ struct SharedUpProjectionBase
 
     __device__ static void publish_up_output(Workspace* __restrict__ workspace,
                                              SharedStorage* __restrict__ smem) {
-        KERNEL_TIMER_SCOPE(smem->timer.get(), "shared_publish_up_out");
         workspace->cta_comm.publish_shared_up_out(smem->launch_parity, 1u);
     }
 
@@ -109,8 +108,6 @@ struct SharedUpProjectionBase
         Base::join_up_split_k(partial, gate, up);
         if (split_idx() == 0u &&
             WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
-            KERNEL_TIMER_SCOPE(smem->timer.get(),
-                               "shared_combine_gate_activation");
             Base::combine_gated_activation(
                 partial, smem->shared_expert.act_up_out, gate, up, activation,
                 situ_beta, situ_linear_beta);
@@ -125,10 +122,7 @@ struct SharedUpProjectionBase
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < kUpTilesK; ++k_iter_id) {
             const std::uint32_t slot = k_iter_id % kNumUpSlots;
-            const auto empty_span = KERNEL_TIMER_BEGIN(
-                smem->timer.get(), "shared_wait_up_input_empty", k_iter_id);
             smem->barriers.shared_up.wait_input_empty(k_iter_id);
-            KERNEL_TIMER_END(smem->timer.get(), empty_span);
             smem->barriers.shared_up.input_ready.arrive(k_iter_id,
                                                         kInputTileTxBytes);
             load_input_tile_chunks<SharedUpGemm::kTileShapeN>(
@@ -145,10 +139,7 @@ struct SharedUpProjectionBase
                                                std::uint32_t transaction_bytes,
                                                bool interleaved) {
         const std::uint32_t slot = k_iter_id % kNumUpSlots;
-        const auto empty_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "shared_wait_up_weight_empty", k_iter_id);
         smem->barriers.shared_up.wait_weight_empty(k_iter_id);
-        KERNEL_TIMER_END(smem->timer.get(), empty_span);
         const std::uint32_t k_tile = split_idx() * kUpTilesK + k_iter_id;
         smem->barriers.shared_up.weight_ready.arrive(k_iter_id,
                                                      transaction_bytes);
@@ -199,13 +190,10 @@ struct SharedDownProjectionBase
     __device__ static void run_load_input_k_loop(
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         const void* __restrict__ scales) {
-        const auto up_out_span =
-            KERNEL_TIMER_BEGIN(smem->timer.get(), "wait_shared_up_out");
         workspace->cta_comm.wait_shared_up_out(smem->launch_parity,
                                                kNumUpPublishers);
         // Order cross-CTA stores before TMA reads.
         fence_proxy_async_global();
-        KERNEL_TIMER_END(smem->timer.get(), up_out_span);
 
         // Blockwise uses a full activation-scale table; blockscaled stages one
         // SFB per input slot.
@@ -253,10 +241,7 @@ struct SharedDownProjectionBase
         CUtensorMap const& tma_down_desc, SharedStorage* __restrict__ smem,
         std::uint32_t k_iter_id, std::uint32_t transaction_bytes) {
         const std::uint32_t slot = k_iter_id % kNumDownSlots;
-        const auto empty_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "shared_wait_down_weight_empty", k_iter_id);
         smem->barriers.shared_down.wait_weight_empty(k_iter_id);
-        KERNEL_TIMER_END(smem->timer.get(), empty_span);
         smem->barriers.shared_down.weight_ready.arrive(k_iter_id,
                                                        transaction_bytes);
         Base::template load_weight_tile<SharedDownGemm::kTileShapeM>(
@@ -336,7 +321,6 @@ struct SharedUpProjection<KernelTraits, true>
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         ScaleLayout up_scale_layout, std::uint32_t batch_size,
         Activation activation, float situ_beta, float situ_linear_beta) {
-        KERNEL_TIMER_SCOPE(smem->timer.get(), "shared_expert_up");
         zero_sf_slots(smem);
 
         Accumulator gate;
@@ -405,11 +389,8 @@ struct SharedUpProjection<KernelTraits, true>
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kUpTilesK;
              ++k_iter_id) {
             const std::uint32_t ring = k_iter_id % Base::kNumUpSlots;
-            const auto mma_ready_span = KERNEL_TIMER_BEGIN(
-                smem->timer.get(), "shared_up_wait_mma_ready", k_iter_id);
             smem->barriers.shared_up.template wait_mma_ready<true, false>(
                 k_iter_id);
-            KERNEL_TIMER_END(smem->timer.get(), mma_ready_span);
             if (up_scale_layout == ScaleLayout::kPlain) {
                 Base::build_plain_scale</*Paired=*/true>(
                     smem->shared_expert.w_up_scale[ring],
@@ -445,14 +426,8 @@ struct SharedUpProjection<KernelTraits, true>
         constexpr std::uint32_t kBlocksPerTile =
             SharedUpGemm::MmaCore::kNumSwizzleBoxKs;
         const std::uint32_t slot = k_iter_id % Base::kNumUpSlots;
-        const auto weight_empty_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "shared_wait_up_weight_empty", k_iter_id);
         smem->barriers.shared_up.wait_weight_empty(k_iter_id);
-        KERNEL_TIMER_END(smem->timer.get(), weight_empty_span);
-        const auto input_ready_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "shared_wait_up_input_ready", k_iter_id);
         smem->barriers.shared_up.input_ready.wait(k_iter_id);
-        KERNEL_TIMER_END(smem->timer.get(), input_ready_span);
         const std::uint32_t k_base =
             (Base::split_idx() * Base::kUpTilesK + k_iter_id) *
             SharedUpGemm::kTileShapeK;
@@ -481,7 +456,6 @@ struct SharedUpProjection<KernelTraits, true>
     __device__ static void load_accumulators(SharedStorage* __restrict__ smem,
                                              Accumulator& gate,
                                              Accumulator& up) {
-        KERNEL_TIMER_SCOPE(smem->timer.get(), "shared_up_wait_accumulator");
         smem->barriers.shared_up.accumulator_ready.wait(0u);
         tcgen05_fence_after_thread_sync();
         Base::load_accumulators(smem->tmem_ptr, gate, up);
@@ -562,7 +536,6 @@ struct SharedUpProjection<KernelTraits, false>
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         ScaleLayout up_scale_layout, std::uint32_t batch_size,
         Activation activation, float situ_beta, float situ_linear_beta) {
-        KERNEL_TIMER_SCOPE(smem->timer.get(), "shared_expert_up");
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         Accumulator gate{};
         Accumulator up{};
@@ -612,11 +585,8 @@ struct SharedUpProjection<KernelTraits, false>
              ++k_iter_id) {
             const std::uint32_t ring = k_iter_id % Base::kNumUpSlots;
             const std::uint32_t acc_slot = k_iter_id % kNumAccSlots;
-            const auto mma_ready_span = KERNEL_TIMER_BEGIN(
-                smem->timer.get(), "shared_up_wait_mma_ready", k_iter_id);
             smem->barriers.shared_up.template wait_mma_ready<true, true>(
                 k_iter_id);
-            KERNEL_TIMER_END(smem->timer.get(), mma_ready_span);
             Base::mma(tiled_mma, cta_mma, tCt, &sh.w_up[ring][0][0][0],
                       &sh.quantized_input.data[ring][0][0][0], smem->tmem_ptr,
                       acc_slot);
@@ -644,21 +614,13 @@ struct SharedUpProjection<KernelTraits, false>
     __device__ static void quantize_input_tile(SharedStorage* __restrict__ smem,
                                                std::uint32_t batch_size,
                                                std::uint32_t k_iter_id) {
-        const auto quantize_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "shared_quantize_input_tile", k_iter_id);
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         constexpr std::uint32_t kBlocksPerTile =
             SharedUpGemm::MmaCore::kNumSwizzleBoxKs;
         const std::uint32_t slot = k_iter_id % Base::kNumUpSlots;
-        const auto weight_empty_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "shared_wait_up_weight_empty", k_iter_id);
         smem->barriers.shared_up.wait_weight_empty(k_iter_id);
-        KERNEL_TIMER_END(smem->timer.get(), weight_empty_span);
-        const auto input_ready_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "shared_wait_up_input_ready", k_iter_id);
         smem->barriers.shared_up.input_ready.wait(k_iter_id);
-        KERNEL_TIMER_END(smem->timer.get(), input_ready_span);
         const std::uint32_t k_base =
             (Base::split_idx() * Base::kUpTilesK + k_iter_id) *
             SharedUpGemm::kTileShapeK;
@@ -681,7 +643,6 @@ struct SharedUpProjection<KernelTraits, false>
         if (warp_idx == 0u && lane_idx == 0u) {
             smem->barriers.shared_up.input_empty.arrive(k_iter_id);
         }
-        KERNEL_TIMER_END(smem->timer.get(), quantize_span);
     }
 
     __device__ static void dequant(
@@ -691,12 +652,8 @@ struct SharedUpProjection<KernelTraits, false>
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         const std::uint32_t acc_slot = k_iter_id % kNumAccSlots;
-
-        const auto acc_ready_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "shared_up_wait_accumulator", k_iter_id);
         smem->barriers.shared_up.accumulator_ready.wait(k_iter_id);
         tcgen05_fence_after_thread_sync();
-        KERNEL_TIMER_END(smem->timer.get(), acc_ready_span);
 
         const bool reads_tile = Base::owns_up_rows(warp_idx);
         const std::uint32_t gate_row = Base::slab_idx() *
@@ -786,7 +743,6 @@ struct SharedDownProjection<KernelTraits, true>
         DataType::ElementOut* __restrict__ out,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         ScaleLayout down_scale_layout, std::uint32_t batch_size) {
-        KERNEL_TIMER_SCOPE(smem->timer.get(), "shared_expert_down");
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         if (WarpRole::is_other_loader_thread()) {
             Base::run_load_input_k_loop(workspace, smem,
@@ -869,10 +825,7 @@ struct SharedDownProjection<KernelTraits, true>
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_base =
             32u * (warp_idx & 3u) + 16u * (warp_idx >> 2);
-        const auto done_span =
-            KERNEL_TIMER_BEGIN(smem->timer.get(), "shared_down_wait_done");
         smem->barriers.shared_down.accumulator_ready.wait(0u);
-        KERNEL_TIMER_END(smem->timer.get(), done_span);
         tcgen05_fence_after_thread_sync();
 
 #pragma unroll
@@ -918,7 +871,6 @@ struct SharedDownProjection<KernelTraits, false>
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         [[maybe_unused]] ScaleLayout down_scale_layout,
         std::uint32_t batch_size) {
-        KERNEL_TIMER_SCOPE(smem->timer.get(), "shared_expert_down");
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         if (WarpRole::is_other_loader_thread()) {
             Base::run_load_input_k_loop(workspace, smem,
@@ -974,11 +926,7 @@ struct SharedDownProjection<KernelTraits, false>
         const std::uint32_t lane_base =
             32u * (warp_idx & 3u) + 16u * (warp_idx >> 2);
         const std::uint32_t t0 = lane_idx & 3u;
-
-        const auto done_span =
-            KERNEL_TIMER_BEGIN(smem->timer.get(), "shared_down_wait_done");
         smem->barriers.shared_down.accumulator_ready.wait(0u);
-        KERNEL_TIMER_END(smem->timer.get(), done_span);
 #pragma unroll
         for (std::uint32_t atom = 0; atom < SharedDownGemm::MmaCore::kNumAtomMs;
              ++atom) {

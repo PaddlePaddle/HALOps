@@ -104,9 +104,6 @@ def _run_scenarios(op, cfg):
     try:
         SCENARIOS = OP_REGISTRY[op]
         scenario = cfg.get("scenario")
-        if cfg.get("profile", False):
-            SCENARIOS[scenario](cfg)
-            return True
         for batch_size in cfg.get("batch_sizes", [cfg.get("batch_size", 1)]):
             SCENARIOS[scenario]({**cfg, "batch_size": batch_size})
             print()
@@ -127,12 +124,6 @@ def main(args):
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     raw_configs = args.config or discover_configs(configs_dir)
-
-    if args.profile:
-        if len(raw_configs) != 1:
-            raise SystemExit("--profile requires exactly one --config file.")
-        if args.backend not in (None, "halops"):
-            raise SystemExit("--profile only supports the halops backend.")
 
     if args.backend is not None and len(raw_configs) > 1:
         raise SystemExit(
@@ -159,20 +150,6 @@ def main(args):
                 f"[ERROR] unknown scenario '{scenario}' for op '{op}'. available: {list(SCENARIOS)}"
             )
             sys.exit(1)
-
-        if args.profile:
-            if op != "moe":
-                raise SystemExit("--profile currently supports only MoE configs.")
-            profile_cfg = {
-                **cfg,
-                "profile": True,
-                "profile_output": args.profile_output,
-                "profile_config": config_path,
-                "dry_run_iters": cfg.get("dry_run_iters", args.dry_run_iters),
-            }
-            if not _run_scenarios(op, profile_cfg):
-                sys.exit(1)
-            return
 
         # Benchmark tuning parameters come exclusively from the CLI (single
         # source of truth); overwrite any stale values that may exist in YAML.
@@ -318,16 +295,6 @@ if __name__ == "__main__":
         "--refcheck-reference",
         default=None,
         help="Override YAML refcheck_reference, e.g. --refcheck-reference=golden.",
-    )
-    parser.add_argument(
-        "--profile",
-        action="store_true",
-        help="Profile one MoE config with the kernel timer and write a timeline.",
-    )
-    parser.add_argument(
-        "--profile-output",
-        default="timeline.json",
-        help="Timeline JSON path used with --profile.",
     )
     args = parser.parse_args()
     main(args)

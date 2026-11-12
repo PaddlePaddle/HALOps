@@ -22,7 +22,6 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/tensor.hpp>
 
-#include "common/kernel_timer.hpp"
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/ptx_utils.cuh"
@@ -682,12 +681,6 @@ struct MoESharedStorage {
     uint16_t down_grid_task[kMaxDownTasks + 1];
     uint32_t down_tasks_claimed;
     uint32_t down_task_stores;
-
-#if defined(HALOPS_KERNEL_TIMER_ENABLED)
-    halops::KernelTimerStorage timer;
-    static_assert(Dims::KernelConfig::kBlockSize / 32u <= halops::kTimerWarps,
-                  "block has more warps than timer cursors");
-#endif
 };
 
 // Dynamic shared memory required by fused_moe_kernel<Dims>.

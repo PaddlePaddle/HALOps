@@ -147,10 +147,7 @@ struct LatentDownProjectionBase {
         for (std::uint32_t k_iter_id = 0; k_iter_id < kTilesKPerCta;
              ++k_iter_id) {
             const std::uint32_t slot = k_iter_id % kNumInputSlots;
-            const auto empty_span = KERNEL_TIMER_BEGIN(
-                smem->timer.get(), "latent_wait_input_empty", k_iter_id);
             smem->barriers.latent_down.wait_input_empty(k_iter_id);
-            KERNEL_TIMER_END(smem->timer.get(), empty_span);
 
             smem->barriers.latent_down.input_ready.arrive(k_iter_id,
                                                           kInputTileTxBytes);
@@ -272,8 +269,6 @@ struct LatentDownProjectionBase {
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         constexpr std::uint32_t kWriterWarps = kTileShapeM / 16u;
         if (warp_idx >= kWriterWarps) return;
-        const auto store_span =
-            KERNEL_TIMER_BEGIN(smem->timer.get(), "latent_reduce_and_store");
         const std::uint32_t row =
             row_base() + 16u * group_idx(warp_idx) + lane_idx / 4u;
 #pragma unroll
@@ -290,7 +285,6 @@ struct LatentDownProjectionBase {
                     __float2bfloat16_rn(acc[g][i]);
             }
         }
-        KERNEL_TIMER_END(smem->timer.get(), store_span);
     }
 
     // The calc warps' finished sums, to the split reduction or straight out.
@@ -449,10 +443,7 @@ struct LatentDownProjection<KernelTraits, true>
         } else if (WarpRole::is_weight_loader_thread()) {
             run_load_weight_k_loop(tma_latent_down_weight_desc, smem);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
-            const auto mma_span =
-                KERNEL_TIMER_BEGIN(smem->timer.get(), "latent_down_umma");
             run_mma_k_loop(smem, smem->tmem_ptr);
-            KERNEL_TIMER_END(smem->timer.get(), mma_span);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
             // Overlaps the loaders' first tiles; tile 0's input_empty arrive
             // publishes the slab to the MMA.
@@ -463,14 +454,11 @@ struct LatentDownProjection<KernelTraits, true>
             } else {
                 copy_packed_sfa_table(packed_scale, smem);
             }
-            const auto quant_span =
-                KERNEL_TIMER_BEGIN(smem->timer.get(), "latent_quantize_input");
 #pragma unroll 1
             for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kTilesKPerCta;
                  ++k_iter_id) {
                 quantize_input_tile(smem, batch_size, k_iter_id);
             }
-            KERNEL_TIMER_END(smem->timer.get(), quant_span);
             float acc[Base::kTokenWindows][4] = {};
             load_accumulators(smem, acc);
             Base::store_acc(workspace, smem, acc);
@@ -490,11 +478,7 @@ struct LatentDownProjection<KernelTraits, true>
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kTilesKPerCta;
              ++k_iter_id) {
-            // Wait for MMA to release the previous slot contents.
-            const auto empty_span = KERNEL_TIMER_BEGIN(
-                smem->timer.get(), "latent_wait_weight_empty", k_iter_id);
             smem->barriers.latent_down.wait_weight_empty(k_iter_id);
-            KERNEL_TIMER_END(smem->timer.get(), empty_span);
             Base::load_weight_tile(tma_latent_down_weight_desc, smem, k_iter_id,
                                    MmaCore::kWeightTileBytes);
         }
@@ -509,12 +493,8 @@ struct LatentDownProjection<KernelTraits, true>
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kTilesKPerCta;
              ++k_iter_id) {
             const std::uint32_t w_slot = k_iter_id % Base::kNumWeightSlots;
-
-            const auto mma_ready_span = KERNEL_TIMER_BEGIN(
-                smem->timer.get(), "latent_wait_mma_ready", k_iter_id);
             smem->barriers.latent_down.template wait_mma_ready<true, false>(
                 k_iter_id);
-            KERNEL_TIMER_END(smem->timer.get(), mma_ready_span);
             auto tCsB = cute::make_tensor(
                 cute::make_smem_ptr(Base::staged_block(smem, k_iter_id)),
                 SBLayout{});
@@ -550,15 +530,9 @@ struct LatentDownProjection<KernelTraits, true>
                                                std::uint32_t k_iter_id) {
         const std::uint32_t slot = k_iter_id % Base::kNumInputSlots;
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
-        const auto ready_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "latent_wait_quantize_ready", k_iter_id);
         // Input and weight slots share the previous MMA's completion.
         smem->barriers.latent_down.wait_weight_empty(k_iter_id);
         smem->barriers.latent_down.input_ready.wait(k_iter_id);
-        KERNEL_TIMER_END(smem->timer.get(), ready_span);
-
-        const auto quantize_span =
-            KERNEL_TIMER_BEGIN(smem->timer.get(), "quantize_fp8_blockwise_128");
         const QuantizeTile tile(
             slot, Base::k_tile(k_iter_id) * MmaCore::kNumSwizzleBoxKs,
             Base::token_begin(), batch_size);
@@ -572,7 +546,6 @@ struct LatentDownProjection<KernelTraits, true>
             &smem->latent_down.quantized_input.data[0],
             &smem->latent_down.quantized_input.scale[0][0], tile, warp_idx,
             WarpRole::kCalcWarpCount);
-        KERNEL_TIMER_END(smem->timer.get(), quantize_span);
         // Make FP8 stores visible to the async proxy before signaling
         // readiness.
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -590,12 +563,8 @@ struct LatentDownProjection<KernelTraits, true>
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         // Each warp reads its 16-row TMEM fragment.
         constexpr std::uint32_t kReaderWarps = Base::kTileShapeM / 16u;
-
-        const auto acc_ready_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "latent_wait_accumulator_ready", 0u);
         smem->barriers.latent_down.accumulator_ready.wait(0u);
         tcgen05_fence_after_thread_sync();
-        KERNEL_TIMER_END(smem->timer.get(), acc_ready_span);
         if (warp_idx >= kReaderWarps) return;
 #pragma unroll
         for (std::uint32_t g = 0; g < Base::kTokenWindows; ++g) {
@@ -781,10 +750,7 @@ struct LatentDownProjection<KernelTraits, false>
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kTilesKPerCta;
              ++k_iter_id) {
-            const auto empty_span = KERNEL_TIMER_BEGIN(
-                smem->timer.get(), "latent_wait_weight_empty", k_iter_id);
             smem->barriers.latent_down.wait_weight_empty(k_iter_id);
-            KERNEL_TIMER_END(smem->timer.get(), empty_span);
             Base::load_weight_tile(tma_latent_down_weight_desc, smem, k_iter_id,
                                    MmaCore::kWeightTileBytes);
         }
@@ -800,12 +766,8 @@ struct LatentDownProjection<KernelTraits, false>
              ++k_iter_id) {
             const std::uint32_t acc_slot = k_iter_id % kNumAccSlots;
             const std::uint32_t w_slot = k_iter_id % Base::kNumWeightSlots;
-
-            const auto mma_ready_span = KERNEL_TIMER_BEGIN(
-                smem->timer.get(), "latent_wait_mma_ready", k_iter_id);
             smem->barriers.latent_down.template wait_mma_ready<true, true>(
                 k_iter_id);
-            KERNEL_TIMER_END(smem->timer.get(), mma_ready_span);
             auto tCsB = cute::make_tensor(
                 cute::make_smem_ptr(Base::staged_block(smem, k_iter_id)),
                 SBLayout{});
@@ -827,10 +789,7 @@ struct LatentDownProjection<KernelTraits, false>
                                                std::uint32_t k_iter_id) {
         const std::uint32_t slot = k_iter_id % Base::kNumInputSlots;
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
-        const auto ready_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "latent_wait_input_ready", k_iter_id);
         smem->barriers.latent_down.input_ready.wait(k_iter_id);
-        KERNEL_TIMER_END(smem->timer.get(), ready_span);
 
         const QuantizeTile tile(
             slot, Base::k_tile(k_iter_id) * MmaCore::kNumSwizzleBoxKs,
@@ -913,12 +872,7 @@ struct LatentDownProjection<KernelTraits, false>
         constexpr std::uint32_t kReaderWarps = Base::kTileShapeM / 16u;
         const std::uint32_t t0 = lane_idx & 3u;
         const std::uint32_t token_base = Base::token_begin();
-
-        // Every calc warp waits for its MMA before signaling completion.
-        const auto acc_ready_span = KERNEL_TIMER_BEGIN(
-            smem->timer.get(), "latent_wait_accumulator_ready", k_iter_id);
         smem->barriers.latent_down.accumulator_ready.wait(k_iter_id);
-        KERNEL_TIMER_END(smem->timer.get(), acc_ready_span);
 #pragma unroll
         for (std::uint32_t sub = 0; sub < MmaCore::kNumSwizzleBoxKs; ++sub) {
             // Each split owns kNumScaleBlocksK / kNumSplits scale columns.

@@ -47,10 +47,6 @@ if not os.path.exists(os.path.join(CUTLASS_DIR, "include")):
         cwd=PROJECT_DIR,
     )
 
-timer_flags = []
-if os.environ.get("ENABLE_KERNEL_TIMER", "") not in ("", "0"):
-    timer_flags.append("-DENABLE_KERNEL_TIMER=1")
-
 include_dirs = [
     PROJECT_DIR,
     os.path.join(PROJECT_DIR, "csrc"),
@@ -59,7 +55,6 @@ include_dirs = [
 ]
 
 gencode_flags = [
-    *timer_flags,
     "-std=c++20",
     "-gencode",
     "arch=compute_100f,code=sm_100f",
@@ -106,11 +101,10 @@ setup(
                 # "csrc/kernel/mla/combine_with_rope_quant.cu",
                 # "csrc/kernel/mla/vha_postmix_quant.cu",
                 "csrc/kernel/moe/mega_ll_moe.cu",
-                "csrc/common/kernel_timer_host.cu",
                 "csrc/common/cpp_extensions.cc",
             ],
             include_dirs=include_dirs,
-            extra_compile_args={"nvcc": gencode_flags, "cxx": timer_flags},
+            extra_compile_args={"nvcc": gencode_flags, "cxx": []},
             libraries=["cuda"],
         ),
     ],

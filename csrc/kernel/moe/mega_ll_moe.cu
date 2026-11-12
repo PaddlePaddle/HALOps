@@ -25,7 +25,6 @@
 #include <type_traits>
 
 #include "common/cuda_utils.h"
-#include "common/kernel_timer_host.hpp"
 #include "kernel/moe/moe_kernel.cuh"
 
 namespace halops {
@@ -318,13 +317,10 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
     const uint32_t grid_size =
         CalculateGridSize<MoEDims>(device, stream, grid_cap);
 
-    halops::KernelTimerLaunch timer_launch(static_cast<int>(grid_size), stream);
-    args.timer_events = timer_launch.events();
     const cudaError_t launch_status =
         moe::LaunchMoEKernel<MoEDims>(args, grid_size, stream, use_pdl);
     TORCH_CHECK(launch_status == cudaSuccess,
                 "kernel launch failed: ", cudaGetErrorString(launch_status));
-    timer_launch.collect();
 }
 
 }  // namespace moe

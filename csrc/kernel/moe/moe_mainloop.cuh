@@ -89,7 +89,6 @@ struct CollectiveMainloopMoE {
         std::uint32_t* tail_epochs;
         DataType::ElementOut* tail_out;
         void* workspace;
-        std::uint64_t* timer_events;
         std::uint32_t top_k;
         std::uint32_t tail_rank;
         ScoringFunc scoring_func;
@@ -141,7 +140,6 @@ struct CollectiveMainloopMoE {
         DataType::ElementOut* __restrict__ shared_out;
         DataType::ElementOut* tail_out;
         void* __restrict__ scratchpad;
-        std::uint64_t* timer_events;
         std::uint32_t top_k;
         ScoringFunc scoring_func;
         bool renormalize;
@@ -199,7 +197,6 @@ struct CollectiveMainloopMoE {
             offsetof(Workspace, shared_down_out));
         params.tail_out = args.tail_out;
         params.scratchpad = args.workspace;
-        params.timer_events = args.timer_events;
         for (int r = 0; r < TailGeometryT<Dims>::kWorld; ++r) {
             params.tail_uc_base[r] = args.tail_uc_base[r];
         }
@@ -511,12 +508,8 @@ struct CollectiveMainloopMoE {
         const auto correction_bias =
             load_correction_bias<kExpertsPerThread>(params.correction_bias);
         if (threadIdx.x == 0u) {
-            // One task per router CTA, whatever its M tile or K slice.
-            const auto logits_span =
-                KERNEL_TIMER_BEGIN(smem->timer.get(), "router_wait_logits");
             workspace->cta_comm.wait_router_tasks(smem->launch_parity,
                                                   Traits::RouterGemm::kNumCtas);
-            KERNEL_TIMER_END(smem->timer.get(), logits_span);
         }
         WarpRole::sync_calc_threads();
         const std::uint32_t calc_warp_idx = WarpRole::get_calc_warp_idx();
@@ -533,12 +526,9 @@ struct CollectiveMainloopMoE {
 #pragma unroll 1
         for (std::uint32_t tok = tok_base + calc_warp_idx; tok < tok_end;
              tok += WarpRole::kCalcWarpCount) {
-            const auto topk_span =
-                KERNEL_TIMER_BEGIN(smem->timer.get(), "topk_one_token");
             topk_one_token<Dims, kExpertsPerThread>(
                 tok, params.top_k, params.scoring_func, params.renormalize,
                 correction_bias, params.per_expert_scale, workspace, smem);
-            KERNEL_TIMER_END(smem->timer.get(), topk_span);
         }
         WarpRole::sync_calc_threads();
         if (coop_topk) {
@@ -548,12 +538,9 @@ struct CollectiveMainloopMoE {
                 const std::uint32_t peer_rank =
                     (blockIdx.x % Traits::kClusterSize) ^ 1u;
                 if (lane_idx == 0u) {
-                    const auto coop_span = KERNEL_TIMER_BEGIN(
-                        smem->timer.get(), "router_coop_exchange");
                     smem->barriers.router_coop.arrive();
                     Coop::arrive_remote(
                         smem->barriers.router_coop.partner(peer_rank));
-                    KERNEL_TIMER_END(smem->timer.get(), coop_span);
                 }
                 smem->barriers.router_coop.wait();
                 // Copy the partner IDs and weights as 16-byte words.
@@ -605,12 +592,8 @@ struct CollectiveMainloopMoE {
         if (!reads_published_tables) {
             if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
                 run_router_topk(params, workspace, smem, lane_idx);
-                // Each router CTA has the complete selection.
-                const auto tables_span = KERNEL_TIMER_BEGIN(
-                    smem->timer.get(), "prepare_routing_tables");
                 prepare_routing_tables<Dims>(params.num_tokens, params.top_k,
                                              smem);
-                KERNEL_TIMER_END(smem->timer.get(), tables_span);
                 // Block 0 hands its finished tables to the other blocks.
                 if (blockIdx.x == 0u && WarpRole::get_calc_warp_idx() == 0u) {
                     publish_routing_tables(workspace, smem, lane_idx);
@@ -618,11 +601,7 @@ struct CollectiveMainloopMoE {
             }
         } else if (WarpRole::is_calc_warp(WarpRole::get_warp_idx()) &&
                    WarpRole::get_calc_warp_idx() == 0u) {
-            // Copy routing tables after the latent projection finishes.
-            const auto load_span =
-                KERNEL_TIMER_BEGIN(smem->timer.get(), "load_routing_tables");
             load_routing_tables(workspace, smem, lane_idx);
-            KERNEL_TIMER_END(smem->timer.get(), load_span);
         }
     }
 
@@ -706,13 +685,11 @@ struct CollectiveMainloopMoE {
             reinterpret_cast<Workspace*>(params.scratchpad);
         if (WarpRole::is_other_loader_thread()) {
             if constexpr (Traits::kUseLatent) {
-                KERNEL_TIMER_SCOPE(smem->timer.get(), "up_wait_latent_down");
                 workspace->cta_comm.wait_latent_tasks(
                     smem->launch_parity, Traits::LatentDownGemm::kNumCtas);
                 // Order cross-CTA stores before TMA reads.
                 fence_proxy_async_global();
             }
-            KERNEL_TIMER_SCOPE(smem->timer.get(), "up_load_quantized_input");
             load_quantized_activation(workspace, smem);
         }
         RoutedUpProjection<KernelTraits>::run(
@@ -839,19 +816,13 @@ struct CollectiveMainloopMoE {
         for (std::uint32_t flat = first_cell; flat < num_cells;
              flat += cell_stride) {
             const std::uint32_t tok = flat / kDownOutputColsPerCta;
-            const auto wait_span =
-                KERNEL_TIMER_BEGIN(smem->timer.get(), "wait_down_out", tok);
             workspace->cta_comm.wait_down_out_field(
                 smem->launch_parity, m_block,
                 tok * PackedTokenCounts<Dims>::kBits,
                 PackedTokenCounts<Dims>::kMask, top_k);
-            KERNEL_TIMER_END(smem->timer.get(), wait_span);
-            const auto gather_span = KERNEL_TIMER_BEGIN(
-                smem->timer.get(), "gather_and_combine", tok);
             emit_cell(params, workspace, tok,
                       base_col + flat % kDownOutputColsPerCta, top_k,
                       smem->tail_parity);
-            KERNEL_TIMER_END(smem->timer.get(), gather_span);
         }
     }
 

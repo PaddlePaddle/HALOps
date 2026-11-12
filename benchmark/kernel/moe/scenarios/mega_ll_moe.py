@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 
@@ -32,7 +31,7 @@ from core.output import (
 )
 from core.refcheck import RefcheckResult, _compare_to_reference
 from core.runner import run_bench_for_backend, run_refcheck_cross_backends
-from core.timing import TimingResult, bench_gpu_time, profile_kernel_timeline
+from core.timing import TimingResult, bench_gpu_time
 from kernel.moe.backends.golden import (
     _dequant_weight,
     _route,
@@ -200,12 +199,14 @@ def _quantize_weights(weights: dict, options: dict) -> dict:
             quantized[name] = weight
             continue
         if name == "tail_fc2_weight":
-            # The tail's fc2 follows the latent recipe.
+            # The tail's fc2 follows the latent recipe, scale layout included.
             if quant_mode == "w8a8-blockwise":
                 quant, scale = _quant_fp8_blockwise(weight, power_of_two=True)
             else:
                 quant, scale = group_wise_quant(
-                    weight.flatten(0, -2), mode="w8a8-mxfp8", use_swizzle=False
+                    weight.flatten(0, -2),
+                    mode="w8a8-mxfp8",
+                    use_swizzle=options["latent_use_swizzle"],
                 )
                 quant = quant.reshape(*weight.shape[:-1], quant.shape[-1])
                 scale = scale.reshape(*weight.shape[:-1], weight.shape[-1] // 32)
@@ -301,7 +302,7 @@ def adapt_golden(raw: MoeInput) -> dict:
                 "tail_fc2_scale" if name == "tail_fc2_weight" else name + "_scale"
             )
             if name == "tail_fc2_weight":
-                sfatom = False
+                sfatom = raw.options["latent_use_swizzle"]
             elif name == "latent_down_weight":
                 sfatom = raw.options["latent_use_swizzle"]
             elif name.startswith("shared_"):
@@ -429,73 +430,8 @@ def _bench_entry(
     return MoeTiming(timing, payload["bytes_io"], payload["active_experts"])
 
 
-@torch.no_grad()
-def _profile(options: dict) -> dict:
-    """One launch of a config under the kernel timer."""
-    raw = _build_inputs(options)
-    inputs = adapt_halops(raw)
-    active_experts = _active_experts(raw)
-    del raw
-    profile_kernel_timeline(
-        run_mega_ll_moe,
-        (inputs,),
-        options["profile_output"],
-        warmup_iters=max(0, options.get("dry_run_iters", 5)),
-        warp_roles={
-            0: "calc tmem",
-            1: "calc",
-            2: "calc",
-            3: "calc",
-            4: "calc",
-            5: "calc",
-            6: "calc",
-            7: "calc",
-            8: "mma",
-            9: "tma weight",
-            10: "tma other",
-            11: "idle",
-        },
-        cold_l2_cache=options.get("cold_l2_cache", True),
-        launch_metadata={
-            "config": options.get("profile_config", ""),
-            "cold_l2_cache": options.get("cold_l2_cache", True),
-            "tokens": options["batch_size"],
-            "top_k": options["top_k"],
-            "experts": options["num_experts"],
-            "active_experts": active_experts,
-            "intermediate": options["intermediate_size"],
-            "hidden": options["hidden_size"],
-            "latent": options["latent_size"],
-            "quant_mode": options["quant_mode"],
-            "activation": options["activation"],
-        },
-    )
-    return {"active_experts": active_experts}
-
-
-@torch.no_grad()
-def _run_profile(cfg: dict) -> None:
-    """Profile one launch of a config."""
-    if cfg.get("use_cuda_graph", False):
-        raise ValueError("MoE kernel timer profiling does not support CUDA graph")
-
-    options = _validate_config(
-        {
-            **cfg,
-            "batch_size": max(cfg.get("batch_sizes", [cfg.get("batch_size", 1)])),
-            "top_k": cfg.get("top_k_list", [cfg.get("top_k", 8)])[0],
-            "profile_output": str(Path(cfg["profile_output"]).expanduser().resolve()),
-        }
-    )
-    _profile(options)
-
-
 def run_scenario(cfg: dict) -> None:
     """Benchmark the full fused operator on one GPU."""
-    if cfg.get("profile", False):
-        _run_profile(cfg)
-        return
-
     backend_names = list(dict.fromkeys(cfg.get("backends", ["halops"])))
     _get_backends(backend_names)
     if not backend_names:
