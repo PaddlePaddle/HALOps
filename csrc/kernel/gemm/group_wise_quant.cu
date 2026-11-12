@@ -234,9 +234,10 @@ template <typename T, QuantMode MODE, bool USE_SWIZZLE, bool USE_PDL>
 void LaunchQuantKernel(const T* input, int64_t ld, void* output_quant,
                        void* output_sf, int m, int k, int kb_dim, int grid_dim,
                        int block_dim, cudaStream_t stream) {
-    LaunchKernelWithPdl(group_wise_quant_kernel<T, MODE, USE_SWIZZLE, USE_PDL>,
-                        grid_dim, block_dim, kNoCluster, 0, stream, USE_PDL,
-                        input, ld, output_quant, output_sf, m, k, kb_dim);
+    HALOPS_CUDA_CHECK(LaunchKernelWithPdl(
+        group_wise_quant_kernel<T, MODE, USE_SWIZZLE, USE_PDL>, grid_dim,
+        block_dim, kNoCluster, 0, stream, USE_PDL, input, ld, output_quant,
+        output_sf, m, k, kb_dim));
 }
 
 template <typename T, QuantMode MODE, bool USE_SWIZZLE>
@@ -369,10 +370,6 @@ std::vector<torch::Tensor> GroupWiseQuant(
             input_ptr, ld, quant_data, sf_data, m, k, kb_dim, quant_mode,
             use_swizzle, grid_dim, block_dim, stream, use_pdl);
     }
-
-    cudaError_t cuda_status = cudaGetLastError();
-    TORCH_CHECK(cuda_status == cudaSuccess,
-                "CUDA error: ", cudaGetErrorString(cuda_status));
 
     return {output_quant, output_sf};
 }

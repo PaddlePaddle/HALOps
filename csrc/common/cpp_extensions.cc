@@ -120,11 +120,11 @@ std::vector<torch::Tensor> GroupWiseQuant(
     const bool use_pdl, const std::optional<torch::Tensor>& output_quant,
     const std::optional<torch::Tensor>& output_sf);
 
-std::vector<torch::Tensor> RmsNormQuant(
-    const torch::Tensor& input, const torch::Tensor& weight, const double eps,
-    const bool use_pdl, const std::optional<torch::Tensor>& output_quant,
-    const std::optional<torch::Tensor>& output_sf,
-    const std::optional<torch::Tensor>& output_bf16);
+std::vector<torch::Tensor> RmsNormQuant(const torch::Tensor& input,
+                                        const torch::Tensor& weight,
+                                        const double eps,
+                                        const bool use_swizzle,
+                                        const bool use_pdl);
 
 std::vector<torch::Tensor> VhaPostmixQuant(
     const torch::Tensor& o, const torch::Tensor& mix,
@@ -268,10 +268,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("use_pdl") = true, py::arg("output_quant") = py::none(),
           py::arg("output_sf") = py::none());
     m.def("rms_norm_quant", &halops::RmsNormQuant, py::arg("input"),
-          py::arg("weight"), py::arg("eps"), py::arg("use_pdl") = true,
-          py::arg("output_quant") = py::none(),
-          py::arg("output_sf") = py::none(),
-          py::arg("output_bf16") = py::none());
+          py::arg("weight"), py::arg("eps"), py::arg("use_swizzle") = true,
+          py::arg("use_pdl") = true);
     m.def("prefill_permute_to_masked_gemm",
           &halops::PrefillPermuteToMaskedGemm);
     m.def("fused_swiglu_quant", &halops::FusedSwigluQuant);

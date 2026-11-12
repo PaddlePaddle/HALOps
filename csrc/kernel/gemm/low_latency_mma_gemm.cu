@@ -73,7 +73,6 @@ void LowLatencyMmaGemm(const torch::Tensor& input, const torch::Tensor& weight,
 
     LaunchLlKernel(params, tile, rows_a, num_sms, use_pdl, use_sigmoid,
                    GetCurrentCUDAStream(input));
-    HALOPS_CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace halops
