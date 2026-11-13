@@ -190,6 +190,11 @@ struct RoutedUpProjection<KernelTraits, true>
         const std::uint32_t m_block_idx = sched.cta_group().cta_idx_in_group;
         const std::uint32_t tmem_base = smem->tmem_ptr;
 
+        // Down's input loader stages its first task while up runs.
+        if (WarpRole::is_weight_loader_thread()) {
+            sched.claim_first_down_task();
+        }
+
         TaskInfo task;
         while (sched.get_next_task(task)) {
             const std::uint32_t expert_id =
@@ -214,17 +219,12 @@ struct RoutedUpProjection<KernelTraits, true>
             }
         }
 
-        if (sched.next_task_id() > 0u) {
-            if (WarpRole::is_weight_loader_thread()) {
-                const std::uint32_t last_tile =
-                    sched.next_task_id() * Base::kNumTilesK - 1u;
-                smem->barriers.routed.up_weight_empty.wait(last_tile);
-                // Order completed SMEM reads before down's TMA writes.
-                asm volatile("fence.proxy.async;" ::: "memory");
-            } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
-                smem->barriers.routed.accumulator_empty.wait(
-                    sched.next_task_id() - 1u);
-            }
+        // Down's first lap waits for each weight slot it reuses, so only the
+        // accumulator drains here.
+        if (sched.next_task_id() > 0u &&
+            WarpRole::is_mma_issuer_warp(warp_idx)) {
+            smem->barriers.routed.accumulator_empty.wait(sched.next_task_id() -
+                                                         1u);
         }
     }
 

@@ -77,24 +77,27 @@ class TaskScheduler {
     // The down TMA thread claims and publishes the next task before
     // consumption.
     __device__ void claim_next_task() {
+        // claim_first_down_task may have published this task during up.
+        if (smem_->down_tasks_claimed > task_count_) return;
         const std::uint32_t num_tasks = expert_count_ * kCtasPerExpert;
         const std::uint32_t num_static_tasks =
             cta_group_.num_groups * kCtasPerExpert;
         std::uint32_t grid_task = kNoTask;
         if (task_count_ == 0u && cta_group_.in_whole_group()) {
-            const std::uint32_t static_task =
-                cta_group_.group_idx * kCtasPerExpert +
-                cta_group_.cta_idx_in_group;
-            if (static_task < num_tasks) grid_task = static_task;
+            grid_task = static_down_task();
         } else if (num_tasks > num_static_tasks) {
             const std::uint32_t claimed =
                 workspace_->cta_comm.claim_down_task(smem_->launch_parity);
             if (claimed < num_tasks - num_static_tasks)
                 grid_task = num_static_tasks + claimed;
         }
-        smem_->down_grid_task[task_count_] =
-            static_cast<std::uint16_t>(grid_task);
-        shared_store_release_u32(&smem_->down_tasks_claimed, task_count_ + 1u);
+        store_claim(task_count_, grid_task);
+    }
+
+    // A whole group's first down task is static, so the down TMA thread can
+    // publish it while up runs and the down loaders start on it early.
+    __device__ void claim_first_down_task() {
+        if (cta_group_.in_whole_group()) store_claim(0u, static_down_task());
     }
 
     // The next task of this block, or false once its sequence is exhausted.
@@ -132,6 +135,18 @@ class TaskScheduler {
     __device__ std::uint32_t first_up_expert() const {
         return cta_group_.in_whole_group() ? cta_group_.group_idx
                                            : expert_count_;
+    }
+
+    // Block m of group g starts down on m-block m of the group's first expert.
+    __device__ std::uint32_t static_down_task() const {
+        const std::uint32_t task =
+            cta_group_.group_idx * kCtasPerExpert + cta_group_.cta_idx_in_group;
+        return task < expert_count_ * kCtasPerExpert ? task : kNoTask;
+    }
+
+    __device__ void store_claim(std::uint32_t idx, std::uint32_t grid_task) {
+        smem_->down_grid_task[idx] = static_cast<std::uint16_t>(grid_task);
+        shared_store_release_u32(&smem_->down_tasks_claimed, idx + 1u);
     }
 
     __device__ bool get_next_down_task(TaskInfo& task) {
