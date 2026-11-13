@@ -72,6 +72,11 @@ def _validate_config(cfg: dict) -> dict:
         "quant_mode": "w8a8-blockwise",
         "scoring_func": "sigmoid",
         "renormalize": True,
+        "routed_use_interleaved": True,
+        "routed_use_swizzle": True,
+        "shared_use_interleaved": True,
+        "shared_use_swizzle": True,
+        "latent_use_swizzle": False,
         "activation": "silu",
         "situ_beta": 4.0,
         "situ_linear_beta": 25.0,
@@ -106,6 +111,15 @@ def _validate_config(cfg: dict) -> dict:
         raise ValueError("activation must be silu or situ")
     if not isinstance(options["renormalize"], bool):
         raise ValueError("renormalize must be a boolean")
+    for name in (
+        "routed_use_interleaved",
+        "routed_use_swizzle",
+        "shared_use_interleaved",
+        "shared_use_swizzle",
+        "latent_use_swizzle",
+    ):
+        if not isinstance(options[name], bool):
+            raise ValueError(f"{name} must be a boolean")
     if not all(
         math.isfinite(options[key]) for key in ("eps", "situ_beta", "situ_linear_beta")
     ):
@@ -122,15 +136,18 @@ def _build_inputs(cfg: dict) -> MoeInput:
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(options["seed"])
 
-    def normal(shape, scale=1.0):
+    def normal(shape, scale=1.0, gen=None):
         return torch.randn(
-            shape, device=device, dtype=torch.bfloat16, generator=generator
+            shape,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=generator if gen is None else gen,
         ).mul_(scale)
 
     h, n, z, e = (options[key] for key in MOE_SHAPE)
     x = normal((options["batch_size"], h))
     weights = {
-        "router_weight": normal((2, h, e), h**-0.5),
+        "router_weight": normal((2 * e, h), h**-0.5),
         "expert_up_weights": normal((e, 2 * n, z), z**-0.5),
         "expert_down_weights": normal((e, z, n), n**-0.5),
         "shared_up_weight": normal((2 * n, h), h**-0.5),
@@ -139,25 +156,16 @@ def _build_inputs(cfg: dict) -> MoeInput:
         "tail_fc2_weight": normal((h, z), z**-0.5),
         "tail_norm_weight": normal((z,), 0.1).add_(1.0),
     }
-    # Router steering: the bias is added to the selection scores, the per-expert
-    # scale multiplies the renormalized combine weights.
-    routing_gen = torch.Generator(device=device).manual_seed(options["seed"] + 1)
+    # Router steering stays neutral: a zero bias keeps the selection (and the
+    # active-expert count) unchanged, a unit scale keeps the combine weights.
     parts = set(filter(None, str(options["routing"]).split("+")))
     routing = {
-        "correction_bias": (
-            torch.randn(e, device=device, generator=routing_gen) * 0.3
-            if "bias" in parts
-            else None
-        ),
+        "correction_bias": (torch.zeros(e, device=device) if "bias" in parts else None),
         "per_expert_scale": (
-            0.5 + torch.rand(e, device=device, generator=routing_gen)
-            if "perexpert" in parts
-            else None
+            torch.ones(e, device=device) if "perexpert" in parts else None
         ),
     }
-    return MoeInput(
-        x, _quantize_weights(weights, options["quant_mode"]), options, routing
-    )
+    return MoeInput(x, _quantize_weights(weights, options), options, routing)
 
 
 def _quant_fp8_blockwise(weight: torch.Tensor, power_of_two=False):
@@ -174,26 +182,52 @@ def _quant_fp8_blockwise(weight: torch.Tensor, power_of_two=False):
 
 
 @torch.no_grad()
-def _quantize_weights(weights: dict, quant_mode: str) -> dict:
+def _quantize_weights(weights: dict, options: dict) -> dict:
     from halops import group_wise_quant
+
+    quant_mode = options["quant_mode"]
 
     quantized = {}
     for name, weight in weights.items():
         if name in ("router_weight", "tail_norm_weight"):
             quantized[name] = weight
             continue
-        if name == "tail_fc2_weight" or quant_mode == "w8a8-blockwise":
-            quant, scale = _quant_fp8_blockwise(
-                weight, power_of_two=name == "tail_fc2_weight"
-            )
+        if name == "tail_fc2_weight":
+            # The tail's fc2 follows the latent recipe, scale layout included.
+            if quant_mode == "w8a8-blockwise":
+                quant, scale = _quant_fp8_blockwise(weight, power_of_two=True)
+            else:
+                quant, scale = group_wise_quant(
+                    weight.flatten(0, -2),
+                    mode="w8a8-mxfp8",
+                    use_swizzle=options["latent_use_swizzle"],
+                )
+                quant = quant.reshape(*weight.shape[:-1], quant.shape[-1])
+                scale = scale.reshape(*weight.shape[:-1], weight.shape[-1] // 32)
+        elif quant_mode == "w8a8-blockwise":
+            quant, scale = _quant_fp8_blockwise(weight)
         else:
             mode = (
                 "w4a4-mxfp4"
                 if name.startswith("expert_") and quant_mode == "w4a8-mxfp4"
                 else "w8a8-mxfp8"
             )
+            if name == "latent_down_weight":
+                use_swizzle = options["latent_use_swizzle"]
+            elif name == "shared_up_weight":
+                use_swizzle = (
+                    options["shared_use_swizzle"] or options["shared_use_interleaved"]
+                )
+            elif name.startswith("shared_"):  # shared_down_weight
+                use_swizzle = options["shared_use_swizzle"]
+            elif name == "expert_up_weights":
+                use_swizzle = (
+                    options["routed_use_swizzle"] or options["routed_use_interleaved"]
+                )
+            else:  # expert_down_weights
+                use_swizzle = options["routed_use_swizzle"]
             quant, scale = group_wise_quant(
-                weight.flatten(0, -2), mode=mode, use_swizzle=True
+                weight.flatten(0, -2), mode=mode, use_swizzle=use_swizzle
             )
             quant = quant.reshape(*weight.shape[:-1], quant.shape[-1])
             scale = scale.reshape(*weight.shape[:-1], weight.shape[-1] // 32)
@@ -208,20 +242,23 @@ def _quantize_weights(weights: dict, quant_mode: str) -> dict:
 def adapt_halops(raw: MoeInput) -> dict:
     from halops import get_workspace_for_moe, transform_weights_for_moe
 
-    quantized = raw.weights
-    packed = transform_weights_for_moe(
-        quantized["router_weight"],
+    quantized = dict(raw.weights)
+    (
         quantized["expert_up_weights"],
+        quantized["expert_up_weights_scale"],
         quantized["shared_up_weight"],
-        num_tokens=raw.input.size(0),
-        num_router_gates=2,
-        expert_up_weights_scale=quantized["expert_up_weights_scale"],
-        shared_up_weight_scale=quantized["shared_up_weight_scale"],
+        quantized["shared_up_weight_scale"],
+    ) = transform_weights_for_moe(
+        quantized["expert_up_weights"],
+        quantized["expert_up_weights_scale"],
+        quantized["shared_up_weight"],
+        quantized["shared_up_weight_scale"],
+        routed_use_interleaved=raw.options["routed_use_interleaved"],
+        shared_use_interleaved=raw.options["shared_use_interleaved"],
     )
     return {
         **raw.options,
         **quantized,
-        **packed,
         **raw.routing,
         "input": raw.input,
         "out": torch.empty_like(raw.input),
@@ -239,6 +276,7 @@ def _active_experts(raw: MoeInput) -> int:
                 **raw.routing,
                 "input_bf16": raw.input,
                 "router_weight_fp32": raw.weights["router_weight"].float(),
+                "num_router_gates": 2,
             }
         )[1]
         .unique()
@@ -258,13 +296,26 @@ def adapt_golden(raw: MoeInput) -> dict:
             scale_name = (
                 "tail_fc2_scale" if name == "tail_fc2_weight" else name + "_scale"
             )
-            weights[name] = _dequant_weight(weight, raw.weights[scale_name])
+            if name == "tail_fc2_weight":
+                sfatom = raw.options["latent_use_swizzle"]
+            elif name == "latent_down_weight":
+                sfatom = raw.options["latent_use_swizzle"]
+            elif name.startswith("shared_"):
+                sfatom = raw.options["shared_use_swizzle"]
+            elif name == "expert_up_weights":
+                sfatom = raw.options["routed_use_swizzle"]
+            else:  # expert_down_weights
+                sfatom = raw.options["routed_use_swizzle"]
+            weights[name] = _dequant_weight(
+                weight, raw.weights[scale_name], sfatom=sfatom
+            )
     return {
         **raw.options,
         **raw.routing,
         **weights,
         "input_bf16": raw.input,
         "router_weight_fp32": raw.weights["router_weight"].float(),
+        "num_router_gates": 2,
     }
 
 
@@ -281,36 +332,27 @@ def _get_backends(names):
 
 @torch.no_grad()
 def _refcheck_entry(
-    cfg, ordered_names, refcheck_reference, refcheck_atol, refcheck_rtol
+    cfg, ordered_names, refcheck_reference, refcheck_atol=1e-2, refcheck_rtol=1e-2
 ):
-    raw = _build_inputs(cfg)
-    backends = _get_backends(ordered_names)
-    inputs = {name: pair[0](raw) for name, pair in backends.items()}
-    reference = run_mega_ll_moe_golden(inputs["golden"])
-    if not torch.isfinite(reference).all() or reference.abs().max() < refcheck_atol:
-        raise RuntimeError("BF16 golden output is non-finite or degenerate")
-
-    run_fns = {name: pair[1] for name, pair in backends.items()}
-    run_fns["golden"] = lambda _: reference
+    """Subprocess entry for the refcheck: every backend against the reference."""
+    options = _validate_config(cfg)
+    ordered = [refcheck_reference] + [
+        name for name in ordered_names if name != refcheck_reference
+    ]
+    backends = _get_backends(ordered)
+    raw = _build_inputs({**cfg, **options})
     return run_refcheck(
-        [refcheck_reference]
-        + [name for name in ordered_names if name != refcheck_reference],
-        run_fns,
-        inputs,
+        [name for name in ordered if name in backends],
+        {name: run for name, (_, run) in backends.items()},
+        {name: adapt(raw) for name, (adapt, _) in backends.items()},
         atol=refcheck_atol,
         rtol=refcheck_rtol,
     )
 
 
-@torch.no_grad()
-def _bench_entry(
-    cfg, name, dry_run_iters, repeat_iters, cold_l2_cache, use_cuda_graph, timing_method
-):
-    raw = _build_inputs(cfg)
-    unique_experts = _active_experts(raw)
-    adapt_fn, run_fn = _get_backends([name])[name]
-    inputs = adapt_fn(raw)
-    bytes_io = raw.input.numel() * raw.input.element_size() * 2
+def _bytes_io(inputs: dict, num_experts: int, name: str, unique_experts: int) -> int:
+    """Per-GPU bytes touched: the weights it reads plus the input and output."""
+    bytes_io = inputs["input"].numel() * inputs["input"].element_size() * 2
     for key, value in inputs.items():
         if not isinstance(value, torch.Tensor) or not (
             "weight" in key or key == "tail_fc2_scale"
@@ -320,19 +362,36 @@ def _bench_entry(
             continue
         count = value.numel()
         if key.startswith("expert_"):
-            count = count // raw.options["num_experts"] * unique_experts
+            count = count // num_experts * unique_experts
         bytes_io += count * value.element_size()
+    return bytes_io
+
+
+@torch.no_grad()
+def _bench_entry(
+    cfg, name, dry_run_iters, repeat_iters, cold_l2_cache, use_cuda_graph, timing_method
+):
+    """Subprocess entry: build inputs, adapt, bench a single backend."""
+    options = _validate_config(cfg)
+    raw = _build_inputs({**cfg, **options})
+    adapt_fn, run_fn = _get_backends([name])[name]
+    inputs = adapt_fn(raw)
+    active_experts = _active_experts(raw)
+    bytes_io = _bytes_io(inputs, options["num_experts"], name, active_experts)
     del raw
-    timing = bench_gpu_time(
-        run_fn,
-        (inputs,),
-        dry_run_iters=dry_run_iters,
-        repeat_iters=repeat_iters,
-        cold_l2_cache=cold_l2_cache,
-        use_cuda_graph=use_cuda_graph,
-        method=timing_method,
+    return MoeTiming(
+        bench_gpu_time(
+            run_fn,
+            (inputs,),
+            dry_run_iters=dry_run_iters,
+            repeat_iters=repeat_iters,
+            cold_l2_cache=cold_l2_cache,
+            use_cuda_graph=use_cuda_graph,
+            method=timing_method,
+        ),
+        bytes_io,
+        active_experts,
     )
-    return MoeTiming(timing, bytes_io, unique_experts)
 
 
 def run_scenario(cfg: dict) -> None:

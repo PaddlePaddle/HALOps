@@ -31,6 +31,19 @@ namespace halops {
 namespace moe {
 
 template <typename MoEDims>
+void CheckRouterWeightShape(const torch::Tensor& router_weight) {
+    TORCH_CHECK(router_weight.scalar_type() == at::kBFloat16,
+                "router_weight must be bfloat16.");
+    TORCH_CHECK(router_weight.dim() == 2 &&
+                    router_weight.size(0) ==
+                        MoEDims::kNumRouterGates * MoEDims::kNumExperts &&
+                    router_weight.size(1) == MoEDims::kHiddenSize,
+                "router_weight must be [G * E, H] = [",
+                MoEDims::kNumRouterGates * MoEDims::kNumExperts, ", ",
+                MoEDims::kHiddenSize, "].");
+}
+
+template <typename MoEDims>
 void CheckLatentDownShape(const torch::Tensor& latent_down_weight) {
     TORCH_CHECK(latent_down_weight.dim() == 2 &&
                     latent_down_weight.size(0) == MoEDims::kLatentSize &&
@@ -67,7 +80,7 @@ void CheckSharedExpertShape(const torch::Tensor& shared_up_weight,
     TORCH_CHECK(shared_up_weight.dim() == 2 &&
                     shared_up_weight.size(0) == kUpRows &&
                     shared_up_weight.size(1) == MoEDims::kHiddenSize,
-                "shared_up_weight must be the pair-layout [2N, H].");
+                "shared_up_weight must be [2N, H].");
     TORCH_CHECK(shared_down_weight.dim() == 2 &&
                     shared_down_weight.size(0) == MoEDims::kHiddenSize &&
                     shared_down_weight.size(1) == MoEDims::kIntermediateSize,
@@ -181,7 +194,10 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
              const torch::Tensor& tail_out, int64_t top_k, int64_t scoring_func,
              int64_t activation, int64_t tp_rank, int64_t tail_mc_base,
              int64_t tail_grid_cap, bool renormalize, double situ_beta,
-             double situ_linear_beta, double tail_eps, bool use_pdl) {
+             double situ_linear_beta, double tail_eps, bool use_pdl,
+             bool routed_use_interleaved, bool shared_use_interleaved,
+             bool routed_use_swizzle, bool shared_use_swizzle,
+             bool latent_use_swizzle) {
     const uint32_t num_tokens = static_cast<uint32_t>(input.size(0));
     TORCH_CHECK(num_tokens >= 1 && num_tokens <= MoEDims::kNumTokens,
                 "token count M=", num_tokens,
@@ -193,6 +209,7 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
     TORCH_CHECK(top_k >= 1 && top_k <= kMaxTopk, "top_k must be between 1 and ",
                 kMaxTopk, ".");
 
+    CheckRouterWeightShape<MoEDims>(router_weight);
     CheckRoutedExpertShape<MoEDims>(expert_up_weights, expert_down_weights);
     if constexpr (MoEDims::kUseLatent) {
         CheckLatentDownShape<MoEDims>(latent_down_weight);
@@ -212,6 +229,9 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
                            ? static_cast<uint32_t>(latent_down_weight.size(0))
                            : 0u;
     args.intermediate_size = static_cast<uint32_t>(shared_down_weight.size(1));
+    args.layouts = moe::MoELayouts(routed_use_interleaved, routed_use_swizzle,
+                                   shared_use_interleaved, shared_use_swizzle,
+                                   latent_use_swizzle);
     args.top_k = static_cast<uint32_t>(top_k);
     args.scoring_func = static_cast<ScoringFunc>(scoring_func);
     args.renormalize = renormalize;
@@ -296,6 +316,7 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
 
     const uint32_t grid_size =
         CalculateGridSize<MoEDims>(device, stream, grid_cap);
+
     const cudaError_t launch_status =
         moe::LaunchMoEKernel<MoEDims>(args, grid_size, stream, use_pdl);
     TORCH_CHECK(launch_status == cudaSuccess,
@@ -359,7 +380,9 @@ void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,
                const std::string& scoring_func, const std::string& activation,
                bool renormalize, double situ_beta, double situ_linear_beta,
                double tail_eps, const std::string& quant_mode, int64_t tp_size,
-               bool use_pdl) {
+               bool use_pdl, bool routed_use_interleaved,
+               bool shared_use_interleaved, bool routed_use_swizzle,
+               bool shared_use_swizzle, bool latent_use_swizzle) {
     TORCH_CHECK(
         quant_mode == "w8a8-mxfp8" || quant_mode == "w4a8-mxfp4" ||
             quant_mode == "w8a8-blockwise",
@@ -400,7 +423,9 @@ void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,
             tail_norm_weight, correction_bias, per_expert_scale, tail_epochs,
             tail_uc_bases, workspace, tail_out, top_k, scoring_type,
             activation_type, tp_rank, tail_mc_base, tail_grid_cap, renormalize,
-            situ_beta, situ_linear_beta, tail_eps, use_pdl);
+            situ_beta, situ_linear_beta, tail_eps, use_pdl,
+            routed_use_interleaved, shared_use_interleaved, routed_use_swizzle,
+            shared_use_swizzle, latent_use_swizzle);
     };
 
     constexpr auto kBWFP8 = moe::QuantMethod::kBlockwiseFP8;
@@ -458,14 +483,6 @@ int64_t MoETailRegionBytes(bool wide, int64_t tp_size) {
                       QuantBWFP8{}, true, 4>>()
                 : moe::tail_region_bytes<moe::Dims_BS8_E512_N512_K2048_SM100<
                       QuantBWFP8{}, true, 4>>();
-}
-
-int64_t RouterTileM(int64_t num_tokens = 0) {
-    using QuantBWFP8 = moe::QuantConfig<>;
-    using Bs8 = moe::Dims_BS8_E512_N512_K2048_SM100<QuantBWFP8{}>;
-    using Bs16 = moe::Dims_BS16_E512_N512_K2048_SM100<QuantBWFP8{}>;
-    return (num_tokens > 8) ? moe::RouterGemmTraits<Bs16>::kTileShapeM
-                            : moe::RouterGemmTraits<Bs8>::kTileShapeM;
 }
 
 }  // namespace halops

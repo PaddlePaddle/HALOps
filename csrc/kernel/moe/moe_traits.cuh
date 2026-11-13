@@ -83,7 +83,7 @@ struct LatentDownGemmTraits {
 
     static constexpr std::uint32_t kNumCtas =
         Dims::KernelConfig::kNumCtasForLatentDown;
-    static constexpr std::uint32_t kTileShapeN = 8u;
+    static constexpr std::uint32_t kTileShapeN = Dims::kNumTokens;
     static constexpr std::uint32_t kNumTilesN = kGemmN / kTileShapeN;
 
     static constexpr bool kUseSplitK = Dims::KernelConfig::kLatentDownUseSplitK;
@@ -106,9 +106,6 @@ struct LatentDownGemmTraits {
 
     static constexpr std::uint32_t kNumTilesM = kGemmM / kTileShapeM;
     static constexpr std::uint32_t kNumTilesK = GemmShape::kNumTilesK;
-
-    // A K tile spans this many 128-K staging blocks.
-    static constexpr std::uint32_t kNumStagingBlocks = kTileShapeK / 128u;
 
     static constexpr std::uint32_t kClusterSize = cute::max(
         (OutputQuant::kBlockSize + kTileShapeM - 1) / kTileShapeM, kNumSplits);
@@ -176,6 +173,9 @@ struct RouterGemmTraits {
 
 template <typename Dims>
 struct RoutedUpGemmTraits {
+    static constexpr std::uint32_t kPairGran = 8u;
+    static constexpr bool kWeightHasExpertDim = true;
+
     static constexpr std::uint32_t kGemmM = Dims::kIntermediateSize * 2;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = MoEInputSize<Dims>::value;
@@ -210,13 +210,12 @@ struct RoutedUpGemmTraits {
 
     static constexpr std::uint32_t kNumTilesK = kGemmK / kTileShapeK;
     static constexpr std::uint32_t kNumSplits = 1u;
-    static constexpr std::uint32_t kNumStagingBlocks = kTileShapeK / 128u;
 
     // The output's (the down's input) scale block.
     static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
 
     static constexpr std::uint32_t kNumAccSlots =
-        MmaCore::kUseBlockscaled ? 1 : Dims::KernelConfig::kNumAccSlots;
+        MmaCore::kUseBlockscaled ? 2 : Dims::KernelConfig::kNumAccSlots;
     static constexpr std::uint32_t kNumWeightSlots =
         Dims::KernelConfig::kNumUpWeightSlots;
     static constexpr std::uint32_t kWeightScaleSlots =
@@ -276,11 +275,14 @@ struct RoutedDownGemmTraits {
 // Shared-expert up projection over all tokens.
 template <typename Dims>
 struct SharedUpGemmTraits {
+    static constexpr std::uint32_t kPairGran = 8u;
+    static constexpr bool kWeightHasExpertDim = false;
+
     static constexpr std::uint32_t kGemmM = Dims::kIntermediateSize * 2u;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = Dims::kHiddenSize;
 
-    // One block owns one M atom of the pair layout.
+    // One block owns one M atom of the interleaved rows.
     static constexpr std::uint32_t kTileShapeM = 128u;
     static constexpr std::uint32_t kTileShapeN = kGemmN;
     static constexpr std::uint32_t kTileShapeK = 256u;
@@ -310,9 +312,6 @@ struct SharedUpGemmTraits {
     using ScaleTraits = typename MmaCore::ScaleTraits;
 
     static constexpr std::uint32_t kNumTilesK = kGemmK / kTileShapeK;
-
-    // A K tile spans this many 128-K staging blocks.
-    static constexpr std::uint32_t kNumStagingBlocks = kTileShapeK / 128u;
 
     // The output's (the down's input) scale block.
     static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
@@ -447,12 +446,12 @@ struct MoEKernelTraits {
                   "Grid bounds must be ordered kCtasPerExpert <= kMinGrid <= "
                   "kMaxGrid.");
 
-    // Gate/up rows are interleaved in groups of kPairLayoutGranularity.
-    static constexpr std::uint32_t kPairLayoutGranularity = 8u;
-    static_assert(RoutedUpGemm::kTileShapeM % (2u * kPairLayoutGranularity) ==
+    // Gate/up rows are interleaved in groups of kInterleaveGranularity.
+    static constexpr std::uint32_t kInterleaveGranularity = 8u;
+    static_assert(RoutedUpGemm::kTileShapeM % (2u * kInterleaveGranularity) ==
                       0u,
-                  "The pair-layout interleave period must divide the A tile's "
-                  "row count.");
+                  "The interleave period must divide the A tile's row "
+                  "count.");
 
     static constexpr std::uint32_t kUpSlotsPerDownSlot =
         (RoutedDownGemm::kTileShapeM * RoutedDownGemm::kTileShapeK) /

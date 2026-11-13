@@ -15,7 +15,7 @@
 """
 
 from dataclasses import dataclass
-from typing import Optional, Sequence, Union
+from typing import Optional
 
 import torch
 
@@ -24,19 +24,16 @@ from halops.moe.mega_ll_moe_utils import (
     _NARROW_TOKENS,
     _TAIL_ALIGN,
     _check_workspace,
-    _interleave_up_for_pair_layout,
-    _pack_router_weight,
-    _prepare_shared_expert_up_weight,
-    _prepare_up_scale,
-    _router_gates,
+    _interleave_gate_up_weight,
+    _interleave_gate_up_scale,
 )
 
 __all__ = [
     "MoEWorkspace",
     "mega_ll_moe",
+    "transform_weights_for_moe",
     "get_workspace_for_moe",
     "get_workspace_size_for_moe",
-    "transform_weights_for_moe",
 ]
 
 
@@ -151,6 +148,82 @@ def get_workspace_for_moe(
     )
 
 
+def transform_weights_for_moe(
+    expert_up_weights: torch.Tensor,
+    expert_up_weights_scale: torch.Tensor,
+    shared_up_weight: torch.Tensor,
+    shared_up_weight_scale: torch.Tensor,
+    routed_use_interleaved: bool = True,
+    shared_use_interleaved: bool = True,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Repack the up projections' weights (and MX scale tables) for ``mega_ll_moe``.
+
+    The up projections can interleave their gate/up rows in 8-row groups; the
+    caller selects that layout per projection with ``routed_use_interleaved``
+    and ``shared_use_interleaved`` on ``mega_ll_moe``.  This rewrites the
+    natural ``[..., 2N, K]`` weights, and the ``uint8`` tables from
+    ``group_wise_quant(use_swizzle=True)``, into that order.  Block-wise f32
+    scale tables are returned unchanged.
+
+    Args:
+        expert_up_weights (Tensor): Fused gate/up weights of the routed
+            experts, shape [E, 2N, K], in the natural [gate | up] row order.
+        expert_up_weights_scale (Tensor): Scales of ``expert_up_weights``: the
+            uint8 table in the natural SfAtom layout, or the block-wise f32
+            table.
+        shared_up_weight (Tensor): Fused gate/up weight of the shared expert,
+            shape [2N, K], in the natural row order.
+        shared_up_weight_scale (Tensor): Scales of ``shared_up_weight``, same
+            layout as the routed ones.
+        routed_use_interleaved (bool, optional): Repack the routed rows.
+            Default: True.
+        shared_use_interleaved (bool, optional): Repack the shared rows.
+            Default: True.
+
+    Returns:
+        (Tensor, Tensor, Tensor, Tensor): the routed weight/scale and the
+        shared weight/scale to pass to ``mega_ll_moe``.  Interleaved rows keep
+        the weight's shape; the scale table stays in its SfAtom layout.
+    """
+
+    def pack(weight, scale, interleaved, name):
+        if not interleaved:
+            return weight, scale
+        if scale is None:
+            raise ValueError(
+                f"interleaving {name} needs its scale table: the weight and "
+                "its scale rows move together."
+            )
+        return (
+            _interleave_gate_up_weight(weight).reshape(weight.shape),
+            _interleave_gate_up_scale(scale),
+        )
+
+    expert_up_weights, expert_up_weights_scale = pack(
+        expert_up_weights,
+        expert_up_weights_scale,
+        routed_use_interleaved,
+        "expert_up_weights",
+    )
+    shared_up_weight, shared_up_weight_scale = pack(
+        shared_up_weight,
+        shared_up_weight_scale,
+        shared_use_interleaved,
+        "shared_up_weight",
+    )
+    return (
+        expert_up_weights,
+        expert_up_weights_scale,
+        shared_up_weight,
+        shared_up_weight_scale,
+    )
+
+
 def mega_ll_moe(
     input: torch.Tensor,
     router_weight: torch.Tensor,
@@ -182,84 +255,97 @@ def mega_ll_moe(
     quant_mode: str = "w4a8-mxfp4",
     grid_cap: int = 0,
     use_pdl: bool = True,
+    routed_use_interleaved: bool = True,
+    shared_use_interleaved: bool = True,
+    routed_use_swizzle: bool = True,
+    shared_use_swizzle: bool = True,
+    latent_use_swizzle: bool = False,
 ) -> None:
     """MoE forward pass on Blackwell SM100, support latent.
 
     Runs the router, the latent down-projection, the routed experts' fused
-    up/down projections and the shared expert for 1..16 tokens, writing
-    ``out`` in place.  The shipped schedule is
-    fixed to E=512 experts, hidden size 4096, intermediate size 512 and
-    latent size 2048.  Every weight group runs block-wise FP8 (128x128 blocks)
-    or MXFP8 (1x32 UE8M0 groups); the "w4a8-mxfp4" recipe packs only the routed
-    experts' weights to MXFP4 and keeps the activations fp8.
+    up/down projections and the shared expert for 1..16 tokens. The shipped
+    schedule is fixed to E=512 experts, hidden size 4096, intermediate size 512
+    and latent size 2048 now.
 
     Weights are quantized by the caller (``group_wise_quant`` for MX
-    recipes); the router and up-projection operands are then packed with
-    ``transform_weights_for_moe``.  The down-projection and latent-down
-    weights are quantized directly in the kernel layout and passed as-is.
-    This build runs the latent stage, so ``latent_down_weight`` and
-    ``latent_down_weight_scale`` are required.
+    recipes); the up-projection gate/up rows are either passed pre-interleaved
+    or interleaved by the TMA while loading, and the scale tables are either
+    the caller's SfAtom tables or plain rows the kernel converts.  The layout
+    flags below select which form each operand is in.
 
-    The fused tail always runs as the kernel's last phase (the same single
-    launch)::
+    The whole forward pass runs in a single kernel launch::
 
-        out = fc2(RMSNorm(AllReduce(routed))) + AllReduce(shared)
+        (w, e) = renormalize(topk(sum_g sigmoid(x @ W_g.T)))    # router
+        routed = sum_k w_k * (act(x @ W_latent.T @ W_up[e_k].T) @ W_down[e_k].T)
+        shared = act(x @ W_sup.T) @ W_sdown.T
+        out    = fc2(RMSNorm(AllReduce(routed))) + AllReduce(shared)
 
-    where ``routed`` is this rank's combined routed latent and ``shared`` its
-    partial shared-expert output (computed in-kernel, kept in ``workspace``).  Both
-    AllReduces run over the configured tensor-parallel group.  A scratchpad must
-    always be launched with the same grid, so
-    keep ``grid_cap`` fixed per workspace; the tail needs the shared-expert
-    blocks and its own CTAs inside the grid.
+    where ``x`` is ``input``, ``g`` runs over the router gates, ``e_k``/``w_k``
+    are each token's top-k experts and weights, ``act`` is the gated activation
+    and ``fc2`` the tail projection.  ``routed`` is this rank's combined routed
+    latent and ``shared`` its partial shared-expert output (kept in
+    ``workspace``); both AllReduces run over the configured tensor-parallel
+    group.
 
     Args:
         input (Tensor): Activations, shape [T, 4096], dtype bfloat16, with
             1 <= T <= 16.
-        router_weight (Tensor): Packed router weight from
-            ``transform_weights_for_moe``, dtype bfloat16. Shape is
-            [G * (E // tile_m), K // 64, tile_m, 64], concretely
-            [64, 64, 16, 64] for T <= 8 and [32, 64, 32, 64] otherwise.
-        expert_up_weights (Tensor): Fused gate/up weights in the pair layout
-            returned by ``transform_weights_for_moe``, shape [512, 1024,
-            2048].  Under "w4a8-mxfp4" the dtype is uint8 and the shape is
-            [512, 1024, 1024]: two 4-bit values per byte, low nibble first,
-            as ``group_wise_quant(mode="w4a4-mxfp4")`` packs them.
+        router_weight (Tensor): Router weight, dtype bfloat16, shape
+            [G * E, H] = [1024, 4096], contiguous; the gates are stacked, so
+            gate ``g`` owns rows [g * E, (g + 1) * E).
+        expert_up_weights (Tensor): Fused gate/up weights, dtype
+            float8_e4m3fn, in the natural [512, 2 * 512, 2048] layout. Under
+            "w4a8-mxfp4" the dtype is uint8 and K is halved: two 4-bit values
+            per byte, as ``group_wise_quant(mode="w4a4-mxfp4")`` packs them.
+            Pass the output of ``transform_weights_for_moe`` ([E, N/8, 2, 8,
+            K]) instead to run the 8-row pair layout.
         expert_up_weights_scale (Tensor): Block scales of
-            ``expert_up_weights``, shape [512, 8, 16], dtype float32.
+            ``expert_up_weights``: shape [512, 1024, 64] and dtype uint8 in
+            the CUTLASS SfAtom layout for "w8a8-mxfp8" and "w4a8-mxfp4", or
+            shape [512, 8, 16] and dtype float32 for "w8a8-blockwise".  The
+            MX scales are the natural SfAtom tables from
+            ``group_wise_quant(use_swizzle=True)``; ``transform_weights_for_moe``
+            moves them with the weight.
         expert_down_weights (Tensor): Down weights, shape [512, 2048, 512],
             dtype float8_e4m3fn; under "w4a8-mxfp4" uint8 of shape [512,
             2048, 256], packed the same way.
         expert_down_weights_scale (Tensor): Block scales of
-            ``expert_down_weights``, shape [512, 16, 4], dtype float32.
-        shared_up_weight (Tensor): Shared-expert gate/up weights in the pair
-            layout, shape [1024, 4096], dtype float8_e4m3fn.
+            ``expert_down_weights``: shape [512, 2048, 16] and dtype uint8 in
+            the SfAtom layout for "w8a8-mxfp8" and "w4a8-mxfp4", or shape
+            [512, 16, 4] and dtype float32 for "w8a8-blockwise".
+        shared_up_weight (Tensor): Shared-expert gate/up weights, dtype
+            float8_e4m3fn, in the natural [2 * 512, 4096] layout.
         shared_up_weight_scale (Tensor): Scales of ``shared_up_weight``:
-            shape [8, 32] and dtype float32 for "w8a8-blockwise", or shape
-            [1024, 128] and dtype uint8 in the CUTLASS SfAtom layout for
-            "w8a8-mxfp8".  The MXFP8 scales follow the *packed* pair row
-            order, as returned by ``transform_weights_for_moe``.
+            shape [8, 32] and dtype float32 for "w8a8-blockwise", or the
+            natural [1024, 128] uint8 rows from
+            ``group_wise_quant(use_swizzle=False)`` for "w8a8-mxfp8" and
+            "w4a8-mxfp4" (latent and shared stay MXFP8 in that recipe).
         shared_down_weight (Tensor): Shared-expert down weights, shape
             [4096, 512], dtype float8_e4m3fn.
         shared_down_weight_scale (Tensor): Scales of ``shared_down_weight``:
-            shape [32, 4] and dtype float32 for "w8a8-blockwise", or shape
-            [4096, 16] and dtype uint8 in the SfAtom layout for
-            "w8a8-mxfp8".
+            shape [32, 4] and dtype float32 for "w8a8-blockwise", or the
+            natural [4096, 16] uint8 rows from
+            ``group_wise_quant(use_swizzle=False)`` for "w8a8-mxfp8" and
+            "w4a8-mxfp4".
         latent_down_weight (Tensor): Latent down-projection weight in the
             kernel layout, shape [2048, 4096], dtype float8_e4m3fn.
             Quantize it in this layout and pass it directly.
         latent_down_weight_scale (Tensor): Scales of
             ``latent_down_weight``: shape [16, 32] and dtype float32 for
-            "w8a8-blockwise", or shape [2048, 128] and dtype uint8 in the
-            CUTLASS SfAtom layout (from ``group_wise_quant(use_swizzle=True)``)
-            for "w8a8-mxfp8".
-        latent_up_weight (Tensor): [4096, 2048] float8_e4m3fn latent up weight
-            (the tail's fc2).
+            "w8a8-blockwise", or a [2048, 128] uint8 table for "w8a8-mxfp8"
+            and "w4a8-mxfp4" — plain rows from
+            ``group_wise_quant(use_swizzle=False)``, or the SfAtom table from
+            ``use_swizzle=True`` when ``latent_use_swizzle`` is set.
+        latent_up_weight (Tensor): [4096, 2048] float8_e4m3fn latent up
+            weight.
         latent_up_weight_scale (Tensor): Scales of ``latent_up_weight``,
             following the latent recipe of ``quant_mode``: shape [32, 16] and
             dtype float32 (powers of two) for "w8a8-blockwise"; shape
-            [4096, 64] and dtype uint8 (UE8M0, one per row per 32 columns,
-            plain row-major as from ``group_wise_quant(use_swizzle=False)``,
-            not the SfAtom layout) for "w8a8-mxfp8" and "w4a8-mxfp4".
+            [4096, 64] and dtype uint8 (UE8M0, one per row per 32 columns) for
+            "w8a8-mxfp8" and "w4a8-mxfp4", plain row-major as from
+            ``group_wise_quant(use_swizzle=False)`` or the SfAtom table when
+            ``latent_use_swizzle`` is set.
         norm_weight (Tensor): [2048] bfloat16 RMSNorm weight.
         correction_bias (Tensor or None): [512] float32 CUDA router bias
             (``e_score_correction_bias``). It is added to each expert's score
@@ -273,8 +359,8 @@ def mega_ll_moe(
             from ``get_workspace_for_moe``, matching the token schedule. It
             also fixes the tensor-parallel size and rank of the launch.
         top_k (int): Experts selected per token, in [1, 10].
-        num_router_gates (int, optional): Router gates merged into
-            ``router_weight``; this build requires 2. Default: 2.
+        num_router_gates (int, optional): Gates stacked in
+            ``router_weight``'s rows; this build requires 2. Default: 2.
         scoring_func (str, optional): Router scoring, either "sigmoid" or
             "softmax". Default: "sigmoid".
         renormalize (bool, optional): Renormalize the top-k weights to sum to
@@ -296,6 +382,22 @@ def mega_ll_moe(
             the kernel's setup overlaps the previous kernel's tail. It waits for
             that kernel before touching shared state, and lets the next kernel
             start launching once the tail begins. Default: True.
+        routed_use_interleaved (bool, optional): The routed experts' fused
+            gate/up weights are in the 8-row interleaved order from
+            ``transform_weights_for_moe``. Default: True.
+        shared_use_interleaved (bool, optional): The shared expert's fused
+            gate/up weight is in the 8-row interleaved order from
+            ``transform_weights_for_moe``. Default: True.
+        routed_use_swizzle (bool, optional): The routed up and down scale
+            tables are the caller's SfAtom tables
+            (``group_wise_quant(use_swizzle=True)``) rather than plain rows.
+            Interleaved rows imply it. Default: True.
+        shared_use_swizzle (bool, optional): The shared up and down scale
+            tables are the caller's SfAtom tables rather than plain rows.
+            Interleaved rows imply it. Default: True.
+        latent_use_swizzle (bool, optional): The latent down- and
+            up-projection's scale tables are the caller's SfAtom tables rather
+            than plain rows. Default: False.
 
     Returns:
         None. The outputs are written in place.
@@ -337,6 +439,11 @@ def mega_ll_moe(
         quant_mode,
         workspace.tp_size,
         use_pdl,
+        routed_use_interleaved,
+        shared_use_interleaved,
+        routed_use_swizzle,
+        shared_use_swizzle,
+        latent_use_swizzle,
     )
 
 
@@ -356,89 +463,3 @@ def get_workspace_size_for_moe(
         Size in bytes of the scratchpad plus the tail mailbox.
     """
     return _workspace_layout(input, tp_size)[2]
-
-
-def transform_weights_for_moe(
-    router_weight: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]],
-    expert_up_weights: Optional[torch.Tensor],
-    shared_up_weight: Optional[torch.Tensor],
-    num_tokens: int = 1,
-    num_router_gates: int = 2,
-    expert_up_weights_scale: Optional[torch.Tensor] = None,
-    shared_up_weight_scale: Optional[torch.Tensor] = None,
-) -> dict:
-    """Pack the router and up-projection weights for ``mega_ll_moe``.
-
-    The down-projection and latent-down weights, and the scales, already follow
-    the layout the kernel reads and are passed to ``mega_ll_moe`` as-is.
-    This repacks the operands whose layout differs:
-
-    * ``router_weight`` -- the router's SW128 swizzle, one packed blob per
-      gate.
-    * ``expert_up_weights`` / ``shared_up_weight`` -- the gate/up pair
-      layout.
-
-    Only the layout changes: quantize every weight first, then convert it
-    here.
-
-    ``num_tokens`` selects the router schedule and must match the ``mega_ll_moe``
-    call.  Every operand is optional: only the ones that are given are packed (and
-    returned), e.g. to pack the experts as soon as they are loaded and the router once
-    per schedule.
-
-    Args:
-        router_weight (Tensor, optional): Router weight, shape [K, E], dtype bfloat16;
-            shape [G, K, E] or a sequence of G [K, E] tensors is also
-            accepted, and a single [K, E] weight is reused for every gate.
-        expert_up_weights (Tensor, optional): Routed weights, shape [E, 2N, K], dtype
-            float8_e4m3fn; rows [0, N) are gate and [N, 2N) up.
-        shared_up_weight (Tensor, optional): Shared-expert weights, shape [2N, H],
-            dtype float8_e4m3fn, same gate/up split.
-        num_tokens (int, optional): Token count of the ``mega_ll_moe``
-            call, which picks the router tile M. Default: 1.
-        num_router_gates (int, optional): Gates to merge; this build requires
-            2. Default: 2.
-        expert_up_weights_scale (Tensor, optional): Scales of
-            ``expert_up_weights``, shape [E, 2N, K/32] and dtype uint8 for
-            "w8a8-mxfp8", or [E, 2N/128, K/128] and dtype float32 for
-            "w8a8-blockwise".  Default: None, to convert the weights only.
-        shared_up_weight_scale (Tensor, optional): Scales of
-            ``shared_up_weight``, shape [2N, H/32] and dtype uint8 for
-            "w8a8-mxfp8", or [2N/128, H/128] and dtype float32 for
-            "w8a8-blockwise".  Default: None, to convert the weights only.
-
-    Note:
-        The up-projection's gate/up pairing reorders weight rows, so the
-        MXFP8 SfAtom tables passed in are moved onto the packed rows too.
-        Block-wise f32 tables are addressed by raw row and come back
-        unchanged.
-
-    Returns:
-        A dict with the packed operands:
-
-        * "router_weight" (Tensor): dtype bfloat16, shape
-          [G * (E // tile_m), K // 64, tile_m, 64], where tile_m is 16 for
-          num_tokens <= 8 and 32 otherwise.
-        * "expert_up_weights" (Tensor): dtype float8_e4m3fn, shape
-          [E, 2N, K], gate/up interleaved.
-        * "shared_up_weight" (Tensor): dtype float8_e4m3fn, shape [2N, H],
-          gate/up interleaved.
-        * "expert_up_weights_scale" (Tensor): the converted scale table, only
-          when ``expert_up_weights_scale`` is given.
-        * "shared_up_weight_scale" (Tensor): the converted scale table, only
-          when ``shared_up_weight_scale`` is given.
-    """
-    packed = {}
-    if router_weight is not None:
-        packed["router_weight"] = _pack_router_weight(
-            _router_gates(router_weight, num_router_gates), num_tokens
-        )
-    if expert_up_weights is not None:
-        packed["expert_up_weights"] = _interleave_up_for_pair_layout(expert_up_weights)
-    if shared_up_weight is not None:
-        packed["shared_up_weight"] = _prepare_shared_expert_up_weight(shared_up_weight)
-    if expert_up_weights_scale is not None:
-        packed["expert_up_weights_scale"] = _prepare_up_scale(expert_up_weights_scale)
-    if shared_up_weight_scale is not None:
-        packed["shared_up_weight_scale"] = _prepare_up_scale(shared_up_weight_scale)
-    return packed

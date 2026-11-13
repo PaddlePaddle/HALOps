@@ -28,8 +28,8 @@ class Tee:
 
     _SHUTDOWN_MARKER = b"\0halops-tee-shutdown\0"
     _IGNORED_NATIVE_STDERR = re.compile(
-        rb"^USDT:.* SyncActivityProfilerHandler\.cpp:\d+\] "
-        rb"profiler_(?:start|stop)$"
+        rb"^USDT:.* (?:SyncActivityProfilerHandler|ActivityProfilerController)"
+        rb"\.cpp:\d+\] profiler_(?:start|stop)$"
     )
 
     def __init__(self, log_path: str, intercept_native_stderr: bool = False):

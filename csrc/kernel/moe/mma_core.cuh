@@ -31,6 +31,85 @@
 
 namespace halops::moe {
 
+// SM100_MMA_MXF8F6F4_SS without the election in fma.
+template <class a_type, class b_type, class c_type, class sf_type, int M, int N,
+          cute::UMMA::Major a_major, cute::UMMA::Major b_major>
+struct SM100_MMA_MXF8F6F4_SS_NOELECT
+    : cute::SM100_MMA_MXF8F6F4_SS<a_type, b_type, c_type, sf_type, M, N,
+                                  a_major, b_major> {
+    CUTE_HOST_DEVICE static void fma(std::uint64_t const& desc_a,
+                                     std::uint64_t const& desc_b,
+                                     std::uint32_t const& tmem_c,
+                                     std::uint32_t const& scaleC,
+                                     std::uint64_t const& idescE,
+                                     std::uint32_t const& tsfa_addr,
+                                     std::uint32_t const& tsfb_addr) {
+        asm volatile(
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.ne.b32 p, %4, 0;\n\t"
+            "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale [%0], %1, "
+            "%2, %3, [%5], [%6], p; \n\t"
+            "}\n"
+            :
+            : "r"(tmem_c), "l"(desc_a), "l"(desc_b),
+              "r"(static_cast<std::uint32_t>(idescE >> 32)), "r"(scaleC),
+              "r"(tsfa_addr), "r"(tsfb_addr));
+    }
+};
+
+template <class Op>
+struct IsNoElectUmma : std::false_type {};
+
+template <class a_type, class b_type, class c_type, class sf_type, int M, int N,
+          cute::UMMA::Major a_major, cute::UMMA::Major b_major>
+struct IsNoElectUmma<SM100_MMA_MXF8F6F4_SS_NOELECT<
+    a_type, b_type, c_type, sf_type, M, N, a_major, b_major>> : std::true_type {
+};
+
+}  // namespace halops::moe
+
+namespace cute {
+
+template <class a_type, class b_type, class c_type, class sf_type, int M, int N,
+          UMMA::Major a_major, UMMA::Major b_major>
+struct MMA_Traits<halops::moe::SM100_MMA_MXF8F6F4_SS_NOELECT<
+    a_type, b_type, c_type, sf_type, M, N, a_major, b_major>>
+    : MMA_Traits<SM100_MMA_MXF8F6F4_SS<a_type, b_type, c_type, sf_type, M, N,
+                                       a_major, b_major>> {
+    using Base =
+        MMA_Traits<SM100_MMA_MXF8F6F4_SS<a_type, b_type, c_type, sf_type, M, N,
+                                         a_major, b_major>>;
+
+    template <class TSFA, class TSFALayout, class TSFB, class TSFBLayout>
+    CUTE_HOST_DEVICE constexpr MMA_Traits with(
+        UMMA::ScaleOut accumulate, Tensor<TSFA, TSFALayout> const& SFA,
+        Tensor<TSFB, TSFBLayout> const& SFB) const {
+        return {Base::with(accumulate, SFA, SFB)};
+    }
+
+    template <class TD, class DLayout, class TA, class ALayout_, class TB,
+              class BLayout_, class TC, class CLayout_>
+    CUTE_HOST_DEVICE constexpr friend void mma_unpack(
+        MMA_Traits const& traits, Tensor<TD, DLayout>& tensor_d,
+        Tensor<TA, ALayout_> const& tensor_a,
+        Tensor<TB, BLayout_> const& tensor_b, Tensor<TC, CLayout_> const&) {
+        std::uint64_t desc_a = tensor_a[0];
+        std::uint64_t desc_b = tensor_b[0];
+        std::uint32_t tmem_c = raw_pointer_cast(tensor_d.data());
+        std::uint64_t idesc = UMMA::make_runtime_instr_desc_block_scaled<>(
+            traits.idesc_, traits.tsfa_addr_, traits.tsfb_addr_);
+        halops::moe::SM100_MMA_MXF8F6F4_SS_NOELECT<
+            a_type, b_type, c_type, sf_type, M, N, a_major,
+            b_major>::fma(desc_a, desc_b, tmem_c,
+                          static_cast<std::uint32_t>(traits.accumulate_), idesc,
+                          traits.tsfa_addr_, traits.tsfb_addr_);
+    }
+};
+}  // namespace cute
+
+namespace halops::moe {
+
 // K-major SW128 tile: 128 B of K per swizzle box.
 template <typename T>
 struct SwizzleBoxK {
@@ -69,7 +148,7 @@ template <class ElementAcc, class AtomShape, cute::UMMA::Major MajorA,
           cute::UMMA::Major MajorB>
 struct UmmaAtom<cute::float_e4m3_t, cute::float_e4m3_t, ElementAcc, AtomShape,
                 MajorA, MajorB, QuantMethod::kMXFP8> {
-    using type = cute::SM100_MMA_MXF8F6F4_SS<
+    using type = SM100_MMA_MXF8F6F4_SS_NOELECT<
         cute::float_e4m3_t, cute::float_e4m3_t, ElementAcc, cute::float_ue8m0_t,
         cute::get<0>(AtomShape{}), cute::get<1>(AtomShape{}), MajorA, MajorB>;
 };
@@ -79,7 +158,7 @@ template <class ElementAcc, class AtomShape, cute::UMMA::Major MajorA,
           cute::UMMA::Major MajorB>
 struct UmmaAtom<cutlass::float_e2m1_t, __nv_fp8_e4m3, ElementAcc, AtomShape,
                 MajorA, MajorB, QuantMethod::kMXFP4> {
-    using type = cute::SM100_MMA_MXF8F6F4_SS<
+    using type = SM100_MMA_MXF8F6F4_SS_NOELECT<
         cute::detail::float_e2m1_unpacksmem_t, cute::float_e4m3_t, ElementAcc,
         cute::float_ue8m0_t, cute::get<0>(AtomShape{}),
         cute::get<1>(AtomShape{}), MajorA, MajorB>;
@@ -169,15 +248,6 @@ struct UmmaScaleTraits<TiledMma, TileShape, true> {
         TmemSfb tensor{};
         tensor.data() = addr;
         return tensor;
-    }
-
-    // Copy one slot of scales from SMEM to TMEM.
-    __device__ static void copy_to_tmem(std::uint8_t* __restrict__ sfa,
-                                        std::uint8_t* __restrict__ sfb,
-                                        std::uint32_t sfa_addr,
-                                        std::uint32_t sfb_addr) {
-        copy_sfa_to_tmem(sfa, sfa_addr);
-        copy_sfb_to_tmem(sfb, sfb_addr);
     }
 
     // Copy one operand's scales using its SfAtom layout.
@@ -357,6 +427,9 @@ struct UmmaCore {
                                bool accumulate = false) {
         static_assert(kUseBlockscaled,
                       "the scale-factor run overload is the MXFP8 one");
+        static_assert(IsNoElectUmma<AtomOp>::value,
+                      "an atom that elects inside fma cannot run in an "
+                      "elected lane");
 
         sfa_addr &= 0xFFFFu;
         sfb_addr &= 0xFFFFu;

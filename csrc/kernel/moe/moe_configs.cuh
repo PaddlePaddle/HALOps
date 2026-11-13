@@ -36,6 +36,48 @@ enum class QuantMethod : uint32_t {
     kNone = 3,
 };
 
+// Where a blockscaled weight's scale table comes from.
+enum class ScaleLayout : std::uint32_t {
+    kPackedAtom,  // packed with the interleaved gate/up weights
+    kSfAtom,      // natural-row SfAtom from group_wise_quant(use_swizzle=True)
+    kPlain,       // plain row-major from group_wise_quant(use_swizzle=False)
+};
+
+struct MoELayouts {
+    bool routed_up_interleaved = false;
+    bool shared_up_interleaved = false;
+    ScaleLayout routed_up_scale = ScaleLayout::kSfAtom;
+    ScaleLayout routed_down_scale = ScaleLayout::kSfAtom;
+    ScaleLayout shared_up_scale = ScaleLayout::kPlain;
+    ScaleLayout shared_down_scale = ScaleLayout::kPlain;
+    ScaleLayout latent_down_scale = ScaleLayout::kPlain;
+    ScaleLayout tail_fc2_scale = ScaleLayout::kPlain;
+
+    constexpr MoELayouts() = default;
+
+    constexpr MoELayouts(bool routed_use_interleaved, bool routed_use_swizzle,
+                         bool shared_use_interleaved, bool shared_use_swizzle,
+                         bool latent_use_swizzle)
+        : routed_up_interleaved(routed_use_interleaved),
+          shared_up_interleaved(shared_use_interleaved),
+          routed_up_scale(routed_use_interleaved
+                              ? ScaleLayout::kPackedAtom
+                              : (routed_use_swizzle ? ScaleLayout::kSfAtom
+                                                    : ScaleLayout::kPlain)),
+          routed_down_scale(routed_use_swizzle ? ScaleLayout::kSfAtom
+                                               : ScaleLayout::kPlain),
+          shared_up_scale(shared_use_interleaved
+                              ? ScaleLayout::kPackedAtom
+                              : (shared_use_swizzle ? ScaleLayout::kSfAtom
+                                                    : ScaleLayout::kPlain)),
+          shared_down_scale(shared_use_swizzle ? ScaleLayout::kSfAtom
+                                               : ScaleLayout::kPlain),
+          latent_down_scale(latent_use_swizzle ? ScaleLayout::kSfAtom
+                                               : ScaleLayout::kPlain),
+          tail_fc2_scale(latent_use_swizzle ? ScaleLayout::kSfAtom
+                                            : ScaleLayout::kPlain) {}
+};
+
 // Operand quantization types and group width. MXFP8/MXFP4 use fixed 32-element
 // groups.
 template <QuantMethod Method,
@@ -152,7 +194,8 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr int kTailTpg = 2;
         static constexpr int kTailGsize = 32;
         static constexpr int kTailThreads = 256;
-        static constexpr int kTailStage = TailWorld == 1 ? 0 : 1;
+        static constexpr int kTailStage = 1;
+        static constexpr int kTailBlockRows = 32;
         static constexpr int kTailBlkB = 4;
         static constexpr int kTailWStagePad = 64;
         static constexpr int kTailXPad = 8;

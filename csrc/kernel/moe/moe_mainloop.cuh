@@ -98,6 +98,7 @@ struct CollectiveMainloopMoE {
         Activation activation;
         float situ_beta;
         float situ_linear_beta;
+        MoELayouts layouts;
         std::uint32_t l2_cached_bytes;
         float tail_eps;
     };
@@ -109,8 +110,6 @@ struct CollectiveMainloopMoE {
         std::uint32_t latent_size;
         std::uint32_t intermediate_size;
         const DataType::ElementA* __restrict__ input;
-        const typename Traits::RouterGemm::
-            MmaElement* __restrict__ router_weight;
         const typename Traits::RoutedUpGemm::
             MmaElement* __restrict__ expert_weights_up;
         const typename Traits::RoutedUpGemm::
@@ -150,21 +149,26 @@ struct CollectiveMainloopMoE {
         float situ_linear_beta;
         // Evict weights first when their working set exceeds L2 capacity.
         std::uint32_t l2_expert_capacity;
+        MoELayouts layouts;
         float tail_eps;
         std::uint32_t tail_shared_ctas;
         std::uint32_t tail_rank;
         alignas(128) CUtensorMap tma_up_weights_desc;
+        alignas(128) CUtensorMap tma_up_scale_desc;
         alignas(128) CUtensorMap tma_input_desc;
-        // Router and latent input share the K-tile descriptor.
-        alignas(128) CUtensorMap tma_input_chunks_desc;
+        alignas(128) CUtensorMap tma_router_input_desc;
+        alignas(128) CUtensorMap tma_router_weights_desc;
         alignas(128) CUtensorMap tma_down_weights_desc;
+        alignas(128) CUtensorMap tma_down_scale_desc;
         alignas(128) CUtensorMap tma_down_activations_desc;
         alignas(128) CUtensorMap tma_latent_down_weight_desc;
         alignas(128) CUtensorMap tma_shared_up_desc;
+        alignas(128) CUtensorMap tma_shared_up_scale_desc;
         alignas(128) CUtensorMap tma_shared_down_desc;
+        alignas(128) CUtensorMap tma_shared_down_scale_desc;
     };
 
-    // Builds the device parameters, including the four TMA descriptors.
+    // Builds the device parameters, including the TMA descriptors.
     static Params to_underlying_arguments(Arguments const& args) {
         Params params{};
         params.num_tokens = args.num_tokens;
@@ -172,7 +176,6 @@ struct CollectiveMainloopMoE {
         params.latent_size = args.latent_size;
         params.intermediate_size = args.intermediate_size;
         params.input = args.input;
-        params.router_weight = args.router_weight;
         params.expert_weights_up = args.expert_up_weights;
         params.expert_scales_up = args.expert_up_weights_scale;
         params.expert_weights_down = args.expert_down_weights;
@@ -206,6 +209,7 @@ struct CollectiveMainloopMoE {
         params.situ_beta = args.situ_beta;
         params.situ_linear_beta = args.situ_linear_beta;
         params.tail_eps = args.tail_eps;
+        params.layouts = args.layouts;
         params.tail_shared_ctas = SharedDownGemmTraits<Dims>::kNumCtas;
         params.tail_rank = args.tail_rank;
 
@@ -223,60 +227,254 @@ struct CollectiveMainloopMoE {
                                              expert_weight_bytes)
                 : 0xFFFFFFFFu;
 
-        params.tma_input_desc = CreateTmaDesc2D(
-            "activations", args.input, args.num_tokens, Dims::kHiddenSize,
-            /*box_rows=*/8u, /*box_cols=*/64u);
-        params.tma_input_chunks_desc =
-            CreateTmaDescChunks3D("activations (K tiles)", args.input,
-                                  args.num_tokens, Dims::kHiddenSize);
-        params.tma_up_weights_desc = CreateTmaDesc2D(
-            "up-projection weights", args.expert_up_weights,
-            /*rows=*/Dims::kNumExperts * 2u * Dims::kIntermediateSize,
-            /*cols=*/MoEInputSize<Dims>::value, /*box_rows=*/128u,
-            /*box_cols=*/128u);
-        params.tma_down_weights_desc = CreateTmaDesc2D(
-            "down-projection weights", args.expert_down_weights,
-            /*rows=*/Dims::kNumExperts * MoEInputSize<Dims>::value,
-            /*cols=*/Dims::kIntermediateSize, /*box_rows=*/128u,
-            /*box_cols=*/128u);
-        params.tma_down_activations_desc =
-            CreateTmaDesc2D("down-projection activations",
-                            reinterpret_cast<const DataType::ElementQA*>(
-                                static_cast<const char*>(args.workspace) +
-                                Workspace::kUpOutFp8Offset),
-                            Workspace::kMaxRoutedRows, Dims::kIntermediateSize,
-                            /*box_rows=*/Dims::kNumTokens, /*box_cols=*/128u);
+        constexpr std::uint64_t kInputBytes = sizeof(DataType::ElementA);
+        constexpr std::uint32_t kChunkElems =
+            128u / static_cast<std::uint32_t>(kInputBytes);
+        constexpr std::uint32_t kInputTileChunks =
+            Traits::LatentDownGemm::kTileShapeK / kChunkElems;
+        static_assert(
+            kInputTileChunks * kChunkElems == Traits::SharedUpGemm::kTileShapeK,
+            "the latent and shared up loads share one input box");
+        std::uint64_t input_shape[3] = {kChunkElems, args.num_tokens,
+                                        args.hidden_size / kChunkElems};
+        std::uint64_t input_strides[2] = {args.hidden_size * kInputBytes, 128u};
+        params.tma_input_desc =
+            CreateTmaDesc<3>("input", args.input, input_shape, input_strides,
+                             {kChunkElems, Dims::kNumTokens, kInputTileChunks});
+        params.tma_router_input_desc =
+            CreateTmaDesc<3>("router input", args.input, input_shape,
+                             input_strides, {kChunkElems, 8u, 4u});
 
-        params.tma_shared_up_desc =
-            CreateTmaDesc2D("up-projection weights", args.shared_up_weight,
-                            /*rows=*/Dims::kIntermediateSize * 2u,
-                            /*cols=*/Dims::kHiddenSize,
-                            /*box_rows=*/Traits::SharedUpGemm::kTileShapeM,
-                            /*box_cols=*/128u);
+        std::uint64_t router_w_shape[3] = {
+            kChunkElems, Dims::kNumRouterGates * Dims::kNumExperts,
+            args.hidden_size / kChunkElems};
+        std::uint64_t router_w_strides[2] = {args.hidden_size * kInputBytes,
+                                             128u};
+        std::uint32_t router_w_box[3] = {
+            kChunkElems, Traits::RouterGemm::kTileShapeM,
+            Traits::RouterGemm::MmaCore::kNumSwizzleBoxKs};
+        params.tma_router_weights_desc =
+            CreateTmaDesc<3>("router weights", args.router_weight,
+                             router_w_shape, router_w_strides, router_w_box);
+
+        if (args.layouts.routed_up_interleaved) {
+            // Packed rows: [128-value swizzle box][row][K half] so one box
+            // covers a whole 128-row K tile.
+            using UpGemm = typename Traits::RoutedUpGemm;
+            constexpr std::uint64_t kUpBits =
+                cute::sizeof_bits_v<typename UpGemm::MmaElement>;
+            constexpr std::uint64_t kK = MoEInputSize<Dims>::value;
+            constexpr std::uint32_t kSwizzleBoxK =
+                UpGemm::MmaCore::kSwizzleBoxK;
+            std::uint64_t up_w_shape[3] = {
+                kSwizzleBoxK,
+                std::uint64_t{Dims::kNumExperts} * 2u * Dims::kIntermediateSize,
+                kK / kSwizzleBoxK};
+            std::uint64_t up_w_strides[2] = {kK * kUpBits / 8u,
+                                             kSwizzleBoxK * kUpBits / 8u};
+            std::uint32_t up_w_box[3] = {kSwizzleBoxK, UpGemm::kTileShapeM,
+                                         UpGemm::MmaCore::kNumSwizzleBoxKs};
+            params.tma_up_weights_desc =
+                CreateTmaDesc<3>("routed_up weights", args.expert_up_weights,
+                                 up_w_shape, up_w_strides, up_w_box);
+        } else {
+            // The natural [E, 2, M, K] weight: one box interleaves each
+            // expert's gate/up 8-row groups.
+            using UpGemm = typename Traits::RoutedUpGemm;
+            constexpr std::uint64_t kElemBits =
+                cute::sizeof_bits_v<typename UpGemm::MmaElement>;
+            constexpr std::uint32_t kPairGran = UpGemm::kPairGran;
+            constexpr std::uint32_t kK = MoEInputSize<Dims>::value;
+            constexpr std::uint32_t kM = Dims::kIntermediateSize;
+            std::uint64_t up_w_shape[5] = {kK, kPairGran, 2u, kM / kPairGran,
+                                           Dims::kNumExperts};
+            std::uint64_t up_w_strides[4] = {
+                kK * kElemBits / 8, kM * kK * kElemBits / 8,
+                kPairGran * kK * kElemBits / 8, 2ull * kM * kK * kElemBits / 8};
+            std::uint32_t up_w_box[5] = {
+                UpGemm::MmaCore::kSwizzleBoxK, kPairGran, 2u,
+                UpGemm::kTileShapeM / (2u * kPairGran), 1u};
+            params.tma_up_weights_desc =
+                CreateTmaDesc<5>("routed_up weights", args.expert_up_weights,
+                                 up_w_shape, up_w_strides, up_w_box);
+        }
+        if constexpr (Traits::RoutedUpGemm::MmaCore::kUseBlockscaled) {
+            if (args.layouts.routed_up_scale == ScaleLayout::kSfAtom) {
+                // One box copies both the gate and the up 128-row atom halves
+                // of a weight tile: [16-byte words][K slabs][gate/up band].
+                using UpGemm = typename Traits::RoutedUpGemm;
+                constexpr std::uint64_t kSlabsPerAtomRow =
+                    std::uint64_t{UpGemm::kGemmK} / 128u;
+                constexpr std::uint64_t kAtomRows =
+                    std::uint64_t{Dims::kNumExperts} * (UpGemm::kGemmM / 128u);
+                std::uint64_t up_w_scale_shape[3] = {
+                    128u, kAtomRows * kSlabsPerAtomRow, 2u};
+                std::uint64_t up_w_scale_strides[2] = {
+                    512u, std::uint64_t{UpGemm::kGemmM / 256u} *
+                              kSlabsPerAtomRow * 512u};
+                params.tma_up_scale_desc =
+                    CreateTmaDesc<3>("routed_up weight_scales",
+                                     reinterpret_cast<const std::uint32_t*>(
+                                         args.expert_up_weights_scale),
+                                     up_w_scale_shape, up_w_scale_strides,
+                                     {128u, 2u, 2u}, false);
+            }
+        }
+
+        constexpr std::uint64_t kDownBytes =
+            std::uint64_t{Dims::kIntermediateSize} *
+            cute::sizeof_bits_v<typename Traits::RoutedDownGemm::MmaElement> /
+            8u;
+        std::uint64_t down_w_shape[2] = {
+            Dims::kIntermediateSize,
+            Dims::kNumExperts * MoEInputSize<Dims>::value};
+        params.tma_down_weights_desc = CreateTmaDesc<2>(
+            "routed_down weights", args.expert_down_weights, down_w_shape,
+            {kDownBytes}, {128u, Traits::RoutedDownGemm::kTileShapeM});
+        if constexpr (Traits::RoutedDownGemm::MmaCore::kUseBlockscaled) {
+            if (args.layouts.routed_down_scale != ScaleLayout::kPlain) {
+                // One box carries every row atom of a K tile: [16-byte words][K
+                // slab][row atom].
+                using DownGemm = typename Traits::RoutedDownGemm;
+                constexpr std::uint64_t kSfKBlocksPerRow =
+                    std::uint64_t{DownGemm::kGemmK} / 128u;
+                constexpr std::uint64_t kAtomRows =
+                    std::uint64_t{Dims::kNumExperts} *
+                    (DownGemm::kGemmM / 128u);
+                std::uint64_t down_scale_shape[3] = {128u, kSfKBlocksPerRow,
+                                                     kAtomRows};
+                std::uint64_t down_scale_strides[2] = {512u,
+                                                       kSfKBlocksPerRow * 512u};
+                params.tma_down_scale_desc = CreateTmaDesc<3>(
+                    "routed_down weight_scales",
+                    reinterpret_cast<const std::uint32_t*>(
+                        args.expert_down_weights_scale),
+                    down_scale_shape, down_scale_strides,
+                    {128u, 1u, DownGemm::ScaleTraits::kNumSfaAtoms}, false);
+            }
+        }
+        std::uint64_t down_x_shape[2] = {Dims::kIntermediateSize,
+                                         Workspace::kMaxRoutedRows};
+        params.tma_down_activations_desc = CreateTmaDesc<2>(
+            "routed_down input",
+            reinterpret_cast<const DataType::ElementQA*>(
+                static_cast<const char*>(args.workspace) +
+                Workspace::kUpOutFp8Offset),
+            down_x_shape, {std::uint64_t{Dims::kIntermediateSize}},
+            {128u, args.num_tokens});
+
+        using SharedUp = typename Traits::SharedUpGemm;
+        constexpr std::uint64_t kSharedUpElemBytes =
+            sizeof(typename SharedUp::MmaElement);
+        if (args.layouts.shared_up_interleaved) {
+            // As above: [128-value swizzle box][row][K half].
+            constexpr std::uint32_t kSwizzleBoxK =
+                SharedUp::MmaCore::kSwizzleBoxK;
+            std::uint64_t shared_up_w_shape[3] = {
+                kSwizzleBoxK, std::uint64_t{Dims::kIntermediateSize} * 2u,
+                Dims::kHiddenSize / kSwizzleBoxK};
+            std::uint64_t shared_up_w_strides[2] = {
+                std::uint64_t{Dims::kHiddenSize} * kSharedUpElemBytes,
+                std::uint64_t{kSwizzleBoxK} * kSharedUpElemBytes};
+            params.tma_shared_up_desc =
+                CreateTmaDesc<3>("shared_up weights", args.shared_up_weight,
+                                 shared_up_w_shape, shared_up_w_strides,
+                                 /*box=*/
+                                 {kSwizzleBoxK, SharedUp::kTileShapeM,
+                                  SharedUp::MmaCore::kNumSwizzleBoxKs});
+        } else {
+            // The natural [2, N, H] weight: the box interleaves the gate/up
+            // 8-row groups.
+            constexpr std::uint64_t kSharedUpGran = SharedUp::kPairGran;
+            std::uint64_t shared_up_w_shape[4] = {
+                Dims::kHiddenSize, kSharedUpGran, 2u,
+                Dims::kIntermediateSize / kSharedUpGran};
+            std::uint64_t shared_up_w_strides[3] = {
+                std::uint64_t{Dims::kHiddenSize} * kSharedUpElemBytes,
+                std::uint64_t{Dims::kIntermediateSize} * Dims::kHiddenSize *
+                    kSharedUpElemBytes,
+                kSharedUpGran * Dims::kHiddenSize * kSharedUpElemBytes};
+            std::uint32_t shared_up_w_box[4] = {
+                SharedUp::MmaCore::kSwizzleBoxK, kSharedUpGran, 2u,
+                SharedUp::kTileShapeM / (2u * kSharedUpGran)};
+            params.tma_shared_up_desc = CreateTmaDesc<4>(
+                "shared_up weights", args.shared_up_weight, shared_up_w_shape,
+                shared_up_w_strides, shared_up_w_box);
+        }
         params.tma_shared_down_desc =
-            CreateTmaDesc2D("down-projection weights", args.shared_down_weight,
-                            /*rows=*/Dims::kHiddenSize,
-                            /*cols=*/Dims::kIntermediateSize,
-                            /*box_rows=*/Traits::SharedDownGemm::kTileShapeM,
-                            /*box_cols=*/128u);
+            CreateTmaDesc<2>("shared_down weights", args.shared_down_weight,
+                             {Dims::kIntermediateSize, Dims::kHiddenSize},
+                             {std::uint64_t{Dims::kIntermediateSize}},
+                             {128u, Traits::SharedDownGemm::kTileShapeM});
+        if constexpr (SharedUp::MmaCore::kUseBlockscaled) {
+            constexpr std::uint64_t kSharedUpSlabs = Dims::kHiddenSize / 128u;
+            constexpr std::uint64_t kSharedUpAtomRows = SharedUp::kGemmM / 256u;
+            constexpr std::uint32_t kSharedUpSlabsPerTile =
+                SharedUp::kTileShapeK / 128u;
+            if (args.layouts.shared_up_scale == ScaleLayout::kSfAtom) {
+                std::uint64_t shared_up_scale_shape[3] = {
+                    128u, kSharedUpAtomRows * kSharedUpSlabs, 2u};
+                std::uint64_t shared_up_scale_strides[2] = {
+                    512u, kSharedUpAtomRows * kSharedUpSlabs * 512u};
+                params.tma_shared_up_scale_desc = CreateTmaDesc<3>(
+                    "shared_up weight_scales",
+                    reinterpret_cast<const std::uint32_t*>(
+                        args.shared_up_weight_scale),
+                    shared_up_scale_shape, shared_up_scale_strides,
+                    {128u, kSharedUpSlabsPerTile, 2u}, false);
+            }
+            constexpr std::uint64_t kSharedDownSlabs =
+                Dims::kIntermediateSize / 128u;
+            constexpr std::uint64_t kSharedDownAtomRows =
+                Dims::kHiddenSize / 128u;
+            if (args.layouts.shared_down_scale == ScaleLayout::kSfAtom) {
+                std::uint64_t shared_down_scale_shape[3] = {
+                    128u, kSharedDownSlabs, kSharedDownAtomRows};
+                std::uint64_t shared_down_scale_strides[2] = {
+                    512u, kSharedDownSlabs * 512u};
+                using DownScaleTraits =
+                    typename Traits::SharedDownGemm::ScaleTraits;
+                params.tma_shared_down_scale_desc = CreateTmaDesc<3>(
+                    "shared_down weight_scales",
+                    reinterpret_cast<const std::uint32_t*>(
+                        args.shared_down_weight_scale),
+                    shared_down_scale_shape, shared_down_scale_strides,
+                    {128u, 1u, DownScaleTraits::kNumSfaAtoms}, false);
+            }
+        }
+
         if (args.latent_down_weight != nullptr) {
-            params.tma_latent_down_weight_desc = CreateTmaDesc2D(
-                "latent-projection weights", args.latent_down_weight,
-                Dims::kLatentSize, Dims::kHiddenSize,
-                /*box_rows=*/Traits::LatentDownGemm::kTileShapeM,
-                /*box_cols=*/128u);
+            using LatentGemm = typename Traits::LatentDownGemm;
+            constexpr std::uint64_t kLatentElemBits =
+                cute::sizeof_bits_v<typename LatentGemm::MmaElement>;
+            constexpr std::uint64_t kLatentBytes =
+                std::uint64_t{Dims::kHiddenSize} * kLatentElemBits / 8u;
+            constexpr std::uint32_t kLatentChunkK =
+                LatentGemm::MmaCore::kSwizzleBoxK;
+            std::uint64_t latent_down_w_shape[3] = {
+                kLatentChunkK, Dims::kLatentSize,
+                Dims::kHiddenSize / kLatentChunkK};
+            std::uint64_t latent_down_w_strides[2] = {
+                kLatentBytes,
+                std::uint64_t{kLatentChunkK} * kLatentElemBits / 8u};
+            std::uint32_t latent_down_w_box[3] = {
+                kLatentChunkK, LatentGemm::kTileShapeM,
+                LatentGemm::MmaCore::kNumSwizzleBoxKs};
+            params.tma_latent_down_weight_desc = CreateTmaDesc<3>(
+                "latent_down weights", args.latent_down_weight,
+                latent_down_w_shape, latent_down_w_strides, latent_down_w_box);
         }
         return params;
     }
 
-    // Run latent projection on its assigned CTAs.
+    // Run latent down projection on its assigned CTAs.
     __device__ void run_latent_down(Params const& params,
                                     SharedStorage* __restrict__ smem) {
         if constexpr (Traits::kUseLatent) {
             Latent::run(params.tma_latent_down_weight_desc,
-                        params.tma_input_chunks_desc,
-                        params.latent_down_weight_scale,
+                        params.tma_input_desc, params.latent_down_weight_scale,
                         reinterpret_cast<Workspace*>(params.scratchpad), smem,
+                        params.layouts.latent_down_scale,
                         static_cast<std::uint32_t>(params.num_tokens));
         }
     }
@@ -294,13 +492,17 @@ struct CollectiveMainloopMoE {
         const std::uint32_t batch_size =
             static_cast<std::uint32_t>(params.num_tokens);
         if (Shared::cta_idx() < Shared::kNumUpCtas) {
-            Up::run(params.tma_shared_up_desc, params.tma_input_desc,
-                    params.shared_up_scale, workspace, smem, batch_size,
+            Up::run(params.tma_shared_up_desc, params.tma_shared_up_scale_desc,
+                    params.tma_input_desc, params.shared_up_scale, workspace,
+                    smem, params.layouts.shared_up_scale,
+                    params.layouts.shared_up_interleaved, batch_size,
                     params.activation, params.situ_beta,
                     params.situ_linear_beta);
         }
-        Down::run(params.tma_shared_down_desc, params.shared_down_scale,
-                  params.shared_out, workspace, smem, batch_size);
+        Down::run(params.tma_shared_down_desc,
+                  params.tma_shared_down_scale_desc, params.shared_down_scale,
+                  params.shared_out, workspace, smem,
+                  params.layouts.shared_down_scale, batch_size);
         __syncthreads();
         if (threadIdx.x == 0u) {
             __threadfence();
@@ -319,8 +521,9 @@ struct CollectiveMainloopMoE {
         // Use one warp per token; cluster pairs divide wider token batches.
         const bool coop_topk = Traits::kClusterSize >= 2u &&
                                params.num_tokens > WarpRole::kCalcWarpCount;
+        const auto correction_bias =
+            load_correction_bias<kExpertsPerThread>(params.correction_bias);
         if (threadIdx.x == 0u) {
-            // One task per router CTA, whatever its M tile or K slice.
             workspace->cta_comm.wait_router_tasks(smem->launch_parity,
                                                   Traits::RouterGemm::kNumCtas);
         }
@@ -332,30 +535,16 @@ struct CollectiveMainloopMoE {
                       "one warp per token must cover a split block");
         const std::uint32_t tok_base =
             coop_topk ? (blockIdx.x % 2u) * kTokensPerCta : 0u;
-        if (coop_topk) {
-            // One warp per token, and this block runs only its half.
-            const std::uint32_t tok = tok_base + calc_warp_idx;
-            if (calc_warp_idx < kTokensPerCta && tok < params.num_tokens) {
-                topk_one_token<Dims, kExpertsPerThread>(
-                    tok, params.top_k, params.scoring_func, params.renormalize,
-                    params.correction_bias, params.per_expert_scale, workspace,
-                    smem);
-            }
-        } else {
-            constexpr std::uint32_t kTokensPerWarp =
-                Dims::kNumTokens / WarpRole::kCalcWarpCount;
-            static_assert(Dims::kNumTokens % WarpRole::kCalcWarpCount == 0u,
-                          "the tokens must divide over the calc warps");
+        const std::uint32_t tok_end =
+            coop_topk ? min(tok_base + kTokensPerCta, params.num_tokens)
+                      : params.num_tokens;
+        // One call site keeps a single copy of the selection code.
 #pragma unroll 1
-            for (std::uint32_t g = 0; g < kTokensPerWarp; ++g) {
-                const std::uint32_t tok =
-                    calc_warp_idx + g * WarpRole::kCalcWarpCount;
-                if (tok >= params.num_tokens) break;
-                topk_one_token<Dims, kExpertsPerThread>(
-                    tok, params.top_k, params.scoring_func, params.renormalize,
-                    params.correction_bias, params.per_expert_scale, workspace,
-                    smem);
-            }
+        for (std::uint32_t tok = tok_base + calc_warp_idx; tok < tok_end;
+             tok += WarpRole::kCalcWarpCount) {
+            topk_one_token<Dims, kExpertsPerThread>(
+                tok, params.top_k, params.scoring_func, params.renormalize,
+                correction_bias, params.per_expert_scale, workspace, smem);
         }
         WarpRole::sync_calc_threads();
         if (coop_topk) {
@@ -407,8 +596,9 @@ struct CollectiveMainloopMoE {
         Workspace* __restrict__ workspace =
             reinterpret_cast<Workspace*>(params.scratchpad);
         if (Router::is_router_cta()) {
-            Router::run(params.router_weight, params.tma_input_chunks_desc,
-                        workspace, smem, params.scoring_func);
+            Router::run(params.tma_router_weights_desc,
+                        params.tma_router_input_desc, workspace, smem,
+                        params.scoring_func);
         }
 
         // Router CTAs build their tables; other CTAs copy the tables published
@@ -418,7 +608,6 @@ struct CollectiveMainloopMoE {
         if (!reads_published_tables) {
             if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
                 run_router_topk(params, workspace, smem, lane_idx);
-                // Each router CTA has the complete selection.
                 prepare_routing_tables<Dims>(params.num_tokens, params.top_k,
                                              smem);
                 // Block 0 hands its finished tables to the other blocks.
@@ -428,7 +617,6 @@ struct CollectiveMainloopMoE {
             }
         } else if (WarpRole::is_calc_warp(WarpRole::get_warp_idx()) &&
                    WarpRole::get_calc_warp_idx() == 0u) {
-            // Copy routing tables after the latent projection finishes.
             load_routing_tables(workspace, smem, lane_idx);
         }
     }
@@ -495,10 +683,6 @@ struct CollectiveMainloopMoE {
             static_cast<std::uint32_t>(sizeof(Quantized::data));
         constexpr std::uint32_t kScaleBytes =
             static_cast<std::uint32_t>(sizeof(Quantized::scale));
-        static_assert(kFp8Bytes == Workspace::LatentOut::kDataBytes &&
-                          kScaleBytes == Workspace::LatentOut::kScaleBytes,
-                      "the projection's output must be exactly one up "
-                      "staging tile.");
         smem->barriers.routed.up_input_ready.arrive(0u,
                                                     kFp8Bytes + kScaleBytes);
         tma_load_1d(workspace->latent_down_out.data_ptr(), kFp8Bytes,
@@ -507,7 +691,6 @@ struct CollectiveMainloopMoE {
         tma_load_1d(workspace->latent_down_out.scale_ptr(), kScaleBytes,
                     &smem->routed_experts.quantized_input.scale[0][0],
                     smem->barriers.routed.up_input_ready.raw(0u));
-        smem->barriers.routed.up_input_ready.wait(0u);
     }
 
     // Phase 2: up-projection over this block's tasks, as enumerated by `sched`.
@@ -528,7 +711,9 @@ struct CollectiveMainloopMoE {
         RoutedUpProjection<KernelTraits>::run(
             params.expert_scales_up, params.num_tokens, params.activation,
             params.situ_beta, params.situ_linear_beta, workspace, smem,
-            params.tma_up_weights_desc, sched,
+            params.layouts.routed_up_interleaved,
+            params.layouts.routed_up_scale, params.tma_up_weights_desc,
+            params.tma_up_scale_desc, sched,
             get_tma_cache_hint(smem->routing.active_expert_count >
                                params.l2_expert_capacity));
     }
@@ -540,8 +725,9 @@ struct CollectiveMainloopMoE {
         RoutedDownProjection<KernelTraits>::run(
             params.expert_scales_down,
             reinterpret_cast<Workspace*>(params.scratchpad), smem,
-            params.tma_down_weights_desc, params.tma_down_activations_desc,
-            sched,
+            params.layouts.routed_down_scale, params.tma_down_weights_desc,
+            params.tma_down_scale_desc, params.tma_down_activations_desc,
+            params.num_tokens, sched,
             get_tma_cache_hint(smem->routing.active_expert_count >
                                params.l2_expert_capacity));
     }
@@ -549,9 +735,16 @@ struct CollectiveMainloopMoE {
     // Prefetch the TMA descriptors.
     __device__ static void prefetch_tma_descriptors(Params const& params) {
         cute::prefetch_tma_descriptor(&params.tma_up_weights_desc);
+        cute::prefetch_tma_descriptor(&params.tma_up_scale_desc);
         cute::prefetch_tma_descriptor(&params.tma_input_desc);
-        cute::prefetch_tma_descriptor(&params.tma_input_chunks_desc);
+        cute::prefetch_tma_descriptor(&params.tma_router_input_desc);
+        cute::prefetch_tma_descriptor(&params.tma_router_weights_desc);
         cute::prefetch_tma_descriptor(&params.tma_down_weights_desc);
+        if constexpr (Traits::RoutedDownGemm::MmaCore::kUseBlockscaled) {
+            if (params.layouts.routed_down_scale != ScaleLayout::kPlain) {
+                cute::prefetch_tma_descriptor(&params.tma_down_scale_desc);
+            }
+        }
         cute::prefetch_tma_descriptor(&params.tma_down_activations_desc);
     }
 
@@ -569,10 +762,9 @@ struct CollectiveMainloopMoE {
             // TMEM allocation issued by ONE fully-active warp.
             tmem_alloc(Traits::kTmemColumns, &smem->tmem_ptr);
         } else if (warp_idx == 1 && lane_idx == 0) {
-            // Only this block's prologue role's barriers.
-            if (Router::is_router_cta()) {
-                smem->barriers.init_router_ring();
-            } else if (Latent::is_latent_cta()) {
+            // Only this block's prologue role's barriers; a router block's
+            // loader warp initializes the router ring itself.
+            if (Latent::is_latent_cta()) {
                 smem->barriers.latent_down.init(
                     static_cast<int>(WarpRole::kCalcWarpCount));
             } else if (SharedUpProjectionBase<Traits>::is_shared_cta()) {
@@ -584,9 +776,21 @@ struct CollectiveMainloopMoE {
             // Every block runs the expert phases.
             smem->barriers.routed.init();
             cutlass::arch::fence_barrier_init();
+        } else if (WarpRole::is_weight_loader_warp(warp_idx) &&
+                   Router::is_router_cta()) {
+            Router::prefetch_first_weight_tiles(params.tma_router_weights_desc,
+                                                smem);
+        } else if (warp_idx == 3 && Router::is_router_cta()) {
+            prefetch_routing_vectors<Dims>(params.correction_bias,
+                                           params.per_expert_scale);
         }
 
         pdl_wait();
+        if (WarpRole::is_weight_loader_warp(warp_idx) &&
+            Router::is_router_cta()) {
+            Router::prefetch_first_input_tiles(params.tma_router_input_desc,
+                                               smem);
+        }
         if (warp_idx == 3 && lane_idx == 0) {
             smem->launch_parity = workspace->cta_comm.claim_parity();
             smem->down_tasks_claimed = 0u;

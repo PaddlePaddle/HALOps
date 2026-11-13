@@ -40,7 +40,6 @@ struct RouterProjectionBase {
     using SharedStorage = MoESharedStorage<Dims>;
     using Workspace = MoEWorkspace<Dims>;
     using MmaCore = typename RouterGemm::MmaCore;
-    using Element = typename RouterGemm::MmaElement;
 
     static constexpr std::uint32_t kTileShapeM = RouterGemm::kTileShapeM;
     // TMA byte count for the staged BF16 input tile.
@@ -66,54 +65,129 @@ struct RouterProjectionBase {
                RouterGemm::kTileShapeN;
     }
 
-    // This block's gate weight: the packed blobs are gate-major.
-    __device__ static const Element* gate_weight(
-        const Element* __restrict__ router_weight) {
-        return router_weight + static_cast<std::size_t>(router_gate()) *
-                                   RouterGemm::kGemmM * RouterGemm::kGemmK;
+    // This block's first weight row in the gate-stacked [G * E, H] tensor.
+    __device__ static std::uint32_t weight_row_begin() {
+        return router_gate() * RouterGemm::kGemmM + router_tile() * kTileShapeM;
     }
+
+    // One K tile is kNumSwizzleBoxKs whole 64-K SW128 boxes.
+    static constexpr std::uint32_t kWeightTileChunks =
+        MmaCore::kNumSwizzleBoxKs;
 
     // The router runs on the first kNumCtas blocks, one task each.
     __device__ static bool is_router_cta() {
         return blockIdx.x < RouterGemm::kNumCtas;
     }
 
-    // Stream input K tiles through the ring.
-    __device__ static void run_load_input_k_loop(
-        CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem) {
-#pragma unroll 1
-        for (std::uint32_t k_iter_id = 0; k_iter_id < RouterGemm::kNumTilesK;
-             ++k_iter_id) {
-            const std::uint32_t slot = k_iter_id % RouterGemm::kNumInputSlots;
-            // The slot about to be overwritten must have been consumed.
-            smem->barriers.router.wait_input_empty(k_iter_id);
-            smem->barriers.router.input_ready.arrive(k_iter_id,
-                                                     kInputTileTxBytes);
-            load_input_tile_chunks<RouterGemm::kTileShapeN>(
-                tma_input_desc, k_iter_id, token_begin(),
-                smem->router.input.data[slot],
-                smem->barriers.router.input_ready.raw(slot));
+    // Every slot's first tile, which can be in flight before any slot drains.
+    static constexpr std::uint32_t kNumFirstWeightTiles =
+        RouterGemm::kNumWeightSlots;
+    static constexpr std::uint32_t kNumFirstInputTiles =
+        RouterGemm::kNumInputSlots < RouterGemm::kNumTilesK
+            ? RouterGemm::kNumInputSlots
+            : RouterGemm::kNumTilesK;
+    // Weight tiles that wait for an earlier tile to leave their slot.
+    static constexpr std::uint32_t kNumTailWeightTiles =
+        RouterGemm::kNumTilesK - kNumFirstWeightTiles;
+    static_assert(kNumFirstWeightTiles <= WarpRole::kThreadsPerWarp,
+                  "one loader lane refills each weight slot");
+
+    // Arm a weight tile's slot, then load the tile into it.
+    __device__ static void load_weight_tile(
+        CUtensorMap const& tma_router_weights_desc,
+        SharedStorage* __restrict__ smem, std::uint32_t j) {
+        const std::uint32_t slot = j % RouterGemm::kNumWeightSlots;
+        smem->barriers.router.weight_ready.arrive(j, MmaCore::kWeightTileBytes);
+        tma_load_3d(tma_router_weights_desc, /*coord0=*/0u,
+                    /*row=*/weight_row_begin(),
+                    /*chunk=*/j * kWeightTileChunks,
+                    &smem->router.w_router[slot][0],
+                    smem->barriers.router.weight_ready.raw(slot));
+    }
+
+    // Arm an input tile's slot, then load the tile into it.
+    __device__ static void load_input_tile(CUtensorMap const& tma_input_desc,
+                                           SharedStorage* __restrict__ smem,
+                                           std::uint32_t k_iter_id) {
+        const std::uint32_t slot = k_iter_id % RouterGemm::kNumInputSlots;
+        smem->barriers.router.input_ready.arrive(k_iter_id, kInputTileTxBytes);
+        load_input_tile_chunks<RouterGemm::kTileShapeN>(
+            tma_input_desc, k_iter_id, token_begin(),
+            smem->router.input.data[slot],
+            smem->barriers.router.input_ready.raw(slot));
+    }
+
+    // The weight-loader warp at launch: initialize the router barriers and
+    // issue every weight slot's first tile, before the rest of the prologue
+    // runs. The weights are parameters, so this may precede pdl_wait().
+    __device__ static void prefetch_first_weight_tiles(
+        CUtensorMap const& tma_router_weights_desc,
+        SharedStorage* __restrict__ smem) {
+        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
+        if (lane_idx == 0u) {
+            smem->barriers.init_router_ring();
+            cutlass::arch::fence_barrier_init();
+        }
+        __syncwarp();
+        for (std::uint32_t j = lane_idx; j < kNumFirstWeightTiles;
+             j += WarpRole::kThreadsPerWarp) {
+            load_weight_tile(tma_router_weights_desc, smem, j);
+        }
+        if constexpr (kNumTailWeightTiles > 0u) {
+            // The slot-waiting tiles then load from L2; both token windows of
+            // an M tile read them, so one block prefetches.
+            if (lane_idx == 0u && token_begin() == 0u) {
+#pragma unroll
+                for (std::uint32_t j = kNumFirstWeightTiles;
+                     j < RouterGemm::kNumTilesK; ++j) {
+                    tma_prefetch_l2_3d(tma_router_weights_desc, /*coord0=*/0u,
+                                       /*row=*/weight_row_begin(),
+                                       /*chunk=*/j * kWeightTileChunks);
+                }
+            }
         }
     }
 
-    // Load each weight K tile into its ring slot.
-    __device__ static void run_load_weight_k_loop(
-        const Element* __restrict__ router_weight,
-        SharedStorage* __restrict__ smem, std::uint32_t tile) {
+    // The same warp once pdl_wait() returns: the input is the previous
+    // kernel's output.
+    __device__ static void prefetch_first_input_tiles(
+        CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem) {
+        for (std::uint32_t k = WarpRole::get_lane_idx();
+             k < kNumFirstInputTiles; k += WarpRole::kThreadsPerWarp) {
+            load_input_tile(tma_input_desc, smem, k);
+        }
+    }
+
+    // Stream the input K tiles past the first lap through the ring.
+    __device__ static void run_load_input_k_loop(
+        CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem) {
 #pragma unroll 1
-        for (std::uint32_t j = 0; j < RouterGemm::kNumTilesK; ++j) {
-            const std::uint32_t slot = j % RouterGemm::kNumWeightSlots;
-            smem->barriers.router.wait_weight_empty(j);
-            smem->barriers.router.weight_ready.arrive(
-                j, RouterGemm::MmaCore::kWeightTileBytes);
-            // The tile's byte range inside the `[m, k]` weight matrix.
-            const char* src =
-                reinterpret_cast<const char*>(router_weight) +
-                static_cast<std::size_t>(tile * RouterGemm::kNumTilesK + j) *
-                    RouterGemm::MmaCore::kWeightTileBytes;
-            tma_load_1d(src, RouterGemm::MmaCore::kWeightTileBytes,
-                        &smem->router.w_router[slot][0],
-                        smem->barriers.router.weight_ready.raw(slot));
+        for (std::uint32_t k_iter_id = kNumFirstInputTiles;
+             k_iter_id < RouterGemm::kNumTilesK; ++k_iter_id) {
+            smem->barriers.router.wait_input_empty(k_iter_id);
+            load_input_tile(tma_input_desc, smem, k_iter_id);
+        }
+    }
+
+    // Lane l refills slot l, a lap at a time, as each of its tiles drains.
+    __device__ static void run_load_weight_tail(
+        CUtensorMap const& tma_router_weights_desc,
+        SharedStorage* __restrict__ smem) {
+        if constexpr (kNumTailWeightTiles > 0u) {
+            const std::uint32_t lane_idx = WarpRole::get_lane_idx();
+            std::uint32_t j = kNumFirstWeightTiles + lane_idx;
+            bool pending =
+                lane_idx < kNumFirstWeightTiles && j < RouterGemm::kNumTilesK;
+            // Slot 0 drains first; poll the slots from then on.
+            smem->barriers.router.weight_empty.wait(0u);
+            while (__any_sync(0xffffffffu, pending)) {
+                if (pending && smem->barriers.router.weight_empty.test(
+                                   j - kNumFirstWeightTiles)) {
+                    load_weight_tile(tma_router_weights_desc, smem, j);
+                    j += kNumFirstWeightTiles;
+                    pending = j < RouterGemm::kNumTilesK;
+                }
+            }
         }
     }
 
@@ -158,7 +232,6 @@ struct RouterProjection<KernelTraits, true>
     : RouterProjectionBase<KernelTraits> {
     using Base = RouterProjectionBase<KernelTraits>;
     using Base::kTileShapeM;
-    using typename Base::Element;
     using typename Base::MmaCore;
     using typename Base::RouterGemm;
     using typename Base::SharedStorage;
@@ -173,7 +246,7 @@ struct RouterProjection<KernelTraits, true>
                              cute::Int<RouterGemm::kTileShapeK>{}))));
 
     // Every thread of the block: the loader streams, the issuer consumes.
-    __device__ static void run(const Element* __restrict__ router_weight,
+    __device__ static void run(CUtensorMap const& tma_router_weights_desc,
                                CUtensorMap const& tma_input_desc,
                                Workspace* __restrict__ workspace,
                                SharedStorage* __restrict__ smem,
@@ -189,10 +262,9 @@ struct RouterProjection<KernelTraits, true>
             return;
         }
 
-        // ONE thread issues the ring's TMAs, each armed with its byte count.
-        if (WarpRole::is_weight_loader_thread()) {
-            run_load_weight_k_loop(Base::gate_weight(router_weight), smem,
-                                   Base::router_tile());
+        // The rings' first lap left at launch; the whole warp loads the rest.
+        if (WarpRole::is_weight_loader_warp(warp_idx)) {
+            Base::run_load_weight_tail(tma_router_weights_desc, smem);
             return;
         }
         if (WarpRole::is_mma_issuer_warp(warp_idx)) {
@@ -293,7 +365,6 @@ struct RouterProjection<KernelTraits, false>
     : RouterProjectionBase<KernelTraits> {
     using Base = RouterProjectionBase<KernelTraits>;
     using Base::kTileShapeM;
-    using typename Base::Element;
     using typename Base::MmaCore;
     using typename Base::RouterGemm;
     using typename Base::SharedStorage;
@@ -317,7 +388,7 @@ struct RouterProjection<KernelTraits, false>
                     cute::Int<RouterGemm::kTileShapeK>>{}));
 
     // Every thread of the block: the loader streams, the calc warps consume.
-    __device__ static void run(const Element* __restrict__ router_weight,
+    __device__ static void run(CUtensorMap const& tma_router_weights_desc,
                                CUtensorMap const& tma_input_desc,
                                Workspace* __restrict__ workspace,
                                SharedStorage* __restrict__ smem,
@@ -333,9 +404,9 @@ struct RouterProjection<KernelTraits, false>
             return;
         }
 
-        if (WarpRole::is_weight_loader_thread()) {
-            run_load_weight_k_loop(Base::gate_weight(router_weight), smem,
-                                   Base::router_tile());
+        // The rings' first lap left at launch; the whole warp loads the rest.
+        if (WarpRole::is_weight_loader_warp(WarpRole::get_warp_idx())) {
+            Base::run_load_weight_tail(tma_router_weights_desc, smem);
             return;
         }
 

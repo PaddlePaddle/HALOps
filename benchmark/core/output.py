@@ -299,11 +299,13 @@ def table_header_str(include_dispatch: bool = True) -> str:
         "roof_util%",
         "host(us)",
     ]
+    widths = [20, 10, 8, 8, 8, 8, 7, 12, 10]
     if include_dispatch:
         labels.append("disp(us)")
+        widths.append(10)
     labels += ["mismatch%", "status"]
-    widths = [20, 10, 8, 8, 8, 8, 7, 12] + [10] * (len(labels) - 8)
-    h = "".join(
+    widths += [10, 8]
+    h = " ".join(
         f"{label:<{width}}" if index == 0 else f"{label:>{width}}"
         for index, (label, width) in enumerate(zip(labels, widths))
     )
