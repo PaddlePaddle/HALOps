@@ -1,0 +1,24 @@
+scenario: dense_gemm
+mode: bf16
+
+# CI regression subset for native BF16 dense GEMM, mirroring the routine
+# 10-shape preset in benchmark/configs/gemm/dense_bf16.yaml.
+# halops-only + refcheck off, per the ci_configs convention (baseline
+# comparison is halops-vs-baseline).
+shapes:
+  - [64, 4096, 4096]
+  - [64, 32768, 1024]
+  - [128, 4096, 4096]
+  - [128, 128, 4096]
+  - [256, 4096, 4096]
+  - [1024, 4096, 4096]
+  - [1024, 1600, 4096]
+  - [1024, 32768, 1024]
+  - [4096, 4096, 4096]
+  - [8192, 32768, 1024]
+sm_count: -1
+
+backends: [halops]
+cold_l2_cache: true
+refcheck: false
+refcheck_reference: golden

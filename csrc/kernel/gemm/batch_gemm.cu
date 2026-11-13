@@ -21,22 +21,26 @@
 namespace halops {
 
 void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
-               const torch::Tensor& sfa, const torch::Tensor& sfb,
-               torch::Tensor& output, const std::optional<torch::Tensor>& bias,
+               const std::optional<torch::Tensor>& sfa,
+               const std::optional<torch::Tensor>& sfb, torch::Tensor& output,
+               const std::optional<torch::Tensor>& bias,
                const std::optional<torch::Tensor>& alpha, const int sm_count,
                const std::string& mode, const EpilogueOp epilogue,
                const std::optional<torch::Tensor>& output_sf,
                const std::optional<torch::Tensor>& gate, const bool use_pdl) {
     const CudaDeviceGuard device_guard(input.device());
     TORCH_CHECK(
-        mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" || mode == "w4a4-mxfp4",
+        mode == "bf16" || mode == "w8a8-mxfp8" || mode == "w4a4-nvfp4" ||
+            mode == "w4a4-mxfp4",
         "Unsupported mode: ", mode,
-        ". Expected 'w8a8-mxfp8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
+        ". Expected 'bf16', 'w8a8-mxfp8', 'w4a4-nvfp4' or 'w4a4-mxfp4'.");
     TORCH_CHECK(input.dim() == 3,
                 "input must be a 3D tensor of shape [B, M, K]");
     TORCH_CHECK(weight.dim() == 3,
                 "weight must be a 3D tensor of shape [B, N, K]");
-    TORCH_CHECK(output.dim() == 2,
+    // mode="bf16" also takes the batch-major [B, M, N]; every other mode keeps
+    // the 2D contract the quantized store assumes.
+    TORCH_CHECK(output.dim() == 2 || (output.dim() == 3 && mode == "bf16"),
                 "output must be a 2D tensor of shape [M, B * N]");
 
     const int batches = input.size(0);
@@ -45,8 +49,25 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
     TORCH_CHECK(weight.size(0) == batches,
                 "weight batch dim must match input batch dim, got ",
                 weight.size(0));
-    TORCH_CHECK(output.size(0) == m && output.size(1) == int64_t(batches) * n,
-                "output shape must be [M, B * N]");
+    // Native BF16 also accepts the batch-major [B, M, N] output: contiguous
+    // per item, which writes faster at large B. Every other mode keeps the
+    // default [M, B * N] (the quantized store's TMA descriptor assumes it).
+    const bool bmn_out = output.dim() == 3;
+    if (bmn_out) {
+        TORCH_CHECK(output.is_contiguous(),
+                    "the [B, M, N] output must be contiguous");
+        TORCH_CHECK(output.size(0) == batches && output.size(1) == m &&
+                        output.size(2) == n,
+                    "output shape must be [B, M, N], got [", output.size(0),
+                    ", ", output.size(1), ", ", output.size(2), "], expected [",
+                    batches, ", ", m, ", ", n, "]");
+    } else {
+        TORCH_CHECK(
+            output.size(0) == m && output.size(1) == int64_t(batches) * n,
+            "output shape must be [M, B * N], got [", output.size(0), ", ",
+            output.size(1), "], expected [", m, ", ", int64_t(batches) * n,
+            "]");
+    }
     TORCH_CHECK(
         !output_sf.has_value() || n % (mxfp8::kGroup * mxfp8::kAtomCols) == 0,
         "quantized output needs N % 128 == 0, got ", n);
@@ -65,8 +86,35 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.num_experts = batches;
     params.max_m_per_expert = m;
     params.use_pdl = use_pdl;
+    params.batch_out_bmn = bmn_out;
 
-    if (mode == "w8a8-mxfp8") {
+    if (mode == "bf16") {
+        // Native BF16: sfa/sfb/bias/alpha are ignored; dispatch and launch
+        // live in gemm_dispatch.cuh (bf16::LaunchBatch).
+        const int k = weight.size(2);
+        TORCH_CHECK(input.size(2) == k,
+                    "input K must match weight K, got input K=", input.size(2),
+                    ", weight K=", k);
+        TORCH_CHECK(input.dtype() == torch::kBFloat16,
+                    "bf16 batch GEMM: input must be bfloat16");
+        TORCH_CHECK(weight.dtype() == torch::kBFloat16,
+                    "bf16 batch GEMM: weight must be bfloat16");
+        TORCH_CHECK(output.dtype() == torch::kBFloat16,
+                    "bf16 batch GEMM: output must be bfloat16");
+        TORCH_CHECK(epilogue == EpilogueOp::Identity &&
+                        !output_sf.has_value() && !gate.has_value(),
+                    "bf16 batch GEMM supports EpilogueOp.Identity only");
+        params.k = k;
+        params.ptr_a = input.data_ptr();
+        params.ptr_b = weight.data_ptr();
+        params.ptr_sfa = nullptr;
+        params.ptr_sfb = nullptr;
+        params.ptr_alpha = nullptr;
+        bf16::LaunchBatch(params, sm, stream);
+    } else if (mode == "w8a8-mxfp8") {
+        TORCH_CHECK(sfa.has_value() && sfb.has_value(),
+                    "w8a8-mxfp8 batch GEMM requires sfa/sfb scale factors "
+                    "(only mode='bf16' accepts sfa=None, sfb=None)");
         const int k = weight.size(2);
         TORCH_CHECK(input.size(2) == k,
                     "input K must match weight K, got input K=", input.size(2),
@@ -74,8 +122,8 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();
-        params.ptr_sfa = sfa.data_ptr();
-        params.ptr_sfb = sfb.data_ptr();
+        params.ptr_sfa = sfa->data_ptr();
+        params.ptr_sfb = sfb->data_ptr();
         if (bias.has_value()) {
             params.ptr_c = bias->data_ptr();
         }
@@ -131,6 +179,9 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
                             static_cast<int>(epilogue), " for ", mode);
         }
     } else {
+        TORCH_CHECK(sfa.has_value() && sfb.has_value(),
+                    "W4A4 batch GEMM requires sfa/sfb scale factors "
+                    "(only mode='bf16' accepts sfa=None, sfb=None)");
         const int k = weight.size(2) * 2;  // 2 FP4 per packed byte
         TORCH_CHECK(input.size(2) == weight.size(2),
                     "packed input K/2 must match packed weight K/2, got ",
@@ -138,19 +189,19 @@ void BatchGemm(const torch::Tensor& input, const torch::Tensor& weight,
         params.k = k;
         params.ptr_a = input.data_ptr();
         params.ptr_b = weight.data_ptr();
-        params.ptr_sfa = sfa.data_ptr();
-        params.ptr_sfb = sfb.data_ptr();
+        params.ptr_sfa = sfa->data_ptr();
+        params.ptr_sfb = sfb->data_ptr();
         TORCH_CHECK(!bias.has_value(),
                     "W4A4 batch GEMM does not support bias yet.");
 
         const bool mxfp4 = mode == "w4a4-mxfp4";
         const int sf_k = k / (mxfp4 ? 32 : 16);
-        TORCH_CHECK(sfa.size(-1) == sf_k && sfb.size(-1) == sf_k,
+        TORCH_CHECK(sfa->size(-1) == sf_k && sfb->size(-1) == sf_k,
                     "W4A4 scale-factor shape does not match mode ",
                     mxfp4 ? "'w4a4-mxfp4' (UE8M0 per 32)"
                           : "'w4a4-nvfp4' (UE4M3 per 16)",
-                    " requires SF K = ", sf_k, ", got sfa K=", sfa.size(-1),
-                    " and sfb K=", sfb.size(-1), ".");
+                    " requires SF K = ", sf_k, ", got sfa K=", sfa->size(-1),
+                    " and sfb K=", sfb->size(-1), ".");
 
         TORCH_CHECK(!mxfp4 || !alpha.has_value(),
                     "'w4a4-mxfp4' does not take alpha; the per-batch scaling "
