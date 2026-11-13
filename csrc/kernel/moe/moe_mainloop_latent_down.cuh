@@ -368,8 +368,7 @@ struct LatentDownProjection<KernelTraits, true>
         __syncthreads();
     }
 
-    // 128 rows x K/32 blocks of natural scales -> SfAtom. Each 16-B chunk of
-    // an atom gathers rows 32*mh + ml of K/32 blocks [4*kk, 4*kk + 4).
+    // 128 rows x K/32 blocks of natural scales -> SfAtom.
     static constexpr std::uint32_t kScaleKBlocks = Dims::kHiddenSize / 32u;
     static constexpr std::uint32_t kScaleGroups = kScaleKBlocks / 16u;
     static constexpr std::uint32_t kSfAtomBytes = 512u;
@@ -408,7 +407,6 @@ struct LatentDownProjection<KernelTraits, true>
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
 
-    // A packed table is already in SfAtom order: copy this CTA's tile image.
     __device__ static void copy_packed_sfa_table(
         const std::uint8_t* __restrict__ packed,
         SharedStorage* __restrict__ smem) {
@@ -447,8 +445,6 @@ struct LatentDownProjection<KernelTraits, true>
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
             run_mma_k_loop(smem, smem->tmem_ptr);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
-            // Overlaps the loaders' first tiles; tile 0's input_empty arrive
-            // publishes the slab to the MMA.
             const auto* packed_scale =
                 reinterpret_cast<const std::uint8_t*>(latent_down_weight_scale);
             if (latent_scale_layout == ScaleLayout::kPlain) {

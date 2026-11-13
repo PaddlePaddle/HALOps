@@ -29,8 +29,7 @@
 
 namespace halops::moe {
 
-// One warp warms the selection's routing vectors in L2. They are parameters,
-// so this may precede pdl_wait().
+// One warp warms the selection's routing vectors in L2.
 template <typename Dims>
 __device__ static void prefetch_routing_vectors(
     const float* __restrict__ correction_bias,
@@ -49,8 +48,7 @@ __device__ static void prefetch_routing_vectors(
     }
 }
 
-// The lane's slice of `correction_bias`, or zeros without one. Every token
-// shares it, so the caller loads it before the logits are ready.
+// The lane's slice of `correction_bias`, or zeros without one.
 template <std::uint32_t kExpertsPerThread>
 __device__ static cutlass::Array<float, kExpertsPerThread> load_correction_bias(
     const float* __restrict__ correction_bias) {
@@ -422,7 +420,6 @@ __device__ static void topk_weights_from_scores_fp32_scan(
 #pragma unroll 1
     for (uint32_t k = 0; k < top_k; k++) {
         // The lane's best, ties to the lower index: a tree whose ties go left.
-        // The weight rides along, so no register array is indexed at run time.
         uint32_t best[kExpertsPerThread];
         uint32_t at[kExpertsPerThread];
         float best_weight[kExpertsPerThread];
@@ -561,8 +558,7 @@ __device__ static void topk_weights_from_scores_fp32(
     }
 }
 
-// Top-K expert selection for one token, one warp per token. `correction_bias`
-// is the lane's slice from load_correction_bias.
+// Top-K expert selection for one token, one warp per token.
 template <typename Dims, uint32_t kExpertsPerThread>
 __device__ static void topk_one_token(
     uint32_t token_idx, uint32_t top_k, ScoringFunc scoring_func,

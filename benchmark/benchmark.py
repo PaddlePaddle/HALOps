@@ -234,11 +234,7 @@ if __name__ == "__main__":
         "e.g. 'attention/decode_c16_gqa14.yaml' or just 'decode_c16_gqa14.yaml' "
         "(searched across <configs-dir>/<op>/)",
     )
-    parser.add_argument(
-        "--gpu",
-        default="0",
-        help="CUDA device id, e.g. --gpu=0",
-    )
+    parser.add_argument("--gpu", default="0", help="CUDA device id(s), e.g. --gpu=0")
     parser.add_argument(
         "--output-dir",
         "--output_dir",

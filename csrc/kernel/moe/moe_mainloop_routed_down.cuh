@@ -49,13 +49,13 @@ struct RoutedDownProjectionBase
     using typename Base::Workspace;
     using RoutingTables = MoERoutingTables<Dims>;
 
-    // The loader's box covers the launch's tokens, not the schedule's capacity.
     __device__ static constexpr std::uint32_t down_act_tx_bytes(
         std::uint32_t num_tokens) {
         return DownGemm::kTileShapeK * num_tokens *
                static_cast<std::uint32_t>(
                    sizeof(typename DownGemm::InputQuant::ElementType));
     }
+
     static constexpr std::uint64_t kBLbo = 16ULL;
     static constexpr std::uint64_t kBSbo = 128ULL;
 
@@ -385,11 +385,9 @@ struct RoutedDownProjection<KernelTraits, true>
                       smem->routed_experts.w_down_scale[w_slot],
                       smem->routed_experts.act_down_scale[w_slot], sfa_tmem,
                       sfb_tmem, /*accumulate=*/k_iter_id != 0u);
-            // The commit covers every async tcgen05 op issued before it.
             cutlass::arch::umma_arrive(
                 smem->barriers.routed.down_weight_empty.raw(w_slot));
         }
-        // Down keeps one TMEM accumulator but continues up's barrier ring.
         cutlass::arch::umma_arrive(
             smem->barriers.routed.accumulator_ready.raw(acc_task_id));
     }

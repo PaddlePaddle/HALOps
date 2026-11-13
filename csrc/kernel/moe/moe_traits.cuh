@@ -214,8 +214,6 @@ struct RoutedUpGemmTraits {
     // The output's (the down's input) scale block.
     static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
 
-    // Blockscaled tasks accumulate every K tile in one slot; two slots let the
-    // next task's MMA run while this task's epilogue reads its slot.
     static constexpr std::uint32_t kNumAccSlots =
         MmaCore::kUseBlockscaled ? 2 : Dims::KernelConfig::kNumAccSlots;
     static constexpr std::uint32_t kNumWeightSlots =
@@ -284,7 +282,7 @@ struct SharedUpGemmTraits {
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = Dims::kHiddenSize;
 
-    // One block owns one M atom of the pair layout.
+    // One block owns one M atom of the interleaved rows.
     static constexpr std::uint32_t kTileShapeM = 128u;
     static constexpr std::uint32_t kTileShapeN = kGemmN;
     static constexpr std::uint32_t kTileShapeK = 256u;
@@ -448,12 +446,12 @@ struct MoEKernelTraits {
                   "Grid bounds must be ordered kCtasPerExpert <= kMinGrid <= "
                   "kMaxGrid.");
 
-    // Gate/up rows are interleaved in groups of kPairLayoutGranularity.
-    static constexpr std::uint32_t kPairLayoutGranularity = 8u;
-    static_assert(RoutedUpGemm::kTileShapeM % (2u * kPairLayoutGranularity) ==
+    // Gate/up rows are interleaved in groups of kInterleaveGranularity.
+    static constexpr std::uint32_t kInterleaveGranularity = 8u;
+    static_assert(RoutedUpGemm::kTileShapeM % (2u * kInterleaveGranularity) ==
                       0u,
-                  "The pair-layout interleave period must divide the A tile's "
-                  "row count.");
+                  "The interleave period must divide the A tile's row "
+                  "count.");
 
     static constexpr std::uint32_t kUpSlotsPerDownSlot =
         (RoutedDownGemm::kTileShapeM * RoutedDownGemm::kTileShapeK) /

@@ -78,12 +78,13 @@ __device__ static __forceinline__ void tma_load_2d(
 // Issue one 3D TMA bulk-tensor load, tracked by an mbarrier.
 __device__ static __forceinline__ void tma_load_3d(
     CUtensorMap const& tma_desc, std::uint32_t coord0, std::uint32_t coord1,
-    std::uint32_t coord2, void* dst_smem, std::uint64_t* bar_smem) {
-    cute::SM90_TMA_LOAD_3D::copy(
-        &tma_desc, bar_smem,
-        static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
-        dst_smem, static_cast<std::int32_t>(coord0),
-        static_cast<std::int32_t>(coord1), static_cast<std::int32_t>(coord2));
+    std::uint32_t coord2, void* dst_smem, std::uint64_t* bar_smem,
+    std::uint64_t cache_hint =
+        static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL)) {
+    cute::SM90_TMA_LOAD_3D::copy(&tma_desc, bar_smem, cache_hint, dst_smem,
+                                 static_cast<std::int32_t>(coord0),
+                                 static_cast<std::int32_t>(coord1),
+                                 static_cast<std::int32_t>(coord2));
 }
 
 // Issue one 4D TMA bulk-tensor load, tracked by an mbarrier.
@@ -116,9 +117,6 @@ __device__ static __forceinline__ void tma_load_5d(
 // Input tile box: four 128-byte K chunks.
 inline constexpr std::uint32_t kInputChunksBoxChunks = 4u;
 
-// Load one activation tile in chunk-major order with a single TMA copy.
-// The descriptor's box is the whole tile: the batch as rows, the 128-byte K
-// chunks as depth, so one swizzle atom per K chunk stays contiguous.
 template <std::size_t NumRows, std::size_t NumSwizzleBoxesK,
           std::size_t SwizzleBoxK>
 __device__ __forceinline__ void load_input_tile_chunks(

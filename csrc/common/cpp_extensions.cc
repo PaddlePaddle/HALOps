@@ -263,7 +263,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("input2"), py::arg("weight2"), py::arg("sfa2"),
           py::arg("sfb2"), py::arg("output2"), py::arg("sm_count"),
           py::arg("use_pdl") = true, py::arg("use_sigmoid") = false);
-
     m.def("group_wise_quant", &halops::GroupWiseQuant, py::arg("input"),
           py::arg("mode"), py::arg("use_swizzle") = true,
           py::arg("use_pdl") = true, py::arg("output_quant") = py::none(),

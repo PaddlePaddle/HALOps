@@ -52,8 +52,8 @@ def run_mega_ll_moe(inp: dict):
         quant_mode=inp["quant_mode"],
         grid_cap=inp["grid_cap"],
         routed_use_interleaved=inp["routed_use_interleaved"],
-        routed_use_swizzle=inp["routed_use_swizzle"],
         shared_use_interleaved=inp["shared_use_interleaved"],
+        routed_use_swizzle=inp["routed_use_swizzle"],
         shared_use_swizzle=inp["shared_use_swizzle"],
         latent_use_swizzle=inp["latent_use_swizzle"],
     )

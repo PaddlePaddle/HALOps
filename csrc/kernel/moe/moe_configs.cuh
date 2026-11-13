@@ -38,7 +38,7 @@ enum class QuantMethod : uint32_t {
 
 // Where a blockscaled weight's scale table comes from.
 enum class ScaleLayout : std::uint32_t {
-    kPackedAtom,  // packed with the gate/up pair-layout weights
+    kPackedAtom,  // packed with the interleaved gate/up weights
     kSfAtom,      // natural-row SfAtom from group_wise_quant(use_swizzle=True)
     kPlain,       // plain row-major from group_wise_quant(use_swizzle=False)
 };
@@ -52,6 +52,30 @@ struct MoELayouts {
     ScaleLayout shared_down_scale = ScaleLayout::kPlain;
     ScaleLayout latent_down_scale = ScaleLayout::kPlain;
     ScaleLayout tail_fc2_scale = ScaleLayout::kPlain;
+
+    constexpr MoELayouts() = default;
+
+    constexpr MoELayouts(bool routed_use_interleaved, bool routed_use_swizzle,
+                         bool shared_use_interleaved, bool shared_use_swizzle,
+                         bool latent_use_swizzle)
+        : routed_up_interleaved(routed_use_interleaved),
+          shared_up_interleaved(shared_use_interleaved),
+          routed_up_scale(routed_use_interleaved
+                              ? ScaleLayout::kPackedAtom
+                              : (routed_use_swizzle ? ScaleLayout::kSfAtom
+                                                    : ScaleLayout::kPlain)),
+          routed_down_scale(routed_use_swizzle ? ScaleLayout::kSfAtom
+                                               : ScaleLayout::kPlain),
+          shared_up_scale(shared_use_interleaved
+                              ? ScaleLayout::kPackedAtom
+                              : (shared_use_swizzle ? ScaleLayout::kSfAtom
+                                                    : ScaleLayout::kPlain)),
+          shared_down_scale(shared_use_swizzle ? ScaleLayout::kSfAtom
+                                               : ScaleLayout::kPlain),
+          latent_down_scale(latent_use_swizzle ? ScaleLayout::kSfAtom
+                                               : ScaleLayout::kPlain),
+          tail_fc2_scale(latent_use_swizzle ? ScaleLayout::kSfAtom
+                                            : ScaleLayout::kPlain) {}
 };
 
 // Operand quantization types and group width. MXFP8/MXFP4 use fixed 32-element
@@ -228,33 +252,6 @@ struct MoEInputSize {
     static constexpr std::uint32_t value =
         Dims::kUseLatent ? Dims::kLatentSize : Dims::kHiddenSize;
 };
-
-constexpr MoELayouts make_moe_layouts(bool routed_use_interleaved,
-                                      bool routed_use_swizzle,
-                                      bool shared_use_interleaved,
-                                      bool shared_use_swizzle,
-                                      bool latent_use_swizzle) {
-    MoELayouts layouts{};
-    layouts.routed_up_interleaved = routed_use_interleaved;
-    layouts.routed_up_scale =
-        routed_use_interleaved
-            ? ScaleLayout::kPackedAtom
-            : (routed_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain);
-    layouts.shared_up_interleaved = shared_use_interleaved;
-    layouts.shared_up_scale =
-        shared_use_interleaved
-            ? ScaleLayout::kPackedAtom
-            : (shared_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain);
-    layouts.routed_down_scale =
-        routed_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain;
-    layouts.shared_down_scale =
-        shared_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain;
-    layouts.latent_down_scale =
-        latent_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain;
-    layouts.tail_fc2_scale =
-        latent_use_swizzle ? ScaleLayout::kSfAtom : ScaleLayout::kPlain;
-    return layouts;
-}
 
 // Byte offset of a scale in a 128-row, four-group SfAtom.
 __host__ __device__ static constexpr std::uint32_t sf_atom_offset(

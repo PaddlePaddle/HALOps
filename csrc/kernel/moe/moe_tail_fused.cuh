@@ -106,9 +106,6 @@ struct Fp8Block128 {
     }
 };
 
-// Lanes load like Fp8Block128, so an mma mixes the two 32-column scale groups
-// of a 64-column super-block; mma column n takes token n % TPG from the groups
-// of parity n / TPG only, which keeps each accumulator in one scale group.
 template <class TC, int L>
 struct Mxfp8 {
     using Scale = uint8_t;
@@ -240,7 +237,6 @@ __device__ __forceinline__ void shared_weight_mma_gemv(
         typename R::Frag ca[BLKB], cb[BLKB];
         load_chunk(0, ca, cb);
         typename R::State state = R::init(sf, row, ks, tig);
-        // Two chunks per iteration: the whole loop at tp=4, a quarter at tp=1.
 #pragma unroll 2
         for (int c = 0; c < kNC; ++c) {
             typename R::Frag na[BLKB], nb[BLKB];
@@ -371,8 +367,6 @@ struct TailGroup {
         return active;
     }
 
-    // The fc2 rows go through SMEM a pass at a time when STAGE is set; the
-    // MXFP8 scales of all the CTA's rows ride on the first pass's barrier.
     static constexpr bool kStageSf = TC::kMxfp8;
     static constexpr bool kStaged = STAGE != 0 || kStageSf;
     static constexpr int kBlockRows = TC::kBlockRows;

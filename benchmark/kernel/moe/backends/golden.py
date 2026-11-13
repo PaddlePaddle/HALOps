@@ -26,8 +26,7 @@ def _dequant_weight(
 ) -> torch.Tensor:
     """Decode blockwise FP8 or MXFP8/MXFP4 weights to BF16.
 
-    ``sfatom`` selects the CUTLASS SfAtom scale table; the latent projection
-    takes the plain [N, K/32] rows and builds the SfAtom in-kernel.
+    ``sfatom`` selects the CUTLASS SfAtom scale table.
     """
     if scale.dtype == torch.float32:
         rows, cols = weight.shape[-2:]
@@ -88,7 +87,6 @@ def _route(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
     """
     x = inp["input_bf16"]
     # The dual router publishes FP32 scores without rounding logits to BF16.
-    # Its gates are stacked along the weight's rows: [T, G * E] -> [T, G, E].
     tokens = x.shape[0]
     logits = torch.matmul(x.float(), inp["router_weight_fp32"].transpose(-1, -2))
     logits = logits.view(tokens, inp["num_router_gates"], -1)
@@ -125,10 +123,7 @@ def _activate(up: torch.Tensor, inp: dict) -> torch.Tensor:
 
 @torch.no_grad()
 def routed_and_shared(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
-    """This rank's routed latent and shared-expert partial, both bf16.
-
-    A tensor-parallel run sums these over the ranks before ``tail``.
-    """
+    """This rank's routed latent and shared-expert partial, both bf16."""
     x = inp["input_bf16"]
     weights, ids = _route(inp)
     tokens, top_k = ids.shape
@@ -153,7 +148,7 @@ def routed_and_shared(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
 
 @torch.no_grad()
 def tail(inp: dict, routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:
-    """RMSNorm + fc2 over the summed routed latent, plus the summed shared."""
+    """RMSNorm + latent_up over the summed routed latent, plus the summed shared."""
     routed_float = routed.float()
     rms = torch.rsqrt(routed_float.square().mean(dim=-1, keepdim=True) + inp["eps"])
     normed = (routed_float * rms * inp["tail_norm_weight"].float()).bfloat16()

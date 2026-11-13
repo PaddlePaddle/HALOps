@@ -90,7 +90,6 @@ struct UpProjectionBase {
     static constexpr std::uint32_t kUpSfbTmemOffset =
         kUpSfaTmemOffset + UpScaleTraits::kSfaTmemColumns;
 
-    // SFA bytes this launch's weight loader copies for `layout`.
     __device__ static constexpr std::uint32_t up_scale_tx_bytes(
         ScaleLayout layout) {
         return layout == ScaleLayout::kPlain
@@ -119,12 +118,6 @@ struct UpProjectionBase {
     using OutputQuantizer =
         GroupWiseQuantizer<OutputQuant, kOutputFeatureBlock>;
 
-    static_assert(kNumSplits > 0u && kNumTilesK % kNumSplits == 0u,
-                  "the K tiles must divide evenly over the splits");
-    static_assert(Traits::kClusterSize % kNumSplits == 0u,
-                  "each split group must fit inside one aligned cluster");
-    static_assert(Traits::kPairLayoutGranularity == 8u,
-                  "the TMEM readout pairs gate/up rows eight rows apart");
     static_assert(UpGemm::kTileShapeM / 16u <= WarpRole::kCalcWarpCount,
                   "the tile's 16-row groups must fit the calc warps");
     static constexpr bool kNarrowSlab = UpGemm::kTileShapeM <= 64u;
@@ -182,18 +175,22 @@ struct UpProjectionBase {
     // The caller owns the ring slot and arms its transaction barrier.
     __device__ static void load_weight_tile(
         CUtensorMap const& desc, WeightElement* weight, std::uint64_t* barrier,
-        std::uint32_t row, std::uint32_t k_tile, bool pair_layout,
+        std::uint32_t row, std::uint32_t k_tile, bool interleaved,
         std::uint64_t cache_hint = static_cast<std::uint64_t>(
             cute::TMA::CacheHintSm90::EVICT_NORMAL)) {
+        if (interleaved) {
+            tma_load_3d(desc, /*coord0=*/0u, /*coord1=*/row,
+                        /*coord2=*/k_tile * MmaCore::kNumSwizzleBoxKs, weight,
+                        barrier, cache_hint);
+            return;
+        }
 #pragma unroll 1
         for (std::uint32_t h = 0; h < MmaCore::kNumSwizzleBoxKs; ++h) {
             const std::uint32_t k =
                 k_tile * UpGemm::kTileShapeK + h * MmaCore::kSwizzleBoxK;
             WeightElement* const dest =
                 weight + h * UpGemm::kTileShapeM * MmaCore::kSwizzleBoxK;
-            if (pair_layout) {
-                tma_load_2d(desc, k, row, dest, barrier, cache_hint);
-            } else if constexpr (UpGemm::kWeightHasExpertDim) {
+            if constexpr (UpGemm::kWeightHasExpertDim) {
                 tma_load_5d(
                     desc, k, /*coord1=*/0u, /*coord2=*/0u,
                     /*group=*/(row % UpGemm::kGemmM) / (2u * UpGemm::kPairGran),
@@ -206,8 +203,6 @@ struct UpProjectionBase {
         }
     }
 
-    // `tma_scale_desc` carries the natural-row atoms; the packed table is a
-    // flat byte image, so it needs no tensor map.
     __device__ static void load_weight_scale_tile(
         const typename UpGemm::ElementScale* scale, std::uint32_t row_atom,
         std::uint32_t k_tile, std::uint8_t* dest, std::uint64_t* barrier,
@@ -230,8 +225,8 @@ struct UpProjectionBase {
                 UpScaleTraits::kSfaSmemBytes, dest, barrier);
             return;
         }
-        // Natural rows: one 3-D box copies the gate and the up 128-row halves
-        // of the tile, the same 64-row slice of each band's atom.
+        // One 3-D box copies the gate and the up 128-row halves of the tile,
+        // the same 64-row slice of each band's atom.
         constexpr std::uint32_t kSlabsPerAtomRow = UpGemm::kGemmK / 128u;
         const std::uint32_t atom_row =
             row_atom / kAtomsPerRowTile * kAtomsPerRowTile +
@@ -354,7 +349,7 @@ struct UpProjectionBase {
         }
     }
 
-    // One activation scale group of a K tile, in gate/up pair layout.
+    // One activation scale group of a K tile, in the interleaved rows.
     __device__ static void dequant(std::uint32_t tmem_base,
                                    std::uint32_t acc_col,
                                    const float* act_scale, float gate_scale,

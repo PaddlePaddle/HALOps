@@ -229,9 +229,9 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
                            ? static_cast<uint32_t>(latent_down_weight.size(0))
                            : 0u;
     args.intermediate_size = static_cast<uint32_t>(shared_down_weight.size(1));
-    args.layouts = moe::make_moe_layouts(
-        routed_use_interleaved, routed_use_swizzle, shared_use_interleaved,
-        shared_use_swizzle, latent_use_swizzle);
+    args.layouts = moe::MoELayouts(routed_use_interleaved, routed_use_swizzle,
+                                   shared_use_interleaved, shared_use_swizzle,
+                                   latent_use_swizzle);
     args.top_k = static_cast<uint32_t>(top_k);
     args.scoring_func = static_cast<ScoringFunc>(scoring_func);
     args.renormalize = renormalize;

@@ -443,8 +443,6 @@ struct WeightScaleStorage<GemmTraits, false> {
 template <typename GemmTraits>
 struct WeightScaleStorage<GemmTraits, true> {
     static constexpr std::uint32_t kNumSlots = GemmTraits::kNumWeightSlots;
-    // The slot must hold the largest layout a launch can select: a natural-row
-    // slot stages the gate and up atoms side by side.
     static constexpr std::uint32_t kScaleCols =
         2u * GemmTraits::MmaCore::ScaleTraits::kSfaSmemBytes;
     alignas(128) std::uint8_t scale[kNumSlots][kScaleCols];

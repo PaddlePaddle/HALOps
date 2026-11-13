@@ -120,7 +120,7 @@ struct RouterProjectionBase {
     // The weight-loader warp at launch: initialize the router barriers and
     // issue every weight slot's first tile, before the rest of the prologue
     // runs. The weights are parameters, so this may precede pdl_wait().
-    __device__ static void prefetch_weight(
+    __device__ static void prefetch_first_weight_tiles(
         CUtensorMap const& tma_router_weights_desc,
         SharedStorage* __restrict__ smem) {
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
@@ -150,8 +150,8 @@ struct RouterProjectionBase {
 
     // The same warp once pdl_wait() returns: the input is the previous
     // kernel's output.
-    __device__ static void prefetch_input(CUtensorMap const& tma_input_desc,
-                                          SharedStorage* __restrict__ smem) {
+    __device__ static void prefetch_first_input_tiles(
+        CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem) {
         for (std::uint32_t k = WarpRole::get_lane_idx();
              k < kNumFirstInputTiles; k += WarpRole::kThreadsPerWarp) {
             load_input_tile(tma_input_desc, smem, k);

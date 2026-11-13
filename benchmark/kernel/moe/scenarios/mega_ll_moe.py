@@ -29,15 +29,13 @@ from core.output import (
     print_table_header,
     print_table_row,
 )
-from core.refcheck import RefcheckResult, _compare_to_reference
+from core.refcheck import run_refcheck
 from core.runner import run_bench_for_backend, run_refcheck_cross_backends
 from core.timing import TimingResult, bench_gpu_time
 from kernel.moe.backends.golden import (
     _dequant_weight,
     _route,
-    routed_and_shared,
     run_mega_ll_moe_golden,
-    tail,
 )
 from kernel.moe.backends.halops import run_mega_ll_moe
 
@@ -97,10 +95,7 @@ def _validate_config(cfg: dict) -> dict:
             f"routing must combine 'bias' and 'perexpert', got {options['routing']!r}"
         )
     if options["tp_size"] != 1:
-        raise ValueError(
-            f"tp_size must be 1: the benchmark runs one GPU, got "
-            f"{options['tp_size']}"
-        )
+        raise ValueError("this benchmark runs on one GPU; set tp_size=1")
     if (
         not isinstance(options["batch_size"], int)
         or not 1 <= options["batch_size"] <= 16
@@ -136,7 +131,6 @@ def _validate_config(cfg: dict) -> dict:
 
 @torch.no_grad()
 def _build_inputs(cfg: dict) -> MoeInput:
-    """The launch's tensors."""
     options = _validate_config(cfg)
     torch.backends.cuda.matmul.allow_tf32 = False
     device = torch.device("cuda")
@@ -269,7 +263,7 @@ def adapt_halops(raw: MoeInput) -> dict:
         "input": raw.input,
         "out": torch.empty_like(raw.input),
         "num_router_gates": 2,
-        "workspace": get_workspace_for_moe(raw.input, None, 0, 1),
+        "workspace": get_workspace_for_moe(raw.input, None, 0, raw.options["tp_size"]),
     }
 
 
@@ -337,58 +331,23 @@ def _get_backends(names):
 
 
 @torch.no_grad()
-def _bench(cfg: dict, name: str, timing_kwargs: dict) -> dict:
-    raw = _build_inputs(cfg)
-    adapt_fn, run_fn = _get_backends([name])[name]
-    inputs = adapt_fn(raw)
-    unique_experts = _active_experts(raw)
-    bytes_io = _bytes_io(inputs, cfg["num_experts"], name, unique_experts)
-    del raw
-    timing = bench_gpu_time(run_fn, (inputs,), **timing_kwargs)
-    return {
-        "device_us": [float(v) for v in timing.device_us],
-        "host_us": [float(v) for v in timing.host_us],
-        "dispatch_us": [float(v) for v in timing.dispatch_us],
-        "bytes_io": int(bytes_io),
-        "active_experts": int(unique_experts),
-    }
-
-
-@torch.no_grad()
-def _refcheck(cfg: dict, kwargs: dict) -> dict:
-    atol, rtol = kwargs["atol"], kwargs["rtol"]
-    raw = _build_inputs(cfg)
-    golden_inputs = adapt_golden(raw)
-    halops_inputs = adapt_halops(raw)
-    out = run_mega_ll_moe(halops_inputs)
-    del halops_inputs
-    routed, shared = routed_and_shared(golden_inputs)
-    reference = tail(golden_inputs, routed.float(), shared.float())
-    if not torch.isfinite(reference).all() or reference.abs().max() < atol:
-        raise RuntimeError("BF16 golden output is non-finite or degenerate")
-    result = _compare_to_reference(
-        "halops",
-        "golden",
-        out.float().flatten(),
-        reference.float().flatten(),
-        atol,
-        rtol,
-    )
-    return {
-        "halops": result._asdict(),
-        "golden": RefcheckResult(passed=True)._asdict(),
-    }
-
-
-@torch.no_grad()
 def _refcheck_entry(
-    cfg, ordered_names, refcheck_reference, refcheck_atol, refcheck_rtol
+    cfg, ordered_names, refcheck_reference, refcheck_atol=1e-2, refcheck_rtol=1e-2
 ):
+    """Subprocess entry for the refcheck: every backend against the reference."""
     options = _validate_config(cfg)
-    payload = _refcheck(
-        {**cfg, **options}, {"atol": refcheck_atol, "rtol": refcheck_rtol}
+    ordered = [refcheck_reference] + [
+        name for name in ordered_names if name != refcheck_reference
+    ]
+    backends = _get_backends(ordered)
+    raw = _build_inputs({**cfg, **options})
+    return run_refcheck(
+        [name for name in ordered if name in backends],
+        {name: run for name, (_, run) in backends.items()},
+        {name: adapt(raw) for name, (adapt, _) in backends.items()},
+        atol=refcheck_atol,
+        rtol=refcheck_rtol,
     )
-    return {name: RefcheckResult(**vals) for name, vals in payload.items()}
 
 
 def _bytes_io(inputs: dict, num_experts: int, name: str, unique_experts: int) -> int:
@@ -412,24 +371,27 @@ def _bytes_io(inputs: dict, num_experts: int, name: str, unique_experts: int) ->
 def _bench_entry(
     cfg, name, dry_run_iters, repeat_iters, cold_l2_cache, use_cuda_graph, timing_method
 ):
+    """Subprocess entry: build inputs, adapt, bench a single backend."""
     options = _validate_config(cfg)
-    payload = _bench(
-        {**cfg, **options},
-        name,
-        {
-            "dry_run_iters": dry_run_iters,
-            "repeat_iters": repeat_iters,
-            "cold_l2_cache": cold_l2_cache,
-            "use_cuda_graph": use_cuda_graph,
-            "method": timing_method,
-        },
+    raw = _build_inputs({**cfg, **options})
+    adapt_fn, run_fn = _get_backends([name])[name]
+    inputs = adapt_fn(raw)
+    active_experts = _active_experts(raw)
+    bytes_io = _bytes_io(inputs, options["num_experts"], name, active_experts)
+    del raw
+    return MoeTiming(
+        bench_gpu_time(
+            run_fn,
+            (inputs,),
+            dry_run_iters=dry_run_iters,
+            repeat_iters=repeat_iters,
+            cold_l2_cache=cold_l2_cache,
+            use_cuda_graph=use_cuda_graph,
+            method=timing_method,
+        ),
+        bytes_io,
+        active_experts,
     )
-    timing = TimingResult(
-        device_us=payload["device_us"],
-        host_us=payload["host_us"],
-        dispatch_us=payload["dispatch_us"],
-    )
-    return MoeTiming(timing, payload["bytes_io"], payload["active_experts"])
 
 
 def run_scenario(cfg: dict) -> None:
