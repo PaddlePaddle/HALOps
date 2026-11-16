@@ -74,6 +74,12 @@ CUTE_DEVICE float2 bf16x2_to_float2_opaque(uint32_t u) {
     return make_float2(__uint_as_float(lo), __uint_as_float(hi));
 }
 
+CUTE_DEVICE void prefetch_l2_bulk(const void* ptr, uint32_t bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(ptr),
+                 "r"(bytes)
+                 : "memory");
+}
+
 CUTE_DEVICE void bulk_store_wait_all() {
     asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
 }

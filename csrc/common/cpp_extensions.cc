@@ -236,6 +236,33 @@ int64_t MoETailRegionBytes(bool wide, int64_t tp_size);
 
 int64_t GetWorkspaceSize(int64_t max_tokens);
 
+int64_t RouterTileM(int64_t num_tokens);
+
+std::vector<torch::Tensor> SigmoidGateMulGroupQuant(const torch::Tensor& o,
+                                                    const torch::Tensor& gate,
+                                                    const bool use_pdl);
+
+std::vector<torch::Tensor> FusedAllReduceMhc(
+    const torch::Tensor& x, const torch::Tensor& residual,
+    const torch::Tensor& post, const torch::Tensor& comb,
+    const torch::Tensor& fn, const torch::Tensor& hc_scale,
+    const torch::Tensor& hc_base, const torch::Tensor& norm_weight,
+    const double rms_eps, const double hc_pre_eps, const double hc_sinkhorn_eps,
+    const double hc_post_mult, const int64_t sinkhorn_repeat,
+    const double norm_eps, const bool comb_is_logits, const bool return_logits,
+    const std::optional<torch::Tensor>& peer_ptrs,
+    const std::optional<torch::Tensor>& counters, const int64_t slot_bytes,
+    const int64_t tp_rank, const bool use_pdl);
+
+void MhcSinkhorn(const torch::Tensor& logits, torch::Tensor& out,
+                 const double eps, const int64_t repeat,
+                 const std::vector<torch::Tensor>& prefetch);
+
+torch::Tensor MhcPostHcMean(const torch::Tensor& x,
+                            const torch::Tensor& residual,
+                            const torch::Tensor& post,
+                            const torch::Tensor& comb, const bool use_pdl);
+
 }  // namespace halops
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -308,4 +335,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("tp_size") = 1);
     m.def("moe_get_workspace_size", &halops::GetWorkspaceSize,
           py::arg("max_tokens") = 0);
+    m.def("moe_router_tile_m", &halops::RouterTileM, py::arg("num_tokens") = 0);
+
+    m.def("sigmoid_gate_mul_group_quant", &halops::SigmoidGateMulGroupQuant,
+          py::arg("o"), py::arg("gate"), py::arg("use_pdl") = true);
+    m.def("fused_all_reduce_mhc", &halops::FusedAllReduceMhc, py::arg("x"),
+          py::arg("residual"), py::arg("post"), py::arg("comb"), py::arg("fn"),
+          py::arg("hc_scale"), py::arg("hc_base"), py::arg("norm_weight"),
+          py::arg("rms_eps"), py::arg("hc_pre_eps"), py::arg("hc_sinkhorn_eps"),
+          py::arg("hc_post_mult"), py::arg("sinkhorn_repeat"),
+          py::arg("norm_eps"), py::arg("comb_is_logits") = false,
+          py::arg("return_logits") = false, py::arg("peer_ptrs") = py::none(),
+          py::arg("counters") = py::none(), py::arg("slot_bytes") = 0,
+          py::arg("tp_rank") = 0, py::arg("use_pdl") = true);
+    m.def("mhc_sinkhorn", &halops::MhcSinkhorn, py::arg("logits"),
+          py::arg("out"), py::arg("eps"), py::arg("repeat"),
+          py::arg("prefetch") = std::vector<torch::Tensor>{});
+    m.def("mhc_post_hc_mean", &halops::MhcPostHcMean, py::arg("x"),
+          py::arg("residual"), py::arg("post"), py::arg("comb"),
+          py::arg("use_pdl") = true);
 }

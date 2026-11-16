@@ -18,10 +18,16 @@
 
 #include "common/ptx.cuh"
 
+extern "C" __device__ float __nv_expf(float);
+
 namespace halops {
 
 CUTE_DEVICE float sigmoid(float x) {
     return fmaf(0.5f, tanh_approx(0.5f * x), 0.5f);
+}
+
+CUTE_DEVICE float sigmoid_rn(float x) {
+    return __frcp_rn(__fadd_rn(1.0f, __nv_expf(-x)));
 }
 
 CUTE_DEVICE float2 situ_glu(float2 gate, float2 up, float inv_beta,
