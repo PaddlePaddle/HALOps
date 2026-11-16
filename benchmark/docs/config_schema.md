@@ -132,7 +132,6 @@
 - `eps`：RMSNorm epsilon，默认 `1e-5`。
 - `seed`：输入与原始 BF16 权重的随机种子，默认 `0`。
 - `grid_cap`：kernel CTA 上限，默认 `0`。
-- `routed_use_interleaved` / `shared_use_interleaved`（默认 `true`）：对应 up 投影的 gate/up 权重是否按 8 行交织传入（`transform_weights_for_moe`）。
 - `backends`：`halops`。
 
 固定形状为 `hidden_size=4096`、`intermediate_size=512`、`latent_size=2048`、`num_experts=512`，配置其他形状会报错。

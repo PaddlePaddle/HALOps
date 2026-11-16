@@ -90,19 +90,12 @@ struct UpProjectionBase {
     static constexpr std::uint32_t kUpSfbTmemOffset =
         kUpSfaTmemOffset + UpScaleTraits::kSfaTmemColumns;
 
-    __device__ static constexpr std::uint32_t up_scale_tx_bytes(
-        ScaleLayout layout) {
-        return layout == ScaleLayout::kPlain
-                   ? 0u
-                   : UpScaleTraits::kSfaSmemBytes *
-                         (layout == ScaleLayout::kSfAtom ? 2u : 1u);
-    }
-
-    __device__ static constexpr std::uint32_t up_weight_tx_bytes(
-        ScaleLayout layout) {
-        return MmaCore::kWeightTileTxBytes +
-               (MmaCore::kUseBlockscaled ? up_scale_tx_bytes(layout) : 0u);
-    }
+    // The up projection's scale table is packed with its interleaved rows, so
+    // every K tile stages one SfAtom slab.
+    static constexpr std::uint32_t kUpScaleTxBytes =
+        MmaCore::kUseBlockscaled ? UpScaleTraits::kSfaSmemBytes : 0u;
+    static constexpr std::uint32_t kUpWeightTxBytes =
+        MmaCore::kWeightTileTxBytes + kUpScaleTxBytes;
 
     static constexpr std::uint32_t kOutputFeatureBlock =
         UpGemm::kTileShapeM / 2u;
@@ -175,128 +168,28 @@ struct UpProjectionBase {
     // The caller owns the ring slot and arms its transaction barrier.
     __device__ static void load_weight_tile(
         CUtensorMap const& desc, WeightElement* weight, std::uint64_t* barrier,
-        std::uint32_t row, std::uint32_t k_tile, bool interleaved,
+        std::uint32_t row, std::uint32_t k_tile,
         std::uint64_t cache_hint = static_cast<std::uint64_t>(
             cute::TMA::CacheHintSm90::EVICT_NORMAL)) {
-        if (interleaved) {
-            tma_load_3d(desc, /*coord0=*/0u, /*coord1=*/row,
-                        /*coord2=*/k_tile * MmaCore::kNumSwizzleBoxKs, weight,
-                        barrier, cache_hint);
-            return;
-        }
-#pragma unroll 1
-        for (std::uint32_t h = 0; h < MmaCore::kNumSwizzleBoxKs; ++h) {
-            const std::uint32_t k =
-                k_tile * UpGemm::kTileShapeK + h * MmaCore::kSwizzleBoxK;
-            WeightElement* const dest =
-                weight + h * UpGemm::kTileShapeM * MmaCore::kSwizzleBoxK;
-            if constexpr (UpGemm::kWeightHasExpertDim) {
-                tma_load_5d(
-                    desc, k, /*coord1=*/0u, /*coord2=*/0u,
-                    /*group=*/(row % UpGemm::kGemmM) / (2u * UpGemm::kPairGran),
-                    /*expert=*/row / UpGemm::kGemmM, dest, barrier, cache_hint);
-            } else {
-                tma_load_4d(desc, k, /*coord1=*/0u, /*coord2=*/0u,
-                            /*group=*/row / (2u * UpGemm::kPairGran), dest,
-                            barrier, cache_hint);
-            }
-        }
+        // One box covers a whole 128-row interleaved K tile.
+        tma_load_3d(desc, /*coord0=*/0u, /*coord1=*/row,
+                    /*coord2=*/k_tile * MmaCore::kNumSwizzleBoxKs, weight,
+                    barrier, cache_hint);
     }
 
     __device__ static void load_weight_scale_tile(
         const typename UpGemm::ElementScale* scale, std::uint32_t row_atom,
-        std::uint32_t k_tile, std::uint8_t* dest, std::uint64_t* barrier,
-        ScaleLayout scale_layout, const CUtensorMap* tma_scale_desc = nullptr) {
+        std::uint32_t k_tile, std::uint8_t* dest, std::uint64_t* barrier) {
         static_assert(MmaCore::kUseBlockscaled,
                       "scale tiles are only loaded for blockscaled MMA");
-        if (scale_layout == ScaleLayout::kPlain) {
-            // The issuer converts the plain rows when it consumes the tile.
-            return;
-        }
-        constexpr std::uint32_t kAtomsPerRowTile = UpGemm::kGemmM / 128u;
         constexpr std::uint32_t kSfAtomBytes = 512u;
+        constexpr std::uint32_t kSfKBlocksPerRow = UpGemm::kGemmK / 128u;
         constexpr std::uint32_t kSlabsPerTileK = UpGemm::kTileShapeK / 128u;
-        if (scale_layout == ScaleLayout::kPackedAtom) {
-            constexpr std::uint32_t kSfKBlocksPerRow = UpGemm::kGemmK / 128u;
-            const auto* sfa = reinterpret_cast<const std::uint8_t*>(scale);
-            tma_load_1d(
-                sfa + (row_atom * kSfKBlocksPerRow + k_tile * kSlabsPerTileK) *
-                          kSfAtomBytes,
-                UpScaleTraits::kSfaSmemBytes, dest, barrier);
-            return;
-        }
-        // One 3-D box copies the gate and the up 128-row halves of the tile,
-        // the same 64-row slice of each band's atom.
-        constexpr std::uint32_t kSlabsPerAtomRow = UpGemm::kGemmK / 128u;
-        const std::uint32_t atom_row =
-            row_atom / kAtomsPerRowTile * kAtomsPerRowTile +
-            (row_atom % kAtomsPerRowTile) / 2u;
-        tma_load_3d(
-            *tma_scale_desc, /*coord0=*/0u,
-            /*coord1=*/k_tile * kSlabsPerTileK + atom_row * kSlabsPerAtomRow,
-            /*coord2=*/0u, dest, barrier);
-    }
-
-    // Build one K tile's interleaved SfAtom slab from the plain rows.
-    template <bool Paired>
-    __device__ static void build_plain_scale(
-        std::uint8_t* dest, const std::uint8_t* plain, std::uint32_t row_base,
-        std::uint32_t k_tile, std::uint32_t k32, std::uint32_t half_rows) {
-        constexpr std::uint32_t kSfAtomBytes = 512u;
-        const std::uint32_t lane = WarpRole::get_lane_idx();
-        const std::uint32_t r8 = lane % 8u;
-        const std::uint32_t sel = (lane / 8u) % 2u;
-        const std::uint32_t g_par = lane / 16u;
-#pragma unroll
-        for (std::uint32_t jj = 0; jj < 2u; ++jj) {
-            std::uint32_t rows[4];
-#pragma unroll
-            for (std::uint32_t gq = 0; gq < 4u; ++gq) {
-                const std::uint32_t row = Paired
-                                              ? sel * half_rows + row_base +
-                                                    8u * (2u * gq + g_par) + r8
-                                              : row_base + 32u * gq + lane;
-                rows[gq] = *reinterpret_cast<const std::uint32_t*>(
-                    plain + static_cast<std::size_t>(row) * k32 +
-                    k_tile * (UpGemm::kTileShapeK / 32u) + 4u * jj);
-            }
-            *reinterpret_cast<uint4*>(dest + jj * kSfAtomBytes + lane * 16u) =
-                make_uint4(rows[0], rows[1], rows[2], rows[3]);
-        }
-        __syncwarp();
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    }
-
-    // Fold a packed tile's natural gate/up atoms into the interleaved atom
-    // UTCCP reads; the staged atoms are re-used in place.
-    __device__ static void permute_up_scale(std::uint8_t* data,
-                                            std::uint32_t row_tile) {
-        constexpr std::uint32_t kSfAtomBytes = 512u;
-        const std::uint32_t lane = WarpRole::get_lane_idx();
-        const std::uint32_t r_hi = (row_tile % 2u) * 64u;
-        const std::uint32_t r8 = lane % 8u;
-        const std::uint32_t sel = (lane / 8u) % 2u;
-        const std::uint32_t g_par = lane / 16u;
-        std::uint32_t src[2][4];
-#pragma unroll
-        for (std::uint32_t jj = 0; jj < 2u; ++jj) {
-            const std::uint8_t* const atom =
-                data + (sel * 2u + jj) * kSfAtomBytes;
-#pragma unroll
-            for (std::uint32_t gq = 0; gq < 4u; ++gq) {
-                const std::uint32_t r = r_hi + 8u * (2u * gq + g_par) + r8;
-                src[jj][gq] = *reinterpret_cast<const std::uint32_t*>(
-                    atom + (r % 32u) * 16u + (r / 32u) * 4u);
-            }
-        }
-        __syncwarp();
-#pragma unroll
-        for (std::uint32_t jj = 0; jj < 2u; ++jj) {
-            *reinterpret_cast<uint4*>(data + jj * kSfAtomBytes + lane * 16u) =
-                make_uint4(src[jj][0], src[jj][1], src[jj][2], src[jj][3]);
-        }
-        __syncwarp();
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        const auto* sfa = reinterpret_cast<const std::uint8_t*>(scale);
+        tma_load_1d(
+            sfa + (row_atom * kSfKBlocksPerRow + k_tile * kSlabsPerTileK) *
+                      kSfAtomBytes,
+            UpScaleTraits::kSfaSmemBytes, dest, barrier);
     }
 
     template <typename CtaMma, typename TensorC>

@@ -292,8 +292,6 @@ class MoEParams:
                 latent_w, latent_s = latent_w[0], latent_s[0]
 
         self.router_weight = router
-        # The MX recipes pass the up weights in the 8-row interleaved order.
-        self.interleaved = self.mxfp8_groups
         self.expert_down_weights = w2
         self.expert_down_weights_scale = s2
         self.latent_down_weight = latent_w
@@ -331,8 +329,6 @@ class MoEParams:
             s13,
             shared_up,
             shared_up_s,
-            routed_use_interleaved=self.interleaved,
-            shared_use_interleaved=self.interleaved,
         )
         self.shared_down_weight = shared_down
         self.shared_down_weight_scale = shared_down_s
@@ -661,10 +657,8 @@ class MoEFused:
             eps=p.eps,
             quant_mode=p.quant_mode,
             grid_cap=self.grid_cap,
-            routed_use_interleaved=p.interleaved,
-            routed_use_swizzle=p.interleaved,
-            shared_use_interleaved=p.interleaved,
-            shared_use_swizzle=p.interleaved,
+            routed_use_swizzle=p.mxfp8_groups,
+            shared_use_swizzle=p.mxfp8_groups,
             latent_use_swizzle=p.latent_use_swizzle,
         )
         return out

@@ -66,26 +66,34 @@ def _interleave_gate_up_weight(w: torch.Tensor, gran: int = 8) -> torch.Tensor:
     return torch.stack([gate, up], dim=-3).contiguous()
 
 
-def _interleave_gate_up_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Move an MX up-weight SfAtom table onto the packed pair rows.
+def _interleave_gate_up_scale(
+    scale: torch.Tensor, use_swizzle: bool = True
+) -> torch.Tensor:
+    """Move an MX up-weight scale table onto the packed pair rows.
 
-    ``scale`` is ``[..., 2N, K/32]``: one table per expert, in the natural
-    row order.  The table is indexed by raw row, so the gate/up pairing the
-    weight packing applies has to be applied here as well.  Block-wise f32
-    tables stay on the raw ``[gate | up]`` layout and are returned untouched.
+    ``scale`` is ``[..., 2N, K/32]``, either the CUTLASS SfAtom table from
+    ``group_wise_quant(use_swizzle=True)`` or the plain row-major one from
+    ``use_swizzle=False``; the two hold the same values in different orders.
+    The table is indexed by raw row, so the gate/up pairing the weight packing
+    applies has to be applied here as well.  The result is always the SfAtom
+    table the kernel reads.  Block-wise f32 tables stay on the raw
+    ``[gate | up]`` layout and are returned untouched.
     """
     if scale.dtype != torch.uint8:
         return scale
     rows, cols = int(scale.shape[-2]), int(scale.shape[-1])
     if rows % _SF_ATOM_ROWS or cols % _SF_ATOM_COLS:
         raise ValueError(
-            "an MX SfAtom table packs whole 128-rows-x-4-blocks atoms; got "
+            "an MX scale table packs whole 128-rows-x-4-blocks atoms; got "
             f"{tuple(scale.shape)}."
         )
+    lead = scale.shape[:-2]
     offsets = _sf_atom_offsets(rows, cols, scale.device).reshape(-1)
     tables = scale.reshape(-1, rows * cols)
-    plain = tables[:, offsets]
-    packed = _interleave_gate_up_weight(plain.reshape(*scale.shape[:-2], rows, cols))
+    # The plain table is already row-major; the SfAtom one has to be decoded
+    # first.  Either way the rows move, then the result is re-encoded.
+    plain = tables[:, offsets].reshape(*lead, rows, cols) if use_swizzle else scale
+    packed = _interleave_gate_up_weight(plain)
     out = torch.empty_like(tables)
     out[:, offsets] = packed.reshape(-1, rows * cols)
     return out.reshape(scale.shape)

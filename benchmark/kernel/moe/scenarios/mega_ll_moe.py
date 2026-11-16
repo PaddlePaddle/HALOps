@@ -72,9 +72,7 @@ def _validate_config(cfg: dict) -> dict:
         "quant_mode": "w8a8-blockwise",
         "scoring_func": "sigmoid",
         "renormalize": True,
-        "routed_use_interleaved": True,
         "routed_use_swizzle": True,
-        "shared_use_interleaved": True,
         "shared_use_swizzle": True,
         "latent_use_swizzle": False,
         "activation": "silu",
@@ -112,9 +110,7 @@ def _validate_config(cfg: dict) -> dict:
     if not isinstance(options["renormalize"], bool):
         raise ValueError("renormalize must be a boolean")
     for name in (
-        "routed_use_interleaved",
         "routed_use_swizzle",
-        "shared_use_interleaved",
         "shared_use_swizzle",
         "latent_use_swizzle",
     ):
@@ -214,16 +210,12 @@ def _quantize_weights(weights: dict, options: dict) -> dict:
             )
             if name == "latent_down_weight":
                 use_swizzle = options["latent_use_swizzle"]
-            elif name == "shared_up_weight":
-                use_swizzle = (
-                    options["shared_use_swizzle"] or options["shared_use_interleaved"]
-                )
+            elif name in ("shared_up_weight", "expert_up_weights"):
+                # The up scale tables are packed with the interleaved rows, so
+                # they must come from the SfAtom form.
+                use_swizzle = True
             elif name.startswith("shared_"):  # shared_down_weight
                 use_swizzle = options["shared_use_swizzle"]
-            elif name == "expert_up_weights":
-                use_swizzle = (
-                    options["routed_use_swizzle"] or options["routed_use_interleaved"]
-                )
             else:  # expert_down_weights
                 use_swizzle = options["routed_use_swizzle"]
             quant, scale = group_wise_quant(
@@ -253,8 +245,6 @@ def adapt_halops(raw: MoeInput) -> dict:
         quantized["expert_up_weights_scale"],
         quantized["shared_up_weight"],
         quantized["shared_up_weight_scale"],
-        routed_use_interleaved=raw.options["routed_use_interleaved"],
-        shared_use_interleaved=raw.options["shared_use_interleaved"],
     )
     return {
         **raw.options,
@@ -300,10 +290,11 @@ def adapt_golden(raw: MoeInput) -> dict:
                 sfatom = raw.options["latent_use_swizzle"]
             elif name == "latent_down_weight":
                 sfatom = raw.options["latent_use_swizzle"]
-            elif name.startswith("shared_"):
+            elif name in ("shared_up_weight", "expert_up_weights"):
+                # The up scale tables are packed with the interleaved rows.
+                sfatom = True
+            elif name.startswith("shared_"):  # shared_down_weight
                 sfatom = raw.options["shared_use_swizzle"]
-            elif name == "expert_up_weights":
-                sfatom = raw.options["routed_use_swizzle"]
             else:  # expert_down_weights
                 sfatom = raw.options["routed_use_swizzle"]
             weights[name] = _dequant_weight(

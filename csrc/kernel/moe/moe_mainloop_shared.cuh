@@ -133,20 +133,18 @@ struct SharedUpProjectionBase
     }
 
     // Load one weight tile; the caller includes any scale bytes in the barrier.
-    __device__ static void load_up_weight_tile(CUtensorMap const& tma_up_desc,
-                                               SharedStorage* __restrict__ smem,
-                                               std::uint32_t k_iter_id,
-                                               std::uint32_t transaction_bytes,
-                                               bool interleaved) {
+    __device__ static void load_up_weight_tile(
+        CUtensorMap const& tma_up_desc, SharedStorage* __restrict__ smem,
+        std::uint32_t k_iter_id, std::uint32_t transaction_bytes) {
         const std::uint32_t slot = k_iter_id % kNumUpSlots;
         smem->barriers.shared_up.wait_weight_empty(k_iter_id);
         const std::uint32_t k_tile = split_idx() * kUpTilesK + k_iter_id;
         smem->barriers.shared_up.weight_ready.arrive(k_iter_id,
                                                      transaction_bytes);
-        Base::load_weight_tile(
-            tma_up_desc, &smem->shared_expert.w_up[slot][0][0][0],
-            smem->barriers.shared_up.weight_ready.raw(slot),
-            slab_idx() * SharedUpGemm::kTileShapeM, k_tile, interleaved);
+        Base::load_weight_tile(tma_up_desc,
+                               &smem->shared_expert.w_up[slot][0][0][0],
+                               smem->barriers.shared_up.weight_ready.raw(slot),
+                               slab_idx() * SharedUpGemm::kTileShapeM, k_tile);
     }
 };
 
@@ -315,12 +313,11 @@ struct SharedUpProjection<KernelTraits, true>
         __syncthreads();
     }
     __device__ static void run(
-        CUtensorMap const& tma_up_desc, CUtensorMap const& tma_up_scale_desc,
-        CUtensorMap const& tma_input_desc,
+        CUtensorMap const& tma_up_desc, CUtensorMap const& tma_input_desc,
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        ScaleLayout up_scale_layout, bool interleaved, std::uint32_t batch_size,
-        Activation activation, float situ_beta, float situ_linear_beta) {
+        std::uint32_t batch_size, Activation activation, float situ_beta,
+        float situ_linear_beta) {
         zero_sf_slots(smem);
 
         Accumulator gate;
@@ -330,10 +327,9 @@ struct SharedUpProjection<KernelTraits, true>
         if (WarpRole::is_other_loader_thread()) {
             Base::run_load_input_k_loop(tma_input_desc, smem);
         } else if (WarpRole::is_weight_loader_thread()) {
-            run_load_weight_k_loop(tma_up_desc, tma_up_scale_desc, up_scale,
-                                   smem, up_scale_layout, interleaved);
+            run_load_weight_k_loop(tma_up_desc, up_scale, smem);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
-            run_mma_k_loop(smem, up_scale, up_scale_layout);
+            run_mma_k_loop(smem);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
 #pragma unroll 1
             for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kUpTilesK;
@@ -356,32 +352,25 @@ struct SharedUpProjection<KernelTraits, true>
     }
 
     __device__ static void run_load_weight_k_loop(
-        CUtensorMap const& tma_up_desc, CUtensorMap const& tma_up_scale_desc,
+        CUtensorMap const& tma_up_desc,
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
-        SharedStorage* __restrict__ smem, ScaleLayout up_scale_layout,
-        bool interleaved) {
-        const std::uint32_t tx_bytes =
-            Base::up_weight_tx_bytes(up_scale_layout);
+        SharedStorage* __restrict__ smem) {
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kUpTilesK;
              ++k_iter_id) {
-            Base::load_up_weight_tile(tma_up_desc, smem, k_iter_id, tx_bytes,
-                                      interleaved);
+            Base::load_up_weight_tile(tma_up_desc, smem, k_iter_id,
+                                      Base::kUpWeightTxBytes);
             const std::uint32_t slot = k_iter_id % Base::kNumUpSlots;
             const std::uint32_t k_tile =
                 Base::split_idx() * Base::kUpTilesK + k_iter_id;
             Base::load_weight_scale_tile(
                 up_scale, Base::slab_idx(), k_tile,
                 smem->shared_expert.w_up_scale[slot],
-                smem->barriers.shared_up.weight_ready.raw(slot),
-                up_scale_layout, &tma_up_scale_desc);
+                smem->barriers.shared_up.weight_ready.raw(slot));
         }
     }
 
-    __device__ static void run_mma_k_loop(
-        SharedStorage* __restrict__ smem,
-        const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
-        ScaleLayout up_scale_layout) {
+    __device__ static void run_mma_k_loop(SharedStorage* __restrict__ smem) {
         typename SharedUpGemm::TiledMma tiled_mma{};
         auto cta_mma = tiled_mma.get_slice(cute::_0{});
         auto tCt = Base::make_accumulator_fragment(cta_mma);
@@ -391,18 +380,6 @@ struct SharedUpProjection<KernelTraits, true>
             const std::uint32_t ring = k_iter_id % Base::kNumUpSlots;
             smem->barriers.shared_up.template wait_mma_ready<true, false>(
                 k_iter_id);
-            if (up_scale_layout == ScaleLayout::kPlain) {
-                Base::build_plain_scale</*Paired=*/true>(
-                    smem->shared_expert.w_up_scale[ring],
-                    reinterpret_cast<const std::uint8_t*>(up_scale),
-                    static_cast<std::uint32_t>(Base::slab_idx()) *
-                        (SharedUpGemm::kTileShapeM / 2u),
-                    Base::split_idx() * Base::kUpTilesK + k_iter_id,
-                    SharedUpGemm::kGemmK / 32u, SharedUpGemm::kGemmM / 2u);
-            } else if (up_scale_layout == ScaleLayout::kSfAtom) {
-                Base::permute_up_scale(smem->shared_expert.w_up_scale[ring],
-                                       Base::slab_idx());
-            }
             Base::mma(tiled_mma, cta_mma, tCt,
                       &smem->shared_expert.w_up[ring][0][0][0],
                       &smem->shared_expert.quantized_input.data[ring][0][0][0],
@@ -529,12 +506,9 @@ struct SharedUpProjection<KernelTraits, false>
     using Base::kNumAccSlots;
 
     __device__ static void run(
-        CUtensorMap const& tma_up_desc,
-        [[maybe_unused]] CUtensorMap const& tma_up_scale_desc,
-        CUtensorMap const& tma_input_desc,
+        CUtensorMap const& tma_up_desc, CUtensorMap const& tma_input_desc,
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        [[maybe_unused]] ScaleLayout up_scale_layout, bool interleaved,
         std::uint32_t batch_size, Activation activation, float situ_beta,
         float situ_linear_beta) {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
@@ -543,7 +517,7 @@ struct SharedUpProjection<KernelTraits, false>
         if (WarpRole::is_other_loader_thread()) {
             Base::run_load_input_k_loop(tma_input_desc, smem);
         } else if (WarpRole::is_weight_loader_thread()) {
-            run_load_weight_k_loop(tma_up_desc, smem, interleaved);
+            run_load_weight_k_loop(tma_up_desc, smem);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
             run_mma_k_loop(smem);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
@@ -564,14 +538,12 @@ struct SharedUpProjection<KernelTraits, false>
     }
 
     __device__ static void run_load_weight_k_loop(
-        CUtensorMap const& tma_up_desc, SharedStorage* __restrict__ smem,
-        bool interleaved) {
+        CUtensorMap const& tma_up_desc, SharedStorage* __restrict__ smem) {
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < Base::kUpTilesK;
              ++k_iter_id) {
             Base::load_up_weight_tile(tma_up_desc, smem, k_iter_id,
-                                      SharedUpGemm::MmaCore::kWeightTileTxBytes,
-                                      interleaved);
+                                      Base::kUpWeightTxBytes);
         }
     }
 

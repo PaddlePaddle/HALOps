@@ -219,9 +219,8 @@ void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,
                const std::string& scoring_func, const std::string& activation,
                bool renormalize, double situ_beta, double situ_linear_beta,
                double tail_eps, const std::string& quant_mode, int64_t tp_size,
-               bool use_pdl, bool routed_use_interleaved,
-               bool shared_use_interleaved, bool routed_use_swizzle,
-               bool shared_use_swizzle, bool latent_use_swizzle);
+               bool use_pdl, bool routed_use_swizzle, bool shared_use_swizzle,
+               bool latent_use_swizzle);
 
 int64_t MoETailRegionBytes(bool wide, int64_t tp_size);
 

@@ -173,9 +173,6 @@ struct RouterGemmTraits {
 
 template <typename Dims>
 struct RoutedUpGemmTraits {
-    static constexpr std::uint32_t kPairGran = 8u;
-    static constexpr bool kWeightHasExpertDim = true;
-
     static constexpr std::uint32_t kGemmM = Dims::kIntermediateSize * 2;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = MoEInputSize<Dims>::value;
@@ -275,9 +272,6 @@ struct RoutedDownGemmTraits {
 // Shared-expert up projection over all tokens.
 template <typename Dims>
 struct SharedUpGemmTraits {
-    static constexpr std::uint32_t kPairGran = 8u;
-    static constexpr bool kWeightHasExpertDim = false;
-
     static constexpr std::uint32_t kGemmM = Dims::kIntermediateSize * 2u;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
     static constexpr std::uint32_t kGemmK = Dims::kHiddenSize;
