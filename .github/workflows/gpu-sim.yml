@@ -1,0 +1,138 @@
+name: GPU tests (simulated B200)
+
+# ut.yml needs a self-hosted sm_100f GPU, so GitHub-hosted runs never execute
+# the kernels. This builds the extension as PTX (compute_100f) and runs a
+# subset of tests/ on a simulated NVIDIA B200 with PantheonSim
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements the real-GPU job and
+# does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "csrc/**"
+      - "halops/**"
+      - "tests/**"
+      - "setup.py"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gpu-sim:
+    name: HALOps kernels (CUDA 13.2, simulated B200)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      # csrc/kernel/mla/mla_intrinsics.cuh uses cvt.rn.bf16x2.e4m3x2, which
+      # needs PTX ISA 9.2, so nvcc 13.0 cannot build the extension (ptxas
+      # rejects it for sm_100f as well). Install CUDA 13.2 from NVIDIA's apt
+      # repository and tell the action to use it.
+      - name: Install CUDA 13.2
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cuda-toolkit-13-2
+          echo "CUDA_HOME=/usr/local/cuda-13.2" >> "$GITHUB_ENV"
+          echo "/usr/local/cuda-13.2/bin" >> "$GITHUB_PATH"
+
+      - name: Set up the simulated B200
+        uses: pantheongpu/setup-pantheonsim@a1b9d4237411f9b2b0e0bb895b4d83377f336a7b # v0.1.9
+        with:
+          gpu: nvidia/b200
+          cuda-toolkit: none
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install torch (CUDA 13.0 wheel) and the dependencies
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          source "$RUNNER_TEMP/venv/bin/activate"
+          pip install torch --index-url https://download.pytorch.org/whl/cu130
+          pip install numpy setuptools wheel pytest ninja apache-tvm-ffi "nvidia-cutlass-dsl[cu13]"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      # setup.py builds sm_100f SASS only, which the simulator cannot load for
+      # Blackwell; emit compute_100f PTX instead. The sed touches the checkout
+      # only, not the repository.
+      # A single nvcc job compiling the CUTLASS GEMM files peaks above 14 GB
+      # of RAM, and the hosted runner has 16 GB, so add swap and build with one
+      # job.
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 32G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -g
+          df -h /mnt /
+
+      - name: Build the extension as PTX
+        env:
+          MAX_JOBS: "1"
+        run: |
+          set -x
+          sed -i 's/arch=compute_100f,code=sm_100f/arch=compute_100f,code=compute_100f/' setup.py
+          grep -n "compute_100f" setup.py
+          cudart=$(find "$RUNNER_TEMP/pantheonsim-build" -name libcudart.so | head -n 1)
+          echo "libcudart: $cudart"
+          LIBRARY_PATH=$(dirname "$cudart")
+          export LIBRARY_PATH
+          set +x
+          if ! /usr/bin/time -v python setup.py build_ext --inplace > "$RUNNER_TEMP/build.log" 2>&1; then
+            echo "::group::last 60 lines of the build log"
+            tail -n 60 "$RUNNER_TEMP/build.log"
+            echo "::endgroup::"
+            grep -n -m 40 -E "FAILED|error|Error" "$RUNNER_TEMP/build.log" || true
+            exit 1
+          fi
+
+      # tests/conftest.py skips every test unless the device reports sm_10x, so
+      # a skip means the simulated device was not used: fail on any skip.
+      # Not run, because they fail on the simulator (not investigated):
+      # test_mla_attention_hca/_swa, test_mla_output_proj and test_mla_workspace
+      # (cuTensorMapEncodeTiled rejects the tensor map as not 64-byte aligned),
+      # test_latent_moe (multi-rank results missing), test_group_wise_quant
+      # (the correctness tests mismatch the reference), test_decoder_attention_fp8
+      # and test_group_masked_gemm (accuracy mismatches), and
+      # test_mqa_logits_fused (needs the CuTe DSL JIT).
+      - name: Run the tests on the simulated B200
+        timeout-minutes: 180
+        run: |
+          vgpu run --preload --gpu nvidia/b200 python -m pytest -v -rs -p no:cacheprovider --tb=short \
+            tests/test_batch_gemm.py \
+            tests/test_decoder_attention_bf16.py \
+            tests/test_dense_gemm.py \
+            tests/test_encoder_attention.py \
+            tests/test_fused_swiglu_quant_fp4.py \
+            tests/test_fused_swiglu_quant_fp8.py \
+            tests/test_get_qk_token.py \
+            tests/test_group_contiguous_gemm.py \
+            tests/test_low_latency_mma_gemm.py \
+            tests/test_mla_attention_plan.py \
+            tests/test_prefill_permute_to_masked_gemm.py \
+            tests/test_rms_norm_quant.py \
+            tests/test_vha_postmix_quant.py \
+            tests/test_write_cache_kv.py \
+            2>&1 | tee "$RUNNER_TEMP/pytest.log"
+          test "${PIPESTATUS[0]}" -eq 0
+          if grep -Eq "^SKIPPED|[0-9]+ skipped" "$RUNNER_TEMP/pytest.log"; then
+            echo "::error::tests were skipped; the simulated B200 was not used"
+            exit 1
+          fi
