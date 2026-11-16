@@ -8,9 +8,9 @@
 
    MoEWorkspace
    mega_ll_moe
+   transform_weights_for_moe
    get_workspace_for_moe
    get_workspace_size_for_moe
-   transform_weights_for_moe
 ```
 
 ```{rst-class} api-entry
@@ -38,6 +38,17 @@
 ```{rst-class} api-entry
 ```
 
+## transform_weights_for_moe
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: transform_weights_for_moe
+```
+
+```{rst-class} api-entry
+```
+
 ## get_workspace_for_moe
 
 ```{eval-rst}
@@ -55,15 +66,4 @@
 .. currentmodule:: halops
 
 .. autofunction:: get_workspace_size_for_moe
-```
-
-```{rst-class} api-entry
-```
-
-## transform_weights_for_moe
-
-```{eval-rst}
-.. currentmodule:: halops
-
-.. autofunction:: transform_weights_for_moe
 ```
