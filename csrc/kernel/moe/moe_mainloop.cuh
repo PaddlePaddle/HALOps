@@ -105,10 +105,7 @@ struct CollectiveMainloopMoE {
 
     // Device-side launch parameters.
     struct Params {
-        std::uint32_t num_tokens;
-        std::uint32_t hidden_size;
-        std::uint32_t latent_size;
-        std::uint32_t intermediate_size;
+        MoEProblemSize problem_size;
         const DataType::ElementA* __restrict__ input;
         const typename Traits::RoutedUpGemm::
             MmaElement* __restrict__ expert_weights_up;
@@ -169,10 +166,9 @@ struct CollectiveMainloopMoE {
     // Builds the device parameters, including the TMA descriptors.
     static Params to_underlying_arguments(Arguments const& args) {
         Params params{};
-        params.num_tokens = args.num_tokens;
-        params.hidden_size = args.hidden_size;
-        params.latent_size = args.latent_size;
-        params.intermediate_size = args.intermediate_size;
+        params.problem_size =
+            MoEProblemSize{args.num_tokens, args.hidden_size,
+                           args.intermediate_size, args.latent_size};
         params.input = args.input;
         params.expert_weights_up = args.expert_up_weights;
         params.expert_scales_up = args.expert_up_weights_scale;
@@ -397,8 +393,7 @@ struct CollectiveMainloopMoE {
             Latent::run(params.tma_latent_down_weight_desc,
                         params.tma_input_desc, params.latent_down_weight_scale,
                         reinterpret_cast<Workspace*>(params.scratchpad), smem,
-                        params.layouts.latent_down_scale,
-                        static_cast<std::uint32_t>(params.num_tokens));
+                        params.layouts.latent_down_scale, params.problem_size);
         }
     }
 
@@ -412,18 +407,16 @@ struct CollectiveMainloopMoE {
         if (!Shared::is_shared_cta()) return;
 
         auto* workspace = reinterpret_cast<Workspace*>(params.scratchpad);
-        const std::uint32_t batch_size =
-            static_cast<std::uint32_t>(params.num_tokens);
         if (Shared::cta_idx() < Shared::kNumUpCtas) {
             Up::run(params.tma_shared_up_desc, params.tma_input_desc,
-                    params.shared_up_scale, workspace, smem, batch_size,
-                    params.activation, params.situ_beta,
+                    params.shared_up_scale, workspace, smem,
+                    params.problem_size, params.activation, params.situ_beta,
                     params.situ_linear_beta);
         }
         Down::run(params.tma_shared_down_desc,
                   params.tma_shared_down_scale_desc, params.shared_down_scale,
                   params.shared_out, workspace, smem,
-                  params.layouts.shared_down_scale, batch_size);
+                  params.layouts.shared_down_scale, params.problem_size);
         __syncthreads();
         if (threadIdx.x == 0u) {
             __threadfence();
@@ -440,8 +433,9 @@ struct CollectiveMainloopMoE {
         constexpr std::uint32_t kExpertsPerThread = Dims::kNumExperts / 32u;
 
         // Use one warp per token; cluster pairs divide wider token batches.
-        const bool coop_topk = Traits::kClusterSize >= 2u &&
-                               params.num_tokens > WarpRole::kCalcWarpCount;
+        const bool coop_topk =
+            Traits::kClusterSize >= 2u &&
+            params.problem_size.num_tokens > WarpRole::kCalcWarpCount;
         const auto correction_bias =
             load_correction_bias<kExpertsPerThread>(params.correction_bias);
         if (threadIdx.x == 0u) {
@@ -457,8 +451,9 @@ struct CollectiveMainloopMoE {
         const std::uint32_t tok_base =
             coop_topk ? (blockIdx.x % 2u) * kTokensPerCta : 0u;
         const std::uint32_t tok_end =
-            coop_topk ? min(tok_base + kTokensPerCta, params.num_tokens)
-                      : params.num_tokens;
+            coop_topk
+                ? min(tok_base + kTokensPerCta, params.problem_size.num_tokens)
+                : params.problem_size.num_tokens;
         // One call site keeps a single copy of the selection code.
 #pragma unroll 1
         for (std::uint32_t tok = tok_base + calc_warp_idx; tok < tok_end;
@@ -519,7 +514,7 @@ struct CollectiveMainloopMoE {
         if (Router::is_router_cta()) {
             Router::run(params.tma_router_weights_desc,
                         params.tma_router_input_desc, workspace, smem,
-                        params.scoring_func);
+                        params.scoring_func, params.problem_size);
         }
 
         // Router CTAs build their tables; other CTAs copy the tables published
@@ -529,8 +524,8 @@ struct CollectiveMainloopMoE {
         if (!reads_published_tables) {
             if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
                 run_router_topk(params, workspace, smem, lane_idx);
-                prepare_routing_tables<Dims>(params.num_tokens, params.top_k,
-                                             smem);
+                prepare_routing_tables<Dims>(params.problem_size.num_tokens,
+                                             params.top_k, smem);
                 // Block 0 hands its finished tables to the other blocks.
                 if (blockIdx.x == 0u && WarpRole::get_calc_warp_idx() == 0u) {
                     publish_routing_tables(workspace, smem, lane_idx);
@@ -596,24 +591,6 @@ struct CollectiveMainloopMoE {
         __syncwarp();
     }
 
-    // Copy quantized latent output and scales into routed-up staging.
-    __device__ static void load_quantized_activation(
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem) {
-        using Quantized = decltype(smem->routed_experts.quantized_input);
-        constexpr std::uint32_t kFp8Bytes =
-            static_cast<std::uint32_t>(sizeof(Quantized::data));
-        constexpr std::uint32_t kScaleBytes =
-            static_cast<std::uint32_t>(sizeof(Quantized::scale));
-        smem->barriers.routed.up_input_ready.arrive(0u,
-                                                    kFp8Bytes + kScaleBytes);
-        tma_load_1d(workspace->latent_down_out.data_ptr(), kFp8Bytes,
-                    &smem->routed_experts.quantized_input.data[0][0][0][0],
-                    smem->barriers.routed.up_input_ready.raw(0u));
-        tma_load_1d(workspace->latent_down_out.scale_ptr(), kScaleBytes,
-                    &smem->routed_experts.quantized_input.scale[0][0],
-                    smem->barriers.routed.up_input_ready.raw(0u));
-    }
-
     // Phase 2: up-projection over this block's tasks, as enumerated by `sched`.
     __device__ void run_up(Params const& params,
                            SharedStorage* __restrict__ smem,
@@ -627,12 +604,11 @@ struct CollectiveMainloopMoE {
                 // Order cross-CTA stores before TMA reads.
                 fence_proxy_async_global();
             }
-            load_quantized_activation(workspace, smem);
         }
         RoutedUpProjection<KernelTraits>::run(
-            params.expert_scales_up, params.num_tokens, params.activation,
-            params.situ_beta, params.situ_linear_beta, workspace, smem,
-            params.tma_up_weights_desc, sched,
+            params.expert_scales_up, params.activation, params.situ_beta,
+            params.situ_linear_beta, workspace, smem,
+            params.tma_up_weights_desc, sched, params.problem_size,
             get_tma_cache_hint(smem->routing.active_expert_count >
                                params.l2_expert_capacity));
     }
@@ -645,8 +621,8 @@ struct CollectiveMainloopMoE {
             params.expert_scales_down,
             reinterpret_cast<Workspace*>(params.scratchpad), smem,
             params.layouts.routed_down_scale, params.tma_down_weights_desc,
-            params.tma_down_scale_desc, params.tma_down_activations_desc,
-            params.num_tokens, sched,
+            params.tma_down_scale_desc, params.tma_down_activations_desc, sched,
+            params.problem_size,
             get_tma_cache_hint(smem->routing.active_expert_count >
                                params.l2_expert_capacity));
     }
@@ -697,7 +673,7 @@ struct CollectiveMainloopMoE {
         } else if (WarpRole::is_weight_loader_warp(warp_idx) &&
                    Router::is_router_cta()) {
             Router::prefetch_first_weight_tiles(params.tma_router_weights_desc,
-                                                smem);
+                                                smem, params.problem_size);
         } else if (warp_idx == 3 && Router::is_router_cta()) {
             prefetch_routing_vectors<Dims>(params.correction_bias,
                                            params.per_expert_scale);
@@ -707,7 +683,7 @@ struct CollectiveMainloopMoE {
         if (WarpRole::is_weight_loader_warp(warp_idx) &&
             Router::is_router_cta()) {
             Router::prefetch_first_input_tiles(params.tma_router_input_desc,
-                                               smem);
+                                               smem, params.problem_size);
         }
         if (warp_idx == 3 && lane_idx == 0) {
             smem->launch_parity = workspace->cta_comm.claim_parity();
@@ -733,7 +709,7 @@ struct CollectiveMainloopMoE {
                             CtaGroup<Traits::kCtasPerExpert> const& cta_group) {
         Workspace* __restrict__ workspace =
             reinterpret_cast<Workspace*>(params.scratchpad);
-        const std::uint32_t batch_size = params.num_tokens;
+        const std::uint32_t batch_size = params.problem_size.num_tokens;
         constexpr std::uint32_t kDownOutputColsPerCta =
             Traits::RoutedDownGemm::MmaCore::kTileShapeM;
         // Groups partition the cells of m-block cta_idx_in_group.

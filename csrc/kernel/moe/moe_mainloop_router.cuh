@@ -82,15 +82,18 @@ struct RouterProjectionBase {
     // Every slot's first tile, which can be in flight before any slot drains.
     static constexpr std::uint32_t kNumFirstWeightTiles =
         RouterGemm::kNumWeightSlots;
-    static constexpr std::uint32_t kNumFirstInputTiles =
-        RouterGemm::kNumInputSlots < RouterGemm::kNumTilesK
-            ? RouterGemm::kNumInputSlots
-            : RouterGemm::kNumTilesK;
-    // Weight tiles that wait for an earlier tile to leave their slot.
-    static constexpr std::uint32_t kNumTailWeightTiles =
-        RouterGemm::kNumTilesK - kNumFirstWeightTiles;
     static_assert(kNumFirstWeightTiles <= WarpRole::kThreadsPerWarp,
                   "one loader lane refills each weight slot");
+
+    // Input tiles the first lap can leave in flight.
+    __device__ static std::uint32_t num_first_input_tiles(
+        MoEProblemSize const& problem_size) {
+        const std::uint32_t num_k_tiles =
+            problem_size.hidden_size / RouterGemm::kTileShapeK;
+        return num_k_tiles < RouterGemm::kNumInputSlots
+                   ? num_k_tiles
+                   : RouterGemm::kNumInputSlots;
+    }
 
     // Arm a weight tile's slot, then load the tile into it.
     __device__ static void load_weight_tile(
@@ -122,28 +125,29 @@ struct RouterProjectionBase {
     // runs. The weights are parameters, so this may precede pdl_wait().
     __device__ static void prefetch_first_weight_tiles(
         CUtensorMap const& tma_router_weights_desc,
-        SharedStorage* __restrict__ smem) {
+        SharedStorage* __restrict__ smem, MoEProblemSize const& problem_size) {
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         if (lane_idx == 0u) {
             smem->barriers.init_router_ring();
             cutlass::arch::fence_barrier_init();
         }
         __syncwarp();
-        for (std::uint32_t j = lane_idx; j < kNumFirstWeightTiles;
+        const std::uint32_t num_k_tiles =
+            problem_size.hidden_size / RouterGemm::kTileShapeK;
+        const std::uint32_t first = num_k_tiles < kNumFirstWeightTiles
+                                        ? num_k_tiles
+                                        : kNumFirstWeightTiles;
+        for (std::uint32_t j = lane_idx; j < first;
              j += WarpRole::kThreadsPerWarp) {
             load_weight_tile(tma_router_weights_desc, smem, j);
         }
-        if constexpr (kNumTailWeightTiles > 0u) {
-            // The slot-waiting tiles then load from L2; both token windows of
-            // an M tile read them, so one block prefetches.
-            if (lane_idx == 0u && token_begin() == 0u) {
-#pragma unroll
-                for (std::uint32_t j = kNumFirstWeightTiles;
-                     j < RouterGemm::kNumTilesK; ++j) {
-                    tma_prefetch_l2_3d(tma_router_weights_desc, /*coord0=*/0u,
-                                       /*row=*/weight_row_begin(),
-                                       /*chunk=*/j * kWeightTileChunks);
-                }
+        // The slot-waiting tiles then load from L2; both token windows of an
+        // M tile read them, so one block prefetches.
+        if (lane_idx == 0u && token_begin() == 0u) {
+            for (std::uint32_t j = first; j < num_k_tiles; ++j) {
+                tma_prefetch_l2_3d(tma_router_weights_desc, /*coord0=*/0u,
+                                   /*row=*/weight_row_begin(),
+                                   /*chunk=*/j * kWeightTileChunks);
             }
         }
     }
@@ -151,19 +155,24 @@ struct RouterProjectionBase {
     // The same warp once pdl_wait() returns: the input is the previous
     // kernel's output.
     __device__ static void prefetch_first_input_tiles(
-        CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem) {
-        for (std::uint32_t k = WarpRole::get_lane_idx();
-             k < kNumFirstInputTiles; k += WarpRole::kThreadsPerWarp) {
+        CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem,
+        MoEProblemSize const& problem_size) {
+        const std::uint32_t first = num_first_input_tiles(problem_size);
+        for (std::uint32_t k = WarpRole::get_lane_idx(); k < first;
+             k += WarpRole::kThreadsPerWarp) {
             load_input_tile(tma_input_desc, smem, k);
         }
     }
 
     // Stream the input K tiles past the first lap through the ring.
     __device__ static void run_load_input_k_loop(
-        CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem) {
+        CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem,
+        MoEProblemSize const& problem_size) {
+        const std::uint32_t num_k_tiles =
+            problem_size.hidden_size / RouterGemm::kTileShapeK;
 #pragma unroll 1
-        for (std::uint32_t k_iter_id = kNumFirstInputTiles;
-             k_iter_id < RouterGemm::kNumTilesK; ++k_iter_id) {
+        for (std::uint32_t k_iter_id = num_first_input_tiles(problem_size);
+             k_iter_id < num_k_tiles; ++k_iter_id) {
             smem->barriers.router.wait_input_empty(k_iter_id);
             load_input_tile(tma_input_desc, smem, k_iter_id);
         }
@@ -172,21 +181,22 @@ struct RouterProjectionBase {
     // Lane l refills slot l, a lap at a time, as each of its tiles drains.
     __device__ static void run_load_weight_tail(
         CUtensorMap const& tma_router_weights_desc,
-        SharedStorage* __restrict__ smem) {
-        if constexpr (kNumTailWeightTiles > 0u) {
-            const std::uint32_t lane_idx = WarpRole::get_lane_idx();
-            std::uint32_t j = kNumFirstWeightTiles + lane_idx;
-            bool pending =
-                lane_idx < kNumFirstWeightTiles && j < RouterGemm::kNumTilesK;
-            // Slot 0 drains first; poll the slots from then on.
-            smem->barriers.router.weight_empty.wait(0u);
-            while (__any_sync(0xffffffffu, pending)) {
-                if (pending && smem->barriers.router.weight_empty.test(
-                                   j - kNumFirstWeightTiles)) {
-                    load_weight_tile(tma_router_weights_desc, smem, j);
-                    j += kNumFirstWeightTiles;
-                    pending = j < RouterGemm::kNumTilesK;
-                }
+        SharedStorage* __restrict__ smem, MoEProblemSize const& problem_size) {
+        // The first lap covers every tile when the ring is wide enough.
+        const std::uint32_t num_k_tiles =
+            problem_size.hidden_size / RouterGemm::kTileShapeK;
+        if (num_k_tiles <= kNumFirstWeightTiles) return;
+        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
+        std::uint32_t j = kNumFirstWeightTiles + lane_idx;
+        bool pending = lane_idx < kNumFirstWeightTiles;
+        // Slot 0 drains first; poll the slots from then on.
+        smem->barriers.router.weight_empty.wait(0u);
+        while (__any_sync(0xffffffffu, pending)) {
+            if (pending && smem->barriers.router.weight_empty.test(
+                               j - kNumFirstWeightTiles)) {
+                load_weight_tile(tma_router_weights_desc, smem, j);
+                j += kNumFirstWeightTiles;
+                pending = j < num_k_tiles;
             }
         }
     }
@@ -250,7 +260,8 @@ struct RouterProjection<KernelTraits, true>
                                CUtensorMap const& tma_input_desc,
                                Workspace* __restrict__ workspace,
                                SharedStorage* __restrict__ smem,
-                               ScoringFunc scoring) {
+                               ScoringFunc scoring,
+                               MoEProblemSize const& problem_size) {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         if (!Base::is_router_cta()) {
             return;
@@ -258,17 +269,18 @@ struct RouterProjection<KernelTraits, true>
 
         // The router Linear's B operand, in both modes.
         if (WarpRole::is_other_loader_thread()) {
-            run_load_input_k_loop(tma_input_desc, smem);
+            run_load_input_k_loop(tma_input_desc, smem, problem_size);
             return;
         }
 
         // The rings' first lap left at launch; the whole warp loads the rest.
         if (WarpRole::is_weight_loader_warp(warp_idx)) {
-            Base::run_load_weight_tail(tma_router_weights_desc, smem);
+            Base::run_load_weight_tail(tma_router_weights_desc, smem,
+                                       problem_size);
             return;
         }
         if (WarpRole::is_mma_issuer_warp(warp_idx)) {
-            run_mma_k_loop(smem, smem->tmem_ptr);
+            run_mma_k_loop(smem, smem->tmem_ptr, problem_size);
             return;
         }
         // The calc warps read their accumulators back and publish the logits.
@@ -280,7 +292,8 @@ struct RouterProjection<KernelTraits, true>
 
     // One UMMA tile per SW128 box; warp-collective issue and commit.
     __device__ static void run_mma_k_loop(SharedStorage* __restrict__ smem,
-                                          std::uint32_t tmem_base) {
+                                          std::uint32_t tmem_base,
+                                          MoEProblemSize const& problem_size) {
         typename MmaCore::TiledMma tiled_mma{};
         auto cta_mma = tiled_mma.get_slice(cute::_0{});
         // Shape-only proxy: make_fragment_C only reads its argument's layout.
@@ -294,7 +307,9 @@ struct RouterProjection<KernelTraits, true>
 
         // The streamed input holds one tile at a time; a block reads all K.
         constexpr std::uint32_t kInputSlots = RouterGemm::kNumInputSlots;
-        for (std::uint32_t j = 0; j < RouterGemm::kNumTilesK; ++j) {
+        const std::uint32_t num_k_tiles =
+            problem_size.hidden_size / RouterGemm::kTileShapeK;
+        for (std::uint32_t j = 0; j < num_k_tiles; ++j) {
             const std::uint32_t k_iter_id = j;
             const std::uint32_t slot = k_iter_id % kInputSlots;
             smem->barriers.router.wait_mma_ready(k_iter_id);
@@ -370,11 +385,6 @@ struct RouterProjection<KernelTraits, false>
     using typename Base::SharedStorage;
     using typename Base::Workspace;
 
-    // A warp owns this many K tiles; the last warps may own fewer.
-    static constexpr std::uint32_t kNumTilesKPerWarp =
-        (RouterGemm::kNumTilesK + WarpRole::kCalcWarpCount - 1u) /
-        WarpRole::kCalcWarpCount;
-
     // The B (input) operand of one K tile: its N rows of SW128 boxes.
     using SBLayout = decltype(cute::tile_to_shape(
         cute::composition(
@@ -392,7 +402,8 @@ struct RouterProjection<KernelTraits, false>
                                CUtensorMap const& tma_input_desc,
                                Workspace* __restrict__ workspace,
                                SharedStorage* __restrict__ smem,
-                               ScoringFunc scoring) {
+                               ScoringFunc scoring,
+                               MoEProblemSize const& problem_size) {
         // Split-K is UMMA-only, so every block owns one whole M tile here.
         if (!Base::is_router_cta()) {
             return;
@@ -400,18 +411,19 @@ struct RouterProjection<KernelTraits, false>
 
         // The router Linear's B operand, in both modes.
         if (WarpRole::is_other_loader_thread()) {
-            run_load_input_k_loop(tma_input_desc, smem);
+            run_load_input_k_loop(tma_input_desc, smem, problem_size);
             return;
         }
 
         // The rings' first lap left at launch; the whole warp loads the rest.
         if (WarpRole::is_weight_loader_warp(WarpRole::get_warp_idx())) {
-            Base::run_load_weight_tail(tma_router_weights_desc, smem);
+            Base::run_load_weight_tail(tma_router_weights_desc, smem,
+                                       problem_size);
             return;
         }
 
         if (WarpRole::is_calc_thread()) {
-            run_hmma_k_loop(smem);
+            run_hmma_k_loop(smem, problem_size);
 
             // The calc warps read their partials back and publish the logits.
             store_and_publish_logits(workspace, smem, Base::router_tile(),
@@ -420,16 +432,22 @@ struct RouterProjection<KernelTraits, false>
     }
 
     // Warp w sums its K tiles into mma_out[w], as (token, expert).
-    __device__ static void run_hmma_k_loop(SharedStorage* __restrict__ smem) {
+    __device__ static void run_hmma_k_loop(SharedStorage* __restrict__ smem,
+                                           MoEProblemSize const& problem_size) {
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         float acc[MmaCore::kNumAtomMs][MmaCore::kAtomElemsC] = {};
         constexpr std::uint32_t kInputSlots = RouterGemm::kNumInputSlots;
+        const std::uint32_t num_k_tiles =
+            problem_size.hidden_size / RouterGemm::kTileShapeK;
+        const std::uint32_t num_k_tiles_per_warp =
+            (num_k_tiles + WarpRole::kCalcWarpCount - 1u) /
+            WarpRole::kCalcWarpCount;
 #pragma unroll 1
-        for (std::uint32_t j = 0; j < kNumTilesKPerWarp; ++j) {
+        for (std::uint32_t j = 0; j < num_k_tiles_per_warp; ++j) {
             const std::uint32_t k_iter_id =
                 j * WarpRole::kCalcWarpCount + warp_idx;
-            if (k_iter_id >= RouterGemm::kNumTilesK) break;
+            if (k_iter_id >= num_k_tiles) break;
             const std::uint32_t slot = k_iter_id % kInputSlots;
             smem->barriers.router.wait_mma_ready(k_iter_id);
             MmaCore::run(

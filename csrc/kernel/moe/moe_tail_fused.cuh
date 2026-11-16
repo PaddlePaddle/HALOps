@@ -351,7 +351,7 @@ struct TailGroup {
                    reinterpret_cast<float*>(scratch + TC::kSmemWarp),
                    reinterpret_cast<float*>(scratch + TC::kSmemPart),
                    reinterpret_cast<float*>(scratch + TC::kSmemCol),
-                   p.num_tokens,
+                   p.problem_size.num_tokens,
                    cta,
                    tid,
                    cta % GSIZE,
