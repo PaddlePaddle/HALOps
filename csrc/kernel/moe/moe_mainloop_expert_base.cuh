@@ -203,17 +203,20 @@ struct UpProjectionBase {
         auto tCsB = cute::make_tensor(cute::make_smem_ptr(input), SBLayout{});
         auto tCrB = cta_mma.make_fragment_B(tCsB);
         if constexpr (MmaCore::kUseBlockscaled) {
-            if (cute::elect_one_sync()) {
+            if (WarpRole::get_lane_idx() == 0u) {
                 UpScaleTraits::copy_sfa_to_tmem(
                     sfa, tmem_addr(tmem_base, 0u, kUpSfaTmemOffset));
                 UpScaleTraits::copy_sfb_to_tmem(
                     sfb, tmem_addr(tmem_base, 0u, kUpSfbTmemOffset));
-                MmaCore::run(tiled_mma, cta_mma, weight, tCrB, tCt,
-                             tmem_addr(tmem_base, 0u, acc_slot * kAccColumns),
-                             tmem_addr(tmem_base, 0u, kUpSfaTmemOffset),
-                             tmem_addr(tmem_base, 0u, kUpSfbTmemOffset),
-                             accumulate);
+                tcgen05_fence_before_thread_sync();
             }
+            __syncwarp();
+            tcgen05_fence_after_thread_sync();
+            MmaCore::run(tiled_mma, cta_mma, weight, tCrB, tCt,
+                         tmem_addr(tmem_base, 0u, acc_slot * kAccColumns),
+                         tmem_addr(tmem_base, 0u, kUpSfaTmemOffset),
+                         tmem_addr(tmem_base, 0u, kUpSfbTmemOffset),
+                         accumulate);
         } else {
             MmaCore::template run<MmaCore::kNumQuantBlocksB>(
                 tiled_mma, cta_mma, weight, tCrB, tCt,
@@ -509,7 +512,7 @@ struct DownProjectionBase {
         auto tCsB = cute::make_tensor(cute::make_smem_ptr(input), input_layout);
         auto tCrB = cta_mma.make_fragment_B(tCsB);
         if constexpr (MmaCore::kUseBlockscaled) {
-            if (cute::elect_one_sync()) {
+            if (WarpRole::get_lane_idx() == 0u) {
 #pragma unroll
                 for (std::uint32_t atom = 0;
                      atom < DownScaleTraits::kNumSfaAtoms; ++atom) {
@@ -518,9 +521,12 @@ struct DownProjectionBase {
                         sfa_tmem + atom * DownScaleTraits::kSfaAtomColumns);
                 }
                 DownScaleTraits::copy_sfb_to_tmem(sfb, sfb_tmem);
-                MmaCore::run(tiled_mma, cta_mma, weight, tCrB, tCt, acc_tmem,
-                             sfa_tmem, sfb_tmem, accumulate);
+                tcgen05_fence_before_thread_sync();
             }
+            __syncwarp();
+            tcgen05_fence_after_thread_sync();
+            MmaCore::run(tiled_mma, cta_mma, weight, tCrB, tCt, acc_tmem,
+                         sfa_tmem, sfb_tmem, accumulate);
         } else {
             MmaCore::template run<MmaCore::kNumQuantBlocksB>(
                 tiled_mma, cta_mma, weight, tCrB, tCt, acc_tmem);
