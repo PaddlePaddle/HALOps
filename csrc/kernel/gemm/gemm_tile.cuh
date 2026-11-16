@@ -213,8 +213,7 @@ constexpr TileSpec kFp8_128x16x256_swap = {.block_m = 128,
                                            .epi_stages = 7,
                                            .swap_ab = true,
                                            .dense_only = true,
-                                           .batch = true,
-                                           .searchable = false};
+                                           .batch = true};
 constexpr TileSpec kFp8_128x64 = {.block_m = 128,
                                   .block_n = 64,
                                   .block_k = 128,

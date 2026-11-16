@@ -25,6 +25,7 @@
 
 #include "kernel/gemm/gemm_kernel.cuh"
 #include "kernel/gemm/gemm_tile.cuh"
+#include "kernel/gemm/gemm_tuned_dense_fp8.cuh"
 
 namespace halops {
 
@@ -74,6 +75,9 @@ constexpr bool TileFitsShape(const TileSpec& t, const GemmShape& s,
     } else if (t.act_n() <= 64 && !t.pair() && s.m > 4 * t.act_m()) {
         return false;
     }
+    if (t.swap_ab && t.act_m() == 16 && s.m_grid > 16) {
+        return false;
+    }
     // An activation N that is not 128-aligned overhangs N through the scale
     // run, so N only has to be aligned to the atomic 128 columns.
     const bool n_ok = (t.act_n() > 128 && t.act_n() % 128 != 0)
@@ -88,16 +92,27 @@ constexpr bool TileFitsShape(const TileSpec& t, const GemmShape& s,
     if (s.m % t.act_m() == 0 || mode == KernelMode::Batch) {
         return true;
     }
+    if (mode == KernelMode::Dense && t.swap_ab && t.pair() &&
+        !IsQuantOp(s.op)) {
+        return true;
+    }
     return !t.pair() && mode == KernelMode::Dense && s.m <= t.act_m();
 }
 
 // Cost model
 namespace cost {
-inline constexpr double kWeight = 40.0;     // per weight byte read from L2
+struct Params {
+    double weight;  // per weight byte read from L2
+    double pair_stage;
+    double act_n224;  // 224-wide reads 3 atoms/2
+};
+inline constexpr Params kDefault = {
+    .weight = 40.0, .pair_stage = 0.0, .act_n224 = 1.01};
+inline constexpr Params kDenseFp8 = {
+    .weight = 750.0, .pair_stage = 3.25e6, .act_n224 = 1.08};
 inline constexpr double kStage = 5.0e5;     // per K stage of pipeline fill
 inline constexpr double kPairFill = 5.5e6;  // a pair MMA's extra fill
 inline constexpr double kOverlap = 1.05;    // TMEM overlap costs a little
-inline constexpr double kActN224 = 1.01;    // 224-wide reads 3 atoms/2
 inline constexpr double kSwapPair = 1.03;   // SwapAB pair epilogue + SF run
 inline constexpr double kTieBand = 3e-3;
 inline constexpr double kQuantTail = 0.3;  // quant epilogue tail per tile MAC
@@ -113,22 +128,28 @@ struct TileOverride {
     TileSpec tile;
 };
 
+constexpr double WaveFill(const TileSpec& t, const GemmShape& s) {
+    const int units = s.sm_count / (t.pair() ? 2 : 1);
+    const int grid_tiles =
+        CeilDiv(s.m_grid, t.act_m()) * CeilDiv(s.n, t.act_n());
+    return units > 0 ? static_cast<double>(grid_tiles) /
+                           (CeilDiv(grid_tiles, units) * units)
+                     : 0.0;
+}
+
 inline constexpr TileOverride kDenseFp8Overrides[] = {
     {[](const GemmShape& s) {
-         return s.sm_count == 152 && s.m == 1024 && s.n == 4096 &&
-                s.k >= 1024 && s.k <= 2048;
+         return s.m == 1024 && s.n == 4096 && s.k >= 1024 && s.k <= 2048 &&
+                WaveFill(kFp8_128x224, s) == 1.0;
      },
      kFp8_128x224},
     {[](const GemmShape& s) {
-         return s.m == 8192 && s.n == 4096 && s.k == 1536;
+         return s.m == 8192 && s.n == 4096 && s.k == 1536 &&
+                WaveFill(kFp8_256x224_pair_reg160, s) == 1.0;
      },
      kFp8_256x224_pair_reg160},
     {[](const GemmShape& s) { return s.m <= 16 && s.n >= 8192 && s.k >= 4096; },
      kFp8_128x16x256_swap},
-    {[](const GemmShape& s) { return s.m <= 16 && s.n >= 16384; },
-     kFp8_128x16x256_swap},
-    {[](const GemmShape& s) { return s.m > 16 && s.m <= 64 && s.n >= 16384; },
-     kFp8_128x64x256_swap},
 };
 
 // A 16-row swap tile reads one SfAtom column, so it serves a grid of at most
@@ -218,10 +239,12 @@ inline int ActTiles(const GemmShape& s, const TileSpec& t, KernelMode mode) {
 inline int PickByCostModel(const TileSpec* tiles, int count, MmaKind kind,
                            const GemmShape& s, KernelMode mode) {
     // Dense Fp8 prices an M below one legacy 128-row tile as 128 rows.
-    GemmShape c = s;
-    if (mode == KernelMode::Dense && kind == MmaKind::MXFP8) {
-        c.m = std::max(c.m, cost::kMFloorFp8);
-        c.m_grid = c.m;
+    const bool dense_fp8 = mode == KernelMode::Dense && kind == MmaKind::MXFP8;
+    const cost::Params& p = dense_fp8 ? cost::kDenseFp8 : cost::kDefault;
+    GemmShape floored = s;
+    if (dense_fp8) {
+        floored.m = std::max(floored.m, cost::kMFloorFp8);
+        floored.m_grid = floored.m;
     }
     int best = -1;
     double best_cost = 0.0;
@@ -229,6 +252,7 @@ inline int PickByCostModel(const TileSpec* tiles, int count, MmaKind kind,
     int best_ctas = 0;
     for (int i = 0; i < count; ++i) {
         const TileSpec& t = tiles[i];
+        const GemmShape& c = t.swap_ab && !t.pair() ? s : floored;
         if (t.bias || !t.searchable || !TileAllowedFor(t, mode) ||
             !TileFitsShape(t, c, mode)) {
             continue;
@@ -243,14 +267,14 @@ inline int PickByCostModel(const TileSpec* tiles, int count, MmaKind kind,
         const double area = static_cast<double>(t.act_m() / ctas) * t.act_n();
         // A pair tile multicasts its weight, so only half comes from L2.
         const double weight_bytes = static_cast<double>(t.act_n()) * c.k / ctas;
+        const double stages = static_cast<double>(c.k / t.block_k);
         const double tile_cost =
-            area * c.k + weight_bytes * cost::kWeight +
-            static_cast<double>(c.k / t.block_k) * cost::kStage +
-            (ctas == 2 ? cost::kPairFill : 0.0);
+            area * c.k + weight_bytes * p.weight + stages * cost::kStage +
+            (ctas == 2 ? cost::kPairFill + stages * p.pair_stage : 0.0);
         const double pair_eff = (ctas == 2 && waves > 1) ? 0.95 : 1.0;
         double total = waves * tile_cost * pair_eff *
                        (t.tmem_overlap ? cost::kOverlap : 1.0) *
-                       (t.act_n() == 224 ? cost::kActN224 : 1.0) *
+                       (t.act_n() == 224 ? p.act_n224 : 1.0) *
                        (t.swap_ab && t.pair() ? cost::kSwapPair : 1.0);
         if (IsQuantOp(s.op)) {
             total += cost::kQuantTail * area * c.k;
@@ -272,6 +296,35 @@ inline int PickByCostModel(const TileSpec* tiles, int count, MmaKind kind,
     return best;
 }
 
+inline int TileIndex(const TileSpec* tiles, int count, const TileSpec& t) {
+    for (int i = 0; i < count; ++i) {
+        if (tiles[i] == t) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+inline const TileSpec* TunedTile(MmaKind kind, KernelMode mode,
+                                 const GemmShape& s) {
+    if (mode != KernelMode::Dense || kind != MmaKind::MXFP8 ||
+        IsQuantOp(s.op)) {
+        return nullptr;
+    }
+    for (const TunedShape& e : kDenseFp8Tuned) {
+        if (e.n != s.n || e.k != s.k) {
+            continue;
+        }
+        for (const TunedRow& r : e.rows) {
+            if (r.m == s.m) {
+                return WaveFill(r.alt, s) > WaveFill(r.tile, s) ? &r.alt
+                                                                : &r.tile;
+            }
+        }
+    }
+    return nullptr;
+}
+
 inline int PickTile(const TileSpec* tiles, int count, MmaKind kind,
                     const GemmShape& s, KernelMode mode) {
     if (s.has_bias) {
@@ -291,12 +344,11 @@ inline int PickTile(const TileSpec* tiles, int count, MmaKind kind,
             continue;
         }
 
-        for (int i = 0; i < count; ++i) {
-            if (tiles[i] == r.tile) {
-                return i;
-            }
-        }
-        return -1;
+        return TileIndex(tiles, count, r.tile);
+    }
+    if (const TileSpec* t = TunedTile(kind, mode, s);
+        t && TileAllowedFor(*t, mode) && TileFitsShape(*t, s, mode)) {
+        return TileIndex(tiles, count, *t);
     }
     return PickByCostModel(tiles, count, kind, s, mode);
 }
