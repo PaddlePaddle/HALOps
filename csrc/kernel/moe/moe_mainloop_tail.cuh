@@ -111,6 +111,7 @@ struct TailPhase {
             WarpRole::sync_calc_threads();
             __threadfence();
         }
+
         ::halops::moe::tail::eb5_tail_group_body<
             Geometry::kWorld, Dims::kLatentSize, Dims::kHiddenSize,
             Geometry::kMaxM, Geometry>(

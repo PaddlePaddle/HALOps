@@ -127,7 +127,7 @@
 - `top_k_list`（默认 `[8]`）：选择专家数，取值为 `1..10`。
 - `tp_size`（默认 `1`）：此 benchmark 当前仅支持单卡。
 - `quant_mode`：`w8a8-blockwise`（默认）、`w8a8-mxfp8` 或 `w4a8-mxfp4`。
-- `activation`：`silu`（默认）或 `situ`。SiTU 可配置 `situ_beta`（默认 `4.0`）和 `situ_linear_beta`（默认 `25.0`）；非正值关闭对应 soft cap。
+- `activation`：`silu`（默认）或 `situ`。SiTU 可配置 `situ_beta`（默认 `4.0`）和 `situ_linear_beta`（默认 `25.0`）。
 - `scoring_func`：`sigmoid`（默认）或 `softmax`；`renormalize` 默认 `true`。
 - `eps`：RMSNorm epsilon，默认 `1e-5`。
 - `seed`：输入与原始 BF16 权重的随机种子，默认 `0`。

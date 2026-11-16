@@ -106,6 +106,12 @@ struct BarrierRingBase {
         wait_parity(data[slot_idx % N], phase);
     }
 
+    // Whether `iter`'s phase has completed; never blocks.
+    __device__ __forceinline__ bool test(std::uint32_t iter) const {
+        return cutlass::arch::ClusterBarrier::test_wait(&data[slot(iter)],
+                                                        parity(iter), 1u);
+    }
+
     __device__ __forceinline__ std::uint64_t* raw(std::uint32_t slot_idx) {
         return &data[slot_idx % N];
     }
@@ -262,6 +268,9 @@ struct RoutedBarrier<Dims, true> {
         RoutedUpGemmTraits<Dims>::kNumWeightSlots;
     static constexpr std::uint32_t kNumDownWeightSlots =
         RoutedDownGemmTraits<Dims>::kNumWeightSlots;
+    // Up rotates its tasks over these slots; down continues the same ring.
+    static constexpr std::uint32_t kNumAccSlots =
+        RoutedUpGemmTraits<Dims>::kNumAccSlots;
 
     TransactionBarrier<1> up_input_ready;
     TransactionBarrier<kNumUpWeightSlots> up_weight_ready;
@@ -271,8 +280,8 @@ struct RoutedBarrier<Dims, true> {
     TransactionBarrier<kNumDownWeightSlots> down_weight_ready;
     SimpleBarrier<kNumDownWeightSlots> down_weight_empty;
 
-    SimpleBarrier<1> accumulator_ready;
-    SimpleBarrier<1> accumulator_empty;
+    SimpleBarrier<kNumAccSlots> accumulator_ready;
+    SimpleBarrier<kNumAccSlots> accumulator_empty;
 
     __device__ __forceinline__ void init() {
         const int num_warps = static_cast<int>(WarpRole::kCalcWarpCount);
@@ -435,7 +444,7 @@ template <typename GemmTraits>
 struct WeightScaleStorage<GemmTraits, true> {
     static constexpr std::uint32_t kNumSlots = GemmTraits::kNumWeightSlots;
     static constexpr std::uint32_t kScaleCols =
-        GemmTraits::MmaCore::ScaleTraits::kSfaSmemBytes;
+        2u * GemmTraits::MmaCore::ScaleTraits::kSfaSmemBytes;
     alignas(128) std::uint8_t scale[kNumSlots][kScaleCols];
 
     __device__ auto& operator[](std::uint32_t slot) { return scale[slot]; }
@@ -527,10 +536,9 @@ struct RouterSmem {
 
 template <typename GemmTraits>
 struct LatentDownSmem {
-    alignas(1024) typename GemmTraits::MmaElement
-        w_latent_down[GemmTraits::kNumWeightSlots]
-                     [GemmTraits::kNumStagingBlocks][GemmTraits::kTileShapeM]
-                     [128u];
+    alignas(1024) typename GemmTraits::MmaElement w_latent_down
+        [GemmTraits::kNumWeightSlots][GemmTraits::MmaCore::kNumSwizzleBoxKs]
+        [GemmTraits::kTileShapeM][GemmTraits::MmaCore::kSwizzleBoxK];
 
     ActivationSmem<GemmTraits::kNumInputSlots, GemmTraits::kTileShapeN,
                    GemmTraits::kTileShapeK>
@@ -542,8 +550,11 @@ struct LatentDownSmem {
         GemmTraits::InputQuant::kBlockSize, GemmTraits::InputQuant::kMethod>
         quantized_input;
 
-    // MX stages SfAtoms here; blockwise reads scales directly from gmem.
-    WeightScaleStorage<GemmTraits> w_latent_down_scale;
+    // MXFP8: this CTA's 128-row SfAtom scale slab.
+    static constexpr std::uint32_t kSfaSlabBytes =
+        GemmTraits::MmaCore::kUseBlockscaled ? 128u * (GemmTraits::kGemmK / 32u)
+                                             : 0u;
+    alignas(16) std::uint8_t sfa_slab[kSfaSlabBytes ? kSfaSlabBytes : 1u];
 
     // BF16 staging follows the quantized output's chunk boundaries.
     static constexpr std::uint32_t kOutChunkK =

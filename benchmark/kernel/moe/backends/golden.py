@@ -21,8 +21,13 @@ import torch.nn.functional as F
 
 
 @torch.no_grad()
-def _dequant_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Decode blockwise FP8 or SfAtom-scaled MXFP8/MXFP4 weights to BF16."""
+def _dequant_weight(
+    weight: torch.Tensor, scale: torch.Tensor, sfatom: bool = True
+) -> torch.Tensor:
+    """Decode blockwise FP8 or MXFP8/MXFP4 weights to BF16.
+
+    ``sfatom`` selects the CUTLASS SfAtom scale table.
+    """
     if scale.dtype == torch.float32:
         rows, cols = weight.shape[-2:]
         blocks = weight.float().reshape(
@@ -30,11 +35,14 @@ def _dequant_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         )
         return (blocks * scale[..., :, None, :, None]).reshape(weight.shape).bfloat16()
 
-    from halops.moe.mega_ll_moe_utils import _sf_atom_offsets
-
     rows, groups = scale.shape[-2:]
-    offsets = _sf_atom_offsets(rows, groups, scale.device)
-    plain = scale.reshape(*scale.shape[:-2], -1)[..., offsets]
+    if sfatom:
+        from halops.moe.mega_ll_moe_utils import _sf_atom_offsets
+
+        offsets = _sf_atom_offsets(rows, groups, scale.device)
+        plain = scale.reshape(*scale.shape[:-2], -1)[..., offsets]
+    else:
+        plain = scale
     decoded_scale = torch.exp2(plain.float() - 127.0)
     if weight.dtype == torch.uint8:
         lut = torch.tensor(
@@ -79,12 +87,14 @@ def _route(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
     """
     x = inp["input_bf16"]
     # The dual router publishes FP32 scores without rounding logits to BF16.
-    logits = torch.matmul(x.float(), inp["router_weight_fp32"])
+    tokens = x.shape[0]
+    logits = torch.matmul(x.float(), inp["router_weight_fp32"].transpose(-1, -2))
+    logits = logits.view(tokens, inp["num_router_gates"], -1)
     scores = (
         torch.sigmoid(logits)
         if inp["scoring_func"] == "sigmoid"
         else torch.softmax(logits, dim=-1)
-    ).sum(dim=0)
+    ).sum(dim=1)
     bias = inp.get("correction_bias")
     selection = scores + bias if bias is not None else scores
     ids = torch.argsort(selection, dim=-1, descending=True, stable=True)[
@@ -112,8 +122,8 @@ def _activate(up: torch.Tensor, inp: dict) -> torch.Tensor:
 
 
 @torch.no_grad()
-def run_mega_ll_moe_golden(inp: dict) -> torch.Tensor:
-    """BF16 projections with FP32 routing, activation and normalization."""
+def routed_and_shared(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """This rank's routed latent and shared-expert partial, both bf16."""
     x = inp["input_bf16"]
     weights, ids = _route(inp)
     tokens, top_k = ids.shape
@@ -133,8 +143,21 @@ def run_mega_ll_moe_golden(inp: dict) -> torch.Tensor:
     routed = routed_each.reshape(tokens, top_k, -1).float().sum(dim=1).bfloat16()
     shared_up = x @ inp["shared_up_weight"].T
     shared = _activate(shared_up, inp).bfloat16() @ inp["shared_down_weight"].T
+    return routed, shared
+
+
+@torch.no_grad()
+def tail(inp: dict, routed: torch.Tensor, shared: torch.Tensor) -> torch.Tensor:
+    """RMSNorm + latent_up over the summed routed latent, plus the summed shared."""
     routed_float = routed.float()
     rms = torch.rsqrt(routed_float.square().mean(dim=-1, keepdim=True) + inp["eps"])
     normed = (routed_float * rms * inp["tail_norm_weight"].float()).bfloat16()
-    tail = normed @ inp["tail_fc2_weight"].T
-    return (tail.float() + shared.float()).bfloat16()
+    fc2 = normed @ inp["tail_fc2_weight"].T
+    return (fc2.float() + shared.float()).bfloat16()
+
+
+@torch.no_grad()
+def run_mega_ll_moe_golden(inp: dict) -> torch.Tensor:
+    """BF16 projections with FP32 routing, activation and normalization."""
+    routed, shared = routed_and_shared(inp)
+    return tail(inp, routed, shared)

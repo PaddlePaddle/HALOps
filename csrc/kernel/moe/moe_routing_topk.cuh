@@ -24,9 +24,45 @@
 #include "kernel/moe/moe_shared_storage.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/moe_workspace.cuh"
+#include "kernel/moe/ptx_utils.cuh"
 #include "kernel/moe/quant_utils.cuh"
 
 namespace halops::moe {
+
+// One warp warms the selection's routing vectors in L2.
+template <typename Dims>
+__device__ static void prefetch_routing_vectors(
+    const float* __restrict__ correction_bias,
+    const float* __restrict__ per_expert_scale) {
+    constexpr std::uint32_t kLineBytes = 128u;
+    constexpr std::uint32_t kLines =
+        (Dims::kNumExperts * sizeof(float) + kLineBytes - 1u) / kLineBytes;
+    static_assert(2u * kLines <= WarpRole::kThreadsPerWarp,
+                  "one lane per L2 line of the two vectors");
+    const std::uint32_t lane_idx = WarpRole::get_lane_idx();
+    const float* const vec =
+        lane_idx < kLines ? correction_bias : per_expert_scale;
+    if (vec != nullptr && lane_idx < 2u * kLines) {
+        prefetch_l2_line(reinterpret_cast<const char*>(vec) +
+                         (lane_idx % kLines) * kLineBytes);
+    }
+}
+
+// The lane's slice of `correction_bias`, or zeros without one.
+template <std::uint32_t kExpertsPerThread>
+__device__ static cutlass::Array<float, kExpertsPerThread> load_correction_bias(
+    const float* __restrict__ correction_bias) {
+    cutlass::Array<float, kExpertsPerThread> bias;
+    const std::uint32_t lane_base =
+        WarpRole::get_lane_idx() * kExpertsPerThread;
+#pragma unroll
+    for (std::uint32_t i = 0; i < kExpertsPerThread; ++i) {
+        bias[i] = correction_bias != nullptr
+                      ? __ldg(correction_bias + lane_base + i)
+                      : 0.0f;
+    }
+    return bias;
+}
 
 // Warp `token` reads the token's logits row, lane l its expert slice.
 template <typename Dims, std::uint32_t kExpertsPerThread>
@@ -386,10 +422,12 @@ __device__ static void topk_weights_from_scores_fp32_scan(
         // The lane's best, ties to the lower index: a tree whose ties go left.
         uint32_t best[kExpertsPerThread];
         uint32_t at[kExpertsPerThread];
+        float best_weight[kExpertsPerThread];
 #pragma unroll
         for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
             best[i] = key[i];
             at[i] = i;
+            best_weight[i] = weights[i];
         }
 #pragma unroll
         for (uint32_t w = 1; w < kExpertsPerThread; w *= 2) {
@@ -398,18 +436,15 @@ __device__ static void topk_weights_from_scores_fp32_scan(
                 const bool right = best[i + w] > best[i];
                 best[i] = right ? best[i + w] : best[i];
                 at[i] = right ? at[i + w] : at[i];
+                best_weight[i] = right ? best_weight[i + w] : best_weight[i];
             }
         }
         const uint32_t top = __reduce_max_sync(0xFFFFFFFFu, best[0]);
         const uint32_t winner =
             __ffs(__ballot_sync(0xFFFFFFFFu, best[0] == top)) - 1u;
         const uint32_t expert = lane_idx * kExpertsPerThread + at[0];
-        float winner_weight = 0.0f;
-#pragma unroll
-        for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
-            winner_weight = at[0] == i ? weights[i] : winner_weight;
-        }
-        winner_weight = __shfl_sync(0xFFFFFFFFu, winner_weight, winner);
+        const float winner_weight =
+            __shfl_sync(0xFFFFFFFFu, best_weight[0], winner);
         const uint32_t winner_expert = __shfl_sync(0xFFFFFFFFu, expert, winner);
         if (lane_idx == k) {
             my_score = winner_weight;
@@ -527,7 +562,8 @@ __device__ static void topk_weights_from_scores_fp32(
 template <typename Dims, uint32_t kExpertsPerThread>
 __device__ static void topk_one_token(
     uint32_t token_idx, uint32_t top_k, ScoringFunc scoring_func,
-    bool renormalize, const float* __restrict__ correction_bias,
+    bool renormalize,
+    const cutlass::Array<float, kExpertsPerThread>& correction_bias,
     const float* __restrict__ per_expert_scale,
     const MoEWorkspace<Dims>* __restrict__ workspace,
     MoESharedStorage<Dims>* smem) {
@@ -570,9 +606,7 @@ __device__ static void topk_one_token(
         float choice[kExpertsPerThread];
 #pragma unroll
         for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
-            choice[i] = hi[i] + (correction_bias != nullptr
-                                     ? __ldg(correction_bias + expert_id[i])
-                                     : 0.0f);
+            choice[i] = hi[i] + correction_bias[i];
         }
         topk_weights_from_scores_fp32<kExpertsPerThread, kMaxTopk>(
             token_idx, top_k, renormalize, per_expert_scale, choice, hi,

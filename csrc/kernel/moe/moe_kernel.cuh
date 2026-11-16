@@ -103,8 +103,8 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     sched.begin_phase(BlockPhase::kDown, smem->routing.active_expert_count);
     collective_mainloop.run_down(mainloop_params, smem, sched);
 
-    collective_mainloop.prefetch_tail_weights(mainloop_params);
     // Phase 4: gather and combine each token's top_k combine slots.
+    collective_mainloop.prefetch_tail_weights(mainloop_params);
     collective_mainloop.combine(mainloop_params, smem, sched.cta_group());
 
     // Phase 5: the latent moe tail.
