@@ -133,6 +133,16 @@ std::vector<torch::Tensor> VhaPostmixQuant(
     const std::optional<torch::Tensor>& output_quant,
     const std::optional<torch::Tensor>& output_sf);
 
+std::vector<torch::Tensor> MegaLlMhc(
+    const torch::Tensor& x, const torch::Tensor& residual,
+    const torch::Tensor& post, const torch::Tensor& comb,
+    const torch::Tensor& fn, const torch::Tensor& hc_scale,
+    const torch::Tensor& hc_base, const torch::Tensor& norm_weight,
+    double rms_eps, double hc_pre_eps, double hc_sinkhorn_eps,
+    double hc_post_mult_value, int64_t sinkhorn_repeat, double norm_eps,
+    bool mhc_align_fleet, const std::optional<torch::Tensor>& shared,
+    bool use_pdl, bool use_swizzle, int64_t token_tiles);
+
 std::vector<torch::Tensor> PrefillPermuteToMaskedGemm(
     const torch::Tensor& x, const torch::Tensor& scale,
     const torch::Tensor& topk_ids, const int num_local_experts,
@@ -283,6 +293,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("groups"), py::arg("group_major") = true,
           py::arg("use_pdl") = true, py::arg("output_quant") = py::none(),
           py::arg("output_sf") = py::none());
+
+    m.def("megallmhc", &halops::MegaLlMhc, py::arg("x"), py::arg("residual"),
+          py::arg("post"), py::arg("comb"), py::arg("fn"), py::arg("hc_scale"),
+          py::arg("hc_base"), py::arg("norm_weight"), py::arg("rms_eps"),
+          py::arg("hc_pre_eps"), py::arg("hc_sinkhorn_eps"),
+          py::arg("hc_post_mult_value"), py::arg("sinkhorn_repeat"),
+          py::arg("norm_eps"), py::arg("mhc_align_fleet") = false,
+          py::arg("shared") = py::none(), py::arg("use_pdl") = true,
+          py::arg("use_swizzle") = false, py::arg("token_tiles") = 4);
 
     m.def("mega_ll_moe", &halops::MegaLLMoE);
     m.def("moe_tail_region_bytes", &halops::MoETailRegionBytes, py::arg("wide"),
