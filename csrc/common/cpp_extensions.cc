@@ -236,8 +236,6 @@ int64_t MoETailRegionBytes(bool wide, int64_t tp_size);
 
 int64_t GetWorkspaceSize(int64_t max_tokens);
 
-int64_t RouterTileM(int64_t num_tokens);
-
 std::vector<torch::Tensor> SigmoidGateMulGroupQuant(const torch::Tensor& o,
                                                     const torch::Tensor& gate,
                                                     const bool use_pdl);
@@ -335,7 +333,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("tp_size") = 1);
     m.def("moe_get_workspace_size", &halops::GetWorkspaceSize,
           py::arg("max_tokens") = 0);
-    m.def("moe_router_tile_m", &halops::RouterTileM, py::arg("num_tokens") = 0);
 
     m.def("sigmoid_gate_mul_group_quant", &halops::SigmoidGateMulGroupQuant,
           py::arg("o"), py::arg("gate"), py::arg("use_pdl") = true);

@@ -42,7 +42,7 @@ def test_sigmoid_gate_mul_group_quant(t, hidden, gate_stride):
 
 def test_sigmoid_gate_mul_group_quant_errors():
     o = torch.randn(2, 48).bfloat16()
-    message = "hidden must be a positive multiple of 32, got 48"
+    message = "hidden must be a multiple of 32, got 48"
     with pytest.raises(RuntimeError, match=re.escape(message)):
         sigmoid_gate_mul_group_quant(o, o)
 

@@ -64,6 +64,21 @@ __global__ void __launch_bounds__(kHcMeanThreads, 1)
     }
 }
 
+using HcMeanKernel = void (*)(const __nv_bfloat16*, const __nv_bfloat16*,
+                              const float*, const float*, __nv_bfloat16*, int);
+
+HcMeanKernel SelectHcMeanKernel(int hc) {
+    switch (hc) {
+        case 2:
+            return mhc_post_hc_mean_kernel<2>;
+        case 3:
+            return mhc_post_hc_mean_kernel<3>;
+        case 4:
+            return mhc_post_hc_mean_kernel<4>;
+    }
+    TORCH_CHECK(false, "hc must be 2, 3 or 4, got ", hc);
+}
+
 }  // namespace
 
 torch::Tensor MhcPostHcMean(const torch::Tensor& x,
@@ -79,23 +94,9 @@ torch::Tensor MhcPostHcMean(const torch::Tensor& x,
                           {num_tokens, hc, hidden});
     CheckContiguousTensor(post, "post", torch::kFloat32, {num_tokens, hc});
     CheckContiguousTensor(comb, "comb", torch::kFloat32, {num_tokens, hc, hc});
+    const HcMeanKernel kernel = SelectHcMeanKernel(hc);
     torch::Tensor out = torch::empty({num_tokens, hidden}, x.options());
     if (num_tokens == 0) return out;
-    void (*kernel)(const __nv_bfloat16*, const __nv_bfloat16*, const float*,
-                   const float*, __nv_bfloat16*, int);
-    switch (hc) {
-        case 2:
-            kernel = mhc_post_hc_mean_kernel<2>;
-            break;
-        case 3:
-            kernel = mhc_post_hc_mean_kernel<3>;
-            break;
-        case 4:
-            kernel = mhc_post_hc_mean_kernel<4>;
-            break;
-        default:
-            TORCH_CHECK(false, "hc must be 2, 3 or 4, got ", hc);
-    }
     HALOPS_CUDA_CHECK(LaunchKernelWithPdl(
         kernel, dim3(num_tokens), dim3(kHcMeanThreads), kNoCluster, 0,
         GetCurrentCUDAStream(x), use_pdl,

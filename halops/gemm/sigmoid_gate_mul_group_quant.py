@@ -35,10 +35,10 @@ def sigmoid_gate_mul_group_quant(
     row to float8_e4m3fn with a UE8M0 scale ``2^ceil(log2(amax / 448))``.
 
     Args:
-        o: [T, hidden] bfloat16 contiguous tensor; ``hidden`` is a multiple
-            of 32.
-        gate: [T, hidden] bfloat16 tensor with contiguous, 16-byte aligned
-            rows; the row stride may be larger than ``hidden``.
+        o: [T, hidden] bfloat16 tensor with contiguous, 16-byte aligned rows;
+            ``hidden`` is a multiple of 32 and the row stride may be larger
+            than ``hidden``.
+        gate: [T, hidden] bfloat16 tensor laid out like ``o``.
         use_pdl: Enable Programmatic Dependent Launch (on by default).
 
     Returns:

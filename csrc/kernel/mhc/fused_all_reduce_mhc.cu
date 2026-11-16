@@ -16,39 +16,33 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cutlass/arch/barrier.h>
+#include <cutlass/functional.h>
+#include <cutlass/kernel_hardware_info.h>
+#include <math_constants.h>
 
 #include <algorithm>
 #include <cute/arch/cluster_sm90.hpp>
-#include <map>
-#include <mutex>
+#include <cutlass/cluster_launch.hpp>
 #include <optional>
-#include <utility>
 #include <vector>
 
 #include "common/activation.cuh"
-#include "common/comm.cuh"
 #include "common/cuda_utils.h"
 #include "common/mx_quant.cuh"
 #include "common/pdl.cuh"
-#include "common/ptx.cuh"
+#include "kernel/mla/mla_intrinsics.cuh"
+#include "kernel/moe/moe_tail_prims.cuh"
+#include "kernel/moe/ptx_utils.cuh"
 
 namespace halops {
 
 namespace {
 
-constexpr int kWarpThreads = cutlass::NumThreadsPerWarp;
-constexpr int kMaxClusterSize = 16;
-constexpr int kMaxCols = 256;
-constexpr int kMinColWarps = 2;
-constexpr int kMaxWarps = kMaxCols / kWarpThreads;
+using moe::tail::Vec16;
+
+constexpr int kMaxWorld = 8;
 constexpr int kMaxTokensPerCluster = 4;
-constexpr int kVec = sizeof(uint4) / sizeof(__nv_bfloat16);
-constexpr int kComputeBarrier = 0;
-constexpr int kPushBarrier = 1;
-constexpr int kSinkhornBlock = 32;
 constexpr int kMaxPrefetchRanges = 8;
-constexpr uint32_t kPrefetchChunk = 64 * 1024;
-constexpr float kLog2e = 1.4426950408889634f;
 
 template <int kHc>
 struct MhcShape {
@@ -61,28 +55,24 @@ struct MhcShape {
     static constexpr int kComb = kHc * kHc;
 };
 
-constexpr int MhcClusterSize(int hidden) {
-    if (hidden % kWarpThreads != 0) return 0;
-    const int col_warps = hidden / kWarpThreads;
-    for (int cs = kMaxClusterSize; cs > 1; --cs) {
-        const int warps = col_warps / cs;
-        if (col_warps % cs == 0 && warps >= kMinColWarps && warps <= kMaxWarps)
-            return cs;
-    }
-    return 0;
-}
-
 template <int kHidden>
 struct MhcTile {
-    static constexpr int kClusterSize = MhcClusterSize(kHidden);
-    static_assert(
-        kClusterSize > 0,
-        "hidden must split into at most 16 CTAs of 64 to 256 columns");
+    static constexpr int kClusterSize = 16;
     static constexpr int kCols = kHidden / kClusterSize;
-    static constexpr int kWarps = kCols / kWarpThreads;
+    static constexpr int kWarps = kCols / cutlass::NumThreadsPerWarp;
+    static constexpr int kVec = sizeof(Vec16) / sizeof(__nv_bfloat16);
     static constexpr int kRowVecs = kCols / kVec;
-    static constexpr int kBlock = kCols + kWarpThreads;
+    static constexpr int kBlock = kCols + cutlass::NumThreadsPerWarp;
     static constexpr float kInvHidden = 1.0f / kHidden;
+};
+
+struct LamportPlane {
+    uint8_t* peers[kMaxWorld];
+    uint32_t* counters;
+    int64_t slot_bytes;
+    int world;
+    int rank;
+    int num_counters;
 };
 
 struct MhcParams {
@@ -108,17 +98,18 @@ struct MhcParams {
     float hc_sinkhorn_eps;
     float hc_post_mult;
     float norm_eps;
-    comm::LamportPlane plane;
+    LamportPlane plane;
 };
 
-template <int kHc, int kTPC>
+template <int kHc, int kHidden, int kTPC>
 struct MhcSmem {
     using S = MhcShape<kHc>;
-    alignas(16) __nv_bfloat16 xs[kTPC][kMaxCols];
-    alignas(16) __nv_bfloat16 rs[kTPC][kHc][kMaxCols];
+    using L = MhcTile<kHidden>;
+    alignas(16) __nv_bfloat16 xs[kTPC][L::kCols];
+    alignas(16) __nv_bfloat16 rs[kTPC][kHc][L::kCols];
     alignas(16) float pc[kTPC][S::kPc];
-    alignas(16) float red[kMaxWarps][kTPC][S::kPartialsPad];
-    alignas(16) float cl[kMaxClusterSize][kTPC][S::kPartialsPad];
+    alignas(16) float red[L::kWarps][kTPC][S::kPartialsPad];
+    alignas(16) float cl[L::kClusterSize][kTPC][S::kPartialsPad];
     float tot[kTPC][S::kPartials];
     float hcs[3];
     float hcb[S::kMix];
@@ -134,6 +125,78 @@ struct L2PrefetchArgs {
 CUTE_DEVICE float add_rn(float a, float b) { return __fadd_rn(a, b); }
 CUTE_DEVICE float2 add_rn(float2 a, float2 b) { return __fadd2_rn(a, b); }
 CUTE_DEVICE float2 splat(float v) { return make_float2(v, v); }
+
+CUTE_DEVICE void st_relaxed_16B(const Vec16& v, void* addr, int64_t vid) {
+    const uint4 u = reinterpret_cast<const uint4&>(v);
+    addr = static_cast<uint8_t*>(addr) + vid * sizeof(uint4);
+    asm volatile("st.relaxed.sys.global.v4.b32 [%4], {%0, %1, %2, %3};"
+                 :
+                 : "r"(u.x), "r"(u.y), "r"(u.z), "r"(u.w), "l"(addr));
+}
+
+CUTE_DEVICE void st_async_v4(uint32_t addr, float4 v, uint32_t bar) {
+    asm volatile(
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 "
+        "[%0], {%1, %2, %3, %4}, [%5];" ::"r"(addr),
+        "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w), "r"(bar)
+        : "memory");
+}
+
+CUTE_DEVICE int64_t lamport_phase_offset(const LamportPlane& p, int counter) {
+    return int64_t(p.counters[counter] & 1) * p.world * p.slot_bytes;
+}
+
+CUTE_DEVICE void lamport_push(const LamportPlane& p, int64_t phase_off,
+                              int64_t vid, Vec16 v) {
+    moe::tail::sanitize(v);
+    const int64_t src_off = p.rank * p.slot_bytes + phase_off;
+    CUTLASS_PRAGMA_UNROLL
+    for (int d = 0; d < kMaxWorld; ++d) {
+        if (d < p.world) st_relaxed_16B(v, p.peers[d] + src_off, vid);
+    }
+}
+
+CUTE_DEVICE Vec16 lamport_poll_sum(const LamportPlane& p, int64_t phase_off,
+                                   int64_t vid) {
+    const uint8_t* base = p.peers[p.rank] + phase_off;
+    Vec16 v[kMaxWorld];
+    bool pending;
+    do {
+        pending = false;
+        CUTLASS_PRAGMA_UNROLL
+        for (int s = 0; s < kMaxWorld; ++s) {
+            if (s < p.world)
+                moe::ld_relaxed_16B(v[s], base + s * p.slot_bytes, vid);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int s = 0; s < kMaxWorld; ++s) {
+            const uint4 b = reinterpret_cast<const uint4&>(v[s]);
+            if (s < p.world) pending |= !(b.x && b.y && b.z && b.w);
+        }
+    } while (pending);
+    Vec16 sum;
+    CUTLASS_PRAGMA_UNROLL
+    for (int j = 0; j < 4; ++j) {
+        float2 acc = __bfloat1622float2(v[0][j]);
+        CUTLASS_PRAGMA_UNROLL
+        for (int s = 1; s < kMaxWorld; ++s) {
+            if (s < p.world) acc = __fadd2_rn(acc, __bfloat1622float2(v[s][j]));
+        }
+        sum[j] = __float22bfloat162_rn(acc);
+    }
+    return sum;
+}
+
+CUTE_DEVICE void lamport_reset(const LamportPlane& p, int64_t phase_off,
+                               int64_t vid) {
+    const uint4 empty{};
+    uint8_t* base = p.peers[p.rank] + phase_off;
+    CUTLASS_PRAGMA_UNROLL
+    for (int s = 0; s < kMaxWorld; ++s) {
+        if (s < p.world)
+            moe::st_global_16B(empty, base + s * p.slot_bytes, vid);
+    }
+}
 
 template <int kN, class T>
 CUTE_DEVICE T halving_sum(T (&x)[kN]) {
@@ -184,7 +247,8 @@ CUTE_DEVICE void sinkhorn_rows(SinkhornTile<kHc>& v, float eps) {
         for (int j = 0; j < kHc; ++j)
             x[j] = j % 2 ? v[i][j / 2].y : v[i][j / 2].x;
         const float s = halving_sum(x);
-        const float2 inv = splat(rcp_approx(kFirst ? s : __fadd_rn(s, eps)));
+        const cutlass::reciprocal_approximate_ftz<float> rcp;
+        const float2 inv = splat(rcp(kFirst ? s : __fadd_rn(s, eps)));
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < (kHc + 1) / 2; ++k) {
             v[i][k] = kFirst ? __ffma2_rn(v[i][k], inv, splat(eps))
@@ -201,7 +265,8 @@ CUTE_DEVICE void sinkhorn_cols(SinkhornTile<kHc>& v, float eps) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < kHc; ++i) x[i] = v[i][k];
         const float2 s = __fadd2_rn(halving_sum(x), splat(eps));
-        const float2 inv = make_float2(rcp_approx(s.x), rcp_approx(s.y));
+        const cutlass::reciprocal_approximate_ftz<float> rcp;
+        const float2 inv = make_float2(rcp(s.x), rcp(s.y));
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < kHc; ++i) v[i][k] = __fmul2_rn(v[i][k], inv);
     }
@@ -218,7 +283,7 @@ CUTE_DEVICE void sinkhorn(float (&c)[kHc * kHc], float eps, int repeat) {
         float e[kHc + 1] = {};
         CUTLASS_PRAGMA_UNROLL
         for (int j = 0; j < kHc; ++j)
-            e[j] = exp2f((c[i * kHc + j] - rmax) * kLog2e);
+            e[j] = exp2f((c[i * kHc + j] - rmax) * CUDART_L2E_F);
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < (kHc + 1) / 2; ++k)
             v[i][k] = make_float2(e[2 * k], e[2 * k + 1]);
@@ -282,6 +347,7 @@ struct ReduceScatter<kN, 0> {
 
 template <int kHidden>
 CUTE_DEVICE int64_t push_vid(int tok, int col0, int k) {
+    constexpr int kVec = MhcTile<kHidden>::kVec;
     return int64_t(tok) * (kHidden / kVec) + col0 / kVec + k;
 }
 
@@ -300,9 +366,10 @@ CUTE_DEVICE void load_weights(const MhcParams& p, int h,
     wn = p.norm_weight[h];
 }
 
-template <int kHc, int kTPC>
-CUTE_DEVICE void load_hc_params(const MhcParams& p, MhcSmem<kHc, kTPC>& sm,
-                                int lt, int nthr) {
+template <int kHc, int kHidden, int kTPC>
+CUTE_DEVICE void load_hc_params(const MhcParams& p,
+                                MhcSmem<kHc, kHidden, kTPC>& sm, int lt,
+                                int nthr) {
     for (int i = lt; i < 3 + MhcShape<kHc>::kMix; i += nthr) {
         if (i < 3) {
             sm.hcs[i] = p.hc_scale[i];
@@ -313,8 +380,9 @@ CUTE_DEVICE void load_hc_params(const MhcParams& p, MhcSmem<kHc, kTPC>& sm,
 }
 
 template <bool kWithX, bool kCombLogits, int kHidden, int kHc, int kTPC>
-CUTE_DEVICE void load_inputs(const MhcParams& p, MhcSmem<kHc, kTPC>& sm,
-                             int tok0, int nt, int col0, int lt, int nthr) {
+CUTE_DEVICE void load_inputs(const MhcParams& p,
+                             MhcSmem<kHc, kHidden, kTPC>& sm, int tok0, int nt,
+                             int col0, int lt, int nthr) {
     using S = MhcShape<kHc>;
     constexpr int kRowVecs = MhcTile<kHidden>::kRowVecs;
     constexpr int kFirst = kWithX ? 0 : 1;
@@ -339,9 +407,10 @@ CUTE_DEVICE void load_inputs(const MhcParams& p, MhcSmem<kHc, kTPC>& sm,
     }
 }
 
-template <int kHc, int kTPC>
-CUTE_DEVICE void comb_from_logits(const MhcParams& p, MhcSmem<kHc, kTPC>& sm,
-                                  int tok0, int nt, int lane) {
+template <int kHc, int kHidden, int kTPC>
+CUTE_DEVICE void comb_from_logits(const MhcParams& p,
+                                  MhcSmem<kHc, kHidden, kTPC>& sm, int tok0,
+                                  int nt, int lane) {
     constexpr int kComb = MhcShape<kHc>::kComb;
     if (lane >= nt) return;
     const float* src = p.comb + int64_t(tok0 + lane) * kComb;
@@ -355,7 +424,7 @@ CUTE_DEVICE void comb_from_logits(const MhcParams& p, MhcSmem<kHc, kTPC>& sm,
 
 template <int kHidden, int kHc, int kTPC>
 CUTE_DEVICE void post_residual_and_reduce(
-    const MhcParams& p, MhcSmem<kHc, kTPC>& sm,
+    const MhcParams& p, MhcSmem<kHc, kHidden, kTPC>& sm,
     const float (&w)[MhcShape<kHc>::kMix][kHc], int t, int64_t tok, int h,
     int tid, int lane, int warp, float (&rf)[kHc]) {
     using S = MhcShape<kHc>;
@@ -413,7 +482,7 @@ CUTE_DEVICE void post_residual_and_reduce(
         pv[S::kMix + n] = g.x;
         if (n + 1 < S::kGram) pv[S::kMix + n + 1] = g.y;
     }
-    using RS = ReduceScatter<S::kPartials, kWarpThreads / 2>;
+    using RS = ReduceScatter<S::kPartials, cutlass::NumThreadsPerWarp / 2>;
     float s[RS::kOut];
     RS::run(pv, s, lane);
     CUTLASS_PRAGMA_UNROLL
@@ -424,8 +493,8 @@ CUTE_DEVICE void post_residual_and_reduce(
 }
 
 template <int kHidden, int kHc, int kTPC>
-CUTE_DEVICE void exchange_partials(MhcSmem<kHc, kTPC>& sm, int nt, int rank,
-                                   int tid, uint32_t bar) {
+CUTE_DEVICE void exchange_partials(MhcSmem<kHc, kHidden, kTPC>& sm, int nt,
+                                   int rank, int tid, uint32_t bar) {
     using L = MhcTile<kHidden>;
     constexpr int kPV = MhcShape<kHc>::kPV;
     for (int i = tid; i < L::kClusterSize * nt * kPV; i += L::kCols) {
@@ -439,7 +508,7 @@ CUTE_DEVICE void exchange_partials(MhcSmem<kHc, kTPC>& sm, int nt, int rank,
             lo = __fadd2_rn(lo, make_float2(r.x, r.y));
             hi = __fadd2_rn(hi, make_float2(r.z, r.w));
         }
-        comm::st_async_v4(
+        st_async_v4(
             cute::set_block_rank(
                 cute::cast_smem_ptr_to_uint(&sm.cl[rank][t][4 * k]), dst),
             make_float4(lo.x, lo.y, hi.x, hi.y),
@@ -447,20 +516,21 @@ CUTE_DEVICE void exchange_partials(MhcSmem<kHc, kTPC>& sm, int nt, int rank,
     }
 }
 
-template <int kHc, int kTPC>
-CUTE_DEVICE float comb_logit(const MhcSmem<kHc, kTPC>& sm, int t, float rms,
-                             int k) {
+template <int kHc, int kHidden, int kTPC>
+CUTE_DEVICE float comb_logit(const MhcSmem<kHc, kHidden, kTPC>& sm, int t,
+                             float rms, int k) {
     return fmaf(sm.tot[t][2 * kHc + k] * rms, sm.hcs[2], sm.hcb[2 * kHc + k]);
 }
 
 template <int kHidden, int kHc, int kTPC>
-CUTE_DEVICE void token_scalars(const MhcParams& p, const MhcSmem<kHc, kTPC>& sm,
-                               int tok0, int nt, int lane, bool store,
+CUTE_DEVICE void token_scalars(const MhcParams& p,
+                               const MhcSmem<kHc, kHidden, kTPC>& sm, int tok0,
+                               int nt, int lane, bool store,
                                float (&pre_out)[kTPC][kHc],
                                float (&rn_out)[kTPC]) {
     constexpr int kLanes = 2 * kHc;
     constexpr float kInvHcHidden = 1.0f / (kHc * kHidden);
-    static_assert(kLanes * kTPC <= kWarpThreads);
+    static_assert(kLanes * kTPC <= cutlass::NumThreadsPerWarp);
     const int t = min(lane / kLanes, nt - 1), q = lane % kLanes, j = q % kHc;
     const bool is_post = q >= kHc;
     const float* tot = sm.tot[t];
@@ -501,8 +571,9 @@ CUTE_DEVICE void token_scalars(const MhcParams& p, const MhcSmem<kHc, kTPC>& sm,
 }
 
 template <int kHidden, int kHc, int kTPC>
-CUTE_DEVICE void token_comb(const MhcParams& p, const MhcSmem<kHc, kTPC>& sm,
-                            int t, int64_t tok) {
+CUTE_DEVICE void token_comb(const MhcParams& p,
+                            const MhcSmem<kHc, kHidden, kTPC>& sm, int t,
+                            int64_t tok) {
     constexpr int kComb = MhcShape<kHc>::kComb;
     constexpr float kInvHcHidden = 1.0f / (kHc * kHidden);
     const float rms = token_rms<kHc>(sm.tot[t], kInvHcHidden, p.rms_eps);
@@ -529,7 +600,7 @@ CUTE_DEVICE void norm_quant_out(const MhcParams& p, int64_t tok, int h,
     const float o = __bfloat162float(ob);
     float amax = fabsf(o);
     CUTLASS_PRAGMA_UNROLL
-    for (int m = kWarpThreads / 2; m > 0; m /= 2)
+    for (int m = cutlass::NumThreadsPerWarp / 2; m > 0; m /= 2)
         amax = fmaxf(amax, __shfl_xor_sync(~0u, amax, m));
     const uint32_t e = mxfp8::scale_of_exp8(
         mxfp8::exp8_pair(__float2bfloat162_rn(amax)) & 0xffu);
@@ -548,9 +619,9 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
     using L = MhcTile<kHidden>;
     using cutlass::arch::NamedBarrier;
     extern __shared__ __align__(16) uint8_t smem_raw[];
-    auto& sm = *reinterpret_cast<MhcSmem<kHc, kTPC>*>(smem_raw);
-    const int tid = threadIdx.x, lane = tid % kWarpThreads;
-    const int warp = tid / kWarpThreads;
+    auto& sm = *reinterpret_cast<MhcSmem<kHc, kHidden, kTPC>*>(smem_raw);
+    const int tid = threadIdx.x, lane = tid % cutlass::NumThreadsPerWarp;
+    const int warp = tid / cutlass::NumThreadsPerWarp;
     const bool compute = tid < L::kCols;
     const int rank = cute::block_rank_in_cluster();
     const int col0 = rank * L::kCols, h = col0 + tid;
@@ -577,39 +648,37 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
         cutlass::arch::ClusterBarrier::init(&sm.tot_bar, 1);
         cutlass::arch::fence_barrier_init();
     }
-    comm::cluster_arrive_relaxed();
+    cute::cluster_arrive_relaxed();
     pdl_wait();
 
     if (compute) {
         if constexpr (kFuseAR) {
             const int active = nt * L::kRowVecs;
-            const int pushers = cute::round_up(active, int{kWarpThreads});
+            const int pushers =
+                cute::round_up(active, int{cutlass::NumThreadsPerWarp});
             if (tid < pushers) {
-                const int64_t phase_off =
-                    comm::lamport_phase_offset(p.plane, blk);
+                const int64_t phase_off = lamport_phase_offset(p.plane, blk);
                 const int q = tid / L::kRowVecs, k = tid % L::kRowVecs;
                 const int64_t vid = push_vid<kHidden>(tok0 + q, col0, k);
                 if (tid < active) {
-                    uint4 v;
-                    comm::ld_global_16B(v, p.x, vid);
-                    comm::lamport_push(p.plane, phase_off, vid, v);
+                    Vec16 v;
+                    moe::ld_global_16B(v, p.x, vid);
+                    lamport_push(p.plane, phase_off, vid, v);
                 }
                 pdl_trigger();
-                NamedBarrier::arrive(L::kCols, kPushBarrier);
+                NamedBarrier::arrive(L::kCols, 0);
                 load_weights<kHidden>(p, h, w, wn);
                 if (tid < active) {
-                    uint4 v[comm::kMaxWorld];
-                    comm::lamport_poll(p.plane, phase_off, vid, v);
-                    reinterpret_cast<uint4*>(sm.xs[q])[k] =
-                        comm::sum_bf16x8(p.plane, v);
+                    reinterpret_cast<Vec16*>(sm.xs[q])[k] =
+                        lamport_poll_sum(p.plane, phase_off, vid);
                 }
             } else {
-                NamedBarrier::sync(L::kCols, kPushBarrier);
+                NamedBarrier::sync(L::kCols, 0);
                 const int lt = tid - pushers, nl = L::kCols - pushers;
                 if (blk == 0) {
                     for (int i = L::kClusterSize * gridDim.y + lt;
                          i < p.plane.num_counters; i += nl)
-                        comm::lamport_advance(p.plane, i);
+                        atomicAdd(p.plane.counters + i, 1u);
                 }
                 load_weights<kHidden>(p, h, w, wn);
                 load_inputs<false, kCombLogits, kHidden>(p, sm, tok0, nt, col0,
@@ -621,8 +690,7 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
                                                     L::kCols);
         }
     } else {
-        if constexpr (kFuseAR)
-            reset_off = comm::lamport_phase_offset(p.plane, blk);
+        if constexpr (kFuseAR) reset_off = lamport_phase_offset(p.plane, blk);
         if constexpr (kCombLogits) comb_from_logits(p, sm, tok0, nt, lane);
     }
     __syncthreads();
@@ -635,10 +703,10 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
                 post_residual_and_reduce<kHidden>(p, sm, w, t, tok0 + t, h, tid,
                                                   lane, warp, rf[t]);
         }
-        NamedBarrier::sync(L::kCols, kComputeBarrier);
-        comm::cluster_wait();
+        NamedBarrier::sync(L::kCols, 0);
+        cute::cluster_wait();
         exchange_partials<kHidden>(sm, nt, rank, tid, bar);
-        comm::mbar_wait_cluster(bar, 0);
+        mla::mbar_wait_cluster(bar, 0);
         for (int i = tid; i < nt * S::kPartials; i += L::kCols) {
             const int t = i / S::kPartials, v = i % S::kPartials;
             float s = sm.cl[0][t][v];
@@ -647,8 +715,8 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
                 s = __fadd_rn(s, sm.cl[r][t][v]);
             sm.tot[t][v] = s;
         }
-        comm::cluster_arrive_relaxed();
-        NamedBarrier::sync(L::kCols, kComputeBarrier);
+        cute::cluster_arrive_relaxed();
+        NamedBarrier::sync(L::kCols, 0);
         if (tid == 0) cutlass::arch::ClusterBarrier::arrive(&sm.tot_bar);
         if constexpr (!kFuseAR) pdl_trigger();
         float pre[kTPC][kHc], rn[kTPC];
@@ -662,41 +730,44 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
         }
     } else {
         if constexpr (kFuseAR) {
-            if (lane == 0) comm::lamport_advance(p.plane, blk);
-            for (int i = lane; i < nt * L::kRowVecs; i += kWarpThreads) {
+            if (lane == 0) atomicAdd(p.plane.counters + blk, 1u);
+            for (int i = lane; i < nt * L::kRowVecs;
+                 i += cutlass::NumThreadsPerWarp) {
                 const int q = i / L::kRowVecs, k = i % L::kRowVecs;
-                comm::lamport_reset(p.plane, reset_off,
-                                    push_vid<kHidden>(tok0 + q, col0, k));
+                lamport_reset(p.plane, reset_off,
+                              push_vid<kHidden>(tok0 + q, col0, k));
             }
         }
-        comm::cluster_wait();
-        comm::cluster_arrive_relaxed();
-        comm::mbar_wait_cluster(cute::cast_smem_ptr_to_uint(&sm.tot_bar), 0);
+        cute::cluster_wait();
+        cute::cluster_arrive_relaxed();
+        mla::mbar_wait_cluster(cute::cast_smem_ptr_to_uint(&sm.tot_bar), 0);
         if (lane == 0 && !p.write_logits) {
             for (int t = rank; t < nt; t += L::kClusterSize)
                 token_comb<kHidden>(p, sm, t, tok0 + t);
         }
     }
-    comm::cluster_wait();
+    cute::cluster_wait();
 }
 
 CUTE_DEVICE void l2_prefetch(const L2PrefetchArgs& a, uint32_t w, uint32_t nw) {
+    constexpr uint32_t kChunk = 64 * 1024;
     uint32_t first = 0;
 #pragma unroll 1
     for (int r = 0; r < kMaxPrefetchRanges; ++r) {
         const uint32_t bytes = a.bytes[r];
-        const uint32_t n = (bytes + kPrefetchChunk - 1) / kPrefetchChunk;
+        const uint32_t n = (bytes + kChunk - 1) / kChunk;
         for (uint32_t c = (w + nw - first % nw) % nw; c < n; c += nw) {
-            const uint32_t off = c * kPrefetchChunk;
-            prefetch_l2_bulk(reinterpret_cast<const void*>(a.addr[r] + off),
-                             min(kPrefetchChunk, bytes - off));
+            const uint32_t off = c * kChunk;
+            moe::prefetch_l2_bulk(
+                reinterpret_cast<const void*>(a.addr[r] + off),
+                min(kChunk, bytes - off));
         }
         first += n;
     }
 }
 
 template <int kHc>
-__global__ void __launch_bounds__(kSinkhornBlock, kSinkhornBlock)
+__global__ void __launch_bounds__(cutlass::NumThreadsPerWarp)
     mhc_sinkhorn_kernel(const float* __restrict__ logits,
                         float* __restrict__ out, int num_tokens, float eps,
                         int repeat, const L2PrefetchArgs __grid_constant__ pf) {
@@ -730,31 +801,26 @@ MhcLaunch SelectMhcKernel(int tpc, bool fuse_ar, bool comb_logits) {
         }
     }
     using L = MhcTile<kHidden>;
-    constexpr size_t kSmem = sizeof(MhcSmem<kHc, kTPC>);
-    MhcKernel kernel =
-        comb_logits
-            ? fused_all_reduce_mhc_kernel<kHc, kHidden, kTPC, false, true>
-            : fused_all_reduce_mhc_kernel<kHc, kHidden, kTPC, false, false>;
-    if (fuse_ar) {
-        kernel =
-            comb_logits
-                ? fused_all_reduce_mhc_kernel<kHc, kHidden, kTPC, true, true>
-                : fused_all_reduce_mhc_kernel<kHc, kHidden, kTPC, true, false>;
-    }
-    return {kernel, kSmem, L::kClusterSize, L::kBlock};
+    const MhcKernel kernels[2][2] = {
+        {fused_all_reduce_mhc_kernel<kHc, kHidden, kTPC, false, false>,
+         fused_all_reduce_mhc_kernel<kHc, kHidden, kTPC, false, true>},
+        {fused_all_reduce_mhc_kernel<kHc, kHidden, kTPC, true, false>,
+         fused_all_reduce_mhc_kernel<kHc, kHidden, kTPC, true, true>}};
+    const MhcKernel kernel = kernels[fuse_ar][comb_logits];
+    TORCH_CHECK(cutlass::ClusterLauncher::init(reinterpret_cast<const void*>(
+                    kernel)) == cutlass::Status::kSuccess,
+                "failed to allow a cluster of ", L::kClusterSize, " CTAs");
+    return {kernel, sizeof(MhcSmem<kHc, kHidden, kTPC>), L::kClusterSize,
+            L::kBlock};
 }
 
 template <int kHc>
 MhcLaunch SelectMhcHidden(int hidden, int tpc, bool fuse_ar, bool comb_logits) {
     switch (hidden) {
-        case 1024:
-            return SelectMhcKernel<kHc, 1024>(tpc, fuse_ar, comb_logits);
-        case 1536:
-            return SelectMhcKernel<kHc, 1536>(tpc, fuse_ar, comb_logits);
         case 4096:
             return SelectMhcKernel<kHc, 4096>(tpc, fuse_ar, comb_logits);
     }
-    TORCH_CHECK(false, "hidden must be 1024, 1536 or 4096, got ", hidden);
+    TORCH_CHECK(false, "hidden support 4096 only, got ", hidden);
 }
 
 MhcLaunch SelectMhcKernel(int hc, int hidden, int tpc, bool fuse_ar,
@@ -770,38 +836,13 @@ MhcLaunch SelectMhcKernel(int hc, int hidden, int tpc, bool fuse_ar,
     TORCH_CHECK(false, "hc must be 2, 3 or 4, got ", hc);
 }
 
-int PrepareKernel(const MhcLaunch& launch) {
-    static std::mutex mutex;
-    static std::map<std::pair<MhcKernel, int>, int> max_clusters;
-    const int device = CurrentDevice();
-    const std::lock_guard<std::mutex> lock(mutex);
-    const auto key = std::make_pair(launch.kernel, device);
-    const auto it = max_clusters.find(key);
-    if (it != max_clusters.end()) return it->second;
-    const int cs = launch.cluster_size;
-    const auto* func = reinterpret_cast<const void*>(launch.kernel);
-    int smem = 0;
-    HALOPS_CUDA_CHECK(cudaDeviceGetAttribute(
-        &smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-    HALOPS_CUDA_CHECK(cudaFuncSetAttribute(
-        func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    HALOPS_CUDA_CHECK(cudaFuncSetAttribute(
-        func, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
-    cudaLaunchAttribute attr{};
-    attr.id = cudaLaunchAttributeClusterDimension;
-    attr.val.clusterDim.x = cs;
-    attr.val.clusterDim.y = 1;
-    attr.val.clusterDim.z = 1;
-    cudaLaunchConfig_t config{};
-    config.gridDim = dim3(cs);
-    config.blockDim = dim3(launch.block);
-    config.dynamicSmemBytes = smem;
-    config.attrs = &attr;
-    config.numAttrs = 1;
-    int clusters = 0;
-    HALOPS_CUDA_CHECK(cudaOccupancyMaxActiveClusters(&clusters, func, &config));
-    TORCH_CHECK(clusters > 0, "no cluster of ", cs, " CTAs is schedulable");
-    max_clusters.emplace(key, clusters);
+int MaxActiveClusters(const MhcLaunch& launch) {
+    const int clusters =
+        cutlass::KernelHardwareInfo::query_device_max_active_clusters(
+            dim3(launch.cluster_size), launch.block,
+            reinterpret_cast<const void*>(launch.kernel));
+    TORCH_CHECK(clusters > 0, "no cluster of ", launch.cluster_size,
+                " CTAs is schedulable");
     return clusters;
 }
 
@@ -810,18 +851,28 @@ L2PrefetchArgs MakeL2PrefetchArgs(const std::vector<torch::Tensor>& tensors) {
                 kMaxPrefetchRanges, " prefetch tensors, got ", tensors.size());
     L2PrefetchArgs args{};
     for (size_t i = 0; i < tensors.size(); ++i) {
-        const auto& t = tensors[i];
-        TORCH_CHECK(t.is_cuda() && t.is_contiguous(),
-                    "prefetch tensors must be contiguous CUDA tensors");
-        const auto ptr = reinterpret_cast<uint64_t>(t.data_ptr());
+        const auto ptr = reinterpret_cast<uint64_t>(tensors[i].data_ptr());
         const uint64_t start = ptr & ~uint64_t{15};
-        const uint64_t end = (ptr + t.nbytes() + 15) & ~uint64_t{15};
-        TORCH_CHECK(end - start <= UINT32_MAX,
-                    "prefetch tensors must be under 4 GiB");
+        const uint64_t end = (ptr + tensors[i].nbytes() + 15) & ~uint64_t{15};
         args.addr[i] = start;
         args.bytes[i] = static_cast<uint32_t>(end - start);
     }
     return args;
+}
+
+using SinkhornKernel = void (*)(const float*, float*, int, float, int,
+                                L2PrefetchArgs);
+
+SinkhornKernel SelectSinkhornKernel(int hc) {
+    switch (hc) {
+        case 2:
+            return mhc_sinkhorn_kernel<2>;
+        case 3:
+            return mhc_sinkhorn_kernel<3>;
+        case 4:
+            return mhc_sinkhorn_kernel<4>;
+    }
+    TORCH_CHECK(false, "hc must be 2, 3 or 4, got ", hc);
 }
 
 }  // namespace
@@ -838,29 +889,14 @@ std::vector<torch::Tensor> FusedAllReduceMhc(
     const std::optional<torch::Tensor>& counters, const int64_t slot_bytes,
     const int64_t tp_rank, const bool use_pdl) {
     const CudaDeviceGuard device_guard(x.device());
-    TORCH_CHECK(x.dim() == 2 && x.size(1) > 0 && fn.dim() == 2 &&
-                    fn.size(1) % x.size(1) == 0,
-                "x must be [T, hidden] and fn [hc * (hc + 2), hc * hidden]");
-    const int64_t num_tokens = x.size(0), hidden = x.size(1);
-    const int64_t hc = fn.size(1) / hidden, mix = hc * (hc + 2);
+    TORCH_CHECK(residual.dim() == 3, "residual must be [T, hc, hidden]");
+    const int64_t num_tokens = residual.size(0), hc = residual.size(1),
+                  hidden = residual.size(2);
     CheckContiguousTensor(x, "x", torch::kBFloat16, {num_tokens, hidden});
     CheckContiguousTensor(residual, "residual", torch::kBFloat16,
                           {num_tokens, hc, hidden});
     CheckContiguousTensor(post, "post", torch::kFloat32, {num_tokens, hc});
     CheckContiguousTensor(comb, "comb", torch::kFloat32, {num_tokens, hc, hc});
-    CheckContiguousTensor(fn, "fn", torch::kFloat32, {mix, hc * hidden});
-    CheckContiguousTensor(hc_scale, "hc_scale", torch::kFloat32, {3});
-    CheckContiguousTensor(hc_base, "hc_base", torch::kFloat32, {mix});
-    CheckContiguousTensor(norm_weight, "norm_weight", torch::kBFloat16,
-                          {hidden});
-    TORCH_CHECK(
-        reinterpret_cast<uintptr_t>(x.data_ptr()) % sizeof(uint4) == 0 &&
-            reinterpret_cast<uintptr_t>(residual.data_ptr()) % sizeof(uint4) ==
-                0,
-        "x and residual must be 16-byte aligned");
-    TORCH_CHECK(sinkhorn_repeat >= 1, "sinkhorn_repeat must be positive");
-    TORCH_CHECK(peer_ptrs.has_value() == counters.has_value(),
-                "peer_ptrs and counters must be given together");
     const bool fuse_ar = peer_ptrs.has_value();
     const MhcLaunch probe =
         SelectMhcKernel(hc, hidden, 1, fuse_ar, comb_is_logits);
@@ -881,7 +917,7 @@ std::vector<torch::Tensor> FusedAllReduceMhc(
                                     mix_out,      q,         sf};
     if (num_tokens == 0) return outs;
 
-    const int max_clusters = PrepareKernel(probe);
+    const int max_clusters = MaxActiveClusters(probe);
     int tpc = cute::ceil_div(int(num_tokens), max_clusters);
     TORCH_CHECK(!fuse_ar || tpc <= kMaxTokensPerCluster, "at most ",
                 kMaxTokensPerCluster * max_clusters,
@@ -890,35 +926,19 @@ std::vector<torch::Tensor> FusedAllReduceMhc(
     tpc = std::min(tpc, kMaxTokensPerCluster);
     const MhcLaunch launch =
         SelectMhcKernel(hc, hidden, tpc, fuse_ar, comb_is_logits);
-    PrepareKernel(launch);
     const int num_clusters = cute::ceil_div(int(num_tokens), tpc);
 
-    comm::LamportPlane plane{};
+    LamportPlane plane{};
     if (fuse_ar) {
-        const auto& ptrs = *peer_ptrs;
-        TORCH_CHECK(ptrs.device().is_cpu() &&
-                        ptrs.scalar_type() == torch::kInt64 && ptrs.dim() == 1,
-                    "peer_ptrs must be a 1D int64 CPU tensor");
-        const int world = ptrs.numel();
-        TORCH_CHECK(world >= 1 && world <= comm::kMaxWorld, "world size must ",
-                    "be in [1, ", comm::kMaxWorld, "], got ", world);
-        TORCH_CHECK(tp_rank >= 0 && tp_rank < world, "tp_rank ", tp_rank,
-                    " is out of range for world size ", world);
-        TORCH_CHECK(counters->is_cuda() && counters->is_contiguous() &&
-                        counters->scalar_type() == torch::kInt32 &&
-                        counters->numel() >= int64_t{cs} * num_clusters,
-                    "counters must be a contiguous int32 CUDA tensor of at "
-                    "least ",
-                    cs * num_clusters, " elements");
-        TORCH_CHECK(slot_bytes % sizeof(uint4) == 0 &&
+        const int world = peer_ptrs->numel();
+        TORCH_CHECK(world <= kMaxWorld &&
+                        counters->numel() >= int64_t{cs} * num_clusters &&
                         num_tokens * hidden * int64_t{sizeof(__nv_bfloat16)} <=
                             slot_bytes,
-                    "slot_bytes ", slot_bytes, " cannot hold ", num_tokens,
+                    "workspace for world ", world, " cannot hold ", num_tokens,
                     " tokens");
-        const auto* addrs = ptrs.const_data_ptr<int64_t>();
+        const auto* addrs = peer_ptrs->const_data_ptr<int64_t>();
         for (int r = 0; r < world; ++r) {
-            TORCH_CHECK(addrs[r] != 0 && addrs[r] % sizeof(uint4) == 0,
-                        "peer_ptrs must be 16-byte aligned device addresses");
             plane.peers[r] = reinterpret_cast<uint8_t*>(addrs[r]);
         }
         plane.counters = reinterpret_cast<uint32_t*>(counters->data_ptr());
@@ -971,28 +991,15 @@ void MhcSinkhorn(const torch::Tensor& logits, torch::Tensor& out,
     CheckContiguousTensor(logits, "logits", torch::kFloat32,
                           {num_tokens, hc, hc});
     CheckContiguousTensor(out, "out", torch::kFloat32, {num_tokens, hc, hc});
-    TORCH_CHECK(repeat >= 1, "repeat must be positive");
+    const SinkhornKernel kernel = SelectSinkhornKernel(hc);
     const L2PrefetchArgs pf = MakeL2PrefetchArgs(prefetch);
     if (num_tokens == 0) return;
-    void (*kernel)(const float*, float*, int, float, int, L2PrefetchArgs);
-    switch (hc) {
-        case 2:
-            kernel = mhc_sinkhorn_kernel<2>;
-            break;
-        case 3:
-            kernel = mhc_sinkhorn_kernel<3>;
-            break;
-        case 4:
-            kernel = mhc_sinkhorn_kernel<4>;
-            break;
-        default:
-            TORCH_CHECK(false, "hc must be 2, 3 or 4, got ", hc);
-    }
     HALOPS_CUDA_CHECK(LaunchKernelWithPdl(
-        kernel, dim3(cute::ceil_div(int(num_tokens), kSinkhornBlock)),
-        dim3(kSinkhornBlock), kNoCluster, 0, GetCurrentCUDAStream(logits),
-        false, logits.const_data_ptr<float>(), out.data_ptr<float>(),
-        int(num_tokens), float(eps), int(repeat), pf));
+        kernel,
+        dim3(cute::ceil_div(int(num_tokens), cutlass::NumThreadsPerWarp)),
+        dim3(cutlass::NumThreadsPerWarp), kNoCluster, 0,
+        GetCurrentCUDAStream(logits), false, logits.const_data_ptr<float>(),
+        out.data_ptr<float>(), int(num_tokens), float(eps), int(repeat), pf));
 }
 
 }  // namespace halops

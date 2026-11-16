@@ -78,8 +78,6 @@ def get_workspace_for_mhc(
         >>>
         >>> workspace = get_workspace_for_mhc(16, 4096, "", 0, 1)
     """
-    if not 1 <= tp_size <= 8:
-        raise ValueError(f"tp_size must be in [1, 8], got {tp_size}")
     device = (
         torch.device("cuda", torch.cuda.current_device()) if device is None else device
     )
@@ -108,8 +106,6 @@ def get_workspace_for_mhc(
             (nbytes,), [1], torch.uint8, device, group_name
         )
     handle = _SymmetricMemory.rendezvous(region)
-    if handle is None:
-        raise RuntimeError("symmetric memory rendezvous failed")
     region.zero_()
     peers = [handle.get_buffer(r, [nbytes], torch.uint8) for r in range(tp_size)]
     peer_ptrs = torch.tensor(
@@ -169,11 +165,11 @@ def fused_all_reduce_mhc(
       quantized to float8_e4m3fn with one UE8M0 scale per 32 elements.
 
     Args:
-        x: [T, hidden] bfloat16 contiguous, 16-byte aligned layer output;
+        x: [T, hidden] bfloat16 contiguous layer output;
             this rank's partial sum when ``workspace`` is given. ``hidden``
-            is 1024, 1536 or 4096.
-        residual: [T, hc, hidden] bfloat16 contiguous, 16-byte aligned
-            residual streams; ``hc`` is 2, 3 or 4.
+            is 4096.
+        residual: [T, hc, hidden] bfloat16 contiguous residual streams;
+            ``hc`` is 2, 3 or 4.
         post: [T, hc] float32 contiguous post weights.
         comb: [T, hc, hc] float32 contiguous mixing matrices, or their
             logits with ``comb_is_logits``.
@@ -185,7 +181,7 @@ def fused_all_reduce_mhc(
         hc_pre_eps: Offset added to ``pre``.
         hc_sinkhorn_eps: Epsilon of the Sinkhorn normalization.
         hc_post_mult: Multiplier of ``post_out``.
-        sinkhorn_repeat: Sinkhorn rounds, at least 1.
+        sinkhorn_repeat: Number of Sinkhorn rounds.
         norm_eps: Epsilon of the RMSNorm.
         workspace: Buffers from ``get_workspace_for_mhc``; ``None`` skips
             the all-reduce. With it, T is at most 4 times the number of
@@ -277,7 +273,7 @@ def mhc_sinkhorn(
         logits: [T, hc, hc] float32 contiguous comb logits; ``hc`` is 2, 3
             or 4.
         eps: Epsilon of the normalization (``hc_sinkhorn_eps``).
-        repeat: Sinkhorn rounds, at least 1.
+        repeat: Number of Sinkhorn rounds.
         out: Optional pre-allocated [T, hc, hc] float32 contiguous output.
         prefetch: At most 8 contiguous CUDA tensors, each under 4 GiB.
 

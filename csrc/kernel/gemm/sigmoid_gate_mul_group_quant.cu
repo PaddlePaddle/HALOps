@@ -16,7 +16,6 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <vector>
 
 #include "common/activation.cuh"
@@ -29,69 +28,62 @@ namespace halops {
 namespace {
 
 constexpr int kSgVec = sizeof(uint4) / sizeof(__nv_bfloat16);
-constexpr int kSgGroupThreads = mxfp8::kGroup / kSgVec;
-constexpr int kSgMaxThreads = 1024;
+constexpr int kSgBlock = 128;
 
-__global__ void __launch_bounds__(kSgMaxThreads, 1)
+__global__ void __launch_bounds__(kSgBlock)
     sigmoid_gate_mul_group_quant_kernel(const __nv_bfloat16* __restrict__ o,
+                                        int64_t o_ld,
                                         const __nv_bfloat16* __restrict__ gate,
-                                        int64_t gate_ld, int hidden,
-                                        uint8_t* __restrict__ q,
-                                        uint8_t* __restrict__ sf) {
-    const int64_t token = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int num_vecs = hidden / kSgVec;
-    const auto* o_row = reinterpret_cast<const uint4*>(o + token * hidden);
-    const auto* g_row = reinterpret_cast<const uint4*>(gate + token * gate_ld);
-    auto* q_row = reinterpret_cast<uint2*>(q + token * hidden);
-    uint8_t* sf_row = sf + token * (hidden / mxfp8::kGroup);
-
+                                        int64_t gate_ld, uint2* __restrict__ q,
+                                        uint8_t* __restrict__ sf, int num_vecs,
+                                        int row_vecs) {
+    constexpr int kGroupLanes = mxfp8::kGroup / kSgVec;
     pdl_trigger();
     pdl_wait();
-    for (int base = 0; base < num_vecs; base += blockDim.x) {
-        const int v = base + tid;
-        const bool active = v < num_vecs;
-        uint4 ov{}, gv{};
-        if (active) {
-            ov = o_row[v];
-            gv = g_row[v];
-        }
-        const auto* op = reinterpret_cast<const __nv_bfloat162*>(&ov);
-        const auto* gp = reinterpret_cast<const __nv_bfloat162*>(&gv);
-        float2 n[kSgVec / 2];
-        float amax = 0.0f;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < kSgVec / 2; ++i) {
-            const float2 of = __bfloat1622float2(op[i]);
-            const float2 gf = __bfloat1622float2(gp[i]);
-            const float2 s = __bfloat1622float2(
-                __floats2bfloat162_rn(sigmoid_rn(gf.x), sigmoid_rn(gf.y)));
-            n[i] = __bfloat1622float2(__floats2bfloat162_rn(
-                __fmul_rn(of.x, s.x), __fmul_rn(of.y, s.y)));
-            amax = fmaxf(amax, fmaxf(fabsf(n[i].x), fabsf(n[i].y)));
-        }
-        CUTLASS_PRAGMA_UNROLL
-        for (int m = kSgGroupThreads / 2; m > 0; m /= 2)
-            amax = fmaxf(amax, __shfl_xor_sync(~0u, amax, m));
-        float inv = 0.0f;
-        const uint8_t e = mxfp8::ue8m0_scale(
-            __fmul_rn(fmaxf(amax, mxfp8::kAmaxFloor), 1.0f / mxfp8::kE4m3Max),
-            inv);
-        if (!active) continue;
-        uint2 out;
-        auto* qp = reinterpret_cast<__nv_fp8x2_storage_t*>(&out);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < kSgVec / 2; ++i) {
-            const float2 c = make_float2(
-                fminf(fmaxf(__fmul_rn(n[i].x, inv), -mxfp8::kE4m3Max),
-                      mxfp8::kE4m3Max),
-                fminf(fmaxf(__fmul_rn(n[i].y, inv), -mxfp8::kE4m3Max),
-                      mxfp8::kE4m3Max));
-            qp[i] = __nv_cvt_float2_to_fp8x2(c, __NV_SATFINITE, __NV_E4M3);
-        }
-        q_row[v] = out;
-        if (v % kSgGroupThreads == 0) sf_row[v / kSgGroupThreads] = e;
+    const int v = blockIdx.x * kSgBlock + threadIdx.x;
+    if (v >= num_vecs) return;
+    const int64_t row = v / row_vecs;
+    const int col = v % row_vecs * kSgVec;
+    const uint4 ov = *reinterpret_cast<const uint4*>(o + row * o_ld + col);
+    const uint4 gv =
+        *reinterpret_cast<const uint4*>(gate + row * gate_ld + col);
+    const auto* op = reinterpret_cast<const __nv_bfloat162*>(&ov);
+    const auto* gp = reinterpret_cast<const __nv_bfloat162*>(&gv);
+    float2 y[kSgVec / 2];
+    float amax = mxfp8::kAmaxFloor;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kSgVec / 2; ++i) {
+        const float2 of = __bfloat1622float2(op[i]);
+        const float2 gf = __bfloat1622float2(gp[i]);
+        const float2 s = __bfloat1622float2(
+            __floats2bfloat162_rn(sigmoid_rn(gf.x), sigmoid_rn(gf.y)));
+        y[i] = __bfloat1622float2(
+            __floats2bfloat162_rn(__fmul_rn(of.x, s.x), __fmul_rn(of.y, s.y)));
+        amax = fmaxf(amax, fmaxf(fabsf(y[i].x), fabsf(y[i].y)));
     }
+    const int lane = cutlass::canonical_lane_idx();
+    const uint32_t group_mask = ((1u << kGroupLanes) - 1)
+                                << (lane / kGroupLanes * kGroupLanes);
+    CUTLASS_PRAGMA_UNROLL
+    for (int m = kGroupLanes / 2; m > 0; m /= 2)
+        amax = fmaxf(amax, __shfl_xor_sync(group_mask, amax, m));
+    float inv;
+    const uint8_t e =
+        mxfp8::ue8m0_scale(__fmul_rn(amax, 1.0f / mxfp8::kE4m3Max), inv);
+    const auto clamp = [](float x) {
+        return fminf(fmaxf(x, -mxfp8::kE4m3Max), mxfp8::kE4m3Max);
+    };
+    uint2 codes;
+    auto* cp = reinterpret_cast<__nv_fp8x2_storage_t*>(&codes);
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kSgVec / 2; ++i) {
+        cp[i] =
+            __nv_cvt_float2_to_fp8x2(make_float2(clamp(__fmul_rn(y[i].x, inv)),
+                                                 clamp(__fmul_rn(y[i].y, inv))),
+                                     __NV_SATFINITE, __NV_E4M3);
+    }
+    q[v] = codes;
+    if (v % kGroupLanes == 0) sf[v / kGroupLanes] = e;
 }
 
 }  // namespace
@@ -100,37 +92,30 @@ std::vector<torch::Tensor> SigmoidGateMulGroupQuant(const torch::Tensor& o,
                                                     const torch::Tensor& gate,
                                                     const bool use_pdl) {
     const CudaDeviceGuard device_guard(o.device());
-    TORCH_CHECK(o.dim() == 2, "o must be [T, hidden]");
-    const int64_t num_tokens = o.size(0), hidden = o.size(1);
-    CheckContiguousTensor(o, "o", torch::kBFloat16, {num_tokens, hidden});
-    TORCH_CHECK(hidden > 0 && hidden % mxfp8::kGroup == 0,
-                "hidden must be a positive multiple of ", mxfp8::kGroup,
-                ", got ", hidden);
-    TORCH_CHECK(gate.is_cuda() && gate.scalar_type() == torch::kBFloat16 &&
+    TORCH_CHECK(o.dim() == 2 && o.scalar_type() == torch::kBFloat16 &&
+                    gate.scalar_type() == torch::kBFloat16 &&
                     gate.sizes().equals(o.sizes()),
-                "gate must be a bfloat16 CUDA tensor of shape ", o.sizes());
-    const int64_t gate_ld = num_tokens > 1 ? gate.stride(0) : hidden;
-    TORCH_CHECK(
-        gate.stride(1) == 1 && gate_ld % kSgVec == 0 &&
-            reinterpret_cast<uintptr_t>(gate.data_ptr()) % sizeof(uint4) == 0,
-        "gate rows must be contiguous and 16-byte aligned");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(o.data_ptr()) % sizeof(uint4) == 0,
-                "o must be 16-byte aligned");
+                "o and gate must be bfloat16 tensors of one [T, hidden] shape");
+    CheckRowsVecAligned(o, "o");
+    CheckRowsVecAligned(gate, "gate");
+    const int64_t num_tokens = o.size(0), hidden = o.size(1);
+    TORCH_CHECK(hidden % mxfp8::kGroup == 0, "hidden must be a multiple of ",
+                mxfp8::kGroup, ", got ", hidden);
+    const int row_vecs = hidden / kSgVec;
+    const int num_vecs = num_tokens * row_vecs;
     torch::Tensor q = torch::empty({num_tokens, hidden},
                                    o.options().dtype(torch::kFloat8_e4m3fn));
     torch::Tensor sf = torch::empty({num_tokens, hidden / mxfp8::kGroup},
                                     o.options().dtype(torch::kByte));
-    if (num_tokens == 0) return {q, sf};
-    const int threads = std::min(
-        cute::round_up(int(hidden / kSgVec), int{cutlass::NumThreadsPerWarp}),
-        kSgMaxThreads);
+    if (num_vecs == 0) return {q, sf};
     HALOPS_CUDA_CHECK(LaunchKernelWithPdl(
-        sigmoid_gate_mul_group_quant_kernel, dim3(num_tokens), dim3(threads),
-        kNoCluster, 0, GetCurrentCUDAStream(o), use_pdl,
-        reinterpret_cast<const __nv_bfloat16*>(o.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(gate.data_ptr()), gate_ld,
-        int(hidden), reinterpret_cast<uint8_t*>(q.data_ptr()),
-        sf.data_ptr<uint8_t>()));
+        sigmoid_gate_mul_group_quant_kernel,
+        dim3(cute::ceil_div(num_vecs, kSgBlock)), dim3(kSgBlock), kNoCluster, 0,
+        GetCurrentCUDAStream(o), use_pdl,
+        reinterpret_cast<const __nv_bfloat16*>(o.data_ptr()), o.stride(0),
+        reinterpret_cast<const __nv_bfloat16*>(gate.data_ptr()), gate.stride(0),
+        reinterpret_cast<uint2*>(q.data_ptr()), sf.data_ptr<uint8_t>(),
+        num_vecs, row_vecs));
     return {q, sf};
 }
 

@@ -38,12 +38,13 @@ REPEAT = 20
 FP8_E4M3_MAX = 448.0
 MIX_TOL = dict(atol=1e-3, rtol=1e-3)
 LAYER_TOL = dict(atol=2e-2, rtol=2e-2)
+HIDDEN = 4096
 TP_SIZE = 4
-TP_CASES = [(1, 4, 4096), (16, 4, 4096), (5, 3, 1536)]
+TP_CASES = [(1, 4), (16, 4), (5, 3)]
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def make_inputs(t, hc, hidden):
+def make_inputs(t, hc, hidden=HIDDEN):
     mix = hc * (hc + 2)
     return (
         torch.randn(t, hidden).bfloat16(),
@@ -108,16 +109,16 @@ def assert_equal_outputs(outs, refs, case=""):
 
 
 @pytest.mark.parametrize(
-    "t, hc, hidden",
+    "t, hc",
     [
-        pytest.param(1, 4, 4096, id="t1-hc4-h4096"),
-        pytest.param(64, 4, 4096, id="t64-hc4-h4096"),
-        pytest.param(5, 3, 1536, id="t5-hc3-h1536"),
-        pytest.param(3, 2, 1024, id="t3-hc2-h1024"),
+        pytest.param(1, 4, id="t1-hc4"),
+        pytest.param(64, 4, id="t64-hc4"),
+        pytest.param(5, 3, id="t5-hc3"),
+        pytest.param(3, 2, id="t3-hc2"),
     ],
 )
-def test_fused_all_reduce_mhc(t, hc, hidden):
-    inputs = make_inputs(t, hc, hidden)
+def test_fused_all_reduce_mhc(t, hc):
+    inputs = make_inputs(t, hc)
     residual_out, layer_out, post_out, comb_out, q, sf = run_mhc(inputs)
     residual = ref_post(*inputs[:4])
     post, _, comb, layer = ref_pre(residual, *inputs[4:])
@@ -130,7 +131,7 @@ def test_fused_all_reduce_mhc(t, hc, hidden):
 
 @pytest.mark.parametrize("hc", [2, 3, 4])
 def test_fused_all_reduce_mhc_logits(hc):
-    inputs = make_inputs(4, hc, 1024)
+    inputs = make_inputs(4, hc)
     outs = run_mhc(inputs)
     logit_outs = run_mhc(inputs, return_logits=True)
     _, logits, _, _ = ref_pre(ref_post(*inputs[:4]), *inputs[4:])
@@ -145,9 +146,9 @@ def test_fused_all_reduce_mhc_logits(hc):
 
 
 def test_fused_all_reduce_mhc_workspace():
-    inputs = make_inputs(16, 4, 4096)
+    inputs = make_inputs(16, 4)
     ref = run_mhc(inputs)
-    workspace = get_workspace_for_mhc(16, 4096, "", 0, 1)
+    workspace = get_workspace_for_mhc(16, HIDDEN, "", 0, 1)
     for _ in range(3):
         assert_equal_outputs(run_mhc(inputs, workspace=workspace), ref)
 
@@ -169,10 +170,8 @@ def test_mhc_post_hc_mean(t, hc, hidden):
 @pytest.mark.parametrize(
     "hc, hidden, message",
     [
-        pytest.param(5, 1024, "hc must be 2, 3 or 4, got 5", id="hc5"),
-        pytest.param(
-            4, 4128, "hidden must be 1024, 1536 or 4096, got 4128", id="h4128"
-        ),
+        pytest.param(5, 4096, "hc must be 2, 3 or 4, got 5", id="hc5"),
+        pytest.param(4, 1024, "hidden support 4096 only, got 1024", id="h1024"),
     ],
 )
 def test_fused_all_reduce_mhc_errors(hc, hidden, message):
@@ -205,18 +204,18 @@ def tp_worker():
     torch.set_default_device(dev)
     dist.init_process_group("nccl", device_id=dev)
     group = dist.group.WORLD.group_name
-    for t, hc, hidden in TP_CASES:
+    for t, hc in TP_CASES:
         torch.manual_seed(SEED)
-        partials = torch.randn(world, t, hidden).bfloat16()
-        inputs = make_inputs(t, hc, hidden)
+        partials = torch.randn(world, t, HIDDEN).bfloat16()
+        inputs = make_inputs(t, hc)
         x_sum = partials[0].float()
         for partial in partials[1:]:
             x_sum = x_sum + partial.float()
         ref = run_mhc((x_sum.bfloat16(),) + inputs[1:])
-        workspace = get_workspace_for_mhc(t, hidden, group, rank, world)
+        workspace = get_workspace_for_mhc(t, HIDDEN, group, rank, world)
         for _ in range(3):
             outs = run_mhc((partials[rank],) + inputs[1:], workspace=workspace)
-            assert_equal_outputs(outs, ref, f"rank {rank} t{t} hc{hc} h{hidden}")
+            assert_equal_outputs(outs, ref, f"rank {rank} t{t} hc{hc}")
     dist.destroy_process_group()
 
 
