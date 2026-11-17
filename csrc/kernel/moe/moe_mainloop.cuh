@@ -600,7 +600,9 @@ struct CollectiveMainloopMoE {
         if (WarpRole::is_other_loader_thread()) {
             if constexpr (Traits::kUseLatent) {
                 workspace->cta_comm.wait_latent_tasks(
-                    smem->launch_parity, Traits::LatentDownGemm::kNumCtas);
+                    smem->launch_parity,
+                    Traits::LatentDownGemm::kNumCtas /
+                        Traits::LatentDownGemm::kNumSplits);
                 // Order cross-CTA stores before TMA reads.
                 fence_proxy_async_global();
             }

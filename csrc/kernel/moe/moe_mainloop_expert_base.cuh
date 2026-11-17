@@ -71,11 +71,11 @@ struct GatedActFunctor {
 template <typename KernelTraits, typename GemmTraits>
 struct UpProjectionBase {
     using Traits = KernelTraits;
-    using Cluster = ClusterSplitK<Traits::kClusterSize>;
     using Dims = typename Traits::MoEDims;
     using SharedStorage = MoESharedStorage<Dims>;
     using Workspace = MoEWorkspace<Dims>;
     using UpGemm = GemmTraits;
+    using Cluster = ClusterSplitK<Traits::kClusterSize, UpGemm::kNumSplits>;
     using MmaCore = typename UpGemm::MmaCore;
     using WeightElement = typename MmaCore::SmemElementA;
     using ActElement = typename UpGemm::InputQuant::ElementType;
@@ -341,10 +341,9 @@ struct UpProjectionBase {
         const std::uint32_t feature = 8u * up_group_idx(warp) + (lane >> 2);
         constexpr std::uint32_t kPlaneElems =
             kOutputFeatureBlock * UpGemm::kTileShapeN;
-        std::uint32_t shares[kNumSplits > 1u ? kNumSplits - 1u : 1u];
+        Cluster cluster;
         if constexpr (kNumSplits > 1u) {
-            Cluster::map_peers<kNumSplits>(&partial[0][0][0], Cluster::rank(),
-                                           0u, shares);
+            cluster.map(&partial[0][0][0]);
         }
 #pragma unroll
         for (std::uint32_t group = 0; group < kTokenGroups; ++group) {
@@ -358,10 +357,8 @@ struct UpProjectionBase {
                 if constexpr (kNumSplits > 1u) {
                     const std::uint32_t at =
                         feature * UpGemm::kTileShapeN + token;
-                    gate = Cluster::peer_sum<kNumSplits>(
-                        shares, partial[0][feature][token], at);
-                    up = Cluster::peer_sum<kNumSplits>(
-                        shares, partial[1][feature][token], kPlaneElems + at);
+                    gate = cluster.split_sum(at);
+                    up = cluster.split_sum(kPlaneElems + at);
                 } else {
                     gate = acc_gate[group * 2u + i];
                     up = acc_up[group * 2u + i];
@@ -377,7 +374,6 @@ struct UpProjectionBase {
 template <typename KernelTraits, typename GemmTraits>
 struct DownProjectionBase {
     using Traits = KernelTraits;
-    using Cluster = ClusterSplitK<Traits::kClusterSize>;
     using Dims = typename Traits::MoEDims;
     using SharedStorage = MoESharedStorage<Dims>;
     using Workspace = MoEWorkspace<Dims>;

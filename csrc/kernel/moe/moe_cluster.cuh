@@ -21,14 +21,21 @@
 namespace halops::moe {
 
 // Split-K groups inside a launch cluster: `NumSplits` CTAs that reduce one
-// GEMM. The cluster can be wider than one group (the latent projection runs
-// pairs inside a 4-wide cluster), so callers name their group by its first
-// cluster rank.
-template <std::uint32_t ClusterSize>
+// GEMM.
+template <std::uint32_t ClusterSize, std::uint32_t NumSplits>
 struct ClusterSplitK {
+    static_assert(NumSplits >= 1u, "a group needs one split or more");
+    static_assert(ClusterSize % NumSplits == 0u,
+                  "a split group is a whole run of the launch cluster");
+
     // This CTA's rank inside the launch cluster.
     __device__ static std::uint32_t rank() {
         return static_cast<std::uint32_t>(blockIdx.x) % ClusterSize;
+    }
+
+    __device__ static std::uint32_t split_idx() { return rank() % NumSplits; }
+    __device__ static std::uint32_t group_base() {
+        return rank() - split_idx();
     }
 
     // A cluster-wide barrier: release on arrive, acquire on wait.
@@ -36,49 +43,29 @@ struct ClusterSplitK {
     __device__ static void arrive() { cluster_arrive(); }
     __device__ static void wait() { cluster_wait(); }
 
-    // The other splits' copies of `local`, skipping `split`.
-    template <std::uint32_t NumSplits>
-    __device__ static void map_peers(const void* local,
-                                     std::uint32_t group_base,
-                                     std::uint32_t split,
-                                     std::uint32_t (&peers)[NumSplits - 1u]) {
-        static_assert(NumSplits >= 2u, "a reduction needs two splits or more");
+    __device__ ClusterSplitK() : group_base_(group_base()) {}
+
+    // Point the split addresses at `local`'s copies in every split.
+    __device__ void map(const void* local) {
 #pragma unroll
-        for (std::uint32_t n = 0; n < NumSplits - 1u; ++n) {
-            const std::uint32_t r = n + (n >= split ? 1u : 0u);
-            peers[n] = cluster_map_shared_rank(local, group_base + r);
+        for (std::uint32_t r = 0; r < NumSplits; ++r) {
+            peers_[r] = cluster_map_shared_rank(local, group_base_ + r);
         }
     }
 
-    // `local` plus the peer copies' f32 at `index`.
-    template <std::uint32_t NumSplits>
-    __device__ static float peer_sum(
-        const std::uint32_t (&peers)[NumSplits - 1u], float local,
-        std::uint32_t index) {
-        float v = local;
+    // The f32 at `index` summed over every split of the group.
+    __device__ float split_sum(std::uint32_t index) const {
+        float v = 0.0f;
 #pragma unroll
-        for (std::uint32_t n = 0; n < NumSplits - 1u; ++n) {
-            v += cluster_load_f32(peers[n] + 4u * index);
+        for (std::uint32_t r = 0; r < NumSplits; ++r) {
+            v += cluster_load_f32(peers_[r] + 4u * index);
         }
         return v;
     }
 
-    // The max of the f32 at `index` across every split, this one included.
-    template <std::uint32_t NumSplits>
-    __device__ static float split_max(const void* local,
-                                      std::uint32_t group_base,
-                                      std::uint32_t index) {
-        static_assert(NumSplits >= 1u);
-        float v = cluster_load_f32(cluster_map_shared_rank(local, group_base) +
-                                   4u * index);
-#pragma unroll
-        for (std::uint32_t r = 1; r < NumSplits; ++r) {
-            v = fmaxf(v, cluster_load_f32(
-                             cluster_map_shared_rank(local, group_base + r) +
-                             4u * index));
-        }
-        return v;
-    }
+  private:
+    std::uint32_t group_base_;
+    std::uint32_t peers_[NumSplits];
 };
 
 }  // namespace halops::moe
