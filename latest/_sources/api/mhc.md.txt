@@ -1,0 +1,21 @@
+# MHC
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autosummary::
+   :nosignatures:
+
+   megallmhc
+```
+
+```{rst-class} api-entry
+```
+
+## megallmhc
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: megallmhc
+```
