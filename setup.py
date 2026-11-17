@@ -102,6 +102,7 @@ setup(
                 # "csrc/kernel/mla/combine_with_rope_quant.cu",
                 # "csrc/kernel/mla/vha_postmix_quant.cu",
                 "csrc/kernel/moe/mega_ll_moe.cu",
+                # "csrc/kernel/mhc/megallmhc.cu",
                 "csrc/common/cpp_extensions.cc",
             ],
             include_dirs=include_dirs,

@@ -58,6 +58,22 @@ CUTE_DEVICE float2 tanh_approx(float2 x) {
     return make_float2(tanh_approx(x.x), tanh_approx(x.y));
 }
 
+CUTE_DEVICE float rcp_approx(float x) {
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+// bf16x2 to (lo, hi) floats in asm, so the compiler cannot share the unpack
+// with other conversions of the same word and keeps the packed value live.
+CUTE_DEVICE float2 bf16x2_to_float2_opaque(uint32_t u) {
+    uint32_t lo, hi;
+    asm("shl.b32 %0, %2, 16;\n\tand.b32 %1, %2, 0xffff0000;"
+        : "=r"(lo), "=r"(hi)
+        : "r"(u));
+    return make_float2(__uint_as_float(lo), __uint_as_float(hi));
+}
+
 CUTE_DEVICE void bulk_store_wait_all() {
     asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
 }

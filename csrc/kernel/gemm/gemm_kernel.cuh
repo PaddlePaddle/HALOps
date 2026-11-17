@@ -400,6 +400,9 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
         // Batch takes a partial last M tile.
         constexpr bool kBatchPartialM =
             KernelTraits::KernelType == KernelMode::Batch;
+        constexpr bool kDenseSwapPartialM = KernelTraits::KIsDense &&
+                                            KernelTraits::IsPairUmma &&
+                                            !KernelTraits::KQuantD;
         if constexpr (KernelTraits::SwapAB) {
             TORCH_CHECK(
                 params.n % KernelTraits::KBlockM == 0,
@@ -407,6 +410,7 @@ void CheckGemmKernelLaunchParams(const GemmParams& params,
                 KernelTraits::KBlockM, ", got ", params.n);
             TORCH_CHECK(
                 m_for_tiles % KernelTraits::KBlockN == 0 || kBatchPartialM ||
+                    kDenseSwapPartialM ||
                     (KernelTraits::KIsDense &&
                      params.m <= KernelTraits::KBlockN),
                 "SwapAB gemm_impl requires M to be divisible by KBlockN=",
