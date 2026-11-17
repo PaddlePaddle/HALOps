@@ -18,6 +18,8 @@
 #include <cute/arch/copy_sm100.hpp>
 #include <cute/arch/tmem_allocator_sm100.hpp>
 
+#include "common/ptx.cuh"
+
 namespace halops::moe {
 
 // cp.async scalar helpers (sm_80+)
@@ -233,41 +235,6 @@ __device__ static __forceinline__ void tmem_ld_16x256b1x(std::uint32_t addr,
                                                               v[2], v[3]);
 #pragma unroll
     for (int i = 0; i < 4; ++i) d[i] = __int_as_float(v[i]);
-}
-
-template <typename V>
-__device__ static __forceinline__ void ld_global_16B(V& x, const void* addr,
-                                                     std::int64_t vec_offset) {
-    static_assert(alignof(V) == 16 && sizeof(V) == 16);
-    addr = static_cast<const std::uint8_t*>(addr) + vec_offset * sizeof(V);
-    uint4 val;
-    asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
-                 : "l"(addr));
-    x = *reinterpret_cast<const V*>(&val);
-}
-
-template <typename V>
-__device__ static __forceinline__ void st_global_16B(const V& x, void* addr,
-                                                     std::int64_t vec_offset) {
-    static_assert(alignof(V) == 16 && sizeof(V) == 16);
-    const uint4 val = *reinterpret_cast<const uint4*>(&x);
-    addr = static_cast<std::uint8_t*>(addr) + vec_offset * sizeof(V);
-    asm volatile("st.global.v4.b32 [%4], {%0, %1, %2, %3};"
-                 :
-                 : "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w), "l"(addr));
-}
-
-template <typename V>
-__device__ static __forceinline__ void ld_relaxed_16B(V& x, const void* addr,
-                                                      std::int64_t vec_offset) {
-    static_assert(alignof(V) == 16 && sizeof(V) == 16);
-    addr = static_cast<const std::uint8_t*>(addr) + vec_offset * sizeof(V);
-    uint4 val;
-    asm volatile("ld.relaxed.sys.global.v4.b32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
-                 : "l"(addr));
-    x = *reinterpret_cast<const V*>(&val);
 }
 
 template <typename V>

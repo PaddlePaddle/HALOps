@@ -16,10 +16,12 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cutlass/arch/barrier.h>
+#include <cutlass/array.h>
 #include <cutlass/kernel_hardware_info.h>
 
 #include <algorithm>
 #include <cute/arch/cluster_sm90.hpp>
+#include <cute/arch/copy_sm90_tma.hpp>
 #include <cutlass/cluster_launch.hpp>
 #include <optional>
 #include <vector>
@@ -30,15 +32,12 @@
 #include "common/pdl.cuh"
 #include "common/ptx.cuh"
 #include "kernel/mhc/megallmhc_utils.cuh"
-#include "kernel/mla/mla_intrinsics.cuh"
-#include "kernel/moe/moe_tail_prims.cuh"
-#include "kernel/moe/ptx_utils.cuh"
 
 namespace halops {
 
 namespace {
 
-using moe::tail::Vec16;
+using Vec16 = cutlass::AlignedArray<__nv_bfloat162, 4>;
 
 constexpr int kMaxWorld = 8;
 constexpr int kMaxTokensPerCluster = 4;
@@ -438,9 +437,13 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
                 const int64_t vid = int64_t(tok0 + q) * (kHidden / L::kVec) +
                                     col0 / L::kVec + k;
                 if (tid < active) {
-                    Vec16 v;
-                    moe::ld_global_16B(v, p.x, vid);
-                    moe::tail::sanitize(v);
+                    constexpr uint32_t kNegZeroPair = 0x8000u;
+                    uint4 v;
+                    ld_global_16B(v, p.x, vid);
+                    if (v.x == 0) v.x = kNegZeroPair;
+                    if (v.y == 0) v.y = kNegZeroPair;
+                    if (v.z == 0) v.z = kNegZeroPair;
+                    if (v.w == 0) v.w = kNegZeroPair;
                     const int64_t src_off = pl.rank * pl.slot_bytes + phase_off;
                     CUTLASS_PRAGMA_UNROLL
                     for (int d = 0; d < kMaxWorld; ++d) {
@@ -460,8 +463,8 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
                         CUTLASS_PRAGMA_UNROLL
                         for (int s = 0; s < kMaxWorld; ++s) {
                             if (s < pl.world) {
-                                moe::ld_relaxed_16B(
-                                    v[s], slots + s * pl.slot_bytes, vid);
+                                ld_relaxed_16B(v[s], slots + s * pl.slot_bytes,
+                                               vid);
                             }
                         }
                         CUTLASS_PRAGMA_UNROLL
@@ -557,7 +560,7 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
                 make_float4(lo.x, lo.y, hi.x, hi.y),
                 cute::set_block_rank(bar, dst));
         }
-        mla::mbar_wait_cluster(bar, 0);
+        mbar_wait_cluster(bar, 0);
         for (int i = tid; i < nt * S::kPartials; i += L::kCols) {
             const int t = i / S::kPartials, v = i % S::kPartials;
             float s = sm.cl[0][t][v];
@@ -592,14 +595,13 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
                 CUTLASS_PRAGMA_UNROLL
                 for (int s = 0; s < kMaxWorld; ++s) {
                     if (s < pl.world)
-                        moe::st_global_16B(empty, slots + s * pl.slot_bytes,
-                                           vid);
+                        st_global_16B(empty, slots + s * pl.slot_bytes, vid);
                 }
             }
         }
         cute::cluster_wait();
         cute::cluster_arrive_relaxed();
-        mla::mbar_wait_cluster(cute::cast_smem_ptr_to_uint(&sm.tot_bar), 0);
+        mbar_wait_cluster(cute::cast_smem_ptr_to_uint(&sm.tot_bar), 0);
         if (lane == 0 && !p.write_logits) {
             for (int t = rank; t < nt; t += L::kClusterSize) {
                 const float rms = token_rms<kHc, kHidden>(sm.tot[t], p.rms_eps);
@@ -636,7 +638,7 @@ __global__ void __launch_bounds__(cutlass::NumThreadsPerWarp)
         const uint32_t n = (bytes + kChunk - 1) / kChunk;
         for (uint32_t c = (t + nw - first % nw) % nw; c < n; c += nw) {
             const uint32_t off = c * kChunk;
-            moe::prefetch_l2_bulk(
+            cute::SM90_BULK_COPY_G2S::PREFETCH::copy(
                 reinterpret_cast<const void*>(pf.addr[r] + off),
                 min(kChunk, bytes - off));
         }
