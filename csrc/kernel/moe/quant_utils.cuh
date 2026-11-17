@@ -201,15 +201,18 @@ struct GroupWiseQuantizer<QuantSpec<QuantMethod::kMXFP8, BlockSize>, N> {
 struct QuantizeTile {
     std::uint32_t staging_slot_base;
     std::uint32_t block_base;
+    std::uint32_t scale_row_base;
     std::uint32_t row_start;
     std::uint32_t actual_num_rows;
 
     __host__ __device__ QuantizeTile(std::uint32_t staging_slot_base_in,
                                      std::uint32_t block_base_in,
+                                     std::uint32_t scale_row_base_in,
                                      std::uint32_t row_start_in,
                                      std::uint32_t actual_num_rows_in) {
         staging_slot_base = staging_slot_base_in;
         block_base = block_base_in;
+        scale_row_base = scale_row_base_in;
         row_start = row_start_in;
         actual_num_rows = actual_num_rows_in;
     }
@@ -341,7 +344,7 @@ __device__ inline void quantize_fp8_groupwise_128(
         const std::uint32_t slot =
             tile.staging_slot_base + blk / BlocksPerStage;
         const std::uint32_t chunk_at = (blk % BlocksPerStage) * kChunksPerBlock;
-        const std::uint32_t sblk = tile.block_base + blk;
+        const std::uint32_t sblk = tile.scale_row_base + blk;
         const std::uint32_t k = (tile.block_base + blk) * QuantBlock + col;
         // Padding rows read the first valid row and are zeroed on store.
         const std::uint32_t src_row =

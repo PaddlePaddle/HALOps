@@ -168,6 +168,7 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr std::uint32_t kNumCtasForShared = 32;
         static constexpr std::uint32_t kNumSharedUpWeightSlots = 4;
         static constexpr std::uint32_t kNumSharedDownWeightSlots = 4;
+        static constexpr std::uint32_t kNumSharedDownAccSlots = 4;
         static constexpr bool kSharedUseSplitK = true;
         // MoE configs.
         static constexpr std::uint32_t kCtasPerExpert = 8;
@@ -237,6 +238,26 @@ template <typename Dims>
 struct MoEInputSize {
     static constexpr std::uint32_t value =
         Dims::kUseLatent ? Dims::kLatentSize : Dims::kHiddenSize;
+};
+
+struct MoEProblemSize {
+    constexpr MoEProblemSize() = default;
+    __host__ __device__ constexpr MoEProblemSize(
+        std::uint32_t num_tokens, std::uint32_t hidden_size,
+        std::uint32_t intermediate_size, std::uint32_t latent_size)
+        : num_tokens(num_tokens),
+          hidden_size(hidden_size),
+          intermediate_size(intermediate_size),
+          latent_size(latent_size) {}
+
+    std::uint32_t num_tokens = 0u;
+    std::uint32_t hidden_size = 0u;
+    std::uint32_t intermediate_size = 0u;
+    std::uint32_t latent_size = 0u;
+
+    __host__ __device__ constexpr std::uint32_t input_size() const {
+        return latent_size != 0u ? latent_size : hidden_size;
+    }
 };
 
 // Byte offset of a scale in a 128-row, four-group SfAtom.

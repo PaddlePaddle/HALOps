@@ -75,7 +75,8 @@ struct LatentScaleImage<Dims, true> {
     using Element = std::uint8_t;
 
     // One 128-token SfAtom slab per up K tile holds that tile's 32-K groups.
-    static constexpr std::uint32_t kNumSlots = UpGemm::kNumTilesK;
+    static constexpr std::uint32_t kNumSlots =
+        UpGemm::kGemmK / UpGemm::kTileShapeK;
     static constexpr std::uint32_t kSfAtomBytes =
         128u * (UpGemm::kTileShapeK / 32u);
 
@@ -149,7 +150,8 @@ struct SharedUpOutput {
     static constexpr std::uint32_t kNumScaleCols = kNumCols / kQuantBlock;
 
     // The union keeps workspace sizing identical across quantization recipes.
-    static constexpr std::uint32_t kDownTilesK = SharedDownGemm::kNumTilesK;
+    static constexpr std::uint32_t kDownTilesK =
+        SharedDownGemm::kGemmK / SharedDownGemm::kTileShapeK;
     static constexpr std::uint32_t kSfAtomBytes =
         128u * (SharedDownGemm::kTileShapeK / 32u);
 

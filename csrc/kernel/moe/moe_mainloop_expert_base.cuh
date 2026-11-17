@@ -18,6 +18,7 @@
 
 #include <cute/tensor.hpp>
 
+#include "kernel/moe/moe_cluster.cuh"
 #include "kernel/moe/moe_shared_storage.cuh"
 #include "kernel/moe/moe_tma.cuh"
 #include "kernel/moe/moe_traits.cuh"
@@ -74,6 +75,7 @@ struct UpProjectionBase {
     using SharedStorage = MoESharedStorage<Dims>;
     using Workspace = MoEWorkspace<Dims>;
     using UpGemm = GemmTraits;
+    using Cluster = ClusterSplitK<Traits::kClusterSize, UpGemm::kNumSplits>;
     using MmaCore = typename UpGemm::MmaCore;
     using WeightElement = typename MmaCore::SmemElementA;
     using ActElement = typename UpGemm::InputQuant::ElementType;
@@ -81,7 +83,6 @@ struct UpProjectionBase {
     using UpScaleTraits = typename UpGemm::ScaleTraits;
 
     static constexpr std::uint32_t kNumSplits = UpGemm::kNumSplits;
-    static constexpr std::uint32_t kNumTilesK = UpGemm::kNumTilesK;
     static constexpr std::uint32_t kNumWeightSlots = UpGemm::kNumWeightSlots;
     static constexpr std::uint32_t kNumAccSlots = UpGemm::kNumAccSlots;
     static constexpr std::uint32_t kAccColumns = get_gemm_acc_columns<UpGemm>();
@@ -179,16 +180,15 @@ struct UpProjectionBase {
 
     __device__ static void load_weight_scale_tile(
         const typename UpGemm::ElementScale* scale, std::uint32_t row_atom,
-        std::uint32_t k_tile, std::uint8_t* dest, std::uint64_t* barrier) {
+        std::uint32_t k_tile, std::uint8_t* dest, std::uint64_t* barrier,
+        std::uint32_t k_slabs) {
         static_assert(MmaCore::kUseBlockscaled,
                       "scale tiles are only loaded for blockscaled MMA");
         constexpr std::uint32_t kSfAtomBytes = 512u;
-        constexpr std::uint32_t kSfKBlocksPerRow = UpGemm::kGemmK / 128u;
         constexpr std::uint32_t kSlabsPerTileK = UpGemm::kTileShapeK / 128u;
         const auto* sfa = reinterpret_cast<const std::uint8_t*>(scale);
         tma_load_1d(
-            sfa + (row_atom * kSfKBlocksPerRow + k_tile * kSlabsPerTileK) *
-                      kSfAtomBytes,
+            sfa + (row_atom * k_slabs + k_tile * kSlabsPerTileK) * kSfAtomBytes,
             UpScaleTraits::kSfaSmemBytes, dest, barrier);
     }
 
@@ -306,7 +306,7 @@ struct UpProjectionBase {
                 store_up_partial_sums(partial, gate, up);
             }
             __syncthreads();
-            cluster_arrive_and_wait();
+            Cluster::sync();
         }
     }
 
@@ -341,14 +341,9 @@ struct UpProjectionBase {
         const std::uint32_t feature = 8u * up_group_idx(warp) + (lane >> 2);
         constexpr std::uint32_t kPlaneElems =
             kOutputFeatureBlock * UpGemm::kTileShapeN;
-        std::uint32_t shares[kNumSplits > 1u ? kNumSplits - 1u : 1u];
+        Cluster cluster;
         if constexpr (kNumSplits > 1u) {
-            const std::uint32_t first_rank = blockIdx.x % Traits::kClusterSize;
-#pragma unroll
-            for (std::uint32_t r = 1u; r < kNumSplits; ++r) {
-                shares[r - 1u] =
-                    cluster_map_shared_rank(&partial[0][0][0], first_rank + r);
-            }
+            cluster.map(&partial[0][0][0]);
         }
 #pragma unroll
         for (std::uint32_t group = 0; group < kTokenGroups; ++group) {
@@ -360,16 +355,10 @@ struct UpProjectionBase {
                 float gate;
                 float up;
                 if constexpr (kNumSplits > 1u) {
-                    gate = partial[0][feature][token];
-                    up = partial[1][feature][token];
                     const std::uint32_t at =
                         feature * UpGemm::kTileShapeN + token;
-#pragma unroll
-                    for (std::uint32_t n = 0; n < kNumSplits - 1u; ++n) {
-                        gate += cluster_load_f32(shares[n] + 4u * at);
-                        up += cluster_load_f32(shares[n] +
-                                               4u * (kPlaneElems + at));
-                    }
+                    gate = cluster.split_sum(at);
+                    up = cluster.split_sum(kPlaneElems + at);
                 } else {
                     gate = acc_gate[group * 2u + i];
                     up = acc_up[group * 2u + i];
@@ -397,7 +386,6 @@ struct DownProjectionBase {
     using Accumulator = cutlass::Array<float, DownGemm::kTileShapeN>;
 
     static constexpr std::uint32_t kTileShapeM = DownGemm::kTileShapeM;
-    static constexpr std::uint32_t kNumTilesK = DownGemm::kNumTilesK;
     static constexpr std::uint32_t kNumWeightSlots = DownGemm::kNumWeightSlots;
     static constexpr std::uint32_t kAccColumns =
         get_gemm_acc_columns<DownGemm>();
@@ -443,7 +431,8 @@ struct DownProjectionBase {
     __device__ static void load_weight_scale_tile(
         const typename DownGemm::ElementScale* scale, std::uint32_t row_atom,
         std::uint32_t k_tile, std::uint8_t* dest, std::uint64_t* barrier,
-        ScaleLayout scale_layout, const CUtensorMap* tma_scale_desc = nullptr) {
+        ScaleLayout scale_layout, std::uint32_t k_slabs,
+        const CUtensorMap* tma_scale_desc = nullptr) {
         static_assert(MmaCore::kUseBlockscaled,
                       "scale tiles are only loaded for blockscaled MMA");
         static_assert(DownGemm::kTileShapeK == 128u,
@@ -453,7 +442,6 @@ struct DownProjectionBase {
             return;
         }
         constexpr std::uint32_t kSfAtomBytes = DownScaleTraits::kSfaAtomBytes;
-        constexpr std::uint32_t kSfKBlocksPerRow = DownGemm::kGemmK / 128u;
         if (tma_scale_desc != nullptr) {
             tma_load_3d(*tma_scale_desc, /*coord0=*/0u, /*coord1=*/k_tile,
                         /*coord2=*/row_atom, dest, barrier);
@@ -464,7 +452,7 @@ struct DownProjectionBase {
              ++atom) {
             const auto* sfa =
                 reinterpret_cast<const std::uint8_t*>(scale) +
-                ((row_atom + atom) * kSfKBlocksPerRow + k_tile) * kSfAtomBytes;
+                ((row_atom + atom) * k_slabs + k_tile) * kSfAtomBytes;
             tma_load_1d(sfa, kSfAtomBytes, dest + atom * kSfAtomBytes, barrier);
         }
     }

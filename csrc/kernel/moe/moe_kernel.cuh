@@ -55,7 +55,7 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     assert(gridDim.x <= Traits::kMaxGrid);
     assert(gridDim.y == 1 && gridDim.z == 1);
 
-    assert(mainloop_params.num_tokens <= Dims::kNumTokens);
+    assert(mainloop_params.problem_size.num_tokens <= Dims::kNumTokens);
     assert(mainloop_params.top_k >= 1 &&
            mainloop_params.top_k <= Dims::kMaxTopk);
 

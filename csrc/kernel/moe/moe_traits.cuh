@@ -55,7 +55,6 @@ struct GemmTileShape {
     static constexpr std::uint32_t kTileShapeK = 256u;
     static_assert(GemmK % kTileShapeK == 0u,
                   "the reduction must be a whole number of K tiles");
-    static constexpr std::uint32_t kNumTilesK = GemmK / kTileShapeK;
 
     using TileShape =
         cute::Shape<cute::Int<kTileShapeM>, cute::Int<kTileShapeN>,
@@ -84,14 +83,13 @@ struct LatentDownGemmTraits {
     static constexpr std::uint32_t kNumCtas =
         Dims::KernelConfig::kNumCtasForLatentDown;
     static constexpr std::uint32_t kTileShapeN = Dims::kNumTokens;
-    static constexpr std::uint32_t kNumTilesN = kGemmN / kTileShapeN;
 
     static constexpr bool kUseSplitK = Dims::KernelConfig::kLatentDownUseSplitK;
 
+    // The token width is one N tile, so the splits divide M only.
     static constexpr std::uint32_t kNumSplits =
-        kUseSplitK ? kNumCtas / ((kGemmM / 128u) * kNumTilesN) : 1u;
-    static_assert(!kUseSplitK ||
-                      kNumCtas % ((kGemmM / 128u) * kNumTilesN) == 0u,
+        kUseSplitK ? kNumCtas / (kGemmM / 128u) : 1u;
+    static_assert(!kUseSplitK || kNumCtas % (kGemmM / 128u) == 0u,
                   "the split groups must divide the CTAs");
 
     using GemmShape = GemmTileShape<kGemmM, kGemmN, kGemmK, kTileShapeN,
@@ -105,7 +103,6 @@ struct LatentDownGemmTraits {
                     cute::Int<kTileShapeK>>;
 
     static constexpr std::uint32_t kNumTilesM = kGemmM / kTileShapeM;
-    static constexpr std::uint32_t kNumTilesK = GemmShape::kNumTilesK;
 
     static constexpr std::uint32_t kClusterSize = cute::max(
         (OutputQuant::kBlockSize + kTileShapeM - 1) / kTileShapeM, kNumSplits);
@@ -151,8 +148,6 @@ struct RouterGemmTraits {
     static constexpr std::uint32_t kTileShapeM = Gemm::kTileShapeM;
     static constexpr std::uint32_t kTileShapeK = Gemm::kTileShapeK;
     static constexpr std::uint32_t kNumTilesN = Gemm::kNumTilesN;
-    static constexpr std::uint32_t kNumTilesM = Gemm::kNumTilesM;
-    static constexpr std::uint32_t kNumTilesK = Gemm::kNumTilesK;
     using TileShape = typename Gemm::TileShape;
 
     using WeightQuant = QuantSpec<QuantMethod::kNone>;
@@ -164,9 +159,7 @@ struct RouterGemmTraits {
         moe::HmmaCore<TileShape>>;
 
     static constexpr std::uint32_t kNumWeightSlots =
-        Dims::KernelConfig::kNumRouterWeightSlots < kNumTilesK
-            ? Dims::KernelConfig::kNumRouterWeightSlots
-            : kNumTilesK;
+        Dims::KernelConfig::kNumRouterWeightSlots;
     static constexpr std::uint32_t kNumInputSlots =
         Dims::KernelConfig::kNumRouterInputSlots;
 };
@@ -205,7 +198,6 @@ struct RoutedUpGemmTraits {
     using WeightSmemElement = typename MmaCore::SmemElementA;
     using ActElement = typename InputQuant::ElementType;
 
-    static constexpr std::uint32_t kNumTilesK = kGemmK / kTileShapeK;
     static constexpr std::uint32_t kNumSplits = 1u;
 
     // The output's (the down's input) scale block.
@@ -257,8 +249,6 @@ struct RoutedDownGemmTraits {
     using WeightSmemElement = typename MmaCore::SmemElementA;
     using ActElement = typename InputQuant::ElementType;
 
-    static constexpr std::uint32_t kNumTilesK = kGemmK / kTileShapeK;
-
     static constexpr std::uint32_t kNumAccSlots =
         MmaCore::kUseBlockscaled ? 1 : Dims::KernelConfig::kNumAccSlots;
     static constexpr std::uint32_t kNumWeightSlots =
@@ -305,8 +295,6 @@ struct SharedUpGemmTraits {
     using TiledMma = typename MmaCore::TiledMma;
     using ScaleTraits = typename MmaCore::ScaleTraits;
 
-    static constexpr std::uint32_t kNumTilesK = kGemmK / kTileShapeK;
-
     // The output's (the down's input) scale block.
     static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
 
@@ -314,8 +302,6 @@ struct SharedUpGemmTraits {
         MmaCore::kUseBlockscaled ? 1 : Dims::KernelConfig::kNumAccSlots;
     static constexpr std::uint32_t kNumWeightSlots =
         Dims::KernelConfig::kNumSharedUpWeightSlots;
-    static_assert(kNumWeightSlots <= kNumTilesK / kNumSplits,
-                  "the weight ring must fit the block's K tiles");
     static constexpr std::uint32_t kWeightScaleSlots =
         MmaCore::kUseBlockscaled ? 1u : kNumWeightSlots;
     static constexpr auto kWeightScaleShape =
@@ -350,10 +336,9 @@ struct SharedDownGemmTraits {
     using TiledMma = typename MmaCore::TiledMma;
     using ScaleTraits = typename MmaCore::ScaleTraits;
 
-    static constexpr std::uint32_t kNumTilesK = kGemmK / kTileShapeK;
-
     static constexpr std::uint32_t kNumAccSlots =
-        MmaCore::kUseBlockscaled ? 1u : kNumTilesK;
+        MmaCore::kUseBlockscaled ? 1u
+                                 : Dims::KernelConfig::kNumSharedDownAccSlots;
     static constexpr std::uint32_t kNumWeightSlots =
         Dims::KernelConfig::kNumSharedDownWeightSlots;
     static constexpr std::uint32_t kWeightScaleSlots =
