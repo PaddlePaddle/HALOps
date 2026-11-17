@@ -234,7 +234,7 @@ void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,
 
 int64_t MoETailRegionBytes(bool wide, int64_t tp_size);
 
-int64_t GetWorkspaceSize(const std::optional<torch::Tensor>& input);
+int64_t GetWorkspaceSize(int64_t max_tokens);
 
 }  // namespace halops
 
@@ -307,5 +307,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_tail_region_bytes", &halops::MoETailRegionBytes, py::arg("wide"),
           py::arg("tp_size") = 1);
     m.def("moe_get_workspace_size", &halops::GetWorkspaceSize,
-          py::arg("input") = py::none());
+          py::arg("max_tokens") = 0);
 }

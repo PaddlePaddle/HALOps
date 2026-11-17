@@ -328,7 +328,7 @@ constexpr int64_t WorkspaceBytesFor() {
     return static_cast<int64_t>(sizeof(moe::MoEWorkspace<Dims>));
 }
 
-int64_t GetWorkspaceSize(const std::optional<torch::Tensor>& input) {
+int64_t GetWorkspaceSize(int64_t max_tokens) {
     constexpr auto kBWFP8 = moe::QuantMethod::kBlockwiseFP8;
     constexpr auto kMXFP8 = moe::QuantMethod::kMXFP8;
     constexpr auto kMXFP4 = moe::QuantMethod::kMXFP4;
@@ -348,10 +348,10 @@ int64_t GetWorkspaceSize(const std::optional<torch::Tensor>& input) {
                       moe::Dims_BS16_E512_N512_K2048_SM100<QuantMXFP8{}>>(),
                   WorkspaceBytesFor<
                       moe::Dims_BS16_E512_N512_K2048_SM100<QuantMXFP4{}>>()});
-    if (!input.has_value()) {
+    if (max_tokens <= 0) {
         return kBs8Bytes > kBs16Bytes ? kBs8Bytes : kBs16Bytes;
     }
-    return input->size(0) <= 8 ? kBs8Bytes : kBs16Bytes;
+    return max_tokens <= 8 ? kBs8Bytes : kBs16Bytes;
 }
 
 void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,

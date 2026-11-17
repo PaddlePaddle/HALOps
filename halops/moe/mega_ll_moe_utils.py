@@ -108,5 +108,5 @@ def _check_workspace(workspace, num_tokens: int) -> None:
         raise ValueError(
             f"the workspace is bound to the {'wide' if workspace.wide else 'narrow'} "
             f"schedule but T={num_tokens} runs the {'wide' if wide else 'narrow'} one: "
-            f"allocate it from an input with T {'>' if wide else '<='} {_NARROW_TOKENS}."
+            f"allocate it with max_tokens {'>' if wide else '<='} {_NARROW_TOKENS}."
         )
