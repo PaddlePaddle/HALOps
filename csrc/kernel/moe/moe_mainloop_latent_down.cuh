@@ -21,6 +21,7 @@
 #include <cute/tensor.hpp>
 
 #include "kernel/moe/mma_core.cuh"
+#include "kernel/moe/moe_cluster.cuh"
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_shared_storage.cuh"
 #include "kernel/moe/moe_tma.cuh"
@@ -116,12 +117,11 @@ struct LatentDownProjectionBase {
                kNumSplits;
     }
 
-    __device__ static std::uint32_t cluster_rank() {
-        return blockIdx.x % Traits::kClusterSize;
-    }
+    using Cluster = ClusterSplitK<Traits::kClusterSize>;
 
-    __device__ static std::uint32_t group_rank(std::uint32_t r) {
-        return cluster_rank() - split_idx() + r;
+    // First cluster rank of this split group.
+    __device__ static std::uint32_t group_base_rank() {
+        return Cluster::rank() - split_idx();
     }
 
     __device__ static std::uint32_t m_tile_idx() {
@@ -241,28 +241,17 @@ struct LatentDownProjectionBase {
         const std::uint32_t row = 16u * group_idx(warp_idx) + lane_idx / 4u;
         const std::uint32_t t0 = lane_idx & 3u;
         float* const local = &smem->latent_down.splited_mma_out[0][0];
-        // Map peer splits while skipping the local split.
         std::uint32_t shares[kNumSplits > 1u ? kNumSplits - 1u : 1u];
-#pragma unroll
-        for (std::uint32_t n = 0; n + 1u < kNumSplits; ++n) {
-            const std::uint32_t r = n + (n >= split_idx() ? 1u : 0u);
-            shares[n] = cluster_map_shared_rank(
-                &smem->latent_down.splited_mma_out[0][0], group_rank(r));
-        }
+        Cluster::map_peers<kNumSplits>(local, group_base_rank(), split_idx(),
+                                       shares);
 #pragma unroll
         for (std::uint32_t g = 0; g < kTokenWindows; ++g) {
 #pragma unroll
             for (std::uint32_t i = 0; i < 4u; ++i) {
                 const std::uint32_t at = (row + 8u * (i / 2u)) * kTileShapeN +
                                          (8u * g + 2u * t0 + i % 2u);
-                float v = local[at];
-                if constexpr (kNumSplits > 1u) {
-#pragma unroll
-                    for (std::uint32_t n = 0; n < kNumSplits - 1u; ++n) {
-                        v += cluster_load_f32(shares[n] + 4u * at);
-                    }
-                }
-                acc[g][i] = v;
+                acc[g][i] =
+                    Cluster::peer_sum<kNumSplits>(shares, local[at], at);
             }
         }
     }
@@ -310,7 +299,7 @@ struct LatentDownProjectionBase {
                                         SharedStorage* __restrict__ smem) {
         // Every thread joins: the cluster barrier is block-collective.
         __syncthreads();
-        cluster_arrive_and_wait();
+        Cluster::sync();
         if (split_idx() == 0u) {
             if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
                 float acc[kTokenWindows][4] = {};
@@ -319,16 +308,16 @@ struct LatentDownProjectionBase {
                 WarpRole::sync_calc_threads();
             }
             // Release peer reads now; wait after output quantization.
-            cluster_arrive();
+            Cluster::arrive();
         } else {
-            cluster_arrive();
-            cluster_wait();
+            Cluster::arrive();
+            Cluster::wait();
         }
     }
 
     // Split 0's pending arrive from `join_split_k`.
     __device__ static void release_split_partner() {
-        if (split_idx() == 0u) cluster_wait();
+        if (split_idx() == 0u) Cluster::wait();
     }
 };
 
@@ -342,6 +331,7 @@ template <typename KernelTraits>
 struct LatentDownProjection<KernelTraits, true>
     : LatentDownProjectionBase<KernelTraits> {
     using Base = LatentDownProjectionBase<KernelTraits>;
+    using Cluster = typename Base::Cluster;
     using typename Base::Dims;
     using typename Base::LatentDownGemm;
     using typename Base::MmaCore;
@@ -629,7 +619,7 @@ struct LatentDownProjection<KernelTraits, true>
         if constexpr (kLocalScale) {
             __syncthreads();
         } else {
-            cluster_arrive_and_wait();
+            Cluster::sync();
         }
 
         const bool is_cell = owns_slice && threadIdx.x < kCells;
@@ -648,7 +638,7 @@ struct LatentDownProjection<KernelTraits, true>
         }
 
         if constexpr (!kLocalScale) {
-            cluster_arrive_and_wait();
+            Cluster::sync();
         }
 
         if (is_cell) {
@@ -701,6 +691,7 @@ template <typename KernelTraits>
 struct LatentDownProjection<KernelTraits, false>
     : LatentDownProjectionBase<KernelTraits> {
     using Base = LatentDownProjectionBase<KernelTraits>;
+    using Cluster = typename Base::Cluster;
     using typename Base::Dims;
     using typename Base::LatentDownGemm;
     using typename Base::MmaCore;
@@ -852,24 +843,14 @@ struct LatentDownProjection<KernelTraits, false>
         Base::store_acc(workspace, smem, acc);
     }
 
-    // A block's amax over one token's window, gathered from the cluster.
-    __device__ static std::uint32_t group_base_rank() {
-        return blockIdx.x % Traits::kClusterSize -
-               Base::cta_idx() % LatentDownGemm::kClusterSize;
-    }
-
     // Read peer maxima between cluster barriers when a scale spans CTAs.
     __device__ static float cluster_token_max(SharedStorage* __restrict__ smem,
                                               std::uint32_t tok) {
         float amax = smem->latent_down.token_amax[tok][0];
         if constexpr (!kLocalScale) {
-#pragma unroll
-            for (std::uint32_t rank = 0; rank < LatentDownGemm::kClusterSize;
-                 ++rank) {
-                amax = fmaxf(amax, cluster_load_f32(cluster_map_shared_rank(
-                                       &smem->latent_down.token_amax[tok][0],
-                                       group_base_rank() + rank)));
-            }
+            amax = Cluster::split_max<LatentDownGemm::kClusterSize>(
+                &smem->latent_down.token_amax[tok][0], Base::group_base_rank(),
+                0u);
         }
         return amax;
     }
@@ -978,7 +959,7 @@ struct LatentDownProjection<KernelTraits, false>
         if constexpr (kLocalScale) {
             __syncthreads();
         } else {
-            cluster_arrive_and_wait();
+            Cluster::sync();
         }
 
         const bool is_cell = owns_slice && threadIdx.x < kCells;
@@ -1007,7 +988,7 @@ struct LatentDownProjection<KernelTraits, false>
         }
 
         if constexpr (!kLocalScale) {
-            cluster_arrive_and_wait();
+            Cluster::sync();
         }
 
         if (is_cell) {

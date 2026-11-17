@@ -18,6 +18,7 @@
 
 #include <cute/tensor.hpp>
 
+#include "kernel/moe/moe_cluster.cuh"
 #include "kernel/moe/moe_shared_storage.cuh"
 #include "kernel/moe/moe_tma.cuh"
 #include "kernel/moe/moe_traits.cuh"
@@ -70,6 +71,7 @@ struct GatedActFunctor {
 template <typename KernelTraits, typename GemmTraits>
 struct UpProjectionBase {
     using Traits = KernelTraits;
+    using Cluster = ClusterSplitK<Traits::kClusterSize>;
     using Dims = typename Traits::MoEDims;
     using SharedStorage = MoESharedStorage<Dims>;
     using Workspace = MoEWorkspace<Dims>;
@@ -304,7 +306,7 @@ struct UpProjectionBase {
                 store_up_partial_sums(partial, gate, up);
             }
             __syncthreads();
-            cluster_arrive_and_wait();
+            Cluster::sync();
         }
     }
 
@@ -341,12 +343,8 @@ struct UpProjectionBase {
             kOutputFeatureBlock * UpGemm::kTileShapeN;
         std::uint32_t shares[kNumSplits > 1u ? kNumSplits - 1u : 1u];
         if constexpr (kNumSplits > 1u) {
-            const std::uint32_t first_rank = blockIdx.x % Traits::kClusterSize;
-#pragma unroll
-            for (std::uint32_t r = 1u; r < kNumSplits; ++r) {
-                shares[r - 1u] =
-                    cluster_map_shared_rank(&partial[0][0][0], first_rank + r);
-            }
+            Cluster::map_peers<kNumSplits>(&partial[0][0][0], Cluster::rank(),
+                                           0u, shares);
         }
 #pragma unroll
         for (std::uint32_t group = 0; group < kTokenGroups; ++group) {
@@ -358,16 +356,12 @@ struct UpProjectionBase {
                 float gate;
                 float up;
                 if constexpr (kNumSplits > 1u) {
-                    gate = partial[0][feature][token];
-                    up = partial[1][feature][token];
                     const std::uint32_t at =
                         feature * UpGemm::kTileShapeN + token;
-#pragma unroll
-                    for (std::uint32_t n = 0; n < kNumSplits - 1u; ++n) {
-                        gate += cluster_load_f32(shares[n] + 4u * at);
-                        up += cluster_load_f32(shares[n] +
-                                               4u * (kPlaneElems + at));
-                    }
+                    gate = Cluster::peer_sum<kNumSplits>(
+                        shares, partial[0][feature][token], at);
+                    up = Cluster::peer_sum<kNumSplits>(
+                        shares, partial[1][feature][token], kPlaneElems + at);
                 } else {
                     gate = acc_gate[group * 2u + i];
                     up = acc_up[group * 2u + i];
@@ -383,6 +377,7 @@ struct UpProjectionBase {
 template <typename KernelTraits, typename GemmTraits>
 struct DownProjectionBase {
     using Traits = KernelTraits;
+    using Cluster = ClusterSplitK<Traits::kClusterSize>;
     using Dims = typename Traits::MoEDims;
     using SharedStorage = MoESharedStorage<Dims>;
     using Workspace = MoEWorkspace<Dims>;

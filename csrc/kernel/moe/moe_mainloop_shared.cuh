@@ -343,7 +343,7 @@ struct SharedUpProjection<KernelTraits, true>
         }
         // All split readers and publishers finish before the next phase.
         __syncthreads();
-        cluster_arrive_and_wait();
+        Base::Cluster::sync();
         if (Base::split_idx() == 0u && threadIdx.x == 0u) {
             Base::publish_up_output(workspace, smem);
         }
@@ -536,7 +536,7 @@ struct SharedUpProjection<KernelTraits, false>
         }
         // All split readers and publishers finish before the next phase.
         __syncthreads();
-        cluster_arrive_and_wait();
+        Base::Cluster::sync();
         if (Base::split_idx() == 0u && threadIdx.x == 0u) {
             Base::publish_up_output(workspace, smem);
         }
