@@ -760,6 +760,7 @@ struct SharedDownProjection<KernelTraits, true>
         const CUtensorMap* const scale_desc =
             down_scale_layout == ScaleLayout::kSfAtom ? &tma_down_scale_desc
                                                       : nullptr;
+#pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
             Base::load_down_weight_tile(tma_down_desc, smem, k_iter_id,
@@ -884,6 +885,7 @@ struct SharedDownProjection<KernelTraits, false>
     __device__ static void run_load_weight_k_loop(
         CUtensorMap const& tma_down_desc, SharedStorage* __restrict__ smem,
         std::uint32_t num_k_tiles) {
+#pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
             Base::load_down_weight_tile(

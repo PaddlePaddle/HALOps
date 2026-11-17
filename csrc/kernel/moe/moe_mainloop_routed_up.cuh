@@ -640,6 +640,7 @@ struct RoutedUpProjection<KernelTraits, false>
         constexpr uint32_t kNumScaleBlocksM =
             UpGemm::kGemmM / UpGemm::WeightQuant::kBlockSize;
 
+#pragma unroll 1
         for (uint32_t i = lane_idx; i < 2 * num_scale_blocks_k; i += 32u) {
             // 0 → gate half, 1 → up half
             uint32_t rb_local = i / num_scale_blocks_k;

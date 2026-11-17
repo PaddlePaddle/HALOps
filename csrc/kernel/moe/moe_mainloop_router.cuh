@@ -84,6 +84,8 @@ struct RouterProjectionBase {
         RouterGemm::kNumWeightSlots;
     static_assert(kNumFirstWeightTiles <= WarpRole::kThreadsPerWarp,
                   "one loader lane refills each weight slot");
+    static_assert(RouterGemm::kNumInputSlots <= WarpRole::kThreadsPerWarp,
+                  "one loader lane issues each first-lap input tile");
 
     // Input tiles the first lap can leave in flight.
     __device__ static std::uint32_t num_first_input_tiles(
@@ -137,13 +139,13 @@ struct RouterProjectionBase {
         const std::uint32_t first = num_k_tiles < kNumFirstWeightTiles
                                         ? num_k_tiles
                                         : kNumFirstWeightTiles;
-        for (std::uint32_t j = lane_idx; j < first;
-             j += WarpRole::kThreadsPerWarp) {
-            load_weight_tile(tma_router_weights_desc, smem, j);
+        if (lane_idx < first) {
+            load_weight_tile(tma_router_weights_desc, smem, lane_idx);
         }
         // The slot-waiting tiles then load from L2; both token windows of an
         // M tile read them, so one block prefetches.
         if (lane_idx == 0u && token_begin() == 0u) {
+#pragma unroll 1
             for (std::uint32_t j = first; j < num_k_tiles; ++j) {
                 tma_prefetch_l2_3d(tma_router_weights_desc, /*coord0=*/0u,
                                    /*row=*/weight_row_begin(),
@@ -157,10 +159,9 @@ struct RouterProjectionBase {
     __device__ static void prefetch_first_input_tiles(
         CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem,
         MoEProblemSize const& problem_size) {
-        const std::uint32_t first = num_first_input_tiles(problem_size);
-        for (std::uint32_t k = WarpRole::get_lane_idx(); k < first;
-             k += WarpRole::kThreadsPerWarp) {
-            load_input_tile(tma_input_desc, smem, k);
+        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
+        if (lane_idx < num_first_input_tiles(problem_size)) {
+            load_input_tile(tma_input_desc, smem, lane_idx);
         }
     }
 
@@ -309,6 +310,7 @@ struct RouterProjection<KernelTraits, true>
         constexpr std::uint32_t kInputSlots = RouterGemm::kNumInputSlots;
         const std::uint32_t num_k_tiles =
             problem_size.hidden_size / RouterGemm::kTileShapeK;
+#pragma unroll 1
         for (std::uint32_t j = 0; j < num_k_tiles; ++j) {
             const std::uint32_t k_iter_id = j;
             const std::uint32_t slot = k_iter_id % kInputSlots;
