@@ -57,30 +57,32 @@ class MoEWorkspace:
     _keepalive: tuple
 
 
-def _workspace_layout(input: Optional[torch.Tensor], tp_size: int = 1):
+def _workspace_layout(max_tokens: Optional[int], tp_size: int = 1):
     """Return (scratchpad bytes, tail offset, total bytes) of the workspace."""
     if tp_size not in (1, 4):
         raise ValueError(f"tp_size must be 1 or 4, got {tp_size}")
-    scratch = int(halops_kernel.moe_get_workspace_size(input))
+    scratch = int(
+        halops_kernel.moe_get_workspace_size(0 if max_tokens is None else max_tokens)
+    )
     offset = -(-scratch // _TAIL_ALIGN) * _TAIL_ALIGN
-    if input is None:
+    if max_tokens is None:
         tail = max(
             int(halops_kernel.moe_tail_region_bytes(w, tp_size)) for w in (False, True)
         )
     else:
         tail = int(
-            halops_kernel.moe_tail_region_bytes(input.size(0) > _NARROW_TOKENS, tp_size)
+            halops_kernel.moe_tail_region_bytes(max_tokens > _NARROW_TOKENS, tp_size)
         )
     return scratch, offset, offset + tail
 
 
 def get_workspace_for_moe(
-    input: torch.Tensor,
+    max_tokens: int,
     group_name: str,
     tp_rank: int,
     tp_size: int,
 ) -> MoEWorkspace:
-    """Allocate the workspace of ``mega_ll_moe`` for ``input``'s token count.
+    """Allocate the workspace of ``mega_ll_moe`` for up to ``max_tokens`` tokens.
 
     For tp_size 4, allocation is collective over ``group_name``. Allocate it
     once, before any CUDA-graph capture, and reuse it across calls and graph
@@ -88,7 +90,7 @@ def get_workspace_for_moe(
     launched with the same grid.
 
     Args:
-        input: [T, 4096] bfloat16 CUDA tensor; T selects the schedule.
+        max_tokens: Token count the workspace must cover, and should be <= 16.
         group_name: Name of the torch process group of the tensor-parallel
             ranks. It is unused for a single-rank launch.
         tp_rank: Rank in that group.
@@ -97,11 +99,11 @@ def get_workspace_for_moe(
     Returns:
         The workspace to pass to ``mega_ll_moe``.
     """
-    wide = input.size(0) > _NARROW_TOKENS
-    device = input.device
+    wide = max_tokens > _NARROW_TOKENS
+    device = torch.device("cuda", torch.cuda.current_device())
     if tp_size not in (1, 4):
         raise ValueError(f"tp_size must be 1 or 4, got {tp_size}")
-    scratch, offset, nbytes = _workspace_layout(input, tp_size)
+    scratch, offset, nbytes = _workspace_layout(max_tokens, tp_size)
 
     if tp_size == 1:
         region = torch.zeros(nbytes, dtype=torch.uint8, device=device)
@@ -358,8 +360,9 @@ def mega_ll_moe(
             no scaling.
         out (Tensor): [T, 4096] bfloat16 output, identical across ranks.
         workspace (MoEWorkspace): Scratchpad and tail communication state
-            from ``get_workspace_for_moe``, matching the token schedule. It
-            also fixes the tensor-parallel size and rank of the launch.
+            from ``get_workspace_for_moe``, allocated for at least this call's
+            token count (same narrow/wide schedule). It also fixes the
+            tensor-parallel size and rank of the launch.
         top_k (int): Experts selected per token, in [1, 10].
         num_router_gates (int, optional): Gates stacked in
             ``router_weight``'s rows; this build requires 2. Default: 2.
@@ -442,18 +445,18 @@ def mega_ll_moe(
 
 
 def get_workspace_size_for_moe(
-    input: Optional[torch.Tensor] = None, tp_size: int = 1
+    max_tokens: Optional[int] = None, tp_size: int = 1
 ) -> int:
-    """Return the workspace region size in bytes for a token count.
+    """Return the workspace region size in bytes for a token bound.
 
     Args:
-        input (Tensor, optional): Activations, shape [T, 4096], dtype
-            bfloat16. Without it, the larger of the supported schedules is
-            returned. Default: None.
+        max_tokens (int, optional): Token count the workspace must cover.
+            Without it, the larger of the supported schedules is returned.
+            Default: None.
         tp_size (int, optional): Tensor-parallel size, either 1 or 4.
             Default: 1.
 
     Returns:
         Size in bytes of the scratchpad plus the tail mailbox.
     """
-    return _workspace_layout(input, tp_size)[2]
+    return _workspace_layout(max_tokens, tp_size)[2]

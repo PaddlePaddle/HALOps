@@ -630,7 +630,7 @@ class MoEFused:
         p = self.moe_params
         num_tokens = input.size(0)
         if self.workspace is None:
-            self.workspace = get_workspace_for_moe(input, *self.tp)
+            self.workspace = get_workspace_for_moe(input.size(0), *self.tp)
         out = torch.empty(
             num_tokens, p.hidden_size, dtype=torch.bfloat16, device=input.device
         )
