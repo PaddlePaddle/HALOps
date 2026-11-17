@@ -28,32 +28,27 @@ def sigmoid_gate_mul_group_quant(
     gate: torch.Tensor,
     use_pdl: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Sigmoid gating + MXFP8 group-32 quantization in a single pass.
+    """Sigmoid gating fused with W8A8-MXFP8 quantization.
 
-    Computes ``y = o * sigmoid(gate)`` with ``sigmoid(gate)`` and the product
-    each rounded to bf16, then quantizes every 32 consecutive elements of a
-    row to float8_e4m3fn with a UE8M0 scale ``2^ceil(log2(amax / 448))``.
+    Computes ``y = o * torch.sigmoid(gate)`` on the bfloat16 inputs and
+    quantizes it exactly as ``group_wise_quant(y, use_swizzle=False)`` does.
 
     Args:
-        o: [T, hidden] bfloat16 tensor with contiguous, 16-byte aligned rows;
-            ``hidden`` is a multiple of 32 and the row stride may be larger
-            than ``hidden``.
-        gate: [T, hidden] bfloat16 tensor laid out like ``o``.
+        o: [T, hidden] bfloat16 tensor; rows may be strided (``stride(1) ==
+            1``, 16-byte aligned row starts). hidden must be a multiple of 32.
+        gate: [T, hidden] bfloat16 tensor, same layout rules as ``o``.
         use_pdl: Enable Programmatic Dependent Launch (on by default).
 
     Returns:
-        A tuple ``(q, sf)`` where:
-
-        - ``q``: [T, hidden] float8_e4m3fn codes.
-        - ``sf``: [T, hidden / 32] uint8 UE8M0 scales in row-major layout.
+        ``(q, sf)``: [T, hidden] float8_e4m3fn codes and [T, hidden / 32]
+        uint8 UE8M0 scales in row-major layout.
 
     Example:
         >>> from halops import sigmoid_gate_mul_group_quant
         >>>
-        >>> t, hidden = 4, 4096
-        >>> o = torch.randn(t, hidden, dtype=torch.bfloat16, device="cuda")
-        >>> qg = torch.randn(t, 2 * hidden, dtype=torch.bfloat16, device="cuda")
-        >>> q, sf = sigmoid_gate_mul_group_quant(o, qg[:, hidden:])
+        >>> o = torch.randn(4, 4096, dtype=torch.bfloat16, device="cuda")
+        >>> gate = torch.randn(4, 4096, dtype=torch.bfloat16, device="cuda")
+        >>> q, sf = sigmoid_gate_mul_group_quant(o, gate)
     """
     q, sf = halops_kernel.sigmoid_gate_mul_group_quant(o, gate, use_pdl)
     return q, sf

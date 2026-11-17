@@ -62,15 +62,6 @@ inline void CheckRowsVecAligned(const torch::Tensor& t, const char* name) {
                 name, " rows must be contiguous and 16-byte aligned");
 }
 
-inline void CheckContiguousTensor(const torch::Tensor& t, const char* name,
-                                  torch::ScalarType dtype,
-                                  c10::IntArrayRef shape) {
-    TORCH_CHECK(t.is_cuda() && t.scalar_type() == dtype && t.is_contiguous() &&
-                    t.sizes().equals(shape),
-                name, " must be a contiguous ", dtype, " CUDA tensor of shape ",
-                shape, ", got ", t.scalar_type(), " ", t.sizes());
-}
-
 inline int CurrentDevice() {
     int device = 0;
     HALOPS_CUDA_CHECK(cudaGetDevice(&device));

@@ -71,12 +71,10 @@ HcMeanKernel SelectHcMeanKernel(int hc) {
     switch (hc) {
         case 2:
             return mhc_post_hc_mean_kernel<2>;
-        case 3:
-            return mhc_post_hc_mean_kernel<3>;
         case 4:
             return mhc_post_hc_mean_kernel<4>;
     }
-    TORCH_CHECK(false, "hc must be 2, 3 or 4, got ", hc);
+    TORCH_CHECK(false, "hc must be 2 or 4, got ", hc);
 }
 
 }  // namespace
@@ -89,11 +87,6 @@ torch::Tensor MhcPostHcMean(const torch::Tensor& x,
     TORCH_CHECK(residual.dim() == 3, "residual must be [T, hc, hidden]");
     const int64_t num_tokens = residual.size(0), hc = residual.size(1);
     const int64_t hidden = residual.size(2);
-    CheckContiguousTensor(x, "x", torch::kBFloat16, {num_tokens, hidden});
-    CheckContiguousTensor(residual, "residual", torch::kBFloat16,
-                          {num_tokens, hc, hidden});
-    CheckContiguousTensor(post, "post", torch::kFloat32, {num_tokens, hc});
-    CheckContiguousTensor(comb, "comb", torch::kFloat32, {num_tokens, hc, hc});
     const HcMeanKernel kernel = SelectHcMeanKernel(hc);
     torch::Tensor out = torch::empty({num_tokens, hidden}, x.options());
     if (num_tokens == 0) return out;

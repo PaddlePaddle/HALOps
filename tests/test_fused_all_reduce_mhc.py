@@ -40,7 +40,7 @@ MIX_TOL = dict(atol=1e-3, rtol=1e-3)
 LAYER_TOL = dict(atol=2e-2, rtol=2e-2)
 HIDDEN = 4096
 TP_SIZE = 4
-TP_CASES = [(1, 4), (16, 4), (5, 3)]
+TP_CASES = [(1, 4), (16, 4), (5, 2)]
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -113,7 +113,6 @@ def assert_equal_outputs(outs, refs, case=""):
     [
         pytest.param(1, 4, id="t1-hc4"),
         pytest.param(64, 4, id="t64-hc4"),
-        pytest.param(5, 3, id="t5-hc3"),
         pytest.param(3, 2, id="t3-hc2"),
     ],
 )
@@ -129,7 +128,7 @@ def test_fused_all_reduce_mhc(t, hc):
     assert_equal_outputs((q, sf), ref_mxfp8(layer_out))
 
 
-@pytest.mark.parametrize("hc", [2, 3, 4])
+@pytest.mark.parametrize("hc", [2, 4])
 def test_fused_all_reduce_mhc_logits(hc):
     inputs = make_inputs(4, hc)
     outs = run_mhc(inputs)
@@ -157,7 +156,7 @@ def test_fused_all_reduce_mhc_workspace():
     "t, hc, hidden",
     [
         pytest.param(1, 4, 4096, id="t1-hc4-h4096"),
-        pytest.param(16, 3, 1536, id="t16-hc3-h1536"),
+        pytest.param(16, 2, 1536, id="t16-hc2-h1536"),
     ],
 )
 def test_mhc_post_hc_mean(t, hc, hidden):
@@ -170,7 +169,7 @@ def test_mhc_post_hc_mean(t, hc, hidden):
 @pytest.mark.parametrize(
     "hc, hidden, message",
     [
-        pytest.param(5, 4096, "hc must be 2, 3 or 4, got 5", id="hc5"),
+        pytest.param(5, 4096, "hc must be 2 or 4, got 5", id="hc5"),
         pytest.param(4, 1024, "hidden support 4096 only, got 1024", id="h1024"),
     ],
 )

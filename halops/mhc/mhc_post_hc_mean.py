@@ -28,19 +28,16 @@ def mhc_post_hc_mean(
     comb: torch.Tensor,
     use_pdl: bool = True,
 ) -> torch.Tensor:
-    """mHC post mixing of the last layer, averaged over the streams.
+    """mHC post mixing after the last layer, averaged over the ``hc`` streams.
 
-    For every token, stream ``j`` is
-    ``r_j = post[j] * x + sum_i comb[i, j] * residual[i]`` (fp32, rounded to
-    bf16), and the output is the fp32 mean of the ``hc`` streams rounded to
-    bf16.
+    Computes ``mean_j bf16(post[j] * x + sum_i comb[i, j] * residual[i])``
+    per token in fp32, rounded to bf16. All tensors must be contiguous.
 
     Args:
-        x: [T, hidden] bfloat16 contiguous layer output.
-        residual: [T, hc, hidden] bfloat16 contiguous residual streams;
-            ``hc`` is 2, 3 or 4.
-        post: [T, hc] float32 contiguous post weights.
-        comb: [T, hc, hc] float32 contiguous stream mixing matrices.
+        x: [T, hidden] bfloat16 layer output.
+        residual: [T, hc, hidden] bfloat16 residual streams; hc is 2 or 4.
+        post: [T, hc] float32 post weights.
+        comb: [T, hc, hc] float32 comb matrices, [source, dest].
         use_pdl: Enable Programmatic Dependent Launch (on by default).
 
     Returns:
@@ -49,12 +46,10 @@ def mhc_post_hc_mean(
     Example:
         >>> from halops import mhc_post_hc_mean
         >>>
-        >>> t, hc, hidden = 4, 4, 4096
-        >>> x = torch.randn(t, hidden, dtype=torch.bfloat16, device="cuda")
-        >>> residual = torch.randn(t, hc, hidden, dtype=torch.bfloat16,
-        ...                        device="cuda")
-        >>> post = torch.rand(t, hc, device="cuda")
-        >>> comb = torch.rand(t, hc, hc, device="cuda").softmax(-1)
+        >>> x = torch.randn(4, 4096, dtype=torch.bfloat16, device="cuda")
+        >>> residual = torch.randn(4, 4, 4096, dtype=torch.bfloat16, device="cuda")
+        >>> post = torch.rand(4, 4, device="cuda")
+        >>> comb = torch.rand(4, 4, 4, device="cuda")
         >>> out = mhc_post_hc_mean(x, residual, post, comb)
     """
     return halops_kernel.mhc_post_hc_mean(x, residual, post, comb, use_pdl)

@@ -16,9 +16,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cutlass/arch/barrier.h>
-#include <cutlass/functional.h>
 #include <cutlass/kernel_hardware_info.h>
-#include <math_constants.h>
 
 #include <algorithm>
 #include <cute/arch/cluster_sm90.hpp>
@@ -30,6 +28,8 @@
 #include "common/cuda_utils.h"
 #include "common/mx_quant.cuh"
 #include "common/pdl.cuh"
+#include "common/ptx.cuh"
+#include "kernel/mhc/megallmhc_utils.cuh"
 #include "kernel/mla/mla_intrinsics.cuh"
 #include "kernel/moe/moe_tail_prims.cuh"
 #include "kernel/moe/ptx_utils.cuh"
@@ -122,185 +122,21 @@ struct L2PrefetchArgs {
     uint32_t bytes[kMaxPrefetchRanges];
 };
 
-CUTE_DEVICE float add_rn(float a, float b) { return __fadd_rn(a, b); }
-CUTE_DEVICE float2 add_rn(float2 a, float2 b) { return __fadd2_rn(a, b); }
-CUTE_DEVICE float2 splat(float v) { return make_float2(v, v); }
-
-CUTE_DEVICE void st_relaxed_16B(const Vec16& v, void* addr, int64_t vid) {
-    const uint4 u = reinterpret_cast<const uint4&>(v);
-    addr = static_cast<uint8_t*>(addr) + vid * sizeof(uint4);
-    asm volatile("st.relaxed.sys.global.v4.b32 [%4], {%0, %1, %2, %3};"
-                 :
-                 : "r"(u.x), "r"(u.y), "r"(u.z), "r"(u.w), "l"(addr));
-}
-
-CUTE_DEVICE void st_async_v4(uint32_t addr, float4 v, uint32_t bar) {
-    asm volatile(
-        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 "
-        "[%0], {%1, %2, %3, %4}, [%5];" ::"r"(addr),
-        "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w), "r"(bar)
-        : "memory");
-}
-
-CUTE_DEVICE int64_t lamport_phase_offset(const LamportPlane& p, int counter) {
-    return int64_t(p.counters[counter] & 1) * p.world * p.slot_bytes;
-}
-
-CUTE_DEVICE void lamport_push(const LamportPlane& p, int64_t phase_off,
-                              int64_t vid, Vec16 v) {
-    moe::tail::sanitize(v);
-    const int64_t src_off = p.rank * p.slot_bytes + phase_off;
-    CUTLASS_PRAGMA_UNROLL
-    for (int d = 0; d < kMaxWorld; ++d) {
-        if (d < p.world) st_relaxed_16B(v, p.peers[d] + src_off, vid);
-    }
-}
-
-CUTE_DEVICE Vec16 lamport_poll_sum(const LamportPlane& p, int64_t phase_off,
-                                   int64_t vid) {
-    const uint8_t* base = p.peers[p.rank] + phase_off;
-    Vec16 v[kMaxWorld];
-    bool pending;
-    do {
-        pending = false;
-        CUTLASS_PRAGMA_UNROLL
-        for (int s = 0; s < kMaxWorld; ++s) {
-            if (s < p.world)
-                moe::ld_relaxed_16B(v[s], base + s * p.slot_bytes, vid);
-        }
-        CUTLASS_PRAGMA_UNROLL
-        for (int s = 0; s < kMaxWorld; ++s) {
-            const uint4 b = reinterpret_cast<const uint4&>(v[s]);
-            if (s < p.world) pending |= !(b.x && b.y && b.z && b.w);
-        }
-    } while (pending);
-    Vec16 sum;
-    CUTLASS_PRAGMA_UNROLL
-    for (int j = 0; j < 4; ++j) {
-        float2 acc = __bfloat1622float2(v[0][j]);
-        CUTLASS_PRAGMA_UNROLL
-        for (int s = 1; s < kMaxWorld; ++s) {
-            if (s < p.world) acc = __fadd2_rn(acc, __bfloat1622float2(v[s][j]));
-        }
-        sum[j] = __float22bfloat162_rn(acc);
-    }
-    return sum;
-}
-
-CUTE_DEVICE void lamport_reset(const LamportPlane& p, int64_t phase_off,
-                               int64_t vid) {
-    const uint4 empty{};
-    uint8_t* base = p.peers[p.rank] + phase_off;
-    CUTLASS_PRAGMA_UNROLL
-    for (int s = 0; s < kMaxWorld; ++s) {
-        if (s < p.world)
-            moe::st_global_16B(empty, base + s * p.slot_bytes, vid);
-    }
-}
-
-template <int kN, class T>
-CUTE_DEVICE T halving_sum(T (&x)[kN]) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int n = kN; n > 1; n = (n + 1) / 2) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < n / 2; ++k) x[k] = add_rn(x[k], x[k + (n + 1) / 2]);
-    }
-    return x[0];
-}
-
-template <int kN>
-CUTE_DEVICE float pairwise_sum(float (&x)[kN]) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int n = kN; n > 1; n = (n + 1) / 2) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < n / 2; ++k)
-            x[k] = __fadd_rn(x[2 * k], x[2 * k + 1]);
-        if (n % 2) x[n / 2] = x[n - 1];
-    }
-    return x[0];
-}
-
-template <int kHc>
-CUTE_DEVICE float gram_at(const float* tot, int j, int k) {
-    const int a = min(j, k), b = max(j, k);
-    return tot[MhcShape<kHc>::kMix + a * kHc - a * (a - 1) / 2 + (b - a)];
-}
-
-template <int kHc>
-CUTE_DEVICE float token_rms(const float* tot, float inv_n, float eps) {
+template <int kHc, int kHidden>
+CUTE_DEVICE float token_rms(const float* tot, float eps) {
+    constexpr float kInvN = 1.0f / (kHc * kHidden);
     float d[kHc];
     CUTLASS_PRAGMA_UNROLL
-    for (int j = 0; j < kHc; ++j) d[j] = gram_at<kHc>(tot, j, j);
-    const float zsq = pairwise_sum(d);
-    return __frcp_rn(__fadd_rn(__fsqrt_rn(__fmul_rn(zsq, inv_n)), eps));
-}
-
-template <int kHc>
-using SinkhornTile = float2[kHc][(kHc + 1) / 2];
-
-template <int kHc, bool kFirst>
-CUTE_DEVICE void sinkhorn_rows(SinkhornTile<kHc>& v, float eps) {
+    for (int j = 0; j < kHc; ++j)
+        d[j] = tot[MhcShape<kHc>::kMix + j * kHc - j * (j - 1) / 2];
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < kHc; ++i) {
-        float x[kHc];
+    for (int n = kHc; n > 1; n = (n + 1) / 2) {
         CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < kHc; ++j)
-            x[j] = j % 2 ? v[i][j / 2].y : v[i][j / 2].x;
-        const float s = halving_sum(x);
-        const cutlass::reciprocal_approximate_ftz<float> rcp;
-        const float2 inv = splat(rcp(kFirst ? s : __fadd_rn(s, eps)));
-        CUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < (kHc + 1) / 2; ++k) {
-            v[i][k] = kFirst ? __ffma2_rn(v[i][k], inv, splat(eps))
-                             : __fmul2_rn(v[i][k], inv);
-        }
+        for (int k = 0; k < n / 2; ++k)
+            d[k] = __fadd_rn(d[2 * k], d[2 * k + 1]);
+        if (n % 2) d[n / 2] = d[n - 1];
     }
-}
-
-template <int kHc>
-CUTE_DEVICE void sinkhorn_cols(SinkhornTile<kHc>& v, float eps) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int k = 0; k < (kHc + 1) / 2; ++k) {
-        float2 x[kHc];
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < kHc; ++i) x[i] = v[i][k];
-        const float2 s = __fadd2_rn(halving_sum(x), splat(eps));
-        const cutlass::reciprocal_approximate_ftz<float> rcp;
-        const float2 inv = make_float2(rcp(s.x), rcp(s.y));
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < kHc; ++i) v[i][k] = __fmul2_rn(v[i][k], inv);
-    }
-}
-
-template <int kHc>
-CUTE_DEVICE void sinkhorn(float (&c)[kHc * kHc], float eps, int repeat) {
-    SinkhornTile<kHc> v;
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < kHc; ++i) {
-        float rmax = c[i * kHc];
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 1; j < kHc; ++j) rmax = fmaxf(rmax, c[i * kHc + j]);
-        float e[kHc + 1] = {};
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < kHc; ++j)
-            e[j] = exp2f((c[i * kHc + j] - rmax) * CUDART_L2E_F);
-        CUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < (kHc + 1) / 2; ++k)
-            v[i][k] = make_float2(e[2 * k], e[2 * k + 1]);
-    }
-    sinkhorn_rows<kHc, true>(v, eps);
-    sinkhorn_cols<kHc>(v, eps);
-#pragma unroll 1
-    for (int iter = 1; iter < repeat; ++iter) {
-        sinkhorn_rows<kHc, false>(v, eps);
-        sinkhorn_cols<kHc>(v, eps);
-    }
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < kHc; ++i) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < kHc; ++j)
-            c[i * kHc + j] = j % 2 ? v[i][j / 2].y : v[i][j / 2].x;
-    }
+    return __frcp_rn(__fadd_rn(__fsqrt_rn(__fmul_rn(d[0], kInvN)), eps));
 }
 
 template <int kN, int kMask>
@@ -345,12 +181,6 @@ struct ReduceScatter<kN, 0> {
     CUTE_DEVICE static int index(int k, int) { return k; }
 };
 
-template <int kHidden>
-CUTE_DEVICE int64_t push_vid(int tok, int col0, int k) {
-    constexpr int kVec = MhcTile<kHidden>::kVec;
-    return int64_t(tok) * (kHidden / kVec) + col0 / kVec + k;
-}
-
 template <int kHidden, int kHc>
 CUTE_DEVICE void load_weights(const MhcParams& p, int h,
                               float (&w)[MhcShape<kHc>::kMix][kHc],
@@ -364,19 +194,6 @@ CUTE_DEVICE void load_weights(const MhcParams& p, int h,
             w[m][j] = __ldg(fn);
     }
     wn = p.norm_weight[h];
-}
-
-template <int kHc, int kHidden, int kTPC>
-CUTE_DEVICE void load_hc_params(const MhcParams& p,
-                                MhcSmem<kHc, kHidden, kTPC>& sm, int lt,
-                                int nthr) {
-    for (int i = lt; i < 3 + MhcShape<kHc>::kMix; i += nthr) {
-        if (i < 3) {
-            sm.hcs[i] = p.hc_scale[i];
-        } else {
-            sm.hcb[i - 3] = p.hc_base[i - 3];
-        }
-    }
 }
 
 template <bool kWithX, bool kCombLogits, int kHidden, int kHc, int kTPC>
@@ -407,21 +224,6 @@ CUTE_DEVICE void load_inputs(const MhcParams& p,
     }
 }
 
-template <int kHc, int kHidden, int kTPC>
-CUTE_DEVICE void comb_from_logits(const MhcParams& p,
-                                  MhcSmem<kHc, kHidden, kTPC>& sm, int tok0,
-                                  int nt, int lane) {
-    constexpr int kComb = MhcShape<kHc>::kComb;
-    if (lane >= nt) return;
-    const float* src = p.comb + int64_t(tok0 + lane) * kComb;
-    float c[kComb];
-    CUTLASS_PRAGMA_UNROLL
-    for (int k = 0; k < kComb; ++k) c[k] = src[k];
-    sinkhorn<kHc>(c, p.hc_sinkhorn_eps, p.sinkhorn_repeat);
-    CUTLASS_PRAGMA_UNROLL
-    for (int k = 0; k < kComb; ++k) sm.pc[lane][kHc + k] = c[k];
-}
-
 template <int kHidden, int kHc, int kTPC>
 CUTE_DEVICE void post_residual_and_reduce(
     const MhcParams& p, MhcSmem<kHc, kHidden, kTPC>& sm,
@@ -429,21 +231,23 @@ CUTE_DEVICE void post_residual_and_reduce(
     int tid, int lane, int warp, float (&rf)[kHc]) {
     using S = MhcShape<kHc>;
     const float* pc = sm.pc[t];
-    const float2 hin = splat(__bfloat162float(sm.xs[t][tid]));
+    const float xh = __bfloat162float(sm.xs[t][tid]);
+    const float2 hin = mhc::splat(xh);
     float2 r[kHc];
     CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < kHc; ++i)
-        r[i] = splat(__bfloat162float(sm.rs[t][i][tid]));
-    const auto pair = [&](int a, int b) { return make_float2(pc[a], pc[b]); };
+    for (int i = 0; i < kHc; ++i) {
+        r[i] = mhc::splat(__bfloat162float(sm.rs[t][i][tid]));
+    }
     CUTLASS_PRAGMA_UNROLL
     for (int j = 0; j < kHc; j += 2) {
         const int j1 = min(j + 1, kHc - 1);
-        float2 acc = __ffma2_rn(pair(j, j1), hin,
-                                __fmul2_rn(pair(kHc + j, kHc + j1), r[0]));
+        float2 acc = __ffma2_rn(
+            make_float2(pc[j], pc[j1]), hin,
+            __fmul2_rn(make_float2(pc[kHc + j], pc[kHc + j1]), r[0]));
         CUTLASS_PRAGMA_UNROLL
         for (int i = 1; i < kHc; ++i) {
-            acc = __ffma2_rn(pair(kHc + i * kHc + j, kHc + i * kHc + j1), r[i],
-                             acc);
+            const float* ci = pc + kHc + i * kHc;
+            acc = __ffma2_rn(make_float2(ci[j], ci[j1]), r[i], acc);
         }
         const __nv_bfloat162 rb = __float22bfloat162_rn(acc);
         p.residual_out[(tok * kHc + j) * kHidden + h] = rb.x;
@@ -457,10 +261,13 @@ CUTE_DEVICE void post_residual_and_reduce(
     CUTLASS_PRAGMA_UNROLL
     for (int m = 0; m < S::kMix; m += 2) {
         const int m1 = min(m + 1, S::kMix - 1);
-        float2 a = __fmul2_rn(make_float2(w[m][0], w[m1][0]), splat(rf[0]));
+        float2 a =
+            __fmul2_rn(make_float2(w[m][0], w[m1][0]), mhc::splat(rf[0]));
         CUTLASS_PRAGMA_UNROLL
-        for (int j = 1; j < kHc; ++j)
-            a = __ffma2_rn(make_float2(w[m][j], w[m1][j]), splat(rf[j]), a);
+        for (int j = 1; j < kHc; ++j) {
+            a = __ffma2_rn(make_float2(w[m][j], w[m1][j]), mhc::splat(rf[j]),
+                           a);
+        }
         pv[m] = a.x;
         if (m + 1 < S::kMix) pv[m + 1] = a.y;
     }
@@ -493,49 +300,19 @@ CUTE_DEVICE void post_residual_and_reduce(
 }
 
 template <int kHidden, int kHc, int kTPC>
-CUTE_DEVICE void exchange_partials(MhcSmem<kHc, kHidden, kTPC>& sm, int nt,
-                                   int rank, int tid, uint32_t bar) {
-    using L = MhcTile<kHidden>;
-    constexpr int kPV = MhcShape<kHc>::kPV;
-    for (int i = tid; i < L::kClusterSize * nt * kPV; i += L::kCols) {
-        const int dst = i % L::kClusterSize, v = i / L::kClusterSize;
-        const int t = v / kPV, k = v % kPV;
-        float4 r = reinterpret_cast<const float4&>(sm.red[0][t][4 * k]);
-        float2 lo = make_float2(r.x, r.y), hi = make_float2(r.z, r.w);
-        CUTLASS_PRAGMA_UNROLL
-        for (int w = 1; w < L::kWarps; ++w) {
-            r = reinterpret_cast<const float4&>(sm.red[w][t][4 * k]);
-            lo = __fadd2_rn(lo, make_float2(r.x, r.y));
-            hi = __fadd2_rn(hi, make_float2(r.z, r.w));
-        }
-        st_async_v4(
-            cute::set_block_rank(
-                cute::cast_smem_ptr_to_uint(&sm.cl[rank][t][4 * k]), dst),
-            make_float4(lo.x, lo.y, hi.x, hi.y),
-            cute::set_block_rank(bar, dst));
-    }
-}
-
-template <int kHc, int kHidden, int kTPC>
-CUTE_DEVICE float comb_logit(const MhcSmem<kHc, kHidden, kTPC>& sm, int t,
-                             float rms, int k) {
-    return fmaf(sm.tot[t][2 * kHc + k] * rms, sm.hcs[2], sm.hcb[2 * kHc + k]);
-}
-
-template <int kHidden, int kHc, int kTPC>
 CUTE_DEVICE void token_scalars(const MhcParams& p,
                                const MhcSmem<kHc, kHidden, kTPC>& sm, int tok0,
                                int nt, int lane, bool store,
                                float (&pre_out)[kTPC][kHc],
                                float (&rn_out)[kTPC]) {
+    using S = MhcShape<kHc>;
     constexpr int kLanes = 2 * kHc;
-    constexpr float kInvHcHidden = 1.0f / (kHc * kHidden);
     static_assert(kLanes * kTPC <= cutlass::NumThreadsPerWarp);
     const int t = min(lane / kLanes, nt - 1), q = lane % kLanes, j = q % kHc;
     const bool is_post = q >= kHc;
     const float* tot = sm.tot[t];
     const int e = is_post ? kHc + j : j;
-    const float rms = token_rms<kHc>(tot, kInvHcHidden, p.rms_eps);
+    const float rms = token_rms<kHc, kHidden>(tot, p.rms_eps);
     const float s =
         sigmoid_rn(fmaf(tot[e] * rms, sm.hcs[is_post ? 1 : 0], sm.hcb[e]));
     const float pre_j = s + p.hc_pre_eps;
@@ -547,8 +324,12 @@ CUTE_DEVICE void token_scalars(const MhcParams& p,
     CUTLASS_PRAGMA_UNROLL
     for (int a = 0; a < kHc; ++a) {
         CUTLASS_PRAGMA_UNROLL
-        for (int b = 0; b < kHc; ++b)
-            ysq = fmaf(pre[a] * gram_at<kHc>(tot, a, b), pre[b], ysq);
+        for (int b = 0; b < kHc; ++b) {
+            const int lo = min(a, b), hi = max(a, b);
+            const float g =
+                tot[S::kMix + lo * kHc - lo * (lo - 1) / 2 + hi - lo];
+            ysq = fmaf(pre[a] * g, pre[b], ysq);
+        }
     }
     const float rn = rsqrtf(
         __fadd_rn(__fmul_rn(ysq, MhcTile<kHidden>::kInvHidden), p.norm_eps));
@@ -565,24 +346,11 @@ CUTE_DEVICE void token_scalars(const MhcParams& p,
     const int64_t tok = tok0 + t;
     if (is_post) p.post_out[tok * kHc + j] = s * p.hc_post_mult;
     if (p.write_logits) {
-        for (int k = q; k < kHc * kHc; k += kLanes)
-            p.mix_out[tok * kHc * kHc + k] = comb_logit(sm, t, rms, k);
+        for (int k = q; k < kHc * kHc; k += kLanes) {
+            p.mix_out[tok * kHc * kHc + k] =
+                fmaf(tot[2 * kHc + k] * rms, sm.hcs[2], sm.hcb[2 * kHc + k]);
+        }
     }
-}
-
-template <int kHidden, int kHc, int kTPC>
-CUTE_DEVICE void token_comb(const MhcParams& p,
-                            const MhcSmem<kHc, kHidden, kTPC>& sm, int t,
-                            int64_t tok) {
-    constexpr int kComb = MhcShape<kHc>::kComb;
-    constexpr float kInvHcHidden = 1.0f / (kHc * kHidden);
-    const float rms = token_rms<kHc>(sm.tot[t], kInvHcHidden, p.rms_eps);
-    float c[kComb];
-    CUTLASS_PRAGMA_UNROLL
-    for (int k = 0; k < kComb; ++k) c[k] = comb_logit(sm, t, rms, k);
-    sinkhorn<kHc>(c, p.hc_sinkhorn_eps, p.sinkhorn_repeat);
-    CUTLASS_PRAGMA_UNROLL
-    for (int k = 0; k < kComb; ++k) p.mix_out[tok * kComb + k] = c[k];
 }
 
 template <int kHidden, int kHc>
@@ -629,13 +397,20 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
     const int tok0 = blockIdx.y * kTPC;
     const int nt = min(kTPC, p.num_tokens - tok0);
     const uint32_t bar = cute::cast_smem_ptr_to_uint(&sm.bar);
-    int64_t reset_off = 0;
+    const LamportPlane& pl = p.plane;
+    int64_t phase_off = 0;
 
     float w[S::kMix][kHc];
     __nv_bfloat16 wn{};
     if constexpr (!kFuseAR) {
         if (compute) load_weights<kHidden>(p, h, w, wn);
-        load_hc_params(p, sm, tid, L::kBlock);
+        for (int i = tid; i < 3 + S::kMix; i += L::kBlock) {
+            if (i < 3) {
+                sm.hcs[i] = p.hc_scale[i];
+            } else {
+                sm.hcb[i - 3] = p.hc_base[i - 3];
+            }
+        }
     }
     constexpr int kPad = S::kPartialsPad - S::kPartials;
     if (tid < L::kWarps * kTPC * kPad)
@@ -657,41 +432,101 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
             const int pushers =
                 cute::round_up(active, int{cutlass::NumThreadsPerWarp});
             if (tid < pushers) {
-                const int64_t phase_off = lamport_phase_offset(p.plane, blk);
+                phase_off =
+                    int64_t(pl.counters[blk] & 1) * pl.world * pl.slot_bytes;
                 const int q = tid / L::kRowVecs, k = tid % L::kRowVecs;
-                const int64_t vid = push_vid<kHidden>(tok0 + q, col0, k);
+                const int64_t vid = int64_t(tok0 + q) * (kHidden / L::kVec) +
+                                    col0 / L::kVec + k;
                 if (tid < active) {
                     Vec16 v;
                     moe::ld_global_16B(v, p.x, vid);
-                    lamport_push(p.plane, phase_off, vid, v);
+                    moe::tail::sanitize(v);
+                    const int64_t src_off = pl.rank * pl.slot_bytes + phase_off;
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int d = 0; d < kMaxWorld; ++d) {
+                        if (d < pl.world)
+                            st_relaxed_16B(v, pl.peers[d] + src_off, vid);
+                    }
                 }
                 pdl_trigger();
                 NamedBarrier::arrive(L::kCols, 0);
                 load_weights<kHidden>(p, h, w, wn);
                 if (tid < active) {
-                    reinterpret_cast<Vec16*>(sm.xs[q])[k] =
-                        lamport_poll_sum(p.plane, phase_off, vid);
+                    const uint8_t* slots = pl.peers[pl.rank] + phase_off;
+                    Vec16 v[kMaxWorld];
+                    bool pending;
+                    do {
+                        pending = false;
+                        CUTLASS_PRAGMA_UNROLL
+                        for (int s = 0; s < kMaxWorld; ++s) {
+                            if (s < pl.world) {
+                                moe::ld_relaxed_16B(
+                                    v[s], slots + s * pl.slot_bytes, vid);
+                            }
+                        }
+                        CUTLASS_PRAGMA_UNROLL
+                        for (int s = 0; s < kMaxWorld; ++s) {
+                            const uint4 b =
+                                reinterpret_cast<const uint4&>(v[s]);
+                            if (s < pl.world)
+                                pending |= !(b.x && b.y && b.z && b.w);
+                        }
+                    } while (pending);
+                    Vec16 sum;
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int j = 0; j < 4; ++j) {
+                        float2 acc = __bfloat1622float2(v[0][j]);
+                        CUTLASS_PRAGMA_UNROLL
+                        for (int s = 1; s < kMaxWorld; ++s) {
+                            if (s < pl.world) {
+                                acc = __fadd2_rn(acc,
+                                                 __bfloat1622float2(v[s][j]));
+                            }
+                        }
+                        sum[j] = __float22bfloat162_rn(acc);
+                    }
+                    reinterpret_cast<Vec16*>(sm.xs[q])[k] = sum;
                 }
             } else {
                 NamedBarrier::sync(L::kCols, 0);
                 const int lt = tid - pushers, nl = L::kCols - pushers;
                 if (blk == 0) {
                     for (int i = L::kClusterSize * gridDim.y + lt;
-                         i < p.plane.num_counters; i += nl)
-                        atomicAdd(p.plane.counters + i, 1u);
+                         i < pl.num_counters; i += nl)
+                        atomicAdd(pl.counters + i, 1u);
                 }
                 load_weights<kHidden>(p, h, w, wn);
                 load_inputs<false, kCombLogits, kHidden>(p, sm, tok0, nt, col0,
                                                          lt, nl);
-                load_hc_params(p, sm, lt, nl);
+                for (int i = lt; i < 3 + S::kMix; i += nl) {
+                    if (i < 3) {
+                        sm.hcs[i] = p.hc_scale[i];
+                    } else {
+                        sm.hcb[i - 3] = p.hc_base[i - 3];
+                    }
+                }
             }
         } else {
             load_inputs<true, kCombLogits, kHidden>(p, sm, tok0, nt, col0, tid,
                                                     L::kCols);
         }
     } else {
-        if constexpr (kFuseAR) reset_off = lamport_phase_offset(p.plane, blk);
-        if constexpr (kCombLogits) comb_from_logits(p, sm, tok0, nt, lane);
+        if constexpr (kFuseAR) {
+            phase_off =
+                int64_t(pl.counters[blk] & 1) * pl.world * pl.slot_bytes;
+        }
+        if constexpr (kCombLogits) {
+            if (lane < nt) {
+                const float* src = p.comb + int64_t(tok0 + lane) * S::kComb;
+                float c[S::kComb];
+                CUTLASS_PRAGMA_UNROLL
+                for (int k = 0; k < S::kComb; ++k) c[k] = src[k];
+                mhc::sinkhorn<kHc, true>(c, p.hc_sinkhorn_eps,
+                                         p.sinkhorn_repeat);
+                CUTLASS_PRAGMA_UNROLL
+                for (int k = 0; k < S::kComb; ++k) sm.pc[lane][kHc + k] = c[k];
+            }
+        }
     }
     __syncthreads();
 
@@ -705,7 +540,23 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
         }
         NamedBarrier::sync(L::kCols, 0);
         cute::cluster_wait();
-        exchange_partials<kHidden>(sm, nt, rank, tid, bar);
+        for (int i = tid; i < L::kClusterSize * nt * S::kPV; i += L::kCols) {
+            const int dst = i % L::kClusterSize, v = i / L::kClusterSize;
+            const int t = v / S::kPV, k = v % S::kPV;
+            float4 r = reinterpret_cast<const float4&>(sm.red[0][t][4 * k]);
+            float2 lo = make_float2(r.x, r.y), hi = make_float2(r.z, r.w);
+            CUTLASS_PRAGMA_UNROLL
+            for (int wi = 1; wi < L::kWarps; ++wi) {
+                r = reinterpret_cast<const float4&>(sm.red[wi][t][4 * k]);
+                lo = __fadd2_rn(lo, make_float2(r.x, r.y));
+                hi = __fadd2_rn(hi, make_float2(r.z, r.w));
+            }
+            st_async_v4(
+                cute::set_block_rank(
+                    cute::cast_smem_ptr_to_uint(&sm.cl[rank][t][4 * k]), dst),
+                make_float4(lo.x, lo.y, hi.x, hi.y),
+                cute::set_block_rank(bar, dst));
+        }
         mla::mbar_wait_cluster(bar, 0);
         for (int i = tid; i < nt * S::kPartials; i += L::kCols) {
             const int t = i / S::kPartials, v = i % S::kPartials;
@@ -730,40 +581,43 @@ __global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)
         }
     } else {
         if constexpr (kFuseAR) {
-            if (lane == 0) atomicAdd(p.plane.counters + blk, 1u);
+            if (lane == 0) atomicAdd(pl.counters + blk, 1u);
+            const uint4 empty{};
             for (int i = lane; i < nt * L::kRowVecs;
                  i += cutlass::NumThreadsPerWarp) {
                 const int q = i / L::kRowVecs, k = i % L::kRowVecs;
-                lamport_reset(p.plane, reset_off,
-                              push_vid<kHidden>(tok0 + q, col0, k));
+                const int64_t vid = int64_t(tok0 + q) * (kHidden / L::kVec) +
+                                    col0 / L::kVec + k;
+                uint8_t* slots = pl.peers[pl.rank] + phase_off;
+                CUTLASS_PRAGMA_UNROLL
+                for (int s = 0; s < kMaxWorld; ++s) {
+                    if (s < pl.world)
+                        moe::st_global_16B(empty, slots + s * pl.slot_bytes,
+                                           vid);
+                }
             }
         }
         cute::cluster_wait();
         cute::cluster_arrive_relaxed();
         mla::mbar_wait_cluster(cute::cast_smem_ptr_to_uint(&sm.tot_bar), 0);
         if (lane == 0 && !p.write_logits) {
-            for (int t = rank; t < nt; t += L::kClusterSize)
-                token_comb<kHidden>(p, sm, t, tok0 + t);
+            for (int t = rank; t < nt; t += L::kClusterSize) {
+                const float rms = token_rms<kHc, kHidden>(sm.tot[t], p.rms_eps);
+                float c[S::kComb];
+                CUTLASS_PRAGMA_UNROLL
+                for (int k = 0; k < S::kComb; ++k) {
+                    c[k] = fmaf(sm.tot[t][2 * kHc + k] * rms, sm.hcs[2],
+                                sm.hcb[2 * kHc + k]);
+                }
+                mhc::sinkhorn<kHc, true>(c, p.hc_sinkhorn_eps,
+                                         p.sinkhorn_repeat);
+                CUTLASS_PRAGMA_UNROLL
+                for (int k = 0; k < S::kComb; ++k)
+                    p.mix_out[int64_t(tok0 + t) * S::kComb + k] = c[k];
+            }
         }
     }
     cute::cluster_wait();
-}
-
-CUTE_DEVICE void l2_prefetch(const L2PrefetchArgs& a, uint32_t w, uint32_t nw) {
-    constexpr uint32_t kChunk = 64 * 1024;
-    uint32_t first = 0;
-#pragma unroll 1
-    for (int r = 0; r < kMaxPrefetchRanges; ++r) {
-        const uint32_t bytes = a.bytes[r];
-        const uint32_t n = (bytes + kChunk - 1) / kChunk;
-        for (uint32_t c = (w + nw - first % nw) % nw; c < n; c += nw) {
-            const uint32_t off = c * kChunk;
-            moe::prefetch_l2_bulk(
-                reinterpret_cast<const void*>(a.addr[r] + off),
-                min(kChunk, bytes - off));
-        }
-        first += n;
-    }
 }
 
 template <int kHc>
@@ -772,13 +626,27 @@ __global__ void __launch_bounds__(cutlass::NumThreadsPerWarp)
                         float* __restrict__ out, int num_tokens, float eps,
                         int repeat, const L2PrefetchArgs __grid_constant__ pf) {
     constexpr int kComb = MhcShape<kHc>::kComb;
+    constexpr uint32_t kChunk = 64 * 1024;
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    l2_prefetch(pf, t, gridDim.x * blockDim.x);
+    const uint32_t nw = gridDim.x * blockDim.x;
+    uint32_t first = 0;
+#pragma unroll 1
+    for (int r = 0; r < kMaxPrefetchRanges; ++r) {
+        const uint32_t bytes = pf.bytes[r];
+        const uint32_t n = (bytes + kChunk - 1) / kChunk;
+        for (uint32_t c = (t + nw - first % nw) % nw; c < n; c += nw) {
+            const uint32_t off = c * kChunk;
+            moe::prefetch_l2_bulk(
+                reinterpret_cast<const void*>(pf.addr[r] + off),
+                min(kChunk, bytes - off));
+        }
+        first += n;
+    }
     if (t >= num_tokens) return;
     float c[kComb];
     CUTLASS_PRAGMA_UNROLL
     for (int k = 0; k < kComb; ++k) c[k] = logits[int64_t(t) * kComb + k];
-    sinkhorn<kHc>(c, eps, repeat);
+    mhc::sinkhorn<kHc, true>(c, eps, repeat);
     CUTLASS_PRAGMA_UNROLL
     for (int k = 0; k < kComb; ++k) out[int64_t(t) * kComb + k] = c[k];
 }
@@ -828,12 +696,10 @@ MhcLaunch SelectMhcKernel(int hc, int hidden, int tpc, bool fuse_ar,
     switch (hc) {
         case 2:
             return SelectMhcHidden<2>(hidden, tpc, fuse_ar, comb_logits);
-        case 3:
-            return SelectMhcHidden<3>(hidden, tpc, fuse_ar, comb_logits);
         case 4:
             return SelectMhcHidden<4>(hidden, tpc, fuse_ar, comb_logits);
     }
-    TORCH_CHECK(false, "hc must be 2, 3 or 4, got ", hc);
+    TORCH_CHECK(false, "hc must be 2 or 4, got ", hc);
 }
 
 int MaxActiveClusters(const MhcLaunch& launch) {
@@ -867,12 +733,10 @@ SinkhornKernel SelectSinkhornKernel(int hc) {
     switch (hc) {
         case 2:
             return mhc_sinkhorn_kernel<2>;
-        case 3:
-            return mhc_sinkhorn_kernel<3>;
         case 4:
             return mhc_sinkhorn_kernel<4>;
     }
-    TORCH_CHECK(false, "hc must be 2, 3 or 4, got ", hc);
+    TORCH_CHECK(false, "hc must be 2 or 4, got ", hc);
 }
 
 }  // namespace
@@ -892,11 +756,6 @@ std::vector<torch::Tensor> FusedAllReduceMhc(
     TORCH_CHECK(residual.dim() == 3, "residual must be [T, hc, hidden]");
     const int64_t num_tokens = residual.size(0), hc = residual.size(1),
                   hidden = residual.size(2);
-    CheckContiguousTensor(x, "x", torch::kBFloat16, {num_tokens, hidden});
-    CheckContiguousTensor(residual, "residual", torch::kBFloat16,
-                          {num_tokens, hc, hidden});
-    CheckContiguousTensor(post, "post", torch::kFloat32, {num_tokens, hc});
-    CheckContiguousTensor(comb, "comb", torch::kFloat32, {num_tokens, hc, hc});
     const bool fuse_ar = peer_ptrs.has_value();
     const MhcLaunch probe =
         SelectMhcKernel(hc, hidden, 1, fuse_ar, comb_is_logits);
@@ -988,9 +847,6 @@ void MhcSinkhorn(const torch::Tensor& logits, torch::Tensor& out,
     TORCH_CHECK(logits.dim() == 3 && logits.size(1) == logits.size(2),
                 "logits must be [T, hc, hc]");
     const int64_t num_tokens = logits.size(0), hc = logits.size(1);
-    CheckContiguousTensor(logits, "logits", torch::kFloat32,
-                          {num_tokens, hc, hc});
-    CheckContiguousTensor(out, "out", torch::kFloat32, {num_tokens, hc, hc});
     const SinkhornKernel kernel = SelectSinkhornKernel(hc);
     const L2PrefetchArgs pf = MakeL2PrefetchArgs(prefetch);
     if (num_tokens == 0) return;

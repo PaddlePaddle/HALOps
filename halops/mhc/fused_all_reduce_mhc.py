@@ -31,18 +31,12 @@ __all__ = [
 
 @dataclass
 class MhcWorkspace:
-    """Lamport push buffers of the fused all-reduce in ``fused_all_reduce_mhc``.
-
-    Every rank owns a buffer of two phases, each holding one slot of
-    ``slot_bytes`` per source rank; ``peer_ptrs`` lists the buffers of all
-    ranks in rank order and ``counters`` selects the phase of every CTA.
-    """
+    """Workspace of ``fused_all_reduce_mhc``, from ``get_workspace_for_mhc``."""
 
     peer_ptrs: torch.Tensor
     counters: torch.Tensor
     slot_bytes: int
     tp_rank: int
-    tp_size: int
     _keepalive: tuple
 
 
@@ -52,36 +46,26 @@ def get_workspace_for_mhc(
     group_name: str,
     tp_rank: int,
     tp_size: int,
-    device: Optional[torch.device] = None,
 ) -> MhcWorkspace:
-    """Allocate the workspace of the fused all-reduce in ``fused_all_reduce_mhc``.
+    """Allocate the all-reduce workspace of ``fused_all_reduce_mhc``.
 
-    For tp_size > 1 the buffers are symmetric memory and the allocation is
-    collective over ``group_name``. Allocate it once, before any CUDA-graph
-    capture, and reuse it across calls and graph replays; it is returned
-    zero-initialized.
+    With ``tp_size > 1`` this is a collective call on every rank of
+    ``group_name``. Allocate it once before any CUDA-graph capture and reuse
+    it for all calls.
 
     Args:
-        max_tokens: Largest token count T of a call.
+        max_tokens: Largest T of a call.
         hidden: Hidden size of ``x``.
-        group_name: Name of the torch process group of the tensor-parallel
-            ranks. It is unused for a single-rank launch.
+        group_name: Name of the tensor-parallel process group; unused when
+            ``tp_size`` is 1.
         tp_rank: Rank in that group.
         tp_size: Size of that group, at most 8.
-        device: CUDA device of the buffers (the current device by default).
 
     Returns:
         The workspace to pass to ``fused_all_reduce_mhc``.
-
-    Example:
-        >>> from halops import get_workspace_for_mhc
-        >>>
-        >>> workspace = get_workspace_for_mhc(16, 4096, "", 0, 1)
     """
-    device = (
-        torch.device("cuda", torch.cuda.current_device()) if device is None else device
-    )
-    slot_bytes = -(-max_tokens * hidden * 2 // 16) * 16
+    device = torch.device("cuda", torch.cuda.current_device())
+    slot_bytes = max_tokens * hidden * 2
     nbytes = 2 * tp_size * slot_bytes
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     counters = torch.zeros(num_sms, dtype=torch.int32, device=device)
@@ -95,7 +79,6 @@ def get_workspace_for_mhc(
             counters=counters,
             slot_bytes=slot_bytes,
             tp_rank=0,
-            tp_size=1,
             _keepalive=(region,),
         )
 
@@ -118,7 +101,6 @@ def get_workspace_for_mhc(
         counters=counters,
         slot_bytes=slot_bytes,
         tp_rank=tp_rank,
-        tp_size=tp_size,
         _keepalive=(region, peers),
     )
 
@@ -143,84 +125,44 @@ def fused_all_reduce_mhc(
     return_logits: bool = False,
     use_pdl: bool = True,
 ) -> Tuple[torch.Tensor, ...]:
-    """mHC post mixing + all-reduce + mHC pre mixing + RMSNorm + MXFP8 quant.
+    """All-reduce + mHC post + mHC pre + RMSNorm + W8A8-MXFP8 quantization.
 
-    Joins the end of one mHC sub-layer to the start of the next in a single
-    launch. With ``workspace``, ``x`` is first summed over the
-    tensor-parallel ranks (fp32 in rank order, rounded to bf16). Then, per
-    token and in fp32, with ``mix`` laid out as ``[pre (hc), post (hc),
-    comb (hc * hc)]`` and ``g`` = 0, 1, 2 for these parts:
-
-    - ``r_j = bf16(post[j] * x + sum_i comb[i, j] * residual[i])``;
-    - ``z = r.flatten()``, ``rms = 1 / (sqrt(mean(z^2)) + rms_eps)`` and
-      ``mix = (fn @ z) * rms * hc_scale[g] + hc_base``;
-    - ``pre = sigmoid(mix_pre) + hc_pre_eps``,
-      ``post_out = sigmoid(mix_post) * hc_post_mult`` and
-      ``comb_out = sinkhorn(mix_comb)``: a row softmax plus
-      ``hc_sinkhorn_eps``, a column normalization, then
-      ``sinkhorn_repeat - 1`` rounds of row and column normalization, each
-      dividing by ``sum + hc_sinkhorn_eps``;
-    - ``y = bf16(sum_j pre[j] * r_j)`` and
-      ``layer_out = bf16(y * rsqrt(mean(y^2) + norm_eps) * norm_weight)``,
-      quantized to float8_e4m3fn with one UE8M0 scale per 32 elements.
+    Fuses the end of one mHC sub-layer with the start of the next. For every
+    token: ``residual_out[j] = bf16(post[j] * x + sum_i comb[i, j] *
+    residual[i])``; the mix ``fn @ residual_out`` with its RMS gives ``pre``,
+    ``post_out`` (sigmoid) and ``comb_out`` (Sinkhorn); ``layer_out =
+    RMSNorm(bf16(sum_j pre[j] * residual_out[j]))`` is quantized to MXFP8.
+    With ``workspace``, ``x`` is first summed over the tensor-parallel ranks.
+    All tensors must be contiguous.
 
     Args:
-        x: [T, hidden] bfloat16 contiguous layer output;
-            this rank's partial sum when ``workspace`` is given. ``hidden``
-            is 4096.
-        residual: [T, hc, hidden] bfloat16 contiguous residual streams;
-            ``hc`` is 2, 3 or 4.
-        post: [T, hc] float32 contiguous post weights.
-        comb: [T, hc, hc] float32 contiguous mixing matrices, or their
-            logits with ``comb_is_logits``.
-        fn: [hc * (hc + 2), hc * hidden] float32 contiguous mix weights.
+        x: [T, hidden] bfloat16 layer output, this rank's partial sum with
+            ``workspace``. hidden must be 4096.
+        residual: [T, hc, hidden] bfloat16 residual streams; hc is 2 or 4.
+        post: [T, hc] float32 post weights.
+        comb: [T, hc, hc] float32 comb matrices, [source, dest].
+        fn: [hc * (hc + 2), hc * hidden] float32 mix weights.
         hc_scale: [3] float32 scales of the pre, post and comb mixes.
         hc_base: [hc * (hc + 2)] float32 mix biases.
         norm_weight: [hidden] bfloat16 RMSNorm weight.
-        rms_eps: Epsilon of ``rms``.
-        hc_pre_eps: Offset added to ``pre``.
-        hc_sinkhorn_eps: Epsilon of the Sinkhorn normalization.
-        hc_post_mult: Multiplier of ``post_out``.
-        sinkhorn_repeat: Number of Sinkhorn rounds.
+        rms_eps: Epsilon of the mix RMS, ``1 / (sqrt(mean(z^2)) + rms_eps)``.
+        hc_pre_eps: Added to ``pre``.
+        hc_sinkhorn_eps: Sinkhorn epsilon.
+        hc_post_mult: Scale of ``post_out``.
+        sinkhorn_repeat: Sinkhorn iterations.
         norm_eps: Epsilon of the RMSNorm.
-        workspace: Buffers from ``get_workspace_for_mhc``; ``None`` skips
-            the all-reduce. With it, T is at most 4 times the number of
-            co-resident clusters.
-        comb_is_logits: ``comb`` holds logits; the Sinkhorn normalization
-            runs in-kernel before mixing.
-        return_logits: Return the comb logits instead of ``comb_out``; pass
-            them to ``mhc_sinkhorn`` or back as ``comb`` with
-            ``comb_is_logits``.
+        workspace: From ``get_workspace_for_mhc``; ``None`` skips the
+            all-reduce.
+        comb_is_logits: ``comb`` holds logits, normalized in the kernel.
+        return_logits: Return the comb logits as ``comb_out``; normalize
+            them with ``mhc_sinkhorn``.
         use_pdl: Enable Programmatic Dependent Launch (on by default).
 
     Returns:
-        A tuple ``(residual_out, layer_out, post_out, comb_out, q, sf)``:
-
-        - ``residual_out``: [T, hc, hidden] bfloat16 streams ``r``.
-        - ``layer_out``: [T, hidden] bfloat16.
-        - ``post_out``: [T, hc] float32.
-        - ``comb_out``: [T, hc, hc] float32 mixing matrices, or logits with
-          ``return_logits``.
-        - ``q``: [T, hidden] float8_e4m3fn codes of ``layer_out``.
-        - ``sf``: [T, hidden / 32] uint8 UE8M0 scales in row-major layout.
-
-    Example:
-        >>> from halops import fused_all_reduce_mhc
-        >>>
-        >>> t, hc, hidden = 4, 4, 4096
-        >>> mix = hc * (hc + 2)
-        >>> x = torch.randn(t, hidden, dtype=torch.bfloat16, device="cuda")
-        >>> residual = torch.randn(t, hc, hidden, dtype=torch.bfloat16,
-        ...                        device="cuda")
-        >>> post = torch.rand(t, hc, device="cuda")
-        >>> comb = torch.rand(t, hc, hc, device="cuda").softmax(-1)
-        >>> fn = torch.randn(mix, hc * hidden, device="cuda") * 1e-2
-        >>> hc_scale = torch.ones(3, device="cuda")
-        >>> hc_base = torch.zeros(mix, device="cuda")
-        >>> w = torch.ones(hidden, dtype=torch.bfloat16, device="cuda")
-        >>> outs = fused_all_reduce_mhc(x, residual, post, comb, fn, hc_scale,
-        ...                             hc_base, w, 1e-6, 1e-6, 1e-6, 2.0, 20,
-        ...                             1e-6)
+        ``(residual_out, layer_out, post_out, comb_out, q, sf)``: bfloat16
+        [T, hc, hidden] and [T, hidden], float32 [T, hc] and [T, hc, hc],
+        float8_e4m3fn [T, hidden] codes and uint8 [T, hidden / 32] UE8M0
+        scales in row-major layout.
     """
     peer_ptrs = counters = None
     slot_bytes = tp_rank = 0
@@ -261,24 +203,20 @@ def mhc_sinkhorn(
     out: Optional[torch.Tensor] = None,
     prefetch: Sequence[torch.Tensor] = (),
 ) -> torch.Tensor:
-    """Sinkhorn normalization of mHC comb logits with optional L2 prefetch.
+    """Sinkhorn normalization of the comb logits of ``fused_all_reduce_mhc``.
 
-    Applies the ``comb_out`` normalization of ``fused_all_reduce_mhc`` to
-    logits returned with ``return_logits``, one thread per token. While it
-    runs, the grid prefetches ``prefetch`` into L2, e.g. the weights of the
-    next ``fused_all_reduce_mhc`` when this kernel overlaps another one on a
-    side stream.
+    Turns the ``comb_out`` returned with ``return_logits`` into the matrices
+    returned without it, and prefetches ``prefetch`` into L2 meanwhile.
 
     Args:
-        logits: [T, hc, hc] float32 contiguous comb logits; ``hc`` is 2, 3
-            or 4.
-        eps: Epsilon of the normalization (``hc_sinkhorn_eps``).
-        repeat: Number of Sinkhorn rounds.
-        out: Optional pre-allocated [T, hc, hc] float32 contiguous output.
-        prefetch: At most 8 contiguous CUDA tensors, each under 4 GiB.
+        logits: [T, hc, hc] float32 contiguous logits; hc is 2 or 4.
+        eps: Sinkhorn epsilon (``hc_sinkhorn_eps``).
+        repeat: Sinkhorn iterations (``sinkhorn_repeat``).
+        out: Optional pre-allocated output shaped like ``logits``.
+        prefetch: Up to 8 CUDA tensors, each under 4 GiB.
 
     Returns:
-        [T, hc, hc] float32 mixing matrices (``out`` when given).
+        [T, hc, hc] float32 comb matrices (``out`` when given).
 
     Example:
         >>> from halops import mhc_sinkhorn

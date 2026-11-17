@@ -334,21 +334,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_get_workspace_size", &halops::GetWorkspaceSize,
           py::arg("max_tokens") = 0);
 
-    m.def("sigmoid_gate_mul_group_quant", &halops::SigmoidGateMulGroupQuant,
-          py::arg("o"), py::arg("gate"), py::arg("use_pdl") = true);
-    m.def("fused_all_reduce_mhc", &halops::FusedAllReduceMhc, py::arg("x"),
-          py::arg("residual"), py::arg("post"), py::arg("comb"), py::arg("fn"),
-          py::arg("hc_scale"), py::arg("hc_base"), py::arg("norm_weight"),
-          py::arg("rms_eps"), py::arg("hc_pre_eps"), py::arg("hc_sinkhorn_eps"),
-          py::arg("hc_post_mult"), py::arg("sinkhorn_repeat"),
-          py::arg("norm_eps"), py::arg("comb_is_logits") = false,
-          py::arg("return_logits") = false, py::arg("peer_ptrs") = py::none(),
-          py::arg("counters") = py::none(), py::arg("slot_bytes") = 0,
-          py::arg("tp_rank") = 0, py::arg("use_pdl") = true);
-    m.def("mhc_sinkhorn", &halops::MhcSinkhorn, py::arg("logits"),
-          py::arg("out"), py::arg("eps"), py::arg("repeat"),
-          py::arg("prefetch") = std::vector<torch::Tensor>{});
-    m.def("mhc_post_hc_mean", &halops::MhcPostHcMean, py::arg("x"),
-          py::arg("residual"), py::arg("post"), py::arg("comb"),
-          py::arg("use_pdl") = true);
+    m.def("sigmoid_gate_mul_group_quant", &halops::SigmoidGateMulGroupQuant);
+    m.def("fused_all_reduce_mhc", &halops::FusedAllReduceMhc);
+    m.def("mhc_sinkhorn", &halops::MhcSinkhorn);
+    m.def("mhc_post_hc_mean", &halops::MhcPostHcMean);
 }
