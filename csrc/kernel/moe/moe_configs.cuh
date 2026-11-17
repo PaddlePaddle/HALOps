@@ -36,9 +36,6 @@ enum class QuantMethod : uint32_t {
     kNone = 3,
 };
 
-// Where a blockscaled down-projection's scale table comes from. The up
-// projections' rows arrive pre-interleaved with their scale tables packed
-// alongside (see transform_weights_for_moe), so they need no selector.
 enum class ScaleLayout : std::uint32_t {
     kSfAtom,  // natural-row SfAtom from group_wise_quant(use_swizzle=True)
     kPlain,   // plain row-major from group_wise_quant(use_swizzle=False)

@@ -54,6 +54,8 @@ struct SharedUpProjectionBase
     static constexpr std::uint32_t kNumUpCtas = SharedUpGemm::kNumCtas;
     static constexpr std::uint32_t kFirstCtaIdx =
         Traits::RouterGemm::kNumCtas + Traits::LatentDownGemm::kNumCtas;
+    static_assert(kFirstCtaIdx % Traits::kClusterSize == 0u,
+                  "the shared-expert blocks must start on a cluster boundary");
     static constexpr std::uint32_t kNumUpPublishers =
         kNumUpCtas / Base::kNumSplits;
     static constexpr std::uint32_t kCluster = Traits::kClusterSize;
@@ -78,12 +80,13 @@ struct SharedUpProjectionBase
                blockIdx.x < kFirstCtaIdx + kNumDownCtas;
     }
 
+    // The M slab whose splits this CTA's block belongs to.
     __device__ static std::uint32_t slab_idx() {
         return cta_idx() / Base::kNumSplits;
     }
 
     __device__ static std::uint32_t split_idx() {
-        return cta_idx() % Base::kNumSplits;
+        return Base::Cluster::split_idx();
     }
 
     __device__ static void publish_up_output(Workspace* __restrict__ workspace,
@@ -416,13 +419,11 @@ struct SharedUpProjection<KernelTraits, true>
                                 /*row_start=*/0u, batch_size);
         const auto* const act = reinterpret_cast<const DataType::ElementA*>(
             &smem->shared_expert.input.data[slot][0][0][0]);
-        quantize_mxfp8_groupwise_1x32<
-            /*Staged=*/true, SharedUpGemm::kTileShapeN,
-            SharedUpGemm::kTileShapeK, 128u, Base::kInputSwizzleBoxK,
-            kBlocksPerTile>(act, k_base,
-                            &smem->shared_expert.quantized_input.data[0],
-                            &smem->shared_expert.quantized_input.scale[0][0],
-                            tile, warp_idx, WarpRole::kCalcWarpCount);
+        quantize_mxfp8_groupwise_1x32<SharedUpGemm::kTileShapeN, 128u,
+                                      Base::kInputSwizzleBoxK, kBlocksPerTile>(
+            act, k_base, &smem->shared_expert.quantized_input.data[0],
+            &smem->shared_expert.quantized_input.scale[0][0], tile, warp_idx,
+            WarpRole::kCalcWarpCount);
         cutlass::arch::fence_view_async_shared();
         WarpRole::sync_calc_threads();
         if (warp_idx == 0u && lane_idx == 0u) {
@@ -611,10 +612,9 @@ struct SharedUpProjection<KernelTraits, false>
         const QuantizeTile tile(/*staging_slot_base=*/0u, blocks_base,
                                 /*scale_row_base=*/slot * kBlocksPerTile,
                                 /*row_start=*/0u, batch_size);
-        quantize_fp8_groupwise_128<
-            /*Staged=*/true, SharedUpGemm::kTileShapeN, SharedUpGemm::kGemmK,
-            SharedUpGemm::kTileShapeN, SharedUpGemm::InputQuant::kBlockSize,
-            Base::kInputSwizzleBoxK, kBlocksPerTile>(
+        quantize_fp8_groupwise_128<SharedUpGemm::kTileShapeN,
+                                   SharedUpGemm::InputQuant::kBlockSize,
+                                   Base::kInputSwizzleBoxK, kBlocksPerTile>(
             reinterpret_cast<const DataType::ElementA*>(
                 &smem->shared_expert.input.data[slot][0][0][0]),
             k_base, &smem->shared_expert.quantized_input.data[slot],

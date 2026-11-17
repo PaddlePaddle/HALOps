@@ -218,9 +218,8 @@ struct QuantizeTile {
     }
 };
 
-// Quantize a NumRows x NumCols tile into per-slot SfAtoms.
-template <bool Staged, std::size_t NumRows, std::size_t NumCols,
-          std::size_t QuantBlock, std::size_t SwizzleBoxK,
+// Quantize one staged tile into per-slot SfAtoms.
+template <std::size_t NumRows, std::size_t QuantBlock, std::size_t SwizzleBoxK,
           std::size_t BlocksPerStage>
 __device__ inline void quantize_mxfp8_groupwise_1x32(
     const DataType::ElementA* __restrict__ data, std::uint32_t k_base,
@@ -229,12 +228,7 @@ __device__ inline void quantize_mxfp8_groupwise_1x32(
                                                       [NumRows + 1u][16u],
     std::uint8_t* __restrict__ quantized_scale, const QuantizeTile& tile,
     std::uint32_t warp_idx, std::uint32_t num_quant_warps) {
-    static constexpr std::uint32_t NumQuantBlocks =
-        Staged ? BlocksPerStage : (NumCols / QuantBlock);
-    static_assert(NumCols % QuantBlock == 0u,
-                  "the tile must span whole quantization blocks");
-    static_assert(NumQuantBlocks % BlocksPerStage == 0u,
-                  "the tile's blocks must fill whole staging slots");
+    constexpr std::uint32_t NumQuantBlocks = BlocksPerStage;
     static_assert(QuantBlock == 128u,
                   "one 128-K block is four 32-K sub-blocks");
     constexpr std::uint32_t kChunksPerBlock = QuantBlock / 16u;
@@ -256,19 +250,11 @@ __device__ inline void quantize_mxfp8_groupwise_1x32(
         const std::uint32_t k = (tile.block_base + blk) * QuantBlock + col;
         const std::uint32_t src_row =
             global_row < tile.actual_num_rows ? row : 0u;
-        const DataType::ElementA* bf16_4;
-        if constexpr (Staged) {
-            const std::uint32_t rel = k - k_base;
-            const std::uint32_t chunk = (rel % SwizzleBoxK) / 8u;
-            bf16_4 = data + (rel / SwizzleBoxK) * (NumRows * SwizzleBoxK) +
-                     src_row * SwizzleBoxK + (chunk ^ (src_row % 8u)) * 8u +
-                     rel % 8u;
-        } else {
-            bf16_4 = data +
-                     (global_row < tile.actual_num_rows ? global_row : 0u) *
-                         NumCols +
-                     k;
-        }
+        const std::uint32_t rel = k - k_base;
+        const std::uint32_t chunk = (rel % SwizzleBoxK) / 8u;
+        const DataType::ElementA* const bf16_4 =
+            data + (rel / SwizzleBoxK) * (NumRows * SwizzleBoxK) +
+            src_row * SwizzleBoxK + (chunk ^ (src_row % 8u)) * 8u + rel % 8u;
 
         const std::uint32_t kc = chunk_at + col / 16u;
         const std::uint32_t ki = col % 16u;
@@ -313,10 +299,10 @@ __device__ inline void quantize_mxfp8_groupwise_1x32(
     }
 }
 
-// Quantize a NumRows x NumCols tile; ScaleCols is the scale-table row stride.
-template <bool Staged, std::size_t NumRows, std::size_t NumCols,
-          std::size_t ScaleCols, std::size_t QuantBlock,
-          std::size_t SwizzleBoxK, std::size_t BlocksPerStage>
+// Quantize one staged tile; the scale table is one row of NumRows tokens per
+// block.
+template <std::size_t NumRows, std::size_t QuantBlock, std::size_t SwizzleBoxK,
+          std::size_t BlocksPerStage>
 __device__ inline void quantize_fp8_groupwise_128(
     const DataType::ElementA* __restrict__ data, std::uint32_t k_base,
     DataType::ElementQA (*__restrict__ quantized_data)[QuantBlock *
@@ -324,13 +310,8 @@ __device__ inline void quantize_fp8_groupwise_128(
                                                       [NumRows + 1u][16u],
     float* __restrict__ quantized_scale, const QuantizeTile& tile,
     std::uint32_t warp_idx, std::uint32_t num_quant_warps) {
-    static constexpr std::uint32_t NumQuantBlocks =
-        Staged ? BlocksPerStage : (NumCols / QuantBlock);
+    constexpr std::uint32_t NumQuantBlocks = BlocksPerStage;
     static_assert(NumRows <= 16u, "FP8 quantize supports BS<=16");
-    static_assert(NumCols % QuantBlock == 0u,
-                  "the tile must span whole quantization blocks");
-    static_assert(NumQuantBlocks % BlocksPerStage == 0u,
-                  "the tile's blocks must fill whole staging slots");
     constexpr std::uint32_t kChunksPerBlock = QuantBlock / 16u;
     const std::uint32_t col = WarpRole::get_lane_idx() * 4u;
 
@@ -350,24 +331,16 @@ __device__ inline void quantize_fp8_groupwise_128(
         const std::uint32_t src_row =
             global_row < tile.actual_num_rows ? row : 0u;
         const DataType::ElementA* bf16_4;
-        if constexpr (Staged) {
-            // The box's 16-B chunk index is XOR-ed with the row.
-            const std::uint32_t rel = k - k_base;
-            const std::uint32_t chunk = (rel % SwizzleBoxK) / 8u;
-            bf16_4 = data + (rel / SwizzleBoxK) * (NumRows * SwizzleBoxK) +
-                     src_row * SwizzleBoxK + (chunk ^ (src_row % 8u)) * 8u +
-                     rel % 8u;
-        } else {
-            // Row-major input uses the global source-row index.
-            bf16_4 = data +
-                     (global_row < tile.actual_num_rows ? global_row : 0u) *
-                         NumCols +
-                     k;
-        }
+        // The box's 16-B chunk index is XOR-ed with the row.
+        const std::uint32_t rel = k - k_base;
+        const std::uint32_t chunk = (rel % SwizzleBoxK) / 8u;
+        bf16_4 = data + (rel / SwizzleBoxK) * (NumRows * SwizzleBoxK) +
+                 src_row * SwizzleBoxK + (chunk ^ (src_row % 8u)) * 8u +
+                 rel % 8u;
         store_quantized_pair(load_quantize_pair(bf16_4), row, chunk_at,
                              global_row, quantized_data[slot],
                              tile.actual_num_rows,
-                             &quantized_scale[sblk * ScaleCols + global_row]);
+                             &quantized_scale[sblk * NumRows + global_row]);
     }
 }
 

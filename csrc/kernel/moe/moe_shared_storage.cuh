@@ -535,14 +535,17 @@ struct RouterSmem {
 
 template <typename GemmTraits>
 struct LatentDownSmem {
-    alignas(1024) typename GemmTraits::MmaElement w_latent_down
-        [GemmTraits::kNumWeightSlots][GemmTraits::MmaCore::kNumSwizzleBoxKs]
-        [GemmTraits::kTileShapeM][GemmTraits::MmaCore::kSwizzleBoxK];
+    union {
+        alignas(1024) typename GemmTraits::MmaElement w_latent_down
+            [GemmTraits::kNumWeightSlots][GemmTraits::MmaCore::kNumSwizzleBoxKs]
+            [GemmTraits::kTileShapeM][GemmTraits::MmaCore::kSwizzleBoxK];
+        alignas(16) float splited_mma_out[GemmTraits::kTileShapeM]
+                                         [GemmTraits::kTileShapeN];
+    };
 
     ActivationSmem<GemmTraits::kNumInputSlots, GemmTraits::kTileShapeN,
                    GemmTraits::kTileShapeK>
         input;
-
     QuantizedActivationSmem<GemmTraits::kNumInputSlots, GemmTraits::kTileShapeN,
                             GemmTraits::kTileShapeK,
                             GemmTraits::InputQuant::kBlockSize,
@@ -550,9 +553,6 @@ struct LatentDownSmem {
         quantized_input;
 
     WeightScaleStorage<GemmTraits> w_scale;
-
-    alignas(16) float splited_mma_out[GemmTraits::kTileShapeM]
-                                     [GemmTraits::kTileShapeN];
 
     // The output amax table.
     static constexpr std::uint32_t kNumAmaxGroups =
