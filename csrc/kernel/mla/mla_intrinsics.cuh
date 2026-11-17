@@ -24,6 +24,7 @@
 #include <cute/tensor.hpp>
 
 #include "common/pdl.cuh"
+#include "common/ptx.cuh"
 
 namespace halops::mla {
 CUTE_DEVICE
@@ -169,17 +170,6 @@ void mbar_arrive_cluster_relaxed(uint32_t bar_cluster) {
     asm volatile(
         "mbarrier.arrive.relaxed.cluster.shared::cluster.b64 _, [%0];" ::"r"(
             bar_cluster)
-        : "memory");
-}
-
-CUTE_DEVICE
-void mbar_wait_cluster(uint32_t bar, uint32_t phase) {
-    asm volatile(
-        "{\n.reg .pred p;\nWAIT_CL:\n"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], "
-        "%1;\n"
-        "@!p bra WAIT_CL;\n}\n" ::"r"(bar),
-        "r"(phase)
         : "memory");
 }
 

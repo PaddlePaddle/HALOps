@@ -78,6 +78,66 @@ CUTE_DEVICE void bulk_store_wait_all() {
     asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
 }
 
+template <class V>
+CUTE_DEVICE void st_relaxed_16B(const V& x, void* addr, int64_t vec_offset) {
+    static_assert(sizeof(V) == sizeof(uint4));
+    const uint4 v = reinterpret_cast<const uint4&>(x);
+    addr = static_cast<uint8_t*>(addr) + vec_offset * sizeof(uint4);
+    asm volatile("st.relaxed.sys.global.v4.b32 [%4], {%0, %1, %2, %3};"
+                 :
+                 : "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w), "l"(addr));
+}
+
+template <class V>
+CUTE_DEVICE void ld_relaxed_16B(V& x, const void* addr, int64_t vec_offset) {
+    static_assert(sizeof(V) == sizeof(uint4));
+    addr = static_cast<const uint8_t*>(addr) + vec_offset * sizeof(uint4);
+    uint4 v;
+    asm volatile("ld.relaxed.sys.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(addr));
+    x = reinterpret_cast<const V&>(v);
+}
+
+template <class V>
+CUTE_DEVICE void ld_global_16B(V& x, const void* addr, int64_t vec_offset) {
+    static_assert(sizeof(V) == sizeof(uint4));
+    addr = static_cast<const uint8_t*>(addr) + vec_offset * sizeof(uint4);
+    uint4 v;
+    asm volatile("ld.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(addr));
+    x = reinterpret_cast<const V&>(v);
+}
+
+template <class V>
+CUTE_DEVICE void st_global_16B(const V& x, void* addr, int64_t vec_offset) {
+    static_assert(sizeof(V) == sizeof(uint4));
+    const uint4 v = reinterpret_cast<const uint4&>(x);
+    addr = static_cast<uint8_t*>(addr) + vec_offset * sizeof(uint4);
+    asm volatile("st.global.v4.b32 [%4], {%0, %1, %2, %3};"
+                 :
+                 : "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w), "l"(addr));
+}
+
+CUTE_DEVICE void st_async_v4(uint32_t dst, const float4& v, uint32_t bar) {
+    asm volatile(
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 "
+        "[%0], {%1, %2, %3, %4}, [%5];" ::"r"(dst),
+        "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w), "r"(bar)
+        : "memory");
+}
+
+CUTE_DEVICE void mbar_wait_cluster(uint32_t bar, uint32_t phase) {
+    asm volatile(
+        "{\n.reg .pred p;\nWAIT_CL:\n"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], "
+        "%1;\n"
+        "@!p bra WAIT_CL;\n}\n" ::"r"(bar),
+        "r"(phase)
+        : "memory");
+}
+
 namespace detail {
 template <class Op, class Src, int N, size_t... I>
 CUTE_DEVICE void copy_to_regs(const Src& src, uint32_t (&r)[N],
