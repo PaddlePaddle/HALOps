@@ -293,6 +293,9 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#halops.rms_norm_quant" title="halops.rms_norm_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rms_norm_quant</span></code></a></p></td>
 <td><p>RMSNorm fused with W8A8-MXFP8 quantization.</p></td>
 </tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.sigmoid_gate_mul_group_quant" title="halops.sigmoid_gate_mul_group_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sigmoid_gate_mul_group_quant</span></code></a></p></td>
+<td><p>Sigmoid gating fused with W8A8-MXFP8 quantization.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -1041,6 +1044,42 @@ else row-major [M, K / 32]</p></li>
 </dd></dl>
 
 </section>
+<section class="api-entry" id="sigmoid-gate-mul-group-quant">
+<h2>sigmoid_gate_mul_group_quant<a class="headerlink" href="#sigmoid-gate-mul-group-quant" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.sigmoid_gate_mul_group_quant">
+<span class="sig-name descname"><span class="pre">sigmoid_gate_mul_group_quant</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">o</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">gate</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#halops.sigmoid_gate_mul_group_quant" title="Link to this definition">¶</a></dt>
+<dd><p>Sigmoid gating fused with W8A8-MXFP8 quantization.</p>
+<p>Computes <code class="docutils literal notranslate"><span class="pre">y</span> <span class="pre">=</span> <span class="pre">o</span> <span class="pre">*</span> <span class="pre">torch.sigmoid(gate)</span></code> on the bfloat16 inputs and
+quantizes it exactly as <code class="docutils literal notranslate"><span class="pre">group_wise_quant(y,</span> <span class="pre">use_swizzle=False)</span></code> does.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>o</strong> (<em>torch.Tensor</em>) – [T, hidden] bfloat16 tensor; rows may be strided (<code class="docutils literal notranslate"><span class="pre">stride(1)</span> <span class="pre">==</span>
+<span class="pre">1</span></code>, 16-byte aligned row starts). hidden must be a multiple of 32.</p></li>
+<li><p><strong>gate</strong> (<em>torch.Tensor</em>) – [T, hidden] bfloat16 tensor, same layout rules as <code class="docutils literal notranslate"><span class="pre">o</span></code>.</p></li>
+<li><p><strong>use_pdl</strong> (<em>bool</em>) – Enable Programmatic Dependent Launch (on by default).</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><code class="docutils literal notranslate"><span class="pre">(q,</span> <span class="pre">sf)</span></code> – [T, hidden] float8_e4m3fn codes and [T, hidden / 32]
+uint8 UE8M0 scales in row-major layout.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><em>Tuple</em>[torch.Tensor, torch.Tensor]</p>
+</dd>
+</dl>
+<p class="rubric">Example</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">halops</span><span class="w"> </span><span class="kn">import</span> <span class="n">sigmoid_gate_mul_group_quant</span>
+
+<span class="n">o</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">gate</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">sf</span> <span class="o">=</span> <span class="n">sigmoid_gate_mul_group_quant</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="n">gate</span><span class="p">)</span>
+</pre></div>
+</div>
+</dd></dl>
+
+</section>
 </section>
 
         </article>
@@ -1109,6 +1148,7 @@ else row-major [M, K / 32]</p></li>
 <li><a class="reference internal" href="#low-latency-mma-gemm">low_latency_mma_gemm</a></li>
 <li><a class="reference internal" href="#prefill-permute-to-masked-gemm">prefill_permute_to_masked_gemm</a></li>
 <li><a class="reference internal" href="#rms-norm-quant">rms_norm_quant</a></li>
+<li><a class="reference internal" href="#sigmoid-gate-mul-group-quant">sigmoid_gate_mul_group_quant</a></li>
 </ul>
 </li>
 </ul>

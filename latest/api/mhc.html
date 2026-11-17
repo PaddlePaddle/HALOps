@@ -263,12 +263,198 @@
 <div class="table-wrapper autosummary longtable docutils container">
 <table class="autosummary longtable docutils align-default">
 <tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.MhcWorkspace" title="halops.MhcWorkspace"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MhcWorkspace</span></code></a></p></td>
+<td><p>Workspace of <code class="docutils literal notranslate"><span class="pre">fused_all_reduce_mhc</span></code>, from <code class="docutils literal notranslate"><span class="pre">get_workspace_for_mhc</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.get_workspace_for_mhc" title="halops.get_workspace_for_mhc"><code class="xref py py-obj docutils literal notranslate"><span class="pre">get_workspace_for_mhc</span></code></a></p></td>
+<td><p>Allocate the all-reduce workspace of <code class="docutils literal notranslate"><span class="pre">fused_all_reduce_mhc</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.fused_all_reduce_mhc" title="halops.fused_all_reduce_mhc"><code class="xref py py-obj docutils literal notranslate"><span class="pre">fused_all_reduce_mhc</span></code></a></p></td>
+<td><p>All-reduce + mHC post + mHC pre + RMSNorm + W8A8-MXFP8 quantization.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.mhc_sinkhorn" title="halops.mhc_sinkhorn"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mhc_sinkhorn</span></code></a></p></td>
+<td><p>Sinkhorn normalization of the comb logits of <code class="docutils literal notranslate"><span class="pre">fused_all_reduce_mhc</span></code>.</p></td>
+</tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#halops.megallmhc" title="halops.megallmhc"><code class="xref py py-obj docutils literal notranslate"><span class="pre">megallmhc</span></code></a></p></td>
 <td><p>Fused mHC post + pre + RMSNorm + W8A8-MXFP8 quantization for decode.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.mhc_post_hc_mean" title="halops.mhc_post_hc_mean"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mhc_post_hc_mean</span></code></a></p></td>
+<td><p>mHC post mixing after the last layer, averaged over the <code class="docutils literal notranslate"><span class="pre">hc</span></code> streams.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<section class="api-entry" id="mhcworkspace">
+<h2>MhcWorkspace<a class="headerlink" href="#mhcworkspace" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.MhcWorkspace">
+<span class="sig-name descname"><span class="pre">MhcWorkspace</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">peer_ptrs</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">counters</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">slot_bytes</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tp_rank</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">_keepalive</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.MhcWorkspace" title="Link to this definition">¶</a></dt>
+<dd><p>Workspace of <code class="docutils literal notranslate"><span class="pre">fused_all_reduce_mhc</span></code>, from <code class="docutils literal notranslate"><span class="pre">get_workspace_for_mhc</span></code>.</p>
+<dl class="field-list simple">
+</dl>
+</dd></dl>
+
+</section>
+<section class="api-entry" id="get-workspace-for-mhc">
+<h2>get_workspace_for_mhc<a class="headerlink" href="#get-workspace-for-mhc" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.get_workspace_for_mhc">
+<span class="sig-name descname"><span class="pre">get_workspace_for_mhc</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">max_tokens</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">hidden</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">group_name</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tp_rank</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tp_size</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.get_workspace_for_mhc" title="Link to this definition">¶</a></dt>
+<dd><p>Allocate the all-reduce workspace of <code class="docutils literal notranslate"><span class="pre">fused_all_reduce_mhc</span></code>.</p>
+<p>With <code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> this is a collective call on every rank of
+<code class="docutils literal notranslate"><span class="pre">group_name</span></code>. Allocate it once before any CUDA-graph capture and reuse
+it for all calls.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>max_tokens</strong> (<em>int</em>) – Largest T of a call.</p></li>
+<li><p><strong>hidden</strong> (<em>int</em>) – Hidden size of <code class="docutils literal notranslate"><span class="pre">x</span></code>.</p></li>
+<li><p><strong>group_name</strong> (<em>str</em>) – Name of the tensor-parallel process group; unused when
+<code class="docutils literal notranslate"><span class="pre">tp_size</span></code> is 1.</p></li>
+<li><p><strong>tp_rank</strong> (<em>int</em>) – Rank in that group.</p></li>
+<li><p><strong>tp_size</strong> (<em>int</em>) – Size of that group, at most 8.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The workspace to pass to <code class="docutils literal notranslate"><span class="pre">fused_all_reduce_mhc</span></code>.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><em>MhcWorkspace</em></p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section class="api-entry" id="fused-all-reduce-mhc">
+<h2>fused_all_reduce_mhc<a class="headerlink" href="#fused-all-reduce-mhc" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.fused_all_reduce_mhc">
+<span class="sig-name descname"><span class="pre">fused_all_reduce_mhc</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">residual</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">post</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">comb</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">fn</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">hc_scale</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">hc_base</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">norm_weight</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">rms_eps</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">hc_pre_eps</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">hc_sinkhorn_eps</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">hc_post_mult</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">sinkhorn_repeat</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">norm_eps</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">workspace</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">comb_is_logits</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">return_logits</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.fused_all_reduce_mhc" title="Link to this definition">¶</a></dt>
+<dd><p>All-reduce + mHC post + mHC pre + RMSNorm + W8A8-MXFP8 quantization.</p>
+<p>Fuses the end of one mHC sub-layer with the start of the next. For every
+token: <code class="docutils literal notranslate"><span class="pre">residual_out[j]</span> <span class="pre">=</span> <span class="pre">bf16(post[j]</span> <span class="pre">*</span> <span class="pre">x</span> <span class="pre">+</span> <span class="pre">sum_i</span> <span class="pre">comb[i,</span> <span class="pre">j]</span> <span class="pre">*</span>
+<span class="pre">residual[i])</span></code>; the mix <code class="docutils literal notranslate"><span class="pre">fn</span> <span class="pre">&#64;</span> <span class="pre">residual_out</span></code> with its RMS gives <code class="docutils literal notranslate"><span class="pre">pre</span></code>,
+<code class="docutils literal notranslate"><span class="pre">post_out</span></code> (sigmoid) and <code class="docutils literal notranslate"><span class="pre">comb_out</span></code> (Sinkhorn); <code class="docutils literal notranslate"><span class="pre">layer_out</span> <span class="pre">=</span>
+<span class="pre">RMSNorm(bf16(sum_j</span> <span class="pre">pre[j]</span> <span class="pre">*</span> <span class="pre">residual_out[j]))</span></code> is quantized to MXFP8.
+With <code class="docutils literal notranslate"><span class="pre">workspace</span></code>, <code class="docutils literal notranslate"><span class="pre">x</span></code> is first summed over the tensor-parallel ranks.
+All tensors must be contiguous.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<em>torch.Tensor</em>) – [T, hidden] bfloat16 layer output, this rank’s partial sum with
+<code class="docutils literal notranslate"><span class="pre">workspace</span></code>. hidden must be 4096.</p></li>
+<li><p><strong>residual</strong> (<em>torch.Tensor</em>) – [T, hc, hidden] bfloat16 residual streams; hc is 2 or 4.</p></li>
+<li><p><strong>post</strong> (<em>torch.Tensor</em>) – [T, hc] float32 post weights.</p></li>
+<li><p><strong>comb</strong> (<em>torch.Tensor</em>) – [T, hc, hc] float32 comb matrices, [source, dest].</p></li>
+<li><p><strong>fn</strong> (<em>torch.Tensor</em>) – [hc * (hc + 2), hc * hidden] float32 mix weights.</p></li>
+<li><p><strong>hc_scale</strong> (<em>torch.Tensor</em>) – [3] float32 scales of the pre, post and comb mixes.</p></li>
+<li><p><strong>hc_base</strong> (<em>torch.Tensor</em>) – [hc * (hc + 2)] float32 mix biases.</p></li>
+<li><p><strong>norm_weight</strong> (<em>torch.Tensor</em>) – [hidden] bfloat16 RMSNorm weight.</p></li>
+<li><p><strong>rms_eps</strong> (<em>float</em>) – Epsilon of the mix RMS, <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">/</span> <span class="pre">(sqrt(mean(z^2))</span> <span class="pre">+</span> <span class="pre">rms_eps)</span></code>.</p></li>
+<li><p><strong>hc_pre_eps</strong> (<em>float</em>) – Added to <code class="docutils literal notranslate"><span class="pre">pre</span></code>.</p></li>
+<li><p><strong>hc_sinkhorn_eps</strong> (<em>float</em>) – Sinkhorn epsilon.</p></li>
+<li><p><strong>hc_post_mult</strong> (<em>float</em>) – Scale of <code class="docutils literal notranslate"><span class="pre">post_out</span></code>.</p></li>
+<li><p><strong>sinkhorn_repeat</strong> (<em>int</em>) – Sinkhorn iterations.</p></li>
+<li><p><strong>norm_eps</strong> (<em>float</em>) – Epsilon of the RMSNorm.</p></li>
+<li><p><strong>workspace</strong> (<em>MhcWorkspace</em><em> | </em><em>None</em>) – From <code class="docutils literal notranslate"><span class="pre">get_workspace_for_mhc</span></code>; <code class="docutils literal notranslate"><span class="pre">None</span></code> skips the
+all-reduce.</p></li>
+<li><p><strong>comb_is_logits</strong> (<em>bool</em>) – <code class="docutils literal notranslate"><span class="pre">comb</span></code> holds logits, normalized in the kernel.</p></li>
+<li><p><strong>return_logits</strong> (<em>bool</em>) – Return the comb logits as <code class="docutils literal notranslate"><span class="pre">comb_out</span></code>; normalize
+them with <code class="docutils literal notranslate"><span class="pre">mhc_sinkhorn</span></code>.</p></li>
+<li><p><strong>use_pdl</strong> (<em>bool</em>) – Enable Programmatic Dependent Launch (on by default).</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><code class="docutils literal notranslate"><span class="pre">(residual_out,</span> <span class="pre">layer_out,</span> <span class="pre">post_out,</span> <span class="pre">comb_out,</span> <span class="pre">q,</span> <span class="pre">sf)</span></code> – bfloat16
+[T, hc, hidden] and [T, hidden], float32 [T, hc] and [T, hc, hc],
+float8_e4m3fn [T, hidden] codes and uint8 [T, hidden / 32] UE8M0
+scales in row-major layout.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><em>Tuple</em>[torch.Tensor, …]</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section class="api-entry" id="mhc-sinkhorn">
+<h2>mhc_sinkhorn<a class="headerlink" href="#mhc-sinkhorn" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.mhc_sinkhorn">
+<span class="sig-name descname"><span class="pre">mhc_sinkhorn</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">logits</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">eps</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">repeat</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">out</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">prefetch</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#halops.mhc_sinkhorn" title="Link to this definition">¶</a></dt>
+<dd><p>Sinkhorn normalization of the comb logits of <code class="docutils literal notranslate"><span class="pre">fused_all_reduce_mhc</span></code>.</p>
+<p>Turns the <code class="docutils literal notranslate"><span class="pre">comb_out</span></code> returned with <code class="docutils literal notranslate"><span class="pre">return_logits</span></code> into the matrices
+returned without it, and prefetches <code class="docutils literal notranslate"><span class="pre">prefetch</span></code> into L2 meanwhile.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>logits</strong> (<em>torch.Tensor</em>) – [T, hc, hc] float32 contiguous logits; hc is 2 or 4.</p></li>
+<li><p><strong>eps</strong> (<em>float</em>) – Sinkhorn epsilon (<code class="docutils literal notranslate"><span class="pre">hc_sinkhorn_eps</span></code>).</p></li>
+<li><p><strong>repeat</strong> (<em>int</em>) – Sinkhorn iterations (<code class="docutils literal notranslate"><span class="pre">sinkhorn_repeat</span></code>).</p></li>
+<li><p><strong>out</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional pre-allocated output shaped like <code class="docutils literal notranslate"><span class="pre">logits</span></code>.</p></li>
+<li><p><strong>prefetch</strong> (<em>Sequence</em><em>[</em><em>torch.Tensor</em><em>]</em>) – Up to 8 CUDA tensors, each under 4 GiB.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>[T, hc, hc] float32 comb matrices (<code class="docutils literal notranslate"><span class="pre">out</span></code> when given).</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>torch.Tensor</p>
+</dd>
+</dl>
+<p class="rubric">Example</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">halops</span><span class="w"> </span><span class="kn">import</span> <span class="n">mhc_sinkhorn</span>
+
+<span class="n">logits</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">comb</span> <span class="o">=</span> <span class="n">mhc_sinkhorn</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="mf">1e-6</span><span class="p">,</span> <span class="mi">20</span><span class="p">)</span>
+</pre></div>
+</div>
+</dd></dl>
+
+</section>
 <section class="api-entry" id="megallmhc">
 <h2>megallmhc<a class="headerlink" href="#megallmhc" title="Link to this heading">¶</a></h2>
 <dl class="py function">
@@ -346,6 +532,44 @@ float8_e4m3fn [T, 4096] codes and uint8 [T, 128] UE8M0 scales
 </dd></dl>
 
 </section>
+<section class="api-entry" id="mhc-post-hc-mean">
+<h2>mhc_post_hc_mean<a class="headerlink" href="#mhc-post-hc-mean" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.mhc_post_hc_mean">
+<span class="sig-name descname"><span class="pre">mhc_post_hc_mean</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">x</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">residual</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">post</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">comb</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#halops.mhc_post_hc_mean" title="Link to this definition">¶</a></dt>
+<dd><p>mHC post mixing after the last layer, averaged over the <code class="docutils literal notranslate"><span class="pre">hc</span></code> streams.</p>
+<p>Computes <code class="docutils literal notranslate"><span class="pre">mean_j</span> <span class="pre">bf16(post[j]</span> <span class="pre">*</span> <span class="pre">x</span> <span class="pre">+</span> <span class="pre">sum_i</span> <span class="pre">comb[i,</span> <span class="pre">j]</span> <span class="pre">*</span> <span class="pre">residual[i])</span></code>
+per token in fp32, rounded to bf16. All tensors must be contiguous.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>x</strong> (<em>torch.Tensor</em>) – [T, hidden] bfloat16 layer output.</p></li>
+<li><p><strong>residual</strong> (<em>torch.Tensor</em>) – [T, hc, hidden] bfloat16 residual streams; hc is 2 or 4.</p></li>
+<li><p><strong>post</strong> (<em>torch.Tensor</em>) – [T, hc] float32 post weights.</p></li>
+<li><p><strong>comb</strong> (<em>torch.Tensor</em>) – [T, hc, hc] float32 comb matrices, [source, dest].</p></li>
+<li><p><strong>use_pdl</strong> (<em>bool</em>) – Enable Programmatic Dependent Launch (on by default).</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>[T, hidden] bfloat16 tensor.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>torch.Tensor</p>
+</dd>
+</dl>
+<p class="rubric">Example</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">halops</span><span class="w"> </span><span class="kn">import</span> <span class="n">mhc_post_hc_mean</span>
+
+<span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">residual</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">post</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">comb</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">rand</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">out</span> <span class="o">=</span> <span class="n">mhc_post_hc_mean</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">residual</span><span class="p">,</span> <span class="n">post</span><span class="p">,</span> <span class="n">comb</span><span class="p">)</span>
+</pre></div>
+</div>
+</dd></dl>
+
+</section>
 </section>
 
         </article>
@@ -404,7 +628,12 @@ float8_e4m3fn [T, 4096] codes and uint8 [T, 128] UE8M0 scales
           <div class="toc-tree">
             <ul>
 <li><a class="reference internal" href="#">MHC</a><ul>
+<li><a class="reference internal" href="#mhcworkspace">MhcWorkspace</a></li>
+<li><a class="reference internal" href="#get-workspace-for-mhc">get_workspace_for_mhc</a></li>
+<li><a class="reference internal" href="#fused-all-reduce-mhc">fused_all_reduce_mhc</a></li>
+<li><a class="reference internal" href="#mhc-sinkhorn">mhc_sinkhorn</a></li>
 <li><a class="reference internal" href="#megallmhc">megallmhc</a></li>
+<li><a class="reference internal" href="#mhc-post-hc-mean">mhc_post_hc_mean</a></li>
 </ul>
 </li>
 </ul>

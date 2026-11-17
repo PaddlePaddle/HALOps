@@ -6,7 +6,56 @@
 .. autosummary::
    :nosignatures:
 
+   MhcWorkspace
+   get_workspace_for_mhc
+   fused_all_reduce_mhc
+   mhc_sinkhorn
    megallmhc
+   mhc_post_hc_mean
+```
+
+```{rst-class} api-entry
+```
+
+## MhcWorkspace
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: MhcWorkspace
+```
+
+```{rst-class} api-entry
+```
+
+## get_workspace_for_mhc
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: get_workspace_for_mhc
+```
+
+```{rst-class} api-entry
+```
+
+## fused_all_reduce_mhc
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: fused_all_reduce_mhc
+```
+
+```{rst-class} api-entry
+```
+
+## mhc_sinkhorn
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: mhc_sinkhorn
 ```
 
 ```{rst-class} api-entry
@@ -18,4 +67,15 @@
 .. currentmodule:: halops
 
 .. autofunction:: megallmhc
+```
+
+```{rst-class} api-entry
+```
+
+## mhc_post_hc_mean
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: mhc_post_hc_mean
 ```

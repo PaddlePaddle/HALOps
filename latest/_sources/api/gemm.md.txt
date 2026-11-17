@@ -16,6 +16,7 @@
    low_latency_mma_gemm
    prefill_permute_to_masked_gemm
    rms_norm_quant
+   sigmoid_gate_mul_group_quant
 ```
 
 ```{rst-class} api-entry
@@ -126,4 +127,15 @@
 .. currentmodule:: halops
 
 .. autofunction:: rms_norm_quant
+```
+
+```{rst-class} api-entry
+```
+
+## sigmoid_gate_mul_group_quant
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: sigmoid_gate_mul_group_quant
 ```
