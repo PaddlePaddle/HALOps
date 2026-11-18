@@ -144,6 +144,106 @@ struct SharedUpProjectionBase
                                smem->barriers.shared_up.weight_ready.raw(slot),
                                slab_idx() * SharedUpGemm::kTileShapeM, k_tile);
     }
+
+    // Quantize one staged input K tile and hand its slot back to the loader.
+    __device__ static void quantize_input_tile(SharedStorage* __restrict__ smem,
+                                               std::uint32_t batch_size,
+                                               std::uint32_t k_iter_id,
+                                               std::uint32_t num_k_tiles) {
+        constexpr std::uint32_t kBlocksPerTile =
+            SharedUpGemm::MmaCore::kNumSwizzleBoxKs;
+        const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
+        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
+        const std::uint32_t slot = k_iter_id % kNumUpSlots;
+        smem->barriers.shared_up.wait_weight_empty(k_iter_id);
+        smem->barriers.shared_up.input_ready.wait(k_iter_id);
+        const std::uint32_t k_tile = split_idx() * num_k_tiles + k_iter_id;
+        const std::uint32_t blocks_base = k_tile * kBlocksPerTile;
+        // A blockwise tile's scale rows live in its staging slot.
+        const SmemTileQuantizer<typename SharedUpGemm::InputQuant,
+                                SharedUpGemm::kTileShapeN, 128u,
+                                kInputSwizzleBoxK, kBlocksPerTile>
+            tile(slot, blocks_base, /*scale_row_base=*/slot * kBlocksPerTile,
+                 /*row_start=*/0u, batch_size);
+        const auto* const act = reinterpret_cast<const DataType::ElementA*>(
+            &smem->shared_expert.input.data[slot][0][0][0]);
+#pragma unroll 1
+        for (std::uint32_t i = warp_idx;
+             i < SharedUpGemm::kTileShapeN * kBlocksPerTile;
+             i += WarpRole::kCalcWarpCount) {
+            tile.quantize(i / kBlocksPerTile, i % kBlocksPerTile, act,
+                          &smem->shared_expert.quantized_input.data[0],
+                          smem->shared_expert.quantized_input.scale_ptr(),
+                          k_tile * SharedUpGemm::kTileShapeK);
+        }
+        cutlass::arch::fence_view_async_shared();
+        WarpRole::sync_calc_threads();
+        if (warp_idx == 0u && lane_idx == 0u) {
+            smem->barriers.shared_up.input_empty.arrive(k_iter_id);
+        }
+    }
+
+    // Quantize the slab's gated activations into the down's staging layout.
+    __device__ static void quantize_output(Workspace* __restrict__ workspace,
+                                           SharedStorage* __restrict__ smem,
+                                           std::uint32_t batch_size) {
+        const std::uint32_t warp_idx = WarpRole::get_warp_idx();
+        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
+        constexpr std::uint32_t kQuantGroups = Base::kOutputFeatureBlock / 32u;
+        // The MXFP8 slab's groups share one 128-feature SfAtom.
+        const std::uint32_t sf_tile =
+            slab_idx() / (128u / Base::kOutputFeatureBlock);
+        const std::uint32_t sf_group =
+            (slab_idx() * Base::kOutputFeatureBlock % 128u) / 32u;
+#pragma unroll 1
+        for (std::uint32_t tok = warp_idx; tok < batch_size;
+             tok += WarpRole::kCalcWarpCount) {
+            DataType::ElementQA quantized[kQuantGroups];
+            typename Base::OutputQuantizer::ScaleArray scales;
+            typename Base::OutputQuantizer::Values values;
+#pragma unroll
+            for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
+                values[i] =
+                    smem->shared_expert.act_up_out[lane_idx + i * 32u][tok];
+            }
+            Base::OutputQuantizer::quantize(values, quantized, scales);
+            if (lane_idx == 0u) {
+                if constexpr (SharedUpGemm::MmaCore::kUseBlockscaled) {
+                    std::uint8_t* const sf =
+                        workspace->shared_up_out.sf_slab(sf_tile);
+#pragma unroll
+                    for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
+                        sf[sf_atom_offset(tok, sf_group + i)] = scales[i];
+                    }
+                } else {
+                    workspace->shared_up_out.scale_row(slab_idx())[tok] =
+                        scales[0];
+                }
+            }
+#pragma unroll
+            for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
+                const std::uint32_t feat = lane_idx + i * 32u;
+                const std::uint32_t feature =
+                    slab_idx() * Base::kOutputFeatureBlock + feat;
+                workspace->shared_up_out.cell(
+                    feature / kLboChunk, tok)[feat % kLboChunk] = quantized[i];
+            }
+        }
+        if constexpr (SharedUpGemm::MmaCore::kUseBlockscaled) {
+            // The padded rows of the tile's slab stay zero for UTCCP.
+            if (lane_idx == 0u) {
+                std::uint8_t* const sf =
+                    workspace->shared_up_out.sf_slab(sf_tile);
+                for (std::uint32_t tok = batch_size + warp_idx; tok < 128u;
+                     tok += WarpRole::kCalcWarpCount) {
+#pragma unroll
+                    for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
+                        sf[sf_atom_offset(tok, sf_group + i)] = 0u;
+                    }
+                }
+            }
+        }
+    }
 };
 
 template <typename KernelTraits>
@@ -309,6 +409,7 @@ struct SharedUpProjection<KernelTraits, true>
         }
         __syncthreads();
     }
+
     __device__ static void run(
         CUtensorMap const& tma_up_desc, CUtensorMap const& tma_input_desc,
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
@@ -399,38 +500,6 @@ struct SharedUpProjection<KernelTraits, true>
             smem->barriers.shared_up.accumulator_ready.raw(0u));
     }
 
-    __device__ static void quantize_input_tile(SharedStorage* __restrict__ smem,
-                                               std::uint32_t batch_size,
-                                               std::uint32_t k_iter_id,
-                                               std::uint32_t num_k_tiles) {
-        const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
-        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
-        constexpr std::uint32_t kBlocksPerTile =
-            SharedUpGemm::MmaCore::kNumSwizzleBoxKs;
-        const std::uint32_t slot = k_iter_id % Base::kNumUpSlots;
-        smem->barriers.shared_up.wait_weight_empty(k_iter_id);
-        smem->barriers.shared_up.input_ready.wait(k_iter_id);
-        const std::uint32_t k_base =
-            (Base::split_idx() * num_k_tiles + k_iter_id) *
-            SharedUpGemm::kTileShapeK;
-        const std::uint32_t blocks_base =
-            (Base::split_idx() * num_k_tiles + k_iter_id) * kBlocksPerTile;
-        const QuantizeTile tile(slot, blocks_base, blocks_base,
-                                /*row_start=*/0u, batch_size);
-        const auto* const act = reinterpret_cast<const DataType::ElementA*>(
-            &smem->shared_expert.input.data[slot][0][0][0]);
-        quantize_mxfp8_groupwise_1x32<SharedUpGemm::kTileShapeN, 128u,
-                                      Base::kInputSwizzleBoxK, kBlocksPerTile>(
-            act, k_base, &smem->shared_expert.quantized_input.data[0],
-            &smem->shared_expert.quantized_input.scale[0][0], tile, warp_idx,
-            WarpRole::kCalcWarpCount);
-        cutlass::arch::fence_view_async_shared();
-        WarpRole::sync_calc_threads();
-        if (warp_idx == 0u && lane_idx == 0u) {
-            smem->barriers.shared_up.input_empty.arrive(k_iter_id);
-        }
-    }
-
     // Read the completed split accumulator.
     __device__ static void load_accumulators(SharedStorage* __restrict__ smem,
                                              Accumulator& gate,
@@ -438,55 +507,6 @@ struct SharedUpProjection<KernelTraits, true>
         smem->barriers.shared_up.accumulator_ready.wait(0u);
         tcgen05_fence_after_thread_sync();
         Base::load_accumulators(smem->tmem_ptr, gate, up);
-    }
-
-    __device__ static void quantize_output(Workspace* __restrict__ workspace,
-                                           SharedStorage* __restrict__ smem,
-                                           std::uint32_t batch_size) {
-        const std::uint32_t warp_idx = WarpRole::get_warp_idx();
-        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
-
-        constexpr std::uint32_t kQuantGroups = Base::kOutputFeatureBlock / 32u;
-        // Store one UE8M0 byte per 32 features in the down-input SfAtom
-        // layout.
-        const std::uint32_t tile =
-            Base::slab_idx() / (128u / Base::kOutputFeatureBlock);
-        const std::uint32_t group_base =
-            (Base::slab_idx() * Base::kOutputFeatureBlock % 128u) / 32u;
-        std::uint8_t* const sf = workspace->shared_up_out.sf_slab(tile);
-#pragma unroll 1
-        for (std::uint32_t tok = warp_idx; tok < batch_size;
-             tok += WarpRole::kCalcWarpCount) {
-            DataType::ElementQA quantized[kQuantGroups];
-            typename Base::OutputQuant::ScaleType scales[kQuantGroups];
-            Base::quantize_output_row(smem->shared_expert.act_up_out, tok,
-                                      quantized, scales);
-            if (lane_idx == 0u) {
-#pragma unroll
-                for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
-                    sf[sf_atom_offset(tok, group_base + i)] = scales[i];
-                }
-            }
-#pragma unroll
-            for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
-                const std::uint32_t feat = lane_idx + i * 32u;
-                const std::uint32_t feature =
-                    Base::slab_idx() * Base::kOutputFeatureBlock + feat;
-                workspace->shared_up_out.cell(feature / Base::kLboChunk,
-                                              tok)[feat % Base::kLboChunk] =
-                    quantized[i];
-            }
-        }
-        // The padded rows of the tile's slab stay zero for UTCCP.
-        if (lane_idx == 0u) {
-            for (std::uint32_t tok = batch_size + warp_idx; tok < 128u;
-                 tok += WarpRole::kCalcWarpCount) {
-#pragma unroll
-                for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
-                    sf[sf_atom_offset(tok, group_base + i)] = 0u;
-                }
-            }
-        }
     }
 };
 
@@ -591,42 +611,6 @@ struct SharedUpProjection<KernelTraits, false>
         dequant(up_scale, smem, num_k_tiles - 1u, gate, up, num_k_tiles);
     }
 
-    __device__ static void quantize_input_tile(SharedStorage* __restrict__ smem,
-                                               std::uint32_t batch_size,
-                                               std::uint32_t k_iter_id,
-                                               std::uint32_t num_k_tiles) {
-        const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
-        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
-        constexpr std::uint32_t kBlocksPerTile =
-            SharedUpGemm::MmaCore::kNumSwizzleBoxKs;
-        const std::uint32_t slot = k_iter_id % Base::kNumUpSlots;
-        smem->barriers.shared_up.wait_weight_empty(k_iter_id);
-        smem->barriers.shared_up.input_ready.wait(k_iter_id);
-        const std::uint32_t k_base =
-            (Base::split_idx() * num_k_tiles + k_iter_id) *
-            SharedUpGemm::kTileShapeK;
-        // The source offset follows the tile's global K block; its scale rows
-        // live in the tile's staging slot.
-        const std::uint32_t blocks_base =
-            (Base::split_idx() * num_k_tiles + k_iter_id) * kBlocksPerTile;
-        const QuantizeTile tile(/*staging_slot_base=*/0u, blocks_base,
-                                /*scale_row_base=*/slot * kBlocksPerTile,
-                                /*row_start=*/0u, batch_size);
-        quantize_fp8_groupwise_128<SharedUpGemm::kTileShapeN,
-                                   SharedUpGemm::InputQuant::kBlockSize,
-                                   Base::kInputSwizzleBoxK, kBlocksPerTile>(
-            reinterpret_cast<const DataType::ElementA*>(
-                &smem->shared_expert.input.data[slot][0][0][0]),
-            k_base, &smem->shared_expert.quantized_input.data[slot],
-            smem->shared_expert.quantized_input.scale_ptr(), tile, warp_idx,
-            WarpRole::kCalcWarpCount);
-        cutlass::arch::fence_view_async_shared();
-        WarpRole::sync_calc_threads();
-        if (warp_idx == 0u && lane_idx == 0u) {
-            smem->barriers.shared_up.input_empty.arrive(k_iter_id);
-        }
-    }
-
     __device__ static void dequant(
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
         SharedStorage* __restrict__ smem, std::uint32_t k_iter_id,
@@ -668,36 +652,6 @@ struct SharedUpProjection<KernelTraits, false>
         WarpRole::sync_calc_threads();
         if (warp_idx == 0u && lane_idx == 0u) {
             smem->barriers.shared_up.accumulator_empty.arrive(k_iter_id);
-        }
-    }
-
-    __device__ static void quantize_output(Workspace* __restrict__ workspace,
-                                           SharedStorage* __restrict__ smem,
-                                           std::uint32_t batch_size) {
-        const std::uint32_t warp_idx = WarpRole::get_warp_idx();
-        const std::uint32_t lane_idx = WarpRole::get_lane_idx();
-
-        constexpr std::uint32_t kQuantGroups = Base::kOutputFeatureBlock / 32u;
-#pragma unroll 1
-        for (std::uint32_t tok = warp_idx; tok < batch_size;
-             tok += WarpRole::kCalcWarpCount) {
-            DataType::ElementQA quantized[kQuantGroups];
-            typename Base::OutputQuantizer::ScaleArray scales;
-            Base::quantize_output_row(smem->shared_expert.act_up_out, tok,
-                                      quantized, scales);
-            if (lane_idx == 0u) {
-                workspace->shared_up_out.scale_row(Base::slab_idx())[tok] =
-                    scales[0];
-            }
-#pragma unroll
-            for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
-                const std::uint32_t feat = lane_idx + i * 32u;
-                const std::uint32_t feature =
-                    Base::slab_idx() * Base::kOutputFeatureBlock + feat;
-                workspace->shared_up_out.cell(feature / Base::kLboChunk,
-                                              tok)[feat % Base::kLboChunk] =
-                    quantized[i];
-            }
         }
     }
 };

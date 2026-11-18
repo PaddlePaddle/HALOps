@@ -107,10 +107,9 @@ struct UpProjectionBase {
     static constexpr std::uint32_t kQuantGroups = kOutputFeatureBlock / 32u;
 
     using Accumulator = cutlass::Array<float, kAccColsPerThread>;
-    using OutputQuant =
-        QuantSpec<UpGemm::InputQuant::kMethod, kOutputQuantBlock>;
-    using OutputQuantizer =
-        GroupWiseQuantizer<OutputQuant, kOutputFeatureBlock>;
+    using OutputQuantizer = RegisterQuantizer<
+        QuantSpec<UpGemm::InputQuant::kMethod, kOutputQuantBlock>,
+        kOutputFeatureBlock>;
 
     static_assert(UpGemm::kTileShapeM / 16u <= WarpRole::kCalcWarpCount,
                   "the tile's 16-row groups must fit the calc warps");
@@ -264,19 +263,6 @@ struct UpProjectionBase {
                 }
             }
         }
-    }
-
-    __device__ static void quantize_output_row(
-        const float (&act)[kOutputFeatureBlock][UpGemm::kTileShapeN + 1u],
-        std::uint32_t token,
-        typename OutputQuant::ElementType (&quantized)[kQuantGroups],
-        typename OutputQuantizer::ScaleArray& scales) {
-        typename OutputQuantizer::Values values;
-#pragma unroll
-        for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
-            values[i] = act[WarpRole::get_lane_idx() + i * 32u][token];
-        }
-        OutputQuantizer::quantize(values, quantized, scales);
     }
 
     // Every CTA thread joins when partial sums are shared across splits.

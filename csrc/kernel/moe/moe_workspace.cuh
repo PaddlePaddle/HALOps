@@ -49,51 +49,12 @@ struct RouterLogits {
     }
 };
 
-// Latent output scales in routed-up staging layout: FP32 blocks or MXFP8
-// SfAtoms.
-template <typename Dims, bool IsMx>
-struct LatentScaleImage;
-
-template <typename Dims>
-struct LatentScaleImage<Dims, false> {
-    using LatentDownGemm = LatentDownGemmTraits<Dims>;
-    using Element = float;
-
-    static constexpr std::uint32_t kNumBlocks = LatentDownGemm::kGemmM / 128u;
-    static constexpr std::uint32_t kNumRows = LatentDownGemm::kGemmN;
-
-    alignas(16) Element data[kNumBlocks][kNumRows];
-
-    __device__ __forceinline__ Element* row(std::uint32_t block) {
-        return data[block];
-    }
-};
-
-template <typename Dims>
-struct LatentScaleImage<Dims, true> {
-    using UpGemm = RoutedUpGemmTraits<Dims>;
-    using Element = std::uint8_t;
-
-    // One 128-token SfAtom slab per up K tile holds that tile's 32-K groups.
-    static constexpr std::uint32_t kNumSlots =
-        UpGemm::kGemmK / UpGemm::kTileShapeK;
-    static constexpr std::uint32_t kSfAtomBytes =
-        128u * (UpGemm::kTileShapeK / 32u);
-
-    alignas(16) Element data[kNumSlots][kSfAtomBytes];
-
-    __device__ __forceinline__ Element* slab(std::uint32_t slot) {
-        return data[slot];
-    }
-};
-
 // Latent output data and scales in routed-up staging layout.
 template <typename Dims>
 struct LatentDownOutput {
     using LatentDownGemm = LatentDownGemmTraits<Dims>;
+    using OutputQuant = typename LatentDownGemm::OutputQuant;
     using Element = DataType::ElementQA;
-    using ScaleImage =
-        LatentScaleImage<Dims, LatentDownGemm::kOutputUseBlockscaled>;
 
     static constexpr std::uint32_t kNumRows = LatentDownGemm::kGemmN;
     static constexpr std::uint32_t kNumCols = LatentDownGemm::kGemmM;
@@ -101,16 +62,26 @@ struct LatentDownOutput {
     static constexpr std::uint32_t kLboChunk = LboChunkK<Element>::value;
     static constexpr std::uint32_t kNumChunks = kNumCols / kLboChunk;
 
+    // UE8M0 bytes: one 128-token SfAtom per four K groups.
+    static constexpr std::uint32_t kSfAtomBytes = 512u;
+    static constexpr std::uint32_t kNumSfAtoms =
+        kNumCols / (4u * OutputQuant::kBlockSize);
+    static_assert(kNumCols % (4u * OutputQuant::kBlockSize) == 0u,
+                  "the latent width must close whole SfAtoms");
+
     alignas(16) Element data[kNumChunks][kNumRows + 1u][kLboChunk];
-    alignas(16) ScaleImage scale;
+    union alignas(16) {
+        typename OutputQuant::ScaleType
+            blockwise[kNumCols / OutputQuant::kBlockSize][kNumRows];
+        std::uint8_t mxfp8[kNumSfAtoms][kSfAtomBytes];
+    } scale;
 
     static constexpr std::uint32_t kDataBytes = sizeof(data);
     static constexpr std::uint32_t kScaleBytes = sizeof(scale);
 
-    __device__ __forceinline__ void store_cell(std::uint32_t chunk,
-                                               std::uint32_t row,
-                                               uint4 const& bytes) {
-        *reinterpret_cast<uint4*>(&data[chunk][row][0]) = bytes;
+    __device__ __forceinline__ Element* cell(std::uint32_t chunk,
+                                             std::uint32_t row) {
+        return &data[chunk][row][0];
     }
 
     __device__ __forceinline__ void clear_pad_row(std::uint32_t chunk) {
@@ -118,12 +89,14 @@ struct LatentDownOutput {
             make_uint4(0u, 0u, 0u, 0u);
     }
 
-    __device__ __forceinline__ auto* scale_row(std::uint32_t block) {
-        return scale.row(block);
+    __device__ __forceinline__ typename OutputQuant::ScaleType* scale_row(
+        std::uint32_t block) {
+        return scale.blockwise[block];
     }
 
-    __device__ __forceinline__ auto* sf_slab(std::uint32_t slot) {
-        return scale.slab(slot);
+    // The SfAtom holding K group `group`.
+    __device__ __forceinline__ std::uint8_t* sf_atom(std::uint32_t group) {
+        return scale.mxfp8[group / 4u];
     }
 
     __host__ __device__ __forceinline__ Element* data_ptr() {
@@ -156,7 +129,7 @@ struct SharedUpOutput {
         128u * (SharedDownGemm::kTileShapeK / 32u);
 
     alignas(16) ElementType data[kNumChunks][kNumRows + 1u][kLboChunk];
-    union alignas(16) ScaleImage {
+    union alignas(16) {
         ScaleType blockwise[kNumScaleCols][kNumRows];
         std::uint8_t mxfp8[kDownTilesK][kSfAtomBytes];
     } scale;
@@ -216,7 +189,7 @@ struct RoutedUpOutput {
 
     alignas(16) ElementType data[(kNumRows + 8u) * kNumCols];
     // The union keeps workspace sizing identical across quantization recipes.
-    union alignas(16) ScaleImage {
+    union alignas(16) {
         ScaleType blockwise[kNumRows * kNumScaleCols];
         std::uint8_t mxfp8[kNumRows * kNumMxScaleCols];
     } scale;

@@ -147,8 +147,7 @@ struct RoutedUpProjectionBase
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         std::uint32_t e, std::uint32_t batch_size, std::uint32_t base_feature,
         std::uint32_t m_block_idx, std::uint32_t tok) {
-        using Quant = typename Traits::RoutedDownGemm::InputQuant;
-        using Quantizer = GroupWiseQuantizer<Quant, UpGemm::kTileShapeM / 2u>;
+        using Quant = typename Base::OutputQuantizer::Quant;
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         std::uint32_t dest_row = 0u;
         if (!output_row(smem, e, tok, batch_size, dest_row)) {
@@ -156,11 +155,16 @@ struct RoutedUpProjectionBase
         }
 
         typename Quant::ElementType quantized[kQuantGroups];
-        typename Quantizer::ScaleArray scales;
-        Base::quantize_output_row(smem->routed_experts.act_up_out, tok,
-                                  quantized, scales);
+        typename Base::OutputQuantizer::ScaleArray scales;
+        typename Base::OutputQuantizer::Values values;
+#pragma unroll
+        for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
+            values[i] =
+                smem->routed_experts.act_up_out[lane_idx + i * 32u][tok];
+        }
+        Base::OutputQuantizer::quantize(values, quantized, scales);
         auto* const out = workspace->routed_up_out.row(dest_row) + base_feature;
-        typename Quantizer::ScaleType* scale;
+        typename Base::OutputQuantizer::ScaleType* scale;
         if constexpr (Quant::kMethod == QuantMethod::kMXFP8) {
             scale = workspace->routed_up_out.mx_scale_row(dest_row) +
                     base_feature / Quant::kBlockSize;
@@ -173,7 +177,8 @@ struct RoutedUpProjectionBase
         }
         if (lane_idx == 0u) {
 #pragma unroll
-            for (std::uint32_t i = 0; i < Quantizer::kNumGroups; ++i) {
+            for (std::uint32_t i = 0; i < Base::OutputQuantizer::kNumGroups;
+                 ++i) {
                 scale[i] = scales[i];
             }
         }

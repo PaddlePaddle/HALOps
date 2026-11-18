@@ -554,13 +554,6 @@ struct LatentDownSmem {
 
     WeightScaleStorage<GemmTraits> w_scale;
 
-    // The output amax table.
-    static constexpr std::uint32_t kNumAmaxGroups =
-        GemmTraits::MmaCore::kUseBlockscaled
-            ? GemmTraits::kTileShapeM / GemmTraits::OutputQuant::kBlockSize
-            : 1u;
-    alignas(16) float token_amax[GemmTraits::kTileShapeN][kNumAmaxGroups];
-
     static constexpr std::uint32_t kOutLboChunkK =
         LboChunkK<typename GemmTraits::OutputQuant::ElementType>::value;
     static constexpr std::uint32_t kNumOutChunks =
