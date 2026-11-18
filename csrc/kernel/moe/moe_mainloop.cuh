@@ -289,11 +289,11 @@ struct CollectiveMainloopMoE {
                 // One box carries every row atom of a K tile: [16-byte words][K
                 // slab][row atom].
                 using DownGemm = typename Traits::RoutedDownGemm;
-                constexpr std::uint64_t kSfKBlocksPerRow =
-                    std::uint64_t{DownGemm::kGemmK} / 128u;
-                constexpr std::uint64_t kAtomRows =
+                const std::uint64_t kSfKBlocksPerRow =
+                    std::uint64_t{args.intermediate_size} / 128u;
+                const std::uint64_t kAtomRows =
                     std::uint64_t{Dims::kNumExperts} *
-                    (DownGemm::kGemmM / 128u);
+                    (std::uint64_t{args.latent_size} / 128u);
                 std::uint64_t down_scale_shape[3] = {128u, kSfKBlocksPerRow,
                                                      kAtomRows};
                 std::uint64_t down_scale_strides[2] = {512u,
@@ -325,9 +325,9 @@ struct CollectiveMainloopMoE {
                 SharedUp::MmaCore::kSwizzleBoxK;
             std::uint64_t shared_up_w_shape[3] = {
                 kSwizzleBoxK, std::uint64_t{Dims::kIntermediateSize} * 2u,
-                Dims::kHiddenSize / kSwizzleBoxK};
+                std::uint64_t{args.hidden_size} / kSwizzleBoxK};
             std::uint64_t shared_up_w_strides[2] = {
-                std::uint64_t{Dims::kHiddenSize} * kSharedUpElemBytes,
+                std::uint64_t{args.hidden_size} * kSharedUpElemBytes,
                 std::uint64_t{kSwizzleBoxK} * kSharedUpElemBytes};
             params.tma_shared_up_desc =
                 CreateTmaDesc<3>("shared_up weights", args.shared_up_weight,
@@ -338,14 +338,13 @@ struct CollectiveMainloopMoE {
         }
         params.tma_shared_down_desc =
             CreateTmaDesc<2>("shared_down weights", args.shared_down_weight,
-                             {Dims::kIntermediateSize, Dims::kHiddenSize},
+                             {Dims::kIntermediateSize, args.hidden_size},
                              {std::uint64_t{Dims::kIntermediateSize}},
                              {128u, Traits::SharedDownGemm::kTileShapeM});
         if constexpr (Traits::SharedDownGemm::MmaCore::kUseBlockscaled) {
             constexpr std::uint64_t kSharedDownSlabs =
                 Dims::kIntermediateSize / 128u;
-            constexpr std::uint64_t kSharedDownAtomRows =
-                Dims::kHiddenSize / 128u;
+            const std::uint64_t kSharedDownAtomRows = args.hidden_size / 128u;
             if (args.layouts.shared_down_scale == ScaleLayout::kSfAtom) {
                 std::uint64_t shared_down_scale_shape[3] = {
                     128u, kSharedDownSlabs, kSharedDownAtomRows};
@@ -366,13 +365,13 @@ struct CollectiveMainloopMoE {
             using LatentGemm = typename Traits::LatentDownGemm;
             constexpr std::uint64_t kLatentElemBits =
                 cute::sizeof_bits_v<typename LatentGemm::MmaElement>;
-            constexpr std::uint64_t kLatentBytes =
-                std::uint64_t{Dims::kHiddenSize} * kLatentElemBits / 8u;
+            const std::uint64_t kLatentBytes =
+                std::uint64_t{args.hidden_size} * kLatentElemBits / 8u;
             constexpr std::uint32_t kLatentChunkK =
                 LatentGemm::MmaCore::kSwizzleBoxK;
             std::uint64_t latent_down_w_shape[3] = {
                 kLatentChunkK, Dims::kLatentSize,
-                Dims::kHiddenSize / kLatentChunkK};
+                std::uint64_t{args.hidden_size} / kLatentChunkK};
             std::uint64_t latent_down_w_strides[2] = {
                 kLatentBytes,
                 std::uint64_t{kLatentChunkK} * kLatentElemBits / 8u};

@@ -245,9 +245,8 @@ struct RoutedExpertsSmemT {
     static_assert(kUseBlockscaled == DownGemmTraits::MmaCore::kUseBlockscaled,
                   "the routed experts run one quantization recipe");
 
-    // A blockwise weight scale ring keeps the kernel config's prefetch depth.
-    static constexpr std::uint32_t kUpScaleSlots =
-        kUseBlockscaled ? kUpSlots : 2u;
+    // The scale ring rides the weight ring: one tile's scales per slot.
+    static constexpr std::uint32_t kUpScaleSlots = kUpSlots;
     static constexpr std::uint32_t kDownScaleSlots =
         kUseBlockscaled ? kDownSlots : 1u;
 
@@ -399,8 +398,7 @@ struct GemmSlots<Dims, RoutedUpGemmTraits<Dims>> {
     static constexpr std::uint32_t kNumSlots =
         up_slots_per_down_slot<Dims>() *
         GemmSlots<Dims, RoutedDownGemmTraits<Dims>>::kNumSlots;
-    static constexpr std::uint32_t kScaleSlots =
-        Up::MmaCore::kUseBlockscaled ? kNumSlots : 2u;
+    static constexpr std::uint32_t kScaleSlots = kNumSlots;
     static constexpr std::uint32_t kTmemScaleSlots =
         Up::MmaCore::kUseBlockscaled ? 2u : 0u;
     static constexpr std::uint32_t kTmemAccSlots =

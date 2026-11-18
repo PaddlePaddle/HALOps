@@ -56,8 +56,8 @@ struct LatentDownOutput {
     using OutputQuant = typename LatentDownGemm::OutputQuant;
     using Element = DataType::ElementQA;
 
-    static constexpr std::uint32_t kNumRows = LatentDownGemm::kGemmN;
-    static constexpr std::uint32_t kNumCols = LatentDownGemm::kGemmM;
+    static constexpr std::uint32_t kNumRows = Dims::kNumTokens;
+    static constexpr std::uint32_t kNumCols = Dims::kLatentSize;
 
     static constexpr std::uint32_t kLboChunk = LboChunkK<Element>::value;
     static constexpr std::uint32_t kNumChunks = kNumCols / kLboChunk;
@@ -115,8 +115,8 @@ struct SharedUpOutput {
 
     static constexpr std::uint32_t kQuantBlock = SharedUpGemm::kTileShapeM / 2u;
 
-    static constexpr std::uint32_t kNumRows = SharedUpGemm::kGemmN;
-    static constexpr std::uint32_t kNumCols = SharedUpGemm::kGemmM / 2u;
+    static constexpr std::uint32_t kNumRows = Dims::kNumTokens;
+    static constexpr std::uint32_t kNumCols = Dims::kIntermediateSize;
 
     static constexpr std::uint32_t kLboChunk = LboChunkK<ElementType>::value;
     static constexpr std::uint32_t kNumChunks = kNumCols / kLboChunk;
@@ -124,7 +124,7 @@ struct SharedUpOutput {
 
     // The union keeps workspace sizing identical across quantization recipes.
     static constexpr std::uint32_t kDownTilesK =
-        SharedDownGemm::kGemmK / SharedDownGemm::kTileShapeK;
+        Dims::kIntermediateSize / SharedDownGemm::kTileShapeK;
     static constexpr std::uint32_t kSfAtomBytes =
         128u * (SharedDownGemm::kTileShapeK / 32u);
 
@@ -179,7 +179,7 @@ struct RoutedUpOutput {
     using UpGemm = RoutedUpGemmTraits<Dims>;
 
     static constexpr std::uint32_t kNumRows = UpGemm::kGemmN * Dims::kMaxTopk;
-    static constexpr std::uint32_t kNumCols = UpGemm::kGemmM / 2u;
+    static constexpr std::uint32_t kNumCols = Dims::kIntermediateSize;
 
     static constexpr std::uint32_t kQuantBlock = UpGemm::kTileShapeM / 2u;
     static constexpr std::uint32_t kNumScaleCols = kNumCols / kQuantBlock;
@@ -225,7 +225,7 @@ struct RoutedDownOutput {
     using DownGemm = RoutedDownGemmTraits<Dims>;
 
     static constexpr std::uint32_t kNumRows = DownGemm::kGemmN * Dims::kMaxTopk;
-    static constexpr std::uint32_t kNumCols = DownGemm::kGemmM;
+    static constexpr std::uint32_t kNumCols = MoEInputSize<Dims>::value;
 
     alignas(16) ElementType data[kNumRows * kNumCols];
 

@@ -202,8 +202,6 @@ struct RoutedBarrier<Dims, false> {
         GemmSlots<Dims, RoutedUpGemmTraits<Dims>>::kNumSlots;
     static constexpr std::uint32_t kNumDownSlots =
         GemmSlots<Dims, RoutedDownGemmTraits<Dims>>::kNumSlots;
-    static constexpr std::uint32_t kNumScaleSlots =
-        GemmSlots<Dims, RoutedUpGemmTraits<Dims>>::kScaleSlots;
     // Up and down share the accumulator ring; up's depth is the larger one.
     static constexpr std::uint32_t kTmemAccSlots =
         GemmSlots<Dims, RoutedUpGemmTraits<Dims>>::kTmemAccSlots;
@@ -213,8 +211,6 @@ struct RoutedBarrier<Dims, false> {
     TransactionBarrier<kNumDownSlots> down_weight_ready;
     TransactionBarrier<kNumDownSlots> down_input_ready;
 
-    SimpleBarrier<kNumScaleSlots> weight_scale_ready;
-    SimpleBarrier<kNumScaleSlots> weight_scale_empty;
     SimpleBarrier<kNumUpSlots> input_scale_empty;
 
     // Each K tile's completion also releases its input and weight slots.
@@ -226,8 +222,6 @@ struct RoutedBarrier<Dims, false> {
         up_weight_ready.init(2);
         down_weight_ready.init(1);
         down_input_ready.init(1);
-        weight_scale_ready.init(1);
-        weight_scale_empty.init(num_warps);
         input_scale_empty.init(num_warps);
         accumulator_ready.init(1);
         accumulator_empty.init(num_warps);
@@ -247,16 +241,6 @@ struct RoutedBarrier<Dims, false> {
         }
         down_weight_ready.wait(local_iter);
         down_input_ready.wait(local_iter);
-    }
-
-    __device__ __forceinline__ void wait_weight_scale_ready(
-        std::uint32_t task_id, std::uint32_t slot) {
-        weight_scale_ready.wait_slot(slot, (task_id / kNumScaleSlots) & 1u);
-    }
-
-    __device__ __forceinline__ void wait_weight_scale_empty(
-        std::uint32_t task_id, std::uint32_t slot) {
-        weight_scale_empty.wait_slot(slot, (task_id / kNumScaleSlots) & 1u);
     }
 };
 

@@ -30,8 +30,8 @@
 namespace halops::moe {
 
 // Tile shape shared by the router Linear and the latent down-projection.
-template <std::uint32_t GemmM, std::uint32_t GemmN, std::uint32_t GemmK,
-          std::uint32_t TileShapeN, std::uint32_t NumCtas, bool UseUmma>
+template <std::uint32_t GemmM, std::uint32_t GemmN, std::uint32_t TileShapeN,
+          std::uint32_t NumCtas, bool UseUmma>
 struct GemmTileShape {
     static constexpr std::uint32_t kTileShapeN = TileShapeN;
     static constexpr std::uint32_t kNumTilesN = GemmN / TileShapeN;
@@ -52,22 +52,21 @@ struct GemmTileShape {
     static_assert(UseUmma || kTileShapeM % 16u == 0u,
                   "an HMMA tile must be whole 16-row instructions");
 
-    // K tile: two 128-K quantization blocks, one weight-ring slot.
+    // K tile: two 128-K quantization blocks, one weight-ring slot. The
+    // reduction width itself comes from the runtime problem size.
     static constexpr std::uint32_t kTileShapeK = 256u;
-    static_assert(GemmK % kTileShapeK == 0u,
-                  "the reduction must be a whole number of K tiles");
 
     using TileShape =
         cute::Shape<cute::Int<kTileShapeM>, cute::Int<kTileShapeN>,
                     cute::Int<kTileShapeK>>;
 };
 
-// Latent projection: M = latent width, N = tokens, K = hidden width.
+// Latent projection: N = tokens. Its M (the latent width) and K (the hidden
+// width) come from the runtime problem size; one split owns a fixed 128-row
+// M tile.
 template <typename Dims>
 struct LatentDownGemmTraits {
-    static constexpr std::uint32_t kGemmM = Dims::kLatentSize;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
-    static constexpr std::uint32_t kGemmK = Dims::kHiddenSize;
 
     using WeightQuant = QuantSpec<Dims::kQuantConfig.kLatentQuant>;
     using InputQuant = QuantSpec<Dims::kQuantConfig.kLatentQuant>;
@@ -86,24 +85,19 @@ struct LatentDownGemmTraits {
     static constexpr std::uint32_t kTileShapeN = Dims::kNumTokens;
 
     static constexpr bool kUseSplitK = Dims::KernelConfig::kLatentDownUseSplitK;
-
+    static_assert(kUseSplitK, "the latent down projection is split-K only");
     // The token width is one N tile, so the splits divide M only.
     static constexpr std::uint32_t kNumSplits =
-        kUseSplitK ? kNumCtas / (kGemmM / 128u) : 1u;
-    static_assert(!kUseSplitK || kNumCtas % (kGemmM / 128u) == 0u,
-                  "the split groups must divide the CTAs");
+        Dims::KernelConfig::kLatentDownSplits;
 
-    using GemmShape = GemmTileShape<kGemmM, kGemmN, kGemmK, kTileShapeN,
-                                    kNumCtas / kNumSplits, /*UseUmma=*/true>;
-
-    static constexpr std::uint32_t kTileShapeM =
-        kUseSplitK ? 128u : GemmShape::kTileShapeM;
-    static constexpr std::uint32_t kTileShapeK = GemmShape::kTileShapeK;
+    static constexpr std::uint32_t kTileShapeM = 128u;
+    static constexpr std::uint32_t kTileShapeK = 256u;
     using TileShape =
         cute::Shape<cute::Int<kTileShapeM>, cute::Int<kTileShapeN>,
                     cute::Int<kTileShapeK>>;
-
-    static constexpr std::uint32_t kNumTilesM = kGemmM / kTileShapeM;
+    // The CTA grid decides how many 128-row M tiles one split owns; the
+    // runtime latent width must match it.
+    static constexpr std::uint32_t kNumTilesM = kNumCtas / kNumSplits;
 
     static constexpr std::uint32_t kClusterSize = cute::max(
         (OutputQuant::kBlockSize + kTileShapeM - 1) / kTileShapeM, kNumSplits);
@@ -119,7 +113,6 @@ template <typename Dims>
 struct RouterGemmTraits {
     static constexpr std::uint32_t kGemmM = Dims::kNumExperts;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
-    static constexpr std::uint32_t kGemmK = Dims::kHiddenSize;
 
     static constexpr bool kUseUmma =
         Dims::KernelConfig::kRouterMma == MmaKind::kUmma;
@@ -134,8 +127,8 @@ struct RouterGemmTraits {
 
     static constexpr std::uint32_t kTileShapeN = 8u;
 
-    using Gemm = GemmTileShape<kGemmM, kGemmN, kGemmK, kTileShapeN,
-                               kNumCtasForRouter, kUseUmma>;
+    using Gemm =
+        GemmTileShape<kGemmM, kGemmN, kTileShapeN, kNumCtasForRouter, kUseUmma>;
     static constexpr std::uint32_t kTileShapeM = Gemm::kTileShapeM;
     static constexpr std::uint32_t kTileShapeK = Gemm::kTileShapeK;
     static constexpr std::uint32_t kNumTilesN = Gemm::kNumTilesN;
@@ -152,16 +145,12 @@ struct RouterGemmTraits {
 
 template <typename Dims>
 struct RoutedUpGemmTraits {
-    static constexpr std::uint32_t kGemmM = Dims::kIntermediateSize * 2;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
-    static constexpr std::uint32_t kGemmK = MoEInputSize<Dims>::value;
 
     static constexpr std::uint32_t kCtasPerExpert =
         Dims::KernelConfig::kCtasPerExpert;
-    static_assert(kGemmM % kCtasPerExpert == 0u,
-                  "kCtasPerExpert must divide kGemmM (kIntermediateSize * 2).");
 
-    static constexpr std::uint32_t kTileShapeM = kGemmM / kCtasPerExpert;
+    static constexpr std::uint32_t kTileShapeM = 128u;
     static constexpr std::uint32_t kTileShapeN = kGemmN;
     static constexpr std::uint32_t kTileShapeK =
         Dims::KernelConfig::kUpTileShapeK;
@@ -189,29 +178,19 @@ struct RoutedUpGemmTraits {
     // The output's (the down's input) scale block.
     static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
 
-    static constexpr auto kWeightScaleShape = [] {
-        if constexpr (MmaCore::kUseBlockscaled) {
-            return WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
-        } else {
-            return cute::make_shape(
-                cute::_2{}, cute::Int<kGemmK / WeightQuant::kBlockSize>{});
-        }
-    }();
+    static constexpr auto kWeightScaleShape =
+        WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
 };
 
 template <typename Dims>
 struct RoutedDownGemmTraits {
-    static constexpr std::uint32_t kGemmM = MoEInputSize<Dims>::value;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
-    static constexpr std::uint32_t kGemmK = Dims::kIntermediateSize;
 
     static constexpr bool kUseLatent = Dims::kUseLatent;
     static constexpr std::uint32_t kCtasPerExpert =
         Dims::KernelConfig::kCtasPerExpert;
-    static_assert(kGemmM % kCtasPerExpert == 0u,
-                  "kCtasPerExpert must divide kGemmM (kHiddenSize).");
 
-    static constexpr std::uint32_t kTileShapeM = kGemmM / kCtasPerExpert;
+    static constexpr std::uint32_t kTileShapeM = 256u;
     static constexpr std::uint32_t kTileShapeN = kGemmN;
     static constexpr std::uint32_t kTileShapeK = 128;
 
@@ -230,28 +209,24 @@ struct RoutedDownGemmTraits {
     using ActElement = typename InputQuant::ElementType;
 
     static constexpr auto kWeightScaleShape =
-        WeightQuant::template ScaleShape<kTileShapeM, kGemmK>();
+        WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
 };
 
 // Shared-expert up projection over all tokens.
 template <typename Dims>
 struct SharedUpGemmTraits {
-    static constexpr std::uint32_t kGemmM = Dims::kIntermediateSize * 2u;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
-    static constexpr std::uint32_t kGemmK = Dims::kHiddenSize;
 
-    // One block owns one M atom of the interleaved rows.
+    // One block owns one 128-row M atom of the interleaved rows; the row count
+    // comes from the runtime problem size.
     static constexpr std::uint32_t kTileShapeM = 128u;
     static constexpr std::uint32_t kTileShapeN = kGemmN;
     static constexpr std::uint32_t kTileShapeK = 256u;
 
     static constexpr std::uint32_t kNumSplits =
-        Dims::KernelConfig::kSharedUseSplitK
-            ? Dims::KernelConfig::kNumCtasForShared / (kGemmM / kTileShapeM)
-            : 1u;
-
+        Dims::KernelConfig::kSharedUpSplits;
     static constexpr std::uint32_t kNumCtas =
-        kNumSplits * (kGemmM / kTileShapeM);
+        Dims::KernelConfig::kNumCtasForShared;
     static constexpr std::uint32_t kClusterSize = kNumSplits;
 
     using WeightQuant = QuantSpec<Dims::kQuantConfig.kSharedQuant>;
@@ -279,16 +254,13 @@ struct SharedUpGemmTraits {
 // The shared expert's down-projection: M hidden, N tokens, K intermediate.
 template <typename Dims>
 struct SharedDownGemmTraits {
-    static constexpr std::uint32_t kGemmM = Dims::kHiddenSize;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
-    static constexpr std::uint32_t kGemmK = Dims::kIntermediateSize;
 
     static constexpr std::uint32_t kNumCtas =
         Dims::KernelConfig::kNumCtasForShared;
-    static_assert(kGemmM % kNumCtas == 0u,
-                  "the blocks must tile the hidden width evenly");
-
-    static constexpr std::uint32_t kTileShapeM = kGemmM / kNumCtas;
+    // One block owns one 128-row M tile; the runtime hidden width must cover
+    // the blocks exactly (checked on the host).
+    static constexpr std::uint32_t kTileShapeM = 128u;
     static constexpr std::uint32_t kTileShapeN = kGemmN;
     static constexpr std::uint32_t kTileShapeK = 128u;
 

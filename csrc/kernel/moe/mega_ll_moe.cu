@@ -229,6 +229,41 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
                            ? static_cast<uint32_t>(latent_down_weight.size(0))
                            : 0u;
     args.intermediate_size = static_cast<uint32_t>(shared_down_weight.size(1));
+
+    // The CTA grid is a compile-time tiling layout: the runtime widths must
+    // land on it exactly (the K widths only have to be whole K tiles).
+    using UpGemm = typename Traits::RoutedUpGemm;
+    using DownGemm = typename Traits::RoutedDownGemm;
+    using SharedUpGemm = typename Traits::SharedUpGemm;
+    using SharedDownGemm = typename Traits::SharedDownGemm;
+    using LatentDownGemm = typename Traits::LatentDownGemm;
+    TORCH_CHECK(args.hidden_size % LatentDownGemm::kTileShapeK == 0u &&
+                    args.hidden_size % SharedUpGemm::kTileShapeK == 0u,
+                "hidden_size must be a whole number of K tiles, got ",
+                args.hidden_size, ".");
+    TORCH_CHECK(
+        args.latent_size == DownGemm::kCtasPerExpert * DownGemm::kTileShapeM &&
+            args.latent_size ==
+                LatentDownGemm::kNumTilesM * LatentDownGemm::kTileShapeM &&
+            args.latent_size % UpGemm::kTileShapeK == 0u,
+        "latent_size must match the latent/routed grids (",
+        DownGemm::kCtasPerExpert * DownGemm::kTileShapeM,
+        " rows) and be whole K tiles, got ", args.latent_size, ".");
+    TORCH_CHECK(2u * args.intermediate_size ==
+                        UpGemm::kCtasPerExpert * UpGemm::kTileShapeM &&
+                    2u * args.intermediate_size ==
+                        (SharedUpGemm::kNumCtas / SharedUpGemm::kNumSplits) *
+                            SharedUpGemm::kTileShapeM,
+                "intermediate_size must match the gate/up grid (",
+                UpGemm::kCtasPerExpert * UpGemm::kTileShapeM, " rows), got ",
+                args.intermediate_size, ".");
+    TORCH_CHECK(args.hidden_size ==
+                    SharedDownGemm::kNumCtas * SharedDownGemm::kTileShapeM,
+                "hidden_size must match the shared-down grid, got ",
+                args.hidden_size, ".");
+    TORCH_CHECK(args.intermediate_size % DownGemm::kTileShapeK == 0u,
+                "intermediate_size must be a whole number of K tiles, got ",
+                args.intermediate_size, ".");
     args.layouts = moe::MoELayouts(routed_use_swizzle, shared_use_swizzle,
                                    latent_use_swizzle);
     args.top_k = static_cast<uint32_t>(top_k);
