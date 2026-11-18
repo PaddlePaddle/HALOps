@@ -656,7 +656,7 @@ struct CollectiveMainloopMoE {
         // previous kernel writes, so it overlaps that kernel under PDL.
         if (WarpRole::is_tmem_warp(warp_idx)) {
             // TMEM allocation issued by ONE fully-active warp.
-            tmem_alloc(Traits::kTmemColumns, &smem->tmem_ptr);
+            tmem_alloc(MoETmemPlan<Dims>::kTmemColumns, &smem->tmem_ptr);
         } else if (warp_idx == 1 && lane_idx == 0) {
             // Only this block's prologue role's barriers; a router block's
             // loader warp initializes the router ring itself.

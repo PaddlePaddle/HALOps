@@ -23,6 +23,7 @@
 #include <cute/tensor.hpp>
 
 #include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_smem_plan.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/ptx_utils.cuh"
 
@@ -140,13 +141,12 @@ struct TransactionBarrier : BarrierRingBase<N> {
     }
 };
 
-template <std::uint32_t NumInputSlots, std::uint32_t NumWeightSlots,
-          std::uint32_t NumAccSlots>
+template <std::uint32_t NumSlots, std::uint32_t NumAccSlots>
 struct GemmPipelineBarrier {
-    TransactionBarrier<NumInputSlots> input_ready;
-    SimpleBarrier<NumInputSlots> input_empty;
-    TransactionBarrier<NumWeightSlots> weight_ready;
-    SimpleBarrier<NumWeightSlots> weight_empty;
+    TransactionBarrier<NumSlots> input_ready;
+    SimpleBarrier<NumSlots> input_empty;
+    TransactionBarrier<NumSlots> weight_ready;
+    SimpleBarrier<NumSlots> weight_empty;
     SimpleBarrier<NumAccSlots> accumulator_ready;
     SimpleBarrier<NumAccSlots> accumulator_empty;
 
@@ -174,14 +174,14 @@ struct GemmPipelineBarrier {
     }
 
     __device__ __forceinline__ void wait_input_empty(std::uint32_t iter) {
-        if (iter >= NumInputSlots) {
-            input_empty.wait(iter - NumInputSlots);
+        if (iter >= NumSlots) {
+            input_empty.wait(iter - NumSlots);
         }
     }
 
     __device__ __forceinline__ void wait_weight_empty(std::uint32_t iter) {
-        if (iter >= NumWeightSlots) {
-            weight_empty.wait(iter - NumWeightSlots);
+        if (iter >= NumSlots) {
+            weight_empty.wait(iter - NumSlots);
         }
     }
 
@@ -198,27 +198,28 @@ struct RoutedBarrier;
 
 template <typename Dims>
 struct RoutedBarrier<Dims, false> {
-    static constexpr std::uint32_t kNumUpWeightSlots =
-        RoutedUpGemmTraits<Dims>::kNumWeightSlots;
-    static constexpr std::uint32_t kNumDownWeightSlots =
-        RoutedDownGemmTraits<Dims>::kNumWeightSlots;
+    static constexpr std::uint32_t kNumUpSlots =
+        GemmSlots<Dims, RoutedUpGemmTraits<Dims>>::kNumSlots;
+    static constexpr std::uint32_t kNumDownSlots =
+        GemmSlots<Dims, RoutedDownGemmTraits<Dims>>::kNumSlots;
     static constexpr std::uint32_t kNumScaleSlots =
-        RoutedUpGemmTraits<Dims>::kWeightScaleSlots;
-    static constexpr std::uint32_t kNumAccSlots =
-        Dims::KernelConfig::kNumAccSlots;
+        GemmSlots<Dims, RoutedUpGemmTraits<Dims>>::kScaleSlots;
+    // Up and down share the accumulator ring; up's depth is the larger one.
+    static constexpr std::uint32_t kTmemAccSlots =
+        GemmSlots<Dims, RoutedUpGemmTraits<Dims>>::kTmemAccSlots;
 
     // Weight and input tiles share a slot: warp 9 and warp 10 each arrive.
-    TransactionBarrier<kNumUpWeightSlots> up_weight_ready;
-    TransactionBarrier<kNumDownWeightSlots> down_weight_ready;
-    TransactionBarrier<kNumDownWeightSlots> down_input_ready;
+    TransactionBarrier<kNumUpSlots> up_weight_ready;
+    TransactionBarrier<kNumDownSlots> down_weight_ready;
+    TransactionBarrier<kNumDownSlots> down_input_ready;
 
     SimpleBarrier<kNumScaleSlots> weight_scale_ready;
     SimpleBarrier<kNumScaleSlots> weight_scale_empty;
-    SimpleBarrier<kNumUpWeightSlots> input_scale_empty;
+    SimpleBarrier<kNumUpSlots> input_scale_empty;
 
     // Each K tile's completion also releases its input and weight slots.
-    SimpleBarrier<kNumAccSlots> accumulator_ready;
-    SimpleBarrier<kNumAccSlots> accumulator_empty;
+    SimpleBarrier<kTmemAccSlots> accumulator_ready;
+    SimpleBarrier<kTmemAccSlots> accumulator_empty;
 
     __device__ __forceinline__ void init() {
         const int num_warps = static_cast<int>(WarpRole::kCalcWarpCount);
@@ -233,16 +234,16 @@ struct RoutedBarrier<Dims, false> {
     }
 
     __device__ __forceinline__ void wait_up_mma_ready(std::uint32_t iter) {
-        if (iter >= kNumAccSlots) {
-            accumulator_empty.wait(iter - kNumAccSlots);
+        if (iter >= kTmemAccSlots) {
+            accumulator_empty.wait(iter - kTmemAccSlots);
         }
         up_weight_ready.wait(iter);
     }
 
     __device__ __forceinline__ void wait_down_mma_ready(
         std::uint32_t local_iter, std::uint32_t acc_iter) {
-        if (acc_iter >= kNumAccSlots) {
-            accumulator_empty.wait(acc_iter - kNumAccSlots);
+        if (acc_iter >= kTmemAccSlots) {
+            accumulator_empty.wait(acc_iter - kTmemAccSlots);
         }
         down_weight_ready.wait(local_iter);
         down_input_ready.wait(local_iter);
@@ -261,24 +262,24 @@ struct RoutedBarrier<Dims, false> {
 
 template <typename Dims>
 struct RoutedBarrier<Dims, true> {
-    static constexpr std::uint32_t kNumUpWeightSlots =
-        RoutedUpGemmTraits<Dims>::kNumWeightSlots;
-    static constexpr std::uint32_t kNumDownWeightSlots =
-        RoutedDownGemmTraits<Dims>::kNumWeightSlots;
+    static constexpr std::uint32_t kNumUpSlots =
+        GemmSlots<Dims, RoutedUpGemmTraits<Dims>>::kNumSlots;
+    static constexpr std::uint32_t kNumDownSlots =
+        GemmSlots<Dims, RoutedDownGemmTraits<Dims>>::kNumSlots;
     // Up rotates its tasks over these slots; down continues the same ring.
-    static constexpr std::uint32_t kNumAccSlots =
-        RoutedUpGemmTraits<Dims>::kNumAccSlots;
+    static constexpr std::uint32_t kTmemAccSlots =
+        GemmSlots<Dims, RoutedUpGemmTraits<Dims>>::kTmemAccSlots;
 
     // Weight and input tiles share a slot: warp 9 and warp 10 each arrive.
-    TransactionBarrier<kNumUpWeightSlots> up_weight_ready;
-    SimpleBarrier<kNumUpWeightSlots> up_weight_empty;
+    TransactionBarrier<kNumUpSlots> up_weight_ready;
+    SimpleBarrier<kNumUpSlots> up_weight_empty;
 
-    TransactionBarrier<kNumDownWeightSlots> down_input_ready;
-    TransactionBarrier<kNumDownWeightSlots> down_weight_ready;
-    SimpleBarrier<kNumDownWeightSlots> down_weight_empty;
+    TransactionBarrier<kNumDownSlots> down_input_ready;
+    TransactionBarrier<kNumDownSlots> down_weight_ready;
+    SimpleBarrier<kNumDownSlots> down_weight_empty;
 
-    SimpleBarrier<kNumAccSlots> accumulator_ready;
-    SimpleBarrier<kNumAccSlots> accumulator_empty;
+    SimpleBarrier<kTmemAccSlots> accumulator_ready;
+    SimpleBarrier<kTmemAccSlots> accumulator_empty;
 
     __device__ __forceinline__ void init() {
         const int num_warps = static_cast<int>(WarpRole::kCalcWarpCount);
@@ -306,30 +307,27 @@ struct RoutedBarrier<Dims, true> {
 template <typename Dims>
 struct MoEBarriers {
     using RouterPipeline =
-        GemmPipelineBarrier<RouterGemmTraits<Dims>::kNumInputSlots,
-                            RouterGemmTraits<Dims>::kNumWeightSlots, 1u>;
-    using LatentDownPipeline =
-        GemmPipelineBarrier<LatentDownGemmTraits<Dims>::kNumInputSlots,
-                            LatentDownGemmTraits<Dims>::kNumWeightSlots,
-                            LatentDownGemmTraits<Dims>::kNumAccSlots>;
+        GemmPipelineBarrier<GemmSlots<Dims, RouterGemmTraits<Dims>>::kNumSlots,
+                            1u>;
+    using LatentDownPipeline = GemmPipelineBarrier<
+        GemmSlots<Dims, LatentDownGemmTraits<Dims>>::kNumSlots,
+        GemmSlots<Dims, LatentDownGemmTraits<Dims>>::kTmemAccSlots>;
 
     RouterPipeline router;
     LatentDownPipeline latent_down;
     RoutedBarrier<Dims> routed;
 
     // SharedExpert
-    static constexpr std::uint32_t kNumSharedUpWeightSlots =
-        SharedUpGemmTraits<Dims>::kNumWeightSlots;
-    static constexpr std::uint32_t kNumSharedDownWeightSlots =
-        SharedDownGemmTraits<Dims>::kNumWeightSlots;
-    using SharedUpPipeline =
-        GemmPipelineBarrier<kNumSharedUpWeightSlots, kNumSharedUpWeightSlots,
-                            SharedUpGemmTraits<Dims>::kNumAccSlots>;
+    static constexpr std::uint32_t kNumSharedUpSlots =
+        GemmSlots<Dims, SharedUpGemmTraits<Dims>>::kNumSlots;
+    static constexpr std::uint32_t kNumSharedDownSlots =
+        GemmSlots<Dims, SharedDownGemmTraits<Dims>>::kNumSlots;
+    using SharedUpPipeline = GemmPipelineBarrier<
+        kNumSharedUpSlots,
+        GemmSlots<Dims, SharedUpGemmTraits<Dims>>::kTmemAccSlots>;
     SharedUpPipeline shared_up;
 
-    using SharedDownPipeline =
-        GemmPipelineBarrier<kNumSharedDownWeightSlots,
-                            kNumSharedDownWeightSlots, 1u>;
+    using SharedDownPipeline = GemmPipelineBarrier<kNumSharedDownSlots, 1u>;
     SharedDownPipeline shared_down;
 
     // The top-k's cluster rendezvous: both blocks of the pair arrive.
@@ -389,245 +387,6 @@ struct RoutingSmem {
     std::uint32_t warp_counts[WarpRole::kCalcWarpCount];
 };
 
-// BF16 activation ring for quantization and MMA input.
-template <std::uint32_t NumSlots, std::uint32_t TileShapeN,
-          std::uint32_t TileShapeK>
-struct ActivationSmem {
-    using Element = DataType::ElementA;
-
-    static constexpr std::uint32_t kNumSlots = NumSlots;
-    static constexpr std::uint32_t kSwizzleBoxK = SwizzleBoxK<Element>::value;
-    static constexpr std::uint32_t kNumSwizzleBoxesK =
-        TileShapeK / kSwizzleBoxK;
-
-    static_assert(TileShapeK % kSwizzleBoxK == 0u,
-                  "a tile must be whole swizzle boxes");
-
-    alignas(1024)
-        Element data[kNumSlots][kNumSwizzleBoxesK][TileShapeN][kSwizzleBoxK];
-};
-
-template <typename GemmTraits,
-          bool UseBlockscaled = GemmTraits::MmaCore::kUseBlockscaled>
-struct WeightScaleStorage;
-
-// Blockwise scale tables follow the GEMM's prefetch granularity.
-template <typename GemmTraits>
-struct WeightScaleStorage<GemmTraits, false> {
-    using Quant = typename GemmTraits::WeightQuant;
-    static_assert(Quant::kMethod == QuantMethod::kBlockwiseFP8,
-                  "the blockwise storage requires FP32 block scales");
-    static constexpr std::uint32_t kNumSlots = GemmTraits::kWeightScaleSlots;
-    static constexpr auto kScaleShape = GemmTraits::kWeightScaleShape;
-    static constexpr std::uint32_t kScaleRows =
-        static_cast<std::uint32_t>(cute::get<0>(kScaleShape));
-    static constexpr std::uint32_t kScaleCols =
-        static_cast<std::uint32_t>(cute::get<1>(kScaleShape));
-    alignas(128)
-        typename Quant::ScaleType scale[kNumSlots][kScaleRows * kScaleCols];
-
-    __device__ auto& operator[](std::uint32_t slot) { return scale[slot]; }
-    __device__ const auto& operator[](std::uint32_t slot) const {
-        return scale[slot];
-    }
-};
-
-// MX stages each weight tile's SfAtom slabs in the corresponding weight slot.
-template <typename GemmTraits>
-struct WeightScaleStorage<GemmTraits, true> {
-    static constexpr std::uint32_t kNumSlots = GemmTraits::kNumWeightSlots;
-    static constexpr std::uint32_t kScaleCols =
-        GemmTraits::MmaCore::ScaleTraits::kSfaSmemBytes;
-    alignas(128) std::uint8_t scale[kNumSlots][kScaleCols];
-
-    __device__ auto& operator[](std::uint32_t slot) { return scale[slot]; }
-    __device__ const auto& operator[](std::uint32_t slot) const {
-        return scale[slot];
-    }
-};
-
-template <typename GemmTraits,
-          bool UseBlockscaled = GemmTraits::MmaCore::kUseBlockscaled>
-struct ActivationScaleStorage;
-
-// Blockwise down rings one K tile's activation scale rows per input slot.
-template <typename GemmTraits>
-struct ActivationScaleStorage<GemmTraits, false> {
-    using Quant = typename GemmTraits::InputQuant;
-    static constexpr std::uint32_t kNumSlots = GemmTraits::kNumWeightSlots;
-    static constexpr std::uint32_t kBlocksPerTile =
-        GemmTraits::kTileShapeK / Quant::kBlockSize;
-    alignas(128) typename Quant::ScaleType
-        scale[kNumSlots][kBlocksPerTile][GemmTraits::kTileShapeN];
-
-    __device__ auto& operator[](std::uint32_t slot) { return scale[slot]; }
-    __device__ const auto& operator[](std::uint32_t slot) const {
-        return scale[slot];
-    }
-};
-
-// MX stages each activation tile's SfAtom in the corresponding input slot.
-template <typename GemmTraits>
-struct ActivationScaleStorage<GemmTraits, true> {
-    static constexpr std::uint32_t kNumSlots = GemmTraits::kNumWeightSlots;
-    static constexpr std::uint32_t kSfAtomBytes =
-        GemmTraits::MmaCore::ScaleTraits::kSfbSmemBytes;
-    alignas(128) std::uint8_t scale[kNumSlots][kSfAtomBytes];
-
-    __device__ auto& operator[](std::uint32_t slot) { return scale[slot]; }
-    __device__ const auto& operator[](std::uint32_t slot) const {
-        return scale[slot];
-    }
-};
-
-// The quantize's fp8 output, which is also the MMA's B operand.
-template <std::uint32_t NumSlots, std::uint32_t TileShapeN,
-          std::uint32_t TileShapeK, std::uint32_t QuantBlock,
-          QuantMethod Method = QuantMethod::kBlockwiseFP8>
-struct QuantizedActivationSmem {
-    using Quant = QuantSpec<Method, QuantBlock>;
-    using ElementType = typename Quant::ElementType;
-    using ElementScale = typename Quant::ScaleType;
-
-    static constexpr std::uint32_t kNumSlots = NumSlots;
-    static constexpr std::uint32_t kLboChunkK = LboChunkK<ElementType>::value;
-    static constexpr std::uint32_t kNumLboChunksK = TileShapeK / kLboChunkK;
-    static_assert(TileShapeK % kLboChunkK == 0u,
-                  "a tile must be whole 16-B chunks");
-
-    // MXFP8 uses per-slot SfAtoms; blockwise keeps one tile's K blocks per
-    // slot, each row as wide as the activation tile.
-    static constexpr std::uint32_t kSfAtomBytes =
-        128u * (TileShapeK / Quant::kBlockSize);
-    static constexpr std::uint32_t kBlockRowsPerSlot =
-        TileShapeK / Quant::kBlockSize;
-    using ScaleArray = std::conditional_t<
-        Method == QuantMethod::kMXFP8, std::uint8_t[NumSlots][kSfAtomBytes],
-        ElementScale[NumSlots][kBlockRowsPerSlot * TileShapeN]>;
-
-    alignas(1024) ElementType
-        data[kNumSlots][kNumLboChunksK][TileShapeN + 1u][kLboChunkK];
-    alignas(128) ScaleArray scale;
-
-    __device__ ElementScale* scale_ptr() {
-        return reinterpret_cast<ElementScale*>(&scale);
-    }
-};
-
-template <typename GemmTraits>
-struct RouterSmem {
-    ActivationSmem<GemmTraits::kNumInputSlots, GemmTraits::kTileShapeN,
-                   GemmTraits::kTileShapeK>
-        input;
-
-    alignas(1024) typename GemmTraits::MmaElement
-        w_router[GemmTraits::kNumWeightSlots]
-                [GemmTraits::MmaCore::kWeightTileElems];
-
-    static constexpr std::uint32_t kNumMmaWarps =
-        GemmTraits::kUseUmma ? 1u : WarpRole::kCalcWarpCount;
-    static constexpr std::uint32_t kMmaRows =
-        GemmTraits::kUseUmma ? 1u : GemmTraits::kTileShapeN;
-    static constexpr std::uint32_t kMmaCols =
-        GemmTraits::kUseUmma ? 1u : GemmTraits::kTileShapeM;
-    float mma_out[kNumMmaWarps][kMmaRows][kMmaCols];
-};
-
-template <typename GemmTraits>
-struct LatentDownSmem {
-    union {
-        alignas(1024) typename GemmTraits::MmaElement w_latent_down
-            [GemmTraits::kNumWeightSlots][GemmTraits::MmaCore::kNumSwizzleBoxKs]
-            [GemmTraits::kTileShapeM][GemmTraits::MmaCore::kSwizzleBoxK];
-        alignas(16) float splited_mma_out[GemmTraits::kTileShapeM]
-                                         [GemmTraits::kTileShapeN];
-    };
-
-    ActivationSmem<GemmTraits::kNumInputSlots, GemmTraits::kTileShapeN,
-                   GemmTraits::kTileShapeK>
-        input;
-    QuantizedActivationSmem<GemmTraits::kNumInputSlots, GemmTraits::kTileShapeN,
-                            GemmTraits::kTileShapeK,
-                            GemmTraits::InputQuant::kBlockSize,
-                            GemmTraits::InputQuant::kMethod>
-        quantized_input;
-
-    WeightScaleStorage<GemmTraits> w_scale;
-
-    static constexpr std::uint32_t kOutLboChunkK =
-        LboChunkK<typename GemmTraits::OutputQuant::ElementType>::value;
-    static constexpr std::uint32_t kNumOutChunks =
-        GemmTraits::kTileShapeM / kOutLboChunkK;
-    alignas(16) DataType::ElementA
-        act_out[kNumOutChunks][GemmTraits::kTileShapeN][kOutLboChunkK];
-};
-
-// The shared expert's own storage, in the union with the other phases.
-template <typename SharedUpGemm, typename SharedDownGemm>
-struct SharedExpertSmem {
-    union {
-        alignas(1024) typename SharedUpGemm::MmaElement
-            w_up[SharedUpGemm::kNumWeightSlots][2u][SharedUpGemm::kTileShapeM]
-                [128u];
-        alignas(1024) typename SharedDownGemm::MmaElement
-            w_down[SharedDownGemm::kNumWeightSlots][SharedDownGemm::kTileShapeM]
-                  [SharedDownGemm::kTileShapeK];
-        alignas(1024) float splited_mma_out[2u][SharedUpGemm::kTileShapeM / 2u]
-                                           [SharedUpGemm::kTileShapeN];
-    };
-
-    ActivationSmem<SharedUpGemm::kNumWeightSlots, SharedUpGemm::kTileShapeN,
-                   SharedUpGemm::kTileShapeK>
-        input;
-
-    alignas(1024) QuantizedActivationSmem<
-        SharedUpGemm::kNumWeightSlots, SharedUpGemm::kTileShapeN,
-        SharedUpGemm::kTileShapeK, SharedUpGemm::InputQuant::kBlockSize,
-        SharedUpGemm::InputQuant::kMethod> quantized_input;
-
-    alignas(1024) QuantizedActivationSmem<
-        SharedDownGemm::kNumWeightSlots, SharedDownGemm::kTileShapeN,
-        SharedDownGemm::kTileShapeK, SharedDownGemm::InputQuant::kBlockSize,
-        SharedDownGemm::InputQuant::kMethod> act_down_input;
-
-    alignas(1024) WeightScaleStorage<SharedUpGemm> w_up_scale;
-    alignas(1024) WeightScaleStorage<SharedDownGemm> w_down_scale;
-
-    alignas(16) float act_up_out[SharedUpGemm::kTileShapeM / 2u]
-                                [SharedUpGemm::kTileShapeN + 1u];
-};
-
-template <typename UpGemm, typename DownGemm>
-struct RoutedExpertsSmem {
-    union {
-        alignas(1024) typename UpGemm::MmaElement
-            w_up[UpGemm::kNumWeightSlots][UpGemm::MmaCore::kNumSwizzleBoxKs]
-                [UpGemm::kTileShapeM * UpGemm::MmaCore::kSwizzleBoxK];
-
-        alignas(1024) typename DownGemm::MmaElement
-            w_down[DownGemm::kNumWeightSlots][DownGemm::kTileShapeM]
-                  [DownGemm::kTileShapeK];
-    };
-
-    float act_up_out[UpGemm::kTileShapeM / 2u][UpGemm::kTileShapeN + 1];
-
-    // The input and its MX scale slabs stream through the weight ring's slots.
-    static constexpr std::uint32_t kNumStagingSlots = UpGemm::kNumWeightSlots;
-    QuantizedActivationSmem<kNumStagingSlots, UpGemm::kTileShapeN,
-                            UpGemm::kTileShapeK, UpGemm::InputQuant::kBlockSize,
-                            UpGemm::InputQuant::kMethod>
-        quantized_input;
-
-    alignas(1024) typename DownGemm::InputQuant::ElementType
-        act_down_input[DownGemm::kNumWeightSlots]
-                      [DownGemm::kTileShapeN * DownGemm::kTileShapeK];
-
-    alignas(1024) WeightScaleStorage<UpGemm> w_up_scale;
-    alignas(1024) WeightScaleStorage<DownGemm> w_down_scale;
-
-    ActivationScaleStorage<DownGemm> act_down_scale;
-};
-
 template <typename Dims>
 struct MoESharedStorage {
     using Traits = MoEKernelTraits<Dims>;
@@ -637,12 +396,13 @@ struct MoESharedStorage {
         "Number of experts too high, cannot store as uint16 anymore.");
 
     union {
-        RouterSmem<typename Traits::RouterGemm> router;
-        LatentDownSmem<typename Traits::LatentDownGemm> latent_down;
+        RouterSmem<Dims, typename Traits::RouterGemm> router;
+        LatentDownSmem<Dims, typename Traits::LatentDownGemm> latent_down;
         RoutingSmem<Dims> routing_scratch;
-        SharedExpertSmem<SharedUpGemmTraits<Dims>, SharedDownGemmTraits<Dims>>
+        SharedExpertSmem<Dims, typename Traits::SharedUpGemm,
+                         typename Traits::SharedDownGemm>
             shared_expert;
-        RoutedExpertsSmem<typename Traits::RoutedUpGemm,
+        RoutedExpertsSmem<Dims, typename Traits::RoutedUpGemm,
                           typename Traits::RoutedDownGemm>
             routed_experts;
     };
@@ -674,10 +434,6 @@ __device__ __host__ constexpr size_t get_moe_smem_size() {
     // The two weight rings are one union view, so they must start together.
     static_assert(offsetof(RoutedSmem, w_up) == offsetof(RoutedSmem, w_down),
                   "the two weight rings must share one region.");
-    // Reserve shared-memory headroom for the driver.
-    static_assert(
-        sizeof(MoESharedStorage<Dims>) <= 224 * 1024,
-        "MoESharedStorage layout exceeds the 224 KB per-block SHM budget.");
     return sizeof(MoESharedStorage<Dims>);
 }
 

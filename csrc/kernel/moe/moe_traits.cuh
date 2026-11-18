@@ -16,6 +16,7 @@
 
 #include <cutlass/arch/barrier.h>
 
+#include <cstdint>
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/atom/mma_traits_sm100.hpp>
 #include <cute/tensor.hpp>
@@ -109,16 +110,6 @@ struct LatentDownGemmTraits {
 
     using MmaCore = moe::UmmaCore<WeightQuant, InputQuant, float, TileShape>;
 
-    static constexpr std::uint32_t kNumAccSlots =
-        MmaCore::kUseBlockscaled ? 1 : Dims::KernelConfig::kNumAccSlots;
-    static constexpr std::uint32_t kMaxWeightSlots =
-        (128u * 1024u) / (kTileShapeM * kTileShapeK);
-    static constexpr std::uint32_t kNumWeightSlots =
-        Dims::KernelConfig::kNumLatentDownWeightSlots < kMaxWeightSlots
-            ? Dims::KernelConfig::kNumLatentDownWeightSlots
-            : kMaxWeightSlots;
-    static constexpr std::uint32_t kNumInputSlots = kNumWeightSlots;
-    static constexpr std::uint32_t kWeightScaleSlots = kNumWeightSlots;
     static constexpr auto kWeightScaleShape =
         WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
 };
@@ -157,11 +148,6 @@ struct RouterGemmTraits {
     using MmaCore = cute::conditional_t<
         kUseUmma, moe::UmmaCore<WeightQuant, InputQuant, float, TileShape>,
         moe::HmmaCore<TileShape>>;
-
-    static constexpr std::uint32_t kNumWeightSlots =
-        Dims::KernelConfig::kNumRouterWeightSlots;
-    static constexpr std::uint32_t kNumInputSlots =
-        Dims::KernelConfig::kNumRouterInputSlots;
 };
 
 template <typename Dims>
@@ -203,12 +189,6 @@ struct RoutedUpGemmTraits {
     // The output's (the down's input) scale block.
     static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
 
-    static constexpr std::uint32_t kNumAccSlots =
-        MmaCore::kUseBlockscaled ? 2 : Dims::KernelConfig::kNumAccSlots;
-    static constexpr std::uint32_t kNumWeightSlots =
-        Dims::KernelConfig::kNumUpWeightSlots;
-    static constexpr std::uint32_t kWeightScaleSlots =
-        MmaCore::kUseBlockscaled ? 1u : 2u;
     static constexpr auto kWeightScaleShape = [] {
         if constexpr (MmaCore::kUseBlockscaled) {
             return WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
@@ -249,12 +229,6 @@ struct RoutedDownGemmTraits {
     using WeightSmemElement = typename MmaCore::SmemElementA;
     using ActElement = typename InputQuant::ElementType;
 
-    static constexpr std::uint32_t kNumAccSlots =
-        MmaCore::kUseBlockscaled ? 1 : Dims::KernelConfig::kNumAccSlots;
-    static constexpr std::uint32_t kNumWeightSlots =
-        Dims::KernelConfig::kNumDownWeightSlots;
-    static constexpr std::uint32_t kWeightScaleSlots =
-        MmaCore::kUseBlockscaled ? kNumWeightSlots : 1u;
     static constexpr auto kWeightScaleShape =
         WeightQuant::template ScaleShape<kTileShapeM, kGemmK>();
 };
@@ -298,12 +272,6 @@ struct SharedUpGemmTraits {
     // The output's (the down's input) scale block.
     static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
 
-    static constexpr std::uint32_t kNumAccSlots =
-        MmaCore::kUseBlockscaled ? 1 : Dims::KernelConfig::kNumAccSlots;
-    static constexpr std::uint32_t kNumWeightSlots =
-        Dims::KernelConfig::kNumSharedUpWeightSlots;
-    static constexpr std::uint32_t kWeightScaleSlots =
-        MmaCore::kUseBlockscaled ? 1u : kNumWeightSlots;
     static constexpr auto kWeightScaleShape =
         WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
 };
@@ -336,13 +304,6 @@ struct SharedDownGemmTraits {
     using TiledMma = typename MmaCore::TiledMma;
     using ScaleTraits = typename MmaCore::ScaleTraits;
 
-    static constexpr std::uint32_t kNumAccSlots =
-        MmaCore::kUseBlockscaled ? 1u
-                                 : Dims::KernelConfig::kNumSharedDownAccSlots;
-    static constexpr std::uint32_t kNumWeightSlots =
-        Dims::KernelConfig::kNumSharedDownWeightSlots;
-    static constexpr std::uint32_t kWeightScaleSlots =
-        MmaCore::kUseBlockscaled ? 1u : kNumWeightSlots;
     static constexpr auto kWeightScaleShape =
         WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
 };
@@ -355,29 +316,6 @@ constexpr std::uint32_t get_gemm_acc_columns() {
                : GemmTraits::MmaCore::kNumAtomMs *
                      GemmTraits::MmaCore::kNumQuantBlocksB *
                      GemmTraits::kTileShapeN;
-}
-
-// One GEMM phase's TMEM columns.
-template <class GemmTraits>
-constexpr std::uint32_t get_gemm_tmem_columns() {
-    return get_gemm_acc_columns<GemmTraits>() * GemmTraits::kNumAccSlots +
-           GemmTraits::kWeightScaleSlots *
-               (GemmTraits::ScaleTraits::kSfaTmemColumns +
-                GemmTraits::ScaleTraits::kSfbTmemColumns);
-}
-
-// Round TMEM columns to an allocation size and check the limit.
-template <std::uint32_t kNeededColumns>
-constexpr std::uint32_t get_tmem_columns() {
-    static_assert(kNeededColumns <= 512u,
-                  "the TMEM allocation must fit 512 columns.");
-    return kNeededColumns <= 32u
-               ? 32u
-               : (kNeededColumns <= 64u
-                      ? 64u
-                      : (kNeededColumns <= 128u
-                             ? 128u
-                             : (kNeededColumns <= 256u ? 256u : 512u)));
 }
 
 template <typename Dims>
@@ -420,7 +358,7 @@ struct MoEKernelTraits {
             cute::max(SharedUpGemm::kNumCtas, SharedDownGemm::kNumCtas),
         TailGeometry::kNumCtas);
 
-    static constexpr std::uint32_t kMaxGrid = kSpecMaxGrid;
+    static constexpr std::uint32_t kMaxGrid = Dims::KernelConfig::kSpecMaxGrid;
     static_assert(kMinGrid <= kMaxGrid,
                   "Grid bounds must be ordered kCtasPerExpert <= kMinGrid <= "
                   "kMaxGrid.");
@@ -435,21 +373,6 @@ struct MoEKernelTraits {
     static constexpr std::uint32_t kUpSlotsPerDownSlot =
         (RoutedDownGemm::kTileShapeM * RoutedDownGemm::kTileShapeK) /
         (RoutedUpGemm::kTileShapeM * RoutedUpGemm::kTileShapeK);
-
-    static constexpr std::uint32_t kUpTmemColumns =
-        get_gemm_tmem_columns<RoutedUpGemm>();
-    static constexpr std::uint32_t kDownTmemColumns =
-        get_gemm_tmem_columns<RoutedDownGemm>();
-    static constexpr std::uint32_t kSharedUpTmemColumns =
-        get_gemm_tmem_columns<SharedUpGemmTraits<Dims>>();
-    static constexpr std::uint32_t kSharedDownTmemColumns =
-        get_gemm_tmem_columns<SharedDownGemmTraits<Dims>>();
-    static constexpr std::uint32_t kMaxGemmTmemColumns =
-        cute::max(cute::max(kUpTmemColumns, kDownTmemColumns),
-                  cute::max(kSharedUpTmemColumns, kSharedDownTmemColumns));
-    // tcgen05.alloc takes a power-of-two column count in [32, 512].
-    static constexpr std::uint32_t kTmemColumns =
-        get_tmem_columns<kMaxGemmTmemColumns>();
 };
 
 }  // namespace halops::moe

@@ -151,28 +151,19 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
     static constexpr QuantConfig kQuantConfig = Config;
     struct KernelConfig {
         static constexpr std::uint32_t kBlockSize = 384;
-        static constexpr std::uint32_t kNumRouterInputSlots = 16;
-        static constexpr std::uint32_t kNumUpInputSlots = 8;
+        static constexpr std::uint32_t kSpecMaxGrid = 256u;
         // Router configs.
-        static constexpr std::uint32_t kNumRouterWeightSlots = 16;
         static constexpr std::uint32_t kNumCtasForRouter = 32;
         static constexpr MmaKind kRouterMma = MmaKind::kHmma;
         // LatentDown configs.
-        static constexpr std::uint32_t kNumLatentDownWeightSlots = 8;
         static constexpr std::uint32_t kNumCtasForLatentDown = 32;
         static constexpr bool kLatentDownUseSplitK = true;
         // SharedExpert configs.
         static constexpr std::uint32_t kNumCtasForShared = 32;
-        static constexpr std::uint32_t kNumSharedUpWeightSlots = 4;
-        static constexpr std::uint32_t kNumSharedDownWeightSlots = 4;
-        static constexpr std::uint32_t kNumSharedDownAccSlots = 4;
         static constexpr bool kSharedUseSplitK = true;
         // MoE configs.
         static constexpr std::uint32_t kCtasPerExpert = 8;
         static constexpr std::uint32_t kUpTileShapeK = 256;
-        static constexpr std::uint32_t kNumUpWeightSlots = 4;
-        static constexpr std::uint32_t kNumDownWeightSlots = 4;
-        static constexpr std::uint32_t kNumAccSlots = 4;
         // Tail configs
         static constexpr int kTailWorld = TailWorld;
         static constexpr int kTailTpg = 2;
@@ -195,18 +186,6 @@ struct Dims_BS16_E512_N512_K2048_SM100
     struct KernelConfig
         : Dims_BS8_E512_N512_K2048_SM100<Config, UseLatent,
                                          TailWorld>::KernelConfig {
-        static constexpr std::uint32_t kNumUpInputSlots = 4;
-        // Router configs.
-        static constexpr std::uint32_t kNumCtasForRouter = 32;
-        static constexpr std::uint32_t kNumRouterWeightSlots = 8;
-        static constexpr std::uint32_t kNumRouterInputSlots = 16;
-        static constexpr MmaKind kRouterMma = MmaKind::kHmma;
-        // LatentDown configs.
-        static constexpr std::uint32_t kNumCtasForLatentDown = 32;
-        static constexpr std::uint32_t kNumLatentDownWeightSlots = 8;
-        static constexpr bool kLatentDownUseSplitK = true;
-        // SharedExpert configs.
-        static constexpr bool kSharedUseSplitK = true;
         // Tail configs
         static constexpr int kTailTpg = 4;
     };
@@ -342,8 +321,5 @@ struct WarpRole {
         asm volatile("bar.sync 14, %0;\n" ::"n"(kThreads) : "memory");
     }
 };
-
-// Upper bound on the launch grid.
-constexpr std::uint32_t kSpecMaxGrid = 256u;
 
 }  // namespace halops::moe

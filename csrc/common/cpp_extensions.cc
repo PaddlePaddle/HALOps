@@ -242,6 +242,8 @@ int64_t MoETailRegionBytes(bool wide, int64_t tp_size);
 
 int64_t GetWorkspaceSize(int64_t max_tokens);
 
+void PrintMoEKernelInfo(const std::string& quant_mode);
+
 }  // namespace halops
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -322,4 +324,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("tp_size") = 1);
     m.def("moe_get_workspace_size", &halops::GetWorkspaceSize,
           py::arg("max_tokens") = 0);
+    m.def("print_moe_kernel_info", &halops::PrintMoEKernelInfo,
+          py::arg("quant_mode") = "");
 }

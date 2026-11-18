@@ -20,6 +20,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -321,12 +322,37 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
                 "kernel launch failed: ", cudaGetErrorString(launch_status));
 }
 
-}  // namespace moe
-
 template <class Dims>
 constexpr int64_t WorkspaceBytesFor() {
     return static_cast<int64_t>(sizeof(moe::MoEWorkspace<Dims>));
 }
+
+template <class Dims, class GemmTraits>
+void PrintGemmInfo(const char* phase) {
+    using Slots = GemmSlots<Dims, GemmTraits>;
+    printf(
+        "  %-12s TileShape=(%u,%u,%u) Slots=%u ScaleSlots=%u TmemAccSlots=%u "
+        "TmemScaleSlots=%u %s\n",
+        phase, GemmTraits::kTileShapeM, GemmTraits::kTileShapeN,
+        GemmTraits::kTileShapeK, Slots::kNumSlots, Slots::kScaleSlots,
+        Slots::kTmemAccSlots, Slots::kTmemScaleSlots,
+        GemmTraits::MmaCore::kUseBlockscaled ? "blockscaled" : "blockwise");
+}
+
+template <class Dims>
+void PrintDimsKernelInfo(const char* tag) {
+    using Traits = MoEKernelTraits<Dims>;
+
+    printf("%s: SMEM=%zu bytes\n", tag, get_moe_smem_size<Dims>());
+    PrintGemmInfo<Dims, typename Traits::RouterGemm>("router");
+    PrintGemmInfo<Dims, typename Traits::LatentDownGemm>("latent_down");
+    PrintGemmInfo<Dims, typename Traits::RoutedUpGemm>("routed_up");
+    PrintGemmInfo<Dims, typename Traits::RoutedDownGemm>("routed_down");
+    PrintGemmInfo<Dims, typename Traits::SharedUpGemm>("shared_up");
+    PrintGemmInfo<Dims, typename Traits::SharedDownGemm>("shared_down");
+}
+
+}  // namespace moe
 
 int64_t GetWorkspaceSize(int64_t max_tokens) {
     constexpr auto kBWFP8 = moe::QuantMethod::kBlockwiseFP8;
@@ -336,22 +362,64 @@ int64_t GetWorkspaceSize(int64_t max_tokens) {
     using QuantMXFP8 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP8>;
     using QuantMXFP4 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP4>;
 
-    constexpr int64_t kBs8Bytes = std::max(
-        {WorkspaceBytesFor<moe::Dims_BS8_E512_N512_K2048_SM100<QuantBWFP8{}>>(),
-         WorkspaceBytesFor<moe::Dims_BS8_E512_N512_K2048_SM100<QuantMXFP8{}>>(),
-         WorkspaceBytesFor<
-             moe::Dims_BS8_E512_N512_K2048_SM100<QuantMXFP4{}>>()});
+    constexpr int64_t kBs8Bytes =
+        std::max({moe::WorkspaceBytesFor<
+                      moe::Dims_BS8_E512_N512_K2048_SM100<QuantBWFP8{}>>(),
+                  moe::WorkspaceBytesFor<
+                      moe::Dims_BS8_E512_N512_K2048_SM100<QuantMXFP8{}>>(),
+                  moe::WorkspaceBytesFor<
+                      moe::Dims_BS8_E512_N512_K2048_SM100<QuantMXFP4{}>>()});
     constexpr int64_t kBs16Bytes =
-        std::max({WorkspaceBytesFor<
+        std::max({moe::WorkspaceBytesFor<
                       moe::Dims_BS16_E512_N512_K2048_SM100<QuantBWFP8{}>>(),
-                  WorkspaceBytesFor<
+                  moe::WorkspaceBytesFor<
                       moe::Dims_BS16_E512_N512_K2048_SM100<QuantMXFP8{}>>(),
-                  WorkspaceBytesFor<
+                  moe::WorkspaceBytesFor<
                       moe::Dims_BS16_E512_N512_K2048_SM100<QuantMXFP4{}>>()});
     if (max_tokens <= 0) {
         return kBs8Bytes > kBs16Bytes ? kBs8Bytes : kBs16Bytes;
     }
     return max_tokens <= 8 ? kBs8Bytes : kBs16Bytes;
+}
+
+void PrintMoEKernelInfo(const std::string& quant_mode) {
+    constexpr auto kBWFP8 = moe::QuantMethod::kBlockwiseFP8;
+    constexpr auto kMXFP8 = moe::QuantMethod::kMXFP8;
+    constexpr auto kMXFP4 = moe::QuantMethod::kMXFP4;
+    using QuantBWFP8 = moe::QuantConfig<kBWFP8, kBWFP8, kBWFP8>;
+    using QuantMXFP8 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP8>;
+    using QuantMXFP4 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP4>;
+
+    const auto wanted = [&quant_mode](const char* tag) {
+        return quant_mode.empty() ||
+               std::string(tag).find(quant_mode) != std::string::npos;
+    };
+
+    if (wanted("w8a8-blockwise")) {
+        moe::PrintDimsKernelInfo<
+            moe::Dims_BS8_E512_N512_K2048_SM100<QuantBWFP8{}>>(
+            "BS8-w8a8-blockwise");
+        moe::PrintDimsKernelInfo<
+            moe::Dims_BS16_E512_N512_K2048_SM100<QuantBWFP8{}>>(
+            "BS16-w8a8-blockwise");
+    }
+    if (wanted("w8a8-mxfp8")) {
+        moe::PrintDimsKernelInfo<
+            moe::Dims_BS8_E512_N512_K2048_SM100<QuantMXFP8{}>>(
+            "BS8-w8a8-mxfp8");
+        moe::PrintDimsKernelInfo<
+            moe::Dims_BS16_E512_N512_K2048_SM100<QuantMXFP8{}>>(
+            "BS16-w8a8-mxfp8");
+    }
+    if (wanted("w4a8-mxfp4")) {
+        moe::PrintDimsKernelInfo<
+            moe::Dims_BS8_E512_N512_K2048_SM100<QuantMXFP4{}>>(
+            "BS8-w4a8-mxfp4");
+        moe::PrintDimsKernelInfo<
+            moe::Dims_BS16_E512_N512_K2048_SM100<QuantMXFP4{}>>(
+            "BS16-w4a8-mxfp4");
+    }
+    fflush(stdout);
 }
 
 void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,

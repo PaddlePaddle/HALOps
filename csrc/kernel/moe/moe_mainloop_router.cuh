@@ -80,11 +80,12 @@ struct RouterProjectionBase {
     }
 
     // Every slot's first tile, which can be in flight before any slot drains.
-    static constexpr std::uint32_t kNumFirstWeightTiles =
-        RouterGemm::kNumWeightSlots;
+    static constexpr std::uint32_t kNumSlots =
+        GemmSlots<Dims, RouterGemm>::kNumSlots;
+    static constexpr std::uint32_t kNumFirstWeightTiles = kNumSlots;
     static_assert(kNumFirstWeightTiles <= WarpRole::kThreadsPerWarp,
                   "one loader lane refills each weight slot");
-    static_assert(RouterGemm::kNumInputSlots <= WarpRole::kThreadsPerWarp,
+    static_assert(kNumSlots <= WarpRole::kThreadsPerWarp,
                   "one loader lane issues each first-lap input tile");
 
     // Input tiles the first lap can leave in flight.
@@ -92,16 +93,14 @@ struct RouterProjectionBase {
         MoEProblemSize const& problem_size) {
         const std::uint32_t num_k_tiles =
             problem_size.hidden_size / RouterGemm::kTileShapeK;
-        return num_k_tiles < RouterGemm::kNumInputSlots
-                   ? num_k_tiles
-                   : RouterGemm::kNumInputSlots;
+        return num_k_tiles < kNumSlots ? num_k_tiles : kNumSlots;
     }
 
     // Arm a weight tile's slot, then load the tile into it.
     __device__ static void load_weight_tile(
         CUtensorMap const& tma_router_weights_desc,
         SharedStorage* __restrict__ smem, std::uint32_t j) {
-        const std::uint32_t slot = j % RouterGemm::kNumWeightSlots;
+        const std::uint32_t slot = j % kNumSlots;
         smem->barriers.router.weight_ready.arrive(j, MmaCore::kWeightTileBytes);
         tma_load_3d(tma_router_weights_desc, /*coord0=*/0u,
                     /*row=*/weight_row_begin(),
@@ -114,7 +113,7 @@ struct RouterProjectionBase {
     __device__ static void load_input_tile(CUtensorMap const& tma_input_desc,
                                            SharedStorage* __restrict__ smem,
                                            std::uint32_t k_iter_id) {
-        const std::uint32_t slot = k_iter_id % RouterGemm::kNumInputSlots;
+        const std::uint32_t slot = k_iter_id % kNumSlots;
         smem->barriers.router.input_ready.arrive(k_iter_id, kInputTileTxBytes);
         load_input_tile_chunks<RouterGemm::kTileShapeN>(
             tma_input_desc, k_iter_id, token_begin(),
@@ -189,7 +188,8 @@ struct RouterProjectionBase {
         if (num_k_tiles <= kNumFirstWeightTiles) return;
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         std::uint32_t j = kNumFirstWeightTiles + lane_idx;
-        bool pending = lane_idx < kNumFirstWeightTiles;
+
+        bool pending = j < num_k_tiles;
         // Slot 0 drains first; poll the slots from then on.
         smem->barriers.router.weight_empty.wait(0u);
         while (__any_sync(0xffffffffu, pending)) {
@@ -242,6 +242,7 @@ template <typename KernelTraits>
 struct RouterProjection<KernelTraits, true>
     : RouterProjectionBase<KernelTraits> {
     using Base = RouterProjectionBase<KernelTraits>;
+    using Base::kNumSlots;
     using Base::kTileShapeM;
     using typename Base::MmaCore;
     using typename Base::RouterGemm;
@@ -307,24 +308,22 @@ struct RouterProjection<KernelTraits, true>
         cute::Tensor tCt = cta_mma.make_fragment_C(tC_proxy);
 
         // The streamed input holds one tile at a time; a block reads all K.
-        constexpr std::uint32_t kInputSlots = RouterGemm::kNumInputSlots;
         const std::uint32_t num_k_tiles =
             problem_size.hidden_size / RouterGemm::kTileShapeK;
 #pragma unroll 1
         for (std::uint32_t j = 0; j < num_k_tiles; ++j) {
             const std::uint32_t k_iter_id = j;
-            const std::uint32_t slot = k_iter_id % kInputSlots;
+            const std::uint32_t slot = k_iter_id % kNumSlots;
             smem->barriers.router.wait_mma_ready(k_iter_id);
             cute::Tensor tCrB = cta_mma.make_fragment_B(cute::make_tensor(
                 cute::make_smem_ptr(
                     reinterpret_cast<typename MmaCore::TiledMma::ValTypeB*>(
                         &smem->router.input.data[slot][0][0][0])),
                 SBLayout{}));
-            MmaCore::run(
-                tiled_mma, cta_mma,
-                &smem->router.w_router[j % RouterGemm::kNumWeightSlots][0],
-                tCrB, tCt, tmem_addr(tmem_base, 0u, 0u),
-                /*accumulate=*/j != 0u);
+            MmaCore::run(tiled_mma, cta_mma,
+                         &smem->router.w_router[j % kNumSlots][0], tCrB, tCt,
+                         tmem_addr(tmem_base, 0u, 0u),
+                         /*accumulate=*/j != 0u);
             // Release the weight slot after UMMA completes.
             cutlass::arch::umma_arrive(
                 smem->barriers.router.weight_empty.raw(j));
@@ -381,6 +380,7 @@ template <typename KernelTraits>
 struct RouterProjection<KernelTraits, false>
     : RouterProjectionBase<KernelTraits> {
     using Base = RouterProjectionBase<KernelTraits>;
+    using Base::kNumSlots;
     using Base::kTileShapeM;
     using typename Base::MmaCore;
     using typename Base::RouterGemm;
@@ -439,7 +439,6 @@ struct RouterProjection<KernelTraits, false>
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         float acc[MmaCore::kNumAtomMs][MmaCore::kAtomElemsC] = {};
-        constexpr std::uint32_t kInputSlots = RouterGemm::kNumInputSlots;
         const std::uint32_t num_k_tiles =
             problem_size.hidden_size / RouterGemm::kTileShapeK;
         const std::uint32_t num_k_tiles_per_warp =
@@ -450,13 +449,12 @@ struct RouterProjection<KernelTraits, false>
             const std::uint32_t k_iter_id =
                 j * WarpRole::kCalcWarpCount + warp_idx;
             if (k_iter_id >= num_k_tiles) break;
-            const std::uint32_t slot = k_iter_id % kInputSlots;
+            const std::uint32_t slot = k_iter_id % kNumSlots;
             smem->barriers.router.wait_mma_ready(k_iter_id);
             MmaCore::run(
                 cute::make_tensor(
                     cute::make_smem_ptr(
-                        &smem->router.w_router[k_iter_id %
-                                               RouterGemm::kNumWeightSlots][0]),
+                        &smem->router.w_router[k_iter_id % kNumSlots][0]),
                     typename MmaCore::WeightTileLayout{}),
                 cute::make_tensor(cute::make_smem_ptr(
                                       &smem->router.input.data[slot][0][0][0]),

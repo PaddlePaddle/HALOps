@@ -35,6 +35,7 @@ from core.runtime_info import (  # noqa: E402
 from kernel.attention.scenarios import SCENARIOS as _attn_scenarios  # noqa: E402
 from kernel.gemm.scenarios import SCENARIOS as _gemm_scenarios  # noqa: E402
 from kernel.moe.scenarios import SCENARIOS as _moe_scenarios  # noqa: E402
+from halops.halops_kernel import print_moe_kernel_info  # noqa: E402
 
 OP_REGISTRY: dict[str, dict] = {
     "attention": _attn_scenarios,
@@ -204,6 +205,9 @@ def main(args):
             print(f"Driver     : {get_driver_version()}")
             print(f"cuda_graph : {cfg.get('use_cuda_graph', False)}")
             print_backend_versions(cfg.get("backends", []))
+            if op == "moe":
+                sys.stdout.flush()
+                print_moe_kernel_info(cfg.get("quant_mode", ""))
             print("=" * 60)
 
             if not _run_scenarios(op, cfg):

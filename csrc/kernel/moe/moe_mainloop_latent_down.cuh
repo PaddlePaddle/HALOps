@@ -57,16 +57,15 @@ struct LatentDownProjectionBase {
     static constexpr std::uint32_t kNumCtas = LatentDownGemm::kNumCtas;
     static constexpr std::uint32_t kNumTilesM = LatentDownGemm::kNumTilesM;
 
-    static constexpr std::uint32_t kNumInputSlots =
-        LatentDownGemm::kNumInputSlots;
-    static constexpr std::uint32_t kNumWeightSlots =
-        LatentDownGemm::kNumWeightSlots;
+    // The weight, input and scale rings share one depth.
+    static constexpr std::uint32_t kNumSlots =
+        GemmSlots<Dims, LatentDownGemm>::kNumSlots;
 
     static constexpr std::uint32_t kNumSplits = LatentDownGemm::kNumSplits;
     using Cluster = ClusterSplitK<Traits::kClusterSize, kNumSplits>;
 
     static constexpr std::uint32_t kOutChunkK =
-        LatentDownSmem<LatentDownGemm>::kOutLboChunkK;
+        LatentDownSmem<Dims, LatentDownGemm>::kOutLboChunkK;
     static constexpr std::uint32_t kOutChunks = kTileShapeM / kOutChunkK;
     static constexpr std::uint32_t kGemmN = LatentDownGemm::kGemmN;
 
@@ -126,7 +125,7 @@ struct LatentDownProjectionBase {
                                           std::uint32_t k_iter_id) {
         return reinterpret_cast<Element*>(
             &smem->latent_down.quantized_input
-                 .data[k_iter_id % kNumInputSlots][0][0][0]);
+                 .data[k_iter_id % kNumSlots][0][0][0]);
     }
 
     __device__ static void run_load_input_k_loop(
@@ -135,7 +134,7 @@ struct LatentDownProjectionBase {
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
-            const std::uint32_t slot = k_iter_id % kNumInputSlots;
+            const std::uint32_t slot = k_iter_id % kNumSlots;
             smem->barriers.latent_down.wait_input_empty(k_iter_id);
 
             smem->barriers.latent_down.input_ready.arrive(k_iter_id,
@@ -151,7 +150,7 @@ struct LatentDownProjectionBase {
         CUtensorMap const& tma_latent_down_weight_desc,
         SharedStorage* __restrict__ smem, std::uint32_t k_iter_id,
         std::uint32_t transaction_bytes, std::uint32_t num_k_tiles) {
-        const std::uint32_t slot = k_iter_id % kNumWeightSlots;
+        const std::uint32_t slot = k_iter_id % kNumSlots;
         smem->barriers.latent_down.weight_ready.arrive(k_iter_id,
                                                        transaction_bytes);
         constexpr std::uint32_t kChunkK = LatentDownGemm::MmaCore::kSwizzleBoxK;
@@ -184,7 +183,7 @@ struct LatentDownProjectionBase {
                                                std::uint32_t batch_size,
                                                std::uint32_t k_iter_id,
                                                std::uint32_t num_k_tiles) {
-        const std::uint32_t slot = k_iter_id % kNumInputSlots;
+        const std::uint32_t slot = k_iter_id % kNumSlots;
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
         if constexpr (LatentDownGemm::InputQuant::kMethod ==
                       QuantMethod::kMXFP8) {
@@ -448,8 +447,7 @@ struct LatentDownProjection<KernelTraits, true>
     // Fill valid SFB rows and zero the padding for UTCCP.
     __device__ static void zero_sf_slots(SharedStorage* __restrict__ smem) {
         constexpr std::uint32_t kSfWords =
-            Base::kNumInputSlots *
-            (128u * (LatentDownGemm::kTileShapeK / 32u)) / 4u;
+            Base::kNumSlots * (128u * (LatentDownGemm::kTileShapeK / 32u)) / 4u;
         auto* const sf = reinterpret_cast<std::uint32_t*>(
             &smem->latent_down.quantized_input.scale[0][0]);
         for (std::uint32_t i = threadIdx.x; i < kSfWords;
@@ -538,7 +536,7 @@ struct LatentDownProjection<KernelTraits, true>
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
-            const std::uint32_t slot = k_iter_id % Base::kNumWeightSlots;
+            const std::uint32_t slot = k_iter_id % Base::kNumSlots;
             const std::uint32_t k_tile = Base::k_tile(k_iter_id, num_k_tiles);
             smem->barriers.latent_down.wait_weight_empty(k_iter_id);
             if (scale_layout == ScaleLayout::kSfAtom) {
@@ -577,7 +575,7 @@ struct LatentDownProjection<KernelTraits, true>
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
-            const std::uint32_t w_slot = k_iter_id % Base::kNumWeightSlots;
+            const std::uint32_t w_slot = k_iter_id % Base::kNumSlots;
             smem->barriers.latent_down.template wait_mma_ready<true, false>(
                 k_iter_id);
             auto tCsB = cute::make_tensor(
@@ -588,7 +586,7 @@ struct LatentDownProjection<KernelTraits, true>
             std::uint8_t* const sfa = &smem->latent_down.w_scale[w_slot][0];
             std::uint8_t* const sfb =
                 &smem->latent_down.quantized_input
-                     .scale[k_iter_id % Base::kNumInputSlots][0];
+                     .scale[k_iter_id % Base::kNumSlots][0];
             if (cute::elect_one_sync()) {
                 ScaleTraits::copy_sfa_to_tmem(sfa, tmem_base + kSfaTmemOffset);
                 ScaleTraits::copy_sfb_to_tmem(sfb, tmem_base + kSfbTmemOffset);
@@ -647,7 +645,8 @@ struct LatentDownProjection<KernelTraits, false>
         !MmaCore::kUseBlockscaled,
         "LatentDownProjection<false> requires a non-blockscaled MMA core");
 
-    static constexpr std::uint32_t kNumAccSlots = LatentDownGemm::kNumAccSlots;
+    static constexpr std::uint32_t kTmemAccSlots =
+        GemmSlots<Dims, LatentDownGemm>::kTmemAccSlots;
     static constexpr std::uint32_t kAccColumns =
         get_gemm_acc_columns<Traits::RoutedUpGemm>();
 
@@ -701,8 +700,8 @@ struct LatentDownProjection<KernelTraits, false>
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
-            const std::uint32_t acc_slot = k_iter_id % kNumAccSlots;
-            const std::uint32_t w_slot = k_iter_id % Base::kNumWeightSlots;
+            const std::uint32_t acc_slot = k_iter_id % kTmemAccSlots;
+            const std::uint32_t w_slot = k_iter_id % Base::kNumSlots;
             smem->barriers.latent_down.template wait_mma_ready<true, true>(
                 k_iter_id);
             auto tCsB = cute::make_tensor(
@@ -770,13 +769,13 @@ struct LatentDownProjection<KernelTraits, false>
                 if (warp_idx < kReaderWarps) {
                     tmem_ld_16x256b1x(
                         tmem_addr(smem->tmem_ptr, Base::lane_base(warp_idx),
-                                  (k_iter_id % kNumAccSlots) * kAccColumns +
+                                  (k_iter_id % kTmemAccSlots) * kAccColumns +
                                       sub * MmaCore::kAtomShapeN + g * 8u),
                         v);
                     cutlass::arch::fence_view_async_tmem_load();
                 }
                 // Value i is (row t1 + 8*(i/2), token 8*g + 2*t0 + i%2).
-                const std::uint32_t act_slot = k_iter_id % Base::kNumInputSlots;
+                const std::uint32_t act_slot = k_iter_id % Base::kNumSlots;
                 const std::uint32_t row =
                     sub * Base::kTileShapeN + 8u * g + 2u * t0;
                 as[0] = smem->latent_down.quantized_input.scale[act_slot][row];

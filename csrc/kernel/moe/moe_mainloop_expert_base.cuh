@@ -83,11 +83,13 @@ struct UpProjectionBase {
     using UpScaleTraits = typename UpGemm::ScaleTraits;
 
     static constexpr std::uint32_t kNumSplits = UpGemm::kNumSplits;
-    static constexpr std::uint32_t kNumWeightSlots = UpGemm::kNumWeightSlots;
-    static constexpr std::uint32_t kNumAccSlots = UpGemm::kNumAccSlots;
+    static constexpr std::uint32_t kNumSlots =
+        GemmSlots<Dims, UpGemm>::kNumSlots;
+    static constexpr std::uint32_t kTmemAccSlots =
+        GemmSlots<Dims, UpGemm>::kTmemAccSlots;
     static constexpr std::uint32_t kAccColumns = get_gemm_acc_columns<UpGemm>();
     static constexpr std::uint32_t kUpSfaTmemOffset =
-        kNumAccSlots * kAccColumns;
+        kTmemAccSlots * kAccColumns;
     static constexpr std::uint32_t kUpSfbTmemOffset =
         kUpSfaTmemOffset + UpScaleTraits::kSfaTmemColumns;
 
@@ -368,7 +370,8 @@ struct DownProjectionBase {
     using Accumulator = cutlass::Array<float, DownGemm::kTileShapeN>;
 
     static constexpr std::uint32_t kTileShapeM = DownGemm::kTileShapeM;
-    static constexpr std::uint32_t kNumWeightSlots = DownGemm::kNumWeightSlots;
+    static constexpr std::uint32_t kNumSlots =
+        GemmSlots<Dims, DownGemm>::kNumSlots;
     static constexpr std::uint32_t kAccColumns =
         get_gemm_acc_columns<DownGemm>();
     static constexpr std::uint32_t kTokenGroups = DownGemm::kTileShapeN / 8u;

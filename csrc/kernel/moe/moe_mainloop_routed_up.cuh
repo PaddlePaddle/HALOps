@@ -43,7 +43,7 @@ struct RoutedUpProjectionBase
     using Base =
         UpProjectionBase<KernelTraits, typename KernelTraits::RoutedUpGemm>;
     using Base::kAccColsPerThread;
-    using Base::kNumWeightSlots;
+    using Base::kNumSlots;
     using Base::kQuantGroups;
     using typename Base::Accumulator;
     using typename Base::Dims;
@@ -208,7 +208,7 @@ struct RoutedUpProjection<KernelTraits, true>
     static_assert(UpGemm::MmaCore::kUseBlockscaled,
                   "RoutedUpProjection<true> requires a blockscaled MMA core");
 
-    using Base::kNumAccSlots;
+    using Base::kTmemAccSlots;
 
     // Run up-projection over this block's expert sequence.
     __device__ static void run(
@@ -272,7 +272,7 @@ struct RoutedUpProjection<KernelTraits, true>
         smem->barriers.routed.accumulator_ready.wait(task_id);
 
         Base::load_accumulators(tmem_base, acc_gate_out, acc_up_out,
-                                task_id % kNumAccSlots);
+                                task_id % kTmemAccSlots);
         cutlass::arch::fence_view_async_tmem_load();
         __syncwarp();
         if (WarpRole::get_lane_idx() == 0u) {
@@ -289,11 +289,11 @@ struct RoutedUpProjection<KernelTraits, true>
         typename UpGemm::TiledMma tiled_mma{};
         auto cta_mma = tiled_mma.get_slice(cute::_0{});
         auto tCt = Base::make_accumulator_fragment(cta_mma);
-        const std::uint32_t acc_slot = task_id % kNumAccSlots;
+        const std::uint32_t acc_slot = task_id % kTmemAccSlots;
 
-        if (task_id >= kNumAccSlots) {
+        if (task_id >= kTmemAccSlots) {
             smem->barriers.routed.accumulator_empty.wait(task_id -
-                                                         kNumAccSlots);
+                                                         kTmemAccSlots);
         }
 
 #pragma unroll 1
@@ -301,15 +301,14 @@ struct RoutedUpProjection<KernelTraits, true>
              ++k_iter_id) {
             const std::uint32_t ring_iter_id =
                 task_id * num_k_tiles + k_iter_id;
-            const std::uint32_t weight_slot =
-                ring_iter_id % Base::kNumWeightSlots;
+            const std::uint32_t weight_slot = ring_iter_id % Base::kNumSlots;
             smem->barriers.routed.wait_up_mma_ready(ring_iter_id);
             Base::mma(
                 tiled_mma, cta_mma, tCt,
                 reinterpret_cast<typename Base::WeightElement*>(
                     &smem->routed_experts.w_up[weight_slot][0]),
                 &smem->routed_experts.quantized_input
-                     .data[ring_iter_id % Base::kNumWeightSlots][0][0][0],
+                     .data[ring_iter_id % Base::kNumSlots][0][0][0],
                 tmem_base, acc_slot,
                 smem->routed_experts.w_up_scale[weight_slot],
                 &smem->routed_experts.quantized_input.scale[weight_slot][0],
@@ -332,19 +331,17 @@ struct RoutedUpProjection<KernelTraits, true>
                 task_id * num_k_tiles + k_iter_id;
             wait_weight_empty(smem, ring_iter_id);
             Base::load_input_tile(workspace, smem,
-                                  ring_iter_id % Base::kNumWeightSlots,
-                                  k_iter_id);
+                                  ring_iter_id % Base::kNumSlots, k_iter_id);
         }
     }
 
     // A weight slot is reusable when its previous K tile's MMA completes.
     __device__ static void wait_weight_empty(SharedStorage* __restrict__ smem,
                                              std::uint32_t arm_id) {
-        if (arm_id < Base::kNumWeightSlots) {
+        if (arm_id < Base::kNumSlots) {
             return;
         }
-        smem->barriers.routed.up_weight_empty.wait(arm_id -
-                                                   Base::kNumWeightSlots);
+        smem->barriers.routed.up_weight_empty.wait(arm_id - Base::kNumSlots);
     }
 
     // Stream weight tiles and their scale atoms through the ring.
@@ -363,7 +360,7 @@ struct RoutedUpProjection<KernelTraits, true>
             const std::uint32_t ring_iter_id =
                 task_id * num_k_tiles + k_iter_id;
             wait_weight_empty(smem, ring_iter_id);
-            const std::uint32_t slot = ring_iter_id % Base::kNumWeightSlots;
+            const std::uint32_t slot = ring_iter_id % Base::kNumSlots;
             smem->barriers.routed.up_weight_ready.arrive(
                 slot, Base::kUpWeightTxBytes);
             Base::load_weight_tile(
@@ -385,7 +382,7 @@ struct RoutedUpProjection<KernelTraits, true>
         std::uint32_t ring_iter_id, std::uint32_t k_tile,
         std::uint32_t expert_id, std::uint32_t weight_row_base,
         std::uint32_t num_k_tiles) {
-        const std::uint32_t slot = ring_iter_id % Base::kNumWeightSlots;
+        const std::uint32_t slot = ring_iter_id % Base::kNumSlots;
         const std::uint32_t row_atom =
             expert_id * (UpGemm::kGemmM / 128u) + weight_row_base / 128u;
         Base::load_weight_scale_tile(
@@ -410,13 +407,14 @@ struct RoutedUpProjection<KernelTraits, false>
     static_assert(
         !UpGemm::MmaCore::kUseBlockscaled,
         "RoutedUpProjection<false> requires a non-blockscaled MMA core");
-    using Base::kNumAccSlots;
+    using Base::kTmemAccSlots;
     static_assert(
-        Base::kNumWeightSlots <= kNumAccSlots,
+        Base::kNumSlots <= kTmemAccSlots,
         "The weight ring must not outrun the accumulator ring, or the "
-        "re-arm's wait_accumulator_ready(arm_id - kNumWeightSlots) "
+        "re-arm's wait_accumulator_ready(arm_id - kNumSlots) "
         "can read a phase the ring has already wrapped past.");
-    static constexpr std::uint32_t kScaleSlots = UpGemm::kWeightScaleSlots;
+    static constexpr std::uint32_t kScaleSlots =
+        GemmSlots<Dims, UpGemm>::kScaleSlots;
 
     // Run up-projection over this block's expert sequence.
     __device__ static void run(
@@ -495,23 +493,22 @@ struct RoutedUpProjection<KernelTraits, false>
         for (std::uint32_t k_iter = 0; k_iter < num_k_tiles; ++k_iter) {
             const std::uint32_t ring_iter = task_id * num_k_tiles + k_iter;
             wait_weight_empty(smem, ring_iter);
-            if (ring_iter >= Base::kNumWeightSlots) {
-                smem->barriers.routed.input_scale_empty.wait(
-                    ring_iter - Base::kNumWeightSlots);
+            if (ring_iter >= Base::kNumSlots) {
+                smem->barriers.routed.input_scale_empty.wait(ring_iter -
+                                                             Base::kNumSlots);
             }
-            Base::load_input_tile(workspace, smem,
-                                  ring_iter % Base::kNumWeightSlots, k_iter);
+            Base::load_input_tile(workspace, smem, ring_iter % Base::kNumSlots,
+                                  k_iter);
         }
     }
 
     // The previous tile's accumulator readiness also releases its weights.
     __device__ static void wait_weight_empty(SharedStorage* __restrict__ smem,
                                              std::uint32_t arm_id) {
-        if (arm_id < Base::kNumWeightSlots) {
+        if (arm_id < Base::kNumSlots) {
             return;
         }
-        smem->barriers.routed.accumulator_ready.wait(arm_id -
-                                                     Base::kNumWeightSlots);
+        smem->barriers.routed.accumulator_ready.wait(arm_id - Base::kNumSlots);
     }
 
     // Stream weight tiles through the ring without scale atoms.
@@ -526,7 +523,7 @@ struct RoutedUpProjection<KernelTraits, false>
             const std::uint32_t ring_iter_id =
                 task_id * num_k_tiles + k_iter_id;
             wait_weight_empty(smem, ring_iter_id);
-            const std::uint32_t slot = ring_iter_id % Base::kNumWeightSlots;
+            const std::uint32_t slot = ring_iter_id % Base::kNumSlots;
             smem->barriers.routed.up_weight_ready.arrive(
                 slot, UpGemm::MmaCore::kWeightTileTxBytes);
             Base::load_weight_tile(
@@ -575,15 +572,14 @@ struct RoutedUpProjection<KernelTraits, false>
              ++k_iter_id) {
             const std::uint32_t ring_iter_id =
                 task_id * num_k_tiles + k_iter_id;
-            const std::uint32_t acc_slot = ring_iter_id % kNumAccSlots;
-            const std::uint32_t weight_slot =
-                ring_iter_id % Base::kNumWeightSlots;
+            const std::uint32_t acc_slot = ring_iter_id % kTmemAccSlots;
+            const std::uint32_t weight_slot = ring_iter_id % Base::kNumSlots;
             smem->barriers.routed.wait_up_mma_ready(ring_iter_id);
             Base::mma(tiled_mma, cta_mma, tCt,
                       reinterpret_cast<typename Base::WeightElement*>(
                           &smem->routed_experts.w_up[weight_slot][0]),
                       &smem->routed_experts.quantized_input
-                           .data[ring_iter_id % Base::kNumWeightSlots][0][0][0],
+                           .data[ring_iter_id % Base::kNumSlots][0][0][0],
                       tmem_base, acc_slot);
             // The commit covers every async tcgen05 op issued before it.
             cutlass::arch::umma_arrive(
@@ -611,7 +607,7 @@ struct RoutedUpProjection<KernelTraits, false>
                                    std::uint32_t tmem_base) {
         smem->barriers.routed.accumulator_ready.wait(ring_iter_id - 1u);
 
-        const std::uint32_t prev_slot = (ring_iter_id - 1u) % kNumAccSlots;
+        const std::uint32_t prev_slot = (ring_iter_id - 1u) % kTmemAccSlots;
 
         const float* ws_buf = smem->routed_experts.w_up_scale[cur_scale_slot];
         const std::uint32_t scale_blocks_k =
@@ -625,12 +621,12 @@ struct RoutedUpProjection<KernelTraits, false>
                 (s - 1u) * UpGemm::MmaCore::kNumQuantBlocksB + sub;
             const std::uint32_t acc_col =
                 prev_slot * Base::kAccColumns + sub * UpGemm::kTileShapeN;
-            Base::dequant(
-                tmem_base, acc_col,
-                &smem->routed_experts.quantized_input
-                     .scale[(ring_iter_id - 1u) % Base::kNumWeightSlots]
-                           [sub * UpGemm::kTileShapeN],
-                ws_buf[kblk], ws_buf[kblk + scale_blocks_k], acc_gate, acc_up);
+            Base::dequant(tmem_base, acc_col,
+                          &smem->routed_experts.quantized_input
+                               .scale[(ring_iter_id - 1u) % Base::kNumSlots]
+                                     [sub * UpGemm::kTileShapeN],
+                          ws_buf[kblk], ws_buf[kblk + scale_blocks_k], acc_gate,
+                          acc_up);
         }
         release_accumulator_slot(smem, ring_iter_id);
     }

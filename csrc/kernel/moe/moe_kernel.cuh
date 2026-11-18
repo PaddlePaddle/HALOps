@@ -113,7 +113,7 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     pdl_trigger();
     __syncthreads();
     if (WarpRole::is_tmem_warp(warp_idx)) {
-        tmem_free(smem->tmem_ptr, Traits::kTmemColumns);
+        tmem_free(smem->tmem_ptr, MoETmemPlan<Dims>::kTmemColumns);
     }
 }
 

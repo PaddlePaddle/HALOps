@@ -62,9 +62,9 @@ struct SharedUpProjectionBase
 
     static constexpr std::uint32_t kLboChunk =
         Workspace::SharedUpOut::kLboChunk;
-    static constexpr std::uint32_t kNumUpSlots = Base::kNumWeightSlots;
+    static constexpr std::uint32_t kNumUpSlots = Base::kNumSlots;
     static constexpr std::uint32_t kInputSwizzleBoxK =
-        decltype(SharedExpertSmem<SharedUpGemm,
+        decltype(SharedExpertSmem<Dims, SharedUpGemm,
                                   SharedDownGemm>::input)::kSwizzleBoxK;
     // TMA byte count for the staged BF16 input tile.
     static constexpr std::uint32_t kInputTileTxBytes =
@@ -264,7 +264,7 @@ struct SharedDownProjectionBase
     static constexpr std::uint32_t kDownActChunks =
         SharedDownGemm::kTileShapeK / Workspace::SharedUpOut::kLboChunk;
     static constexpr std::uint32_t kNumDownSlots =
-        SharedDownGemm::kNumWeightSlots;
+        GemmSlots<Dims, SharedDownGemm>::kNumSlots;
 
     using SBLayout = decltype(cute::make_layout(
         cute::make_shape(
@@ -525,7 +525,7 @@ struct SharedUpProjection<KernelTraits, false>
         !SharedUpGemm::MmaCore::kUseBlockscaled,
         "SharedUpProjection<false> requires a non-blockscaled MMA core");
 
-    using Base::kNumAccSlots;
+    using Base::kTmemAccSlots;
 
     __device__ static void run(
         CUtensorMap const& tma_up_desc, CUtensorMap const& tma_input_desc,
@@ -584,7 +584,7 @@ struct SharedUpProjection<KernelTraits, false>
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
             const std::uint32_t ring = k_iter_id % Base::kNumUpSlots;
-            const std::uint32_t acc_slot = k_iter_id % kNumAccSlots;
+            const std::uint32_t acc_slot = k_iter_id % kTmemAccSlots;
             smem->barriers.shared_up.template wait_mma_ready<true, true>(
                 k_iter_id);
             Base::mma(tiled_mma, cta_mma, tCt, &sh.w_up[ring][0][0][0],
@@ -617,7 +617,7 @@ struct SharedUpProjection<KernelTraits, false>
         Accumulator& gate, Accumulator& up, std::uint32_t num_k_tiles) {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
-        const std::uint32_t acc_slot = k_iter_id % kNumAccSlots;
+        const std::uint32_t acc_slot = k_iter_id % kTmemAccSlots;
         smem->barriers.shared_up.accumulator_ready.wait(k_iter_id);
         tcgen05_fence_after_thread_sync();
 
