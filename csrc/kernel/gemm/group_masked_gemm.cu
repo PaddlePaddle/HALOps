@@ -75,8 +75,7 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
     params.use_pdl = true;
 
     if (mode == "bf16") {
-        // Native BF16: sfa/sfb/bias/alpha are ignored; dispatch and launch
-        // live in gemm_dispatch.cuh (bf16::LaunchMasked).
+        // Native BF16: sfa/sfb/bias/alpha are ignored.
         const int k = weight.size(2);
         TORCH_CHECK(input.size(1) == k,
                     "input K must match weight K, got input K=", input.size(1),
@@ -93,7 +92,15 @@ void GroupMaskedGemm(const torch::Tensor& input, const torch::Tensor& weight,
         params.ptr_sfa = nullptr;
         params.ptr_sfb = nullptr;
         params.ptr_alpha = nullptr;
-        bf16::LaunchMasked(params, sm, stream);
+        LaunchCfg<KernelMode::Masked, MmaKind::BF16>(
+            params,
+            {.m = max_m_per_expert,
+             .n = n,
+             .k = k,
+             .m_grid = m,
+             .sm_count = sm,
+             .has_bias = false},
+            stream);
     } else if (mode == "w8a8-mxfp8") {
         TORCH_CHECK(sfa.has_value() && sfb.has_value(),
                     "w8a8-mxfp8 masked grouped GEMM requires sfa/sfb scale "

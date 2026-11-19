@@ -73,8 +73,7 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
                                : 0.0f};
 
     if (mode == "bf16") {
-        // Native BF16: sfa/sfb/bias/alpha are ignored; the tile ladder,
-        // validation and launch live in gemm_dispatch.cuh (bf16::LaunchDense).
+        // Native BF16: sfa/sfb/bias/alpha are ignored.
         TORCH_CHECK(input.dtype() == torch::kBFloat16,
                     "bf16 dense GEMM: input must be bfloat16");
         TORCH_CHECK(weight.dtype() == torch::kBFloat16,
@@ -106,7 +105,15 @@ void DenseGemm(const torch::Tensor& input, const torch::Tensor& weight,
             CheckDivisible(m, 64, "BF16 GEMM SwapAB M");
             CheckDivisible(k, 64, "BF16 GEMM SwapAB K");
         }
-        bf16::LaunchDense(params, sm, stream);
+        LaunchCfg<KernelMode::Dense, MmaKind::BF16>(
+            params,
+            {.m = m,
+             .n = n,
+             .k = k,
+             .m_grid = m,
+             .sm_count = sm,
+             .has_bias = false},
+            stream);
     } else if (mode == "w8a8-mxfp8") {
         TORCH_CHECK(sfa.has_value() && sfb.has_value(),
                     "w8a8-mxfp8 dense GEMM requires sfa/sfb scale factors "
