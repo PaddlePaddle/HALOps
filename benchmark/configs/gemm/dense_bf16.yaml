@@ -1,0 +1,30 @@
+# configs/gemm/dense_bf16.yaml
+# Default quick preset: 10 shapes, for routine runs. Picks one or two
+# representatives per M-based dispatch tier in DenseGemm (dense_gemm.cu), plus
+# the odd-N shapes and the biggest absolute-loss shape.
+#
+#   M=64    x2  thin-M non-swap rung (incl. widest N=32768)
+#   M=128   x2  thin-M / 96-wide rung (incl. narrow N=128)
+#   M=256   x1  mid-M ladder entry
+#   M=1024  x3  mid-M valley + N=1600 + widest N
+#   M=4096  x1  large-M square
+#   M=8192  x1  large-M, N=32768 family
+scenario: dense_gemm
+mode: bf16
+shapes:
+  - [64, 4096, 4096]     # thin-M
+  - [64, 32768, 1024]    # thin-M widest N
+  - [128, 4096, 4096]    # thin-M / 96-wide rung
+  - [128, 128, 4096]     # narrow N
+  - [256, 4096, 4096]    # mid-M ladder entry
+  - [1024, 4096, 4096]   # mid-M valley
+  - [1024, 1600, 4096]   # N=1600 (predicated N-tail)
+  - [1024, 32768, 1024]  # mid-M widest N
+  - [4096, 4096, 4096]   # large-M square
+  - [8192, 32768, 1024]  # large-M, biggest absolute-loss shape
+sm_count: -1
+
+backends: [halops, fi, deepgemm]
+cold_l2_cache: true
+refcheck: true
+refcheck_reference: golden

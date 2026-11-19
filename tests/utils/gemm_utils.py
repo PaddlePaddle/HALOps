@@ -28,6 +28,7 @@ from tests.utils.fp4_utils import (
 W8A8_MXFP8_TOL = dict(rtol=2e-2, atol=2e-3)
 MXFP8_BLOCK_SIZE = 32
 W4A4_TOL = dict(rtol=5e-2, atol=5e-2)
+BF16_TOL = dict(rtol=1e-2, atol=1e-2)
 
 # =====================================================================
 # FP8 (W8A8-MXFP8) quantization helpers

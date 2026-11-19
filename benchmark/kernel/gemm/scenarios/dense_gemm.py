@@ -45,7 +45,7 @@ FP8_SF_BLOCK = 32
 NVFP4_SF_BLOCK = 16
 # group_wise_quant can also produce MXFP4 inputs, but this benchmark only
 # generates the FP8 and NVFP4 recipes (the kernel supports w4a4-mxfp4 too).
-DENSE_MODES = ("w8a8-mxfp8", "w4a4-nvfp4")
+DENSE_MODES = ("w8a8-mxfp8", "w4a4-nvfp4", "bf16")
 
 
 @dataclass
@@ -80,6 +80,29 @@ def _build_inputs(
             f"Expected one of {DENSE_MODES}."
         )
     is_nvfp4 = mode == "w4a4-nvfp4"
+
+    if mode == "bf16":
+        # Native BF16: no quantization, no scale factors, no alpha. The kernel
+        # consumes the bf16 source directly; x/w double as the golden source.
+        assert k % 64 == 0, f"k={k} must be divisible by 64 for bf16"
+        x_bf16 = torch.randn(m, k, dtype=torch.bfloat16, device=dev)
+        w_bf16 = torch.randn(n, k, dtype=torch.bfloat16, device=dev)
+        out = torch.empty(m, n, dtype=torch.bfloat16, device=dev)
+        return GemmInput(
+            x=x_bf16,
+            w=w_bf16,
+            sfa=None,
+            sfb=None,
+            out=out,
+            m=m,
+            n=n,
+            k=k,
+            sm_count=sm_count,
+            mode=mode,
+            x_bf16=x_bf16,
+            w_bf16=w_bf16,
+            alpha=None,
+        )
 
     if is_nvfp4:
         assert k % (2 * NVFP4_SF_BLOCK) == 0, f"k={k} must be divisible by 32"
@@ -128,6 +151,13 @@ def adapt_halops(inp: GemmInput) -> dict:
 
 def adapt_fi(inp: GemmInput) -> dict:
     """Adapt inputs for FlashInfer backend."""
+    if inp.mode == "bf16":
+        return {
+            "x": inp.x,
+            "w": inp.w,
+            "out": inp.out,
+            "mode": "bf16",
+        }
     if inp.mode == "w4a4-nvfp4":
         return {
             "x": inp.x,
@@ -272,9 +302,17 @@ def run_scenario(cfg: dict) -> None:
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
-    # Bytes per operand element for the bandwidth metric: FP8 = 1, FP4 = 0.5.
-    dtype_bytes = 0.5 if mode == "w4a4-nvfp4" else 1
-    dtype_str = "fp4_e2m1" if mode == "w4a4-nvfp4" else "fp8_e4m3"
+    # Bytes per operand element for the bandwidth metric: FP8 = 1, FP4 = 0.5,
+    # BF16 = 2.
+    if mode == "bf16":
+        dtype_bytes = 2
+        dtype_str = "bf16"
+    elif mode == "w4a4-nvfp4":
+        dtype_bytes = 0.5
+        dtype_str = "fp4_e2m1"
+    else:
+        dtype_bytes = 1
+        dtype_str = "fp8_e4m3"
 
     for shape in cfg["shapes"]:
         m, n, k = shape

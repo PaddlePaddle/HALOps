@@ -14,6 +14,7 @@
 # limitations under the License.
 """
 
+from kernel.gemm.scenarios.batch_gemm import run_scenario as run_batch_gemm
 from kernel.gemm.scenarios.dense_gemm import run_scenario as run_dense_gemm
 from kernel.gemm.scenarios.grouped_gemm import (
     run_group_masked,
@@ -22,6 +23,7 @@ from kernel.gemm.scenarios.grouped_gemm import (
 
 SCENARIOS = {
     "dense_gemm": run_dense_gemm,
+    "batch_gemm": run_batch_gemm,
     "group_masked": run_group_masked,
     "group_contiguous": run_group_contiguous,
 }

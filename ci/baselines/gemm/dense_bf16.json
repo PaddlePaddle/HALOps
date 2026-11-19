@@ -1,0 +1,147 @@
+{
+  "config": "dense_bf16",
+  "op": "gemm",
+  "threshold": 0.05,
+  "entries": [
+    {
+      "key": {
+        "scenario": "dense_gemm",
+        "backend": "halops",
+        "num_experts": "",
+        "max_m": "",
+        "m": 64,
+        "n": 4096,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "dense_bf16"
+      },
+      "median_us": 10.832
+    },
+    {
+      "key": {
+        "scenario": "dense_gemm",
+        "backend": "halops",
+        "num_experts": "",
+        "max_m": "",
+        "m": 64,
+        "n": 32768,
+        "k": 1024,
+        "mode": "bf16",
+        "case_tag": "dense_bf16"
+      },
+      "median_us": 16.944
+    },
+    {
+      "key": {
+        "scenario": "dense_gemm",
+        "backend": "halops",
+        "num_experts": "",
+        "max_m": "",
+        "m": 128,
+        "n": 4096,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "dense_bf16"
+      },
+      "median_us": 12.352
+    },
+    {
+      "key": {
+        "scenario": "dense_gemm",
+        "backend": "halops",
+        "num_experts": "",
+        "max_m": "",
+        "m": 128,
+        "n": 128,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "dense_bf16"
+      },
+      "median_us": 7.136
+    },
+    {
+      "key": {
+        "scenario": "dense_gemm",
+        "backend": "halops",
+        "num_experts": "",
+        "max_m": "",
+        "m": 256,
+        "n": 4096,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "dense_bf16"
+      },
+      "median_us": 14.753
+    },
+    {
+      "key": {
+        "scenario": "dense_gemm",
+        "backend": "halops",
+        "num_experts": "",
+        "max_m": "",
+        "m": 1024,
+        "n": 4096,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "dense_bf16"
+      },
+      "median_us": 27.393
+    },
+    {
+      "key": {
+        "scenario": "dense_gemm",
+        "backend": "halops",
+        "num_experts": "",
+        "max_m": "",
+        "m": 1024,
+        "n": 1600,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "dense_bf16"
+      },
+      "median_us": 16.128
+    },
+    {
+      "key": {
+        "scenario": "dense_gemm",
+        "backend": "halops",
+        "num_experts": "",
+        "max_m": "",
+        "m": 1024,
+        "n": 32768,
+        "k": 1024,
+        "mode": "bf16",
+        "case_tag": "dense_bf16"
+      },
+      "median_us": 49.056
+    },
+    {
+      "key": {
+        "scenario": "dense_gemm",
+        "backend": "halops",
+        "num_experts": "",
+        "max_m": "",
+        "m": 4096,
+        "n": 4096,
+        "k": 4096,
+        "mode": "bf16",
+        "case_tag": "dense_bf16"
+      },
+      "median_us": 93.153
+    },
+    {
+      "key": {
+        "scenario": "dense_gemm",
+        "backend": "halops",
+        "num_experts": "",
+        "max_m": "",
+        "m": 8192,
+        "n": 32768,
+        "k": 1024,
+        "mode": "bf16",
+        "case_tag": "dense_bf16"
+      },
+      "median_us": 335.369
+    }
+  ]
+}

@@ -64,6 +64,7 @@ struct GemmKernelConfig {
     static constexpr bool AddBias = false;
     static constexpr bool SwapAB = false;
     static constexpr bool KIsFP4 = false;
+    static constexpr bool KIsBF16 = false;
     static constexpr bool HasAlpha = false;
     // Scale-factor vector size: 16 = NVFP4 (UE4M3), 32 = MXFP4 (UE8M0). Fixes
     // the MMA and SF atom shapes, so it is a compile-time config.
@@ -72,6 +73,12 @@ struct GemmKernelConfig {
     static constexpr bool SkipTmemFence = false;
     static constexpr EpilogueOp KEpiOp = EpilogueOp::Identity;
     static constexpr bool KSwapSfbRun = false;
+    // Epilogue warp groups; 0 = auto (SwapAB ? 1 : 2). KEpiComputeN must be
+    // >= 32 when CtaM == 64, so narrow tiles (e.g. 64x32) need 1.
+    static constexpr int KEpilogueWarpGroupsOverride = 0;
+    // Force N predication even for power-of-two KBlockN (e.g. N=1600 on a
+    // 128-wide tile).
+    static constexpr bool KForceEpiNPredicate = false;
 };
 
 static constexpr int get_num_warps(int load_c_warp_id, bool add_bias) {
