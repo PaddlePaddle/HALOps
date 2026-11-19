@@ -357,29 +357,8 @@ inline int PickTile(const TileSpec* tiles, int count, MmaKind kind,
 // Dispatch
 using TileLauncher = void (*)(GemmParams&, const GemmShape&, cudaStream_t);
 
-// Candidates is any type exposing `static constexpr tiles`. Every kind draws
-// from one table; BF16 has a separate one per mode.
-template <MmaKind Kind, KernelMode Mode>
-struct CandidateTilesFor {
-    static constexpr const auto& tiles = CandidateTiles<Kind>::tiles;
-};
-template <>
-struct CandidateTilesFor<MmaKind::BF16, KernelMode::Dense> {
-    static constexpr const auto& tiles = kBF16DenseTiles;
-};
-template <>
-struct CandidateTilesFor<MmaKind::BF16, KernelMode::Contiguous> {
-    static constexpr const auto& tiles = kBF16ContiguousTiles;
-};
-template <>
-struct CandidateTilesFor<MmaKind::BF16, KernelMode::Masked> {
-    static constexpr const auto& tiles = kBF16MaskedTiles;
-};
-template <>
-struct CandidateTilesFor<MmaKind::BF16, KernelMode::Batch> {
-    static constexpr const auto& tiles = kBF16BatchTiles;
-};
-
+// Candidates is any type exposing `static constexpr tiles`; every kind
+// resolves through CandidateTiles<Kind> (gemm_tile.cuh).
 // Divisibility contract of a selected tile: the output M/N tile multiples
 // (N relaxes to %64 for predicated tails and %32 for non-power-of-2 widths),
 // K a KBlockK multiple. SwapAB swaps the roles: KBlockM tiles the weight
@@ -431,7 +410,7 @@ constexpr std::array<TileLauncher, sizeof...(I)> MakeTileLaunchers(
 }
 
 template <MmaKind Kind, KernelMode Mode, EpilogueOp Op,
-          class Candidates = CandidateTilesFor<Kind, Mode>>
+          class Candidates = CandidateTiles<Kind>>
 inline constexpr auto kTileLaunchers =
     MakeTileLaunchers<Kind, Mode, Op, Candidates>(
         std::make_index_sequence<Candidates::tiles.size()>{});
@@ -450,7 +429,7 @@ int PickBf16Tile(KernelMode mode, const GemmShape& shape);
 template <KernelMode Mode, MmaKind Kind, EpilogueOp Op = EpilogueOp::Identity>
 void LaunchCfg(GemmParams& params, GemmShape shape, cudaStream_t stream) {
     shape.op = Op;
-    constexpr auto& candidates = CandidateTilesFor<Kind, Mode>::tiles;
+    constexpr auto& candidates = CandidateTiles<Kind>::tiles;
     const int pick =
         Kind == MmaKind::BF16
             ? bf16::PickBf16Tile(Mode, shape)
@@ -585,36 +564,37 @@ inline SmallNTile PickSmallNTile(int m, int n, int64_t target) {
 }
 
 // ---- Dense -----------------------------------------------------------------
-// Ids into kBF16DenseTiles (gemm_tile.cuh); the enum order mirrors the table.
+// Ids into kBF16Tiles (gemm_tile.cuh), derived from the tile itself.
 enum DenseTile : int {
-    kPair256x256,  // 256x256 pair, 6 stages
-    kPair256x256P7,
-    kPair256x128,  // 8 stages
-    kPair256x128Ntail,
-    kPair256x128P9,
-    kPair256x128P9Ntail,
-    kPair256x192,
-    kPair256x64,  // 10 stages
-    kM128x256,
-    kM128x128,
-    kM128x64,        // 8 stages
-    kM128x32,        // 10 stages
-    kPair128x64P18,  // 18 stages, 1 epilogue warp group
-    kM64x128,
-    kM64x96P11,  // 11 stages, 1 epilogue warp group
-    kM64x224,    // 1 epilogue warp group
-    kM64x64,     // 2 epilogue warp groups, 10 stages
-    kM64x64_1wg,
-    kM64x64_1wgP14,
-    kM64x32_1wg,
-    kM64x32_1wgP18,
-    kSwap128x64,
-    kSwap128x32,
-    kSwap256x64Pair,
-    kSwap128x64K128,  // SwapAB, KBlockK=128 (k >= 8192)
+    kPair256x256 = Bf16TileId(kBF16_256x256_pair),
+    kPair256x256P7 = Bf16TileId(kBF16_256x256_pair_p7),
+    kPair256x128 = Bf16TileId(kBF16_256x128_pair),
+    kPair256x128Ntail = Bf16TileId(kBF16_256x128_pair_ntail),
+    kPair256x128P9 = Bf16TileId(kBF16_256x128_pair_p9),
+    kPair256x128P9Ntail = Bf16TileId(kBF16_256x128_pair_p9_ntail),
+    kPair256x192 = Bf16TileId(kBF16_256x192_pair),
+    kPair256x64 = Bf16TileId(kBF16_256x64_pair),
+    kM128x256 = Bf16TileId(kBF16_128x256),
+    kM128x128 = Bf16TileId(kBF16_128x128),
+    kM128x64 = Bf16TileId(kBF16_128x64),
+    kM128x32 = Bf16TileId(kBF16_128x32),
+    kPair128x64P18 = Bf16TileId(kBF16_128x64_pair_p18),
+    kM64x128 = Bf16TileId(kBF16_64x128),
+    kM64x96P11 = Bf16TileId(kBF16_64x96_p11),
+    kM64x224 = Bf16TileId(kBF16_64x224),
+    kM64x64 = Bf16TileId(kBF16_64x64),
+    kM64x64_1wg = Bf16TileId(kBF16_64x64_1wg),
+    kM64x64_1wgP14 = Bf16TileId(kBF16_64x64_1wg_p14),
+    kM64x32_1wg = Bf16TileId(kBF16_64x32_1wg),
+    kM64x32_1wgP18 = Bf16TileId(kBF16_64x32_1wg_p18),
+    kSwap128x64 = Bf16TileId(kBF16_128x64_swap),
+    kSwap128x32 = Bf16TileId(kBF16_128x32_swap),
+    kSwap256x64Pair = Bf16TileId(kBF16_256x64_swap_pair),
+    kSwap128x64K128 = Bf16TileId(kBF16_128x64x128_swap),
 };
-static_assert(kSwap128x64K128 + 1 == static_cast<int>(kBF16DenseTiles.size()),
-              "BF16 dense tile table and DenseTile enum drifted apart");
+static_assert(kSwap128x64K128 >= 0 &&
+                  kSwap128x64K128 < static_cast<int>(kBF16Tiles.size()),
+              "BF16 dense tile id outside kBF16Tiles");
 
 // m >= 4096: pair tiles, with a small-N ladder for narrow N.
 inline int SelectLargeMTile(int m, int n, int k, int target) {
@@ -891,18 +871,18 @@ inline int SelectBF16Cfg(int m, int n, int k, int sm_count) {
 
 // ---- Grouped / batch -------------------------------------------------------
 
-// Ids into kBF16ContiguousTiles (gemm_tile.cuh).
+// Ids into kBF16Tiles (gemm_tile.cuh), derived from the tile itself.
 enum ContiguousTile : int {
-    kContPair256x256,  // 256x256 pair, 7 stages
-    kContPair256x128,  // 256x128 pair, 9 stages
-    kContM128x256,     // 128x256, 16 overlap cols
-    kContM128x128,     // 128x128, 6 stages
-    kContM128x64,      // 128x64, 16 overlap cols
-    kContSwap128x64,
+    kContPair256x256 = Bf16TileId(kBF16_256x256_pair_p7),
+    kContPair256x128 = Bf16TileId(kBF16_256x128_pair_p9),
+    kContM128x256 = Bf16TileId(kBF16_128x256_ovlp16),
+    kContM128x128 = Bf16TileId(kBF16_128x128_p6),
+    kContM128x64 = Bf16TileId(kBF16_128x64_ovlp16),
+    kContSwap128x64 = Bf16TileId(kBF16_128x64_swap),
 };
-static_assert(kContSwap128x64 + 1 ==
-                  static_cast<int>(kBF16ContiguousTiles.size()),
-              "BF16 contiguous tile table and enum drifted apart");
+static_assert(kContSwap128x64 >= 0 &&
+                  kContSwap128x64 < static_cast<int>(kBF16Tiles.size()),
+              "BF16 contiguous tile id outside kBF16Tiles");
 
 // m is the total token count.
 inline int SelectBF16ContiguousCfg(int m, int n, int k, int sm_count) {
@@ -939,17 +919,18 @@ inline int SelectBF16ContiguousCfg(int m, int n, int k, int sm_count) {
     return kContSwap128x64;
 }
 
-// Ids into kBF16MaskedTiles (gemm_tile.cuh).
+// Ids into kBF16Tiles (gemm_tile.cuh), derived from the tile itself.
 enum MaskedTile : int {
-    kMaskM128x256,  // 128x256, 16 overlap cols
-    kMaskSwap128x64,
-    kMaskM128x128,     // 128x128, 6 stages
-    kMaskM128x64,      // 128x64, 16 overlap cols
-    kMaskPair256x256,  // 256x256 pair, 7 stages
-    kMaskPair256x128,  // 256x128 pair, 9 stages
+    kMaskM128x256 = Bf16TileId(kBF16_128x256_ovlp16),
+    kMaskSwap128x64 = Bf16TileId(kBF16_128x64_swap),
+    kMaskM128x128 = Bf16TileId(kBF16_128x128_p6),
+    kMaskM128x64 = Bf16TileId(kBF16_128x64_ovlp16),
+    kMaskPair256x256 = Bf16TileId(kBF16_256x256_pair_p7),
+    kMaskPair256x128 = Bf16TileId(kBF16_256x128_pair_p9),
 };
-static_assert(kMaskPair256x128 + 1 == static_cast<int>(kBF16MaskedTiles.size()),
-              "BF16 masked tile table and enum drifted apart");
+static_assert(kMaskPair256x128 >= 0 &&
+                  kMaskPair256x128 < static_cast<int>(kBF16Tiles.size()),
+              "BF16 masked tile id outside kBF16Tiles");
 
 // Masked pads every expert to max_m_per_expert, so the grid scales with
 // num_experts * ceil(max_m / tm) * ceil(n / tn).
@@ -982,14 +963,15 @@ inline int SelectBF16MaskedCfg(int num_experts, int mm, int n, int k,
     return kMaskSwap128x64;
 }
 
-// Ids into kBF16BatchTiles (gemm_tile.cuh).
+// Ids into kBF16Tiles (gemm_tile.cuh), derived from the tile itself.
 enum BatchTile : int {
-    kBatchPair256x256,  // 256x256 pair, 6 stages
-    kBatchM128x256,     // 128x256, 16 overlap cols
-    kBatchSwap128x64,
+    kBatchPair256x256 = Bf16TileId(kBF16_256x256_pair),
+    kBatchM128x256 = Bf16TileId(kBF16_128x256_ovlp16),
+    kBatchSwap128x64 = Bf16TileId(kBF16_128x64_swap),
 };
-static_assert(kBatchSwap128x64 + 1 == static_cast<int>(kBF16BatchTiles.size()),
-              "BF16 batch tile table and enum drifted apart");
+static_assert(kBatchSwap128x64 >= 0 &&
+                  kBatchSwap128x64 < static_cast<int>(kBF16Tiles.size()),
+              "BF16 batch tile id outside kBF16Tiles");
 
 // Pure alignment ladder (no runtime SM reasoning); m is one item's rows.
 inline int SelectBF16BatchCfg(int m, int n, int k) {
