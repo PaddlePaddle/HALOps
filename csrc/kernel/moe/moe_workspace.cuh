@@ -30,7 +30,7 @@ template <typename Dims>
 struct RouterLogits {
     using RouterGemm = RouterGemmTraits<Dims>;
 
-    static constexpr std::uint32_t kNumGates = RouterGemm::kNumRouterGates;
+    static constexpr std::uint32_t kNumGates = MoERuntime::kMaxRouterGates;
     static constexpr bool kStoreScores = kNumGates > 1u;
 
     using ResultType = std::conditional_t<kStoreScores, float, __nv_bfloat16>;
@@ -225,7 +225,11 @@ struct RoutedDownOutput {
     using DownGemm = RoutedDownGemmTraits<Dims>;
 
     static constexpr std::uint32_t kNumRows = DownGemm::kGemmN * Dims::kMaxTopk;
-    static constexpr std::uint32_t kNumCols = MoEInputSize<Dims>::value;
+    // The latent stage narrows the experts' reduction; size for the wider
+    // input so one workspace serves either recipe.
+    static constexpr std::uint32_t kNumCols =
+        Dims::kLatentSize > Dims::kHiddenSize ? Dims::kLatentSize
+                                              : Dims::kHiddenSize;
 
     alignas(16) ElementType data[kNumRows * kNumCols];
 
@@ -272,11 +276,10 @@ struct MoEWorkspace {
 
     MoERoutingTables<Dims> router_tables;
 
-    static constexpr uint32_t kCtasPerExpert =
-        Dims::KernelConfig::kCtasPerExpert;
+    static constexpr uint32_t kMaxCtasPerExpert = MoERuntime::kMaxCtasPerExpert;
 
     using CtaComm = MoECtaComm<kSpecMaxGrid, kMaxRoutedRows,
-                               RoutedUpOut::kNumScaleCols, kCtasPerExpert>;
+                               RoutedUpOut::kNumScaleCols, kMaxCtasPerExpert>;
     static constexpr uint32_t kUpOutReadyFull = CtaComm::kUpOutReadyFull;
 
     CtaComm cta_comm;

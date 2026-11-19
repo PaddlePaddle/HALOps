@@ -18,6 +18,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cutlass/cutlass.h>
+#include <cutlass/fast_math.h>
 
 #include <cstdint>
 #include <cute/tensor.hpp>
@@ -138,17 +139,20 @@ struct QuantConfig {
     static constexpr std::uint32_t kBlockSize = 128;
 };
 
-template <QuantConfig Config, bool UseLatent = true, int TailWorld = 4>
-struct Dims_BS8_E512_N512_K2048_SM100 {
+template <QuantConfig Config, std::uint32_t NumTokens, int TailWorld = 4>
+struct MoEDims_E512_N512_K2048 {
     static constexpr uint32_t kHiddenSize = 4096;
     static constexpr uint32_t kIntermediateSize = 512;
     static constexpr std::uint32_t kLatentSize = 2048;
-    static constexpr uint32_t kNumTokens = 8;
+    static constexpr uint32_t kNumTokens = NumTokens;
     static constexpr uint32_t kNumExperts = 512;
     static constexpr uint32_t kMaxTopk = 10;
-    static constexpr bool kUseLatent = UseLatent;
-    static constexpr std::uint32_t kNumRouterGates = 2;
     static constexpr QuantConfig kQuantConfig = Config;
+
+    // The schedule serves a narrow (8-token) or a wide (16-token) batch.
+    static_assert(NumTokens == 8u || NumTokens == 16u,
+                  "the schedule serves 8 or 16 tokens");
+
     struct KernelConfig {
         static constexpr std::uint32_t kBlockSize = 384;
         static constexpr std::uint32_t kSpecMaxGrid = 256u;
@@ -157,16 +161,13 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr MmaKind kRouterMma = MmaKind::kHmma;
         // LatentDown configs.
         static constexpr std::uint32_t kNumCtasForLatentDown = 32;
-        static constexpr bool kLatentDownUseSplitK = true;
         // SharedExpert configs.
         static constexpr std::uint32_t kNumCtasForShared = 32;
-        static constexpr bool kSharedUseSplitK = true;
         // MoE configs.
         static constexpr std::uint32_t kCtasPerExpert = 8;
-        static constexpr std::uint32_t kUpTileShapeK = 256;
-        // Tail configs
+        // Tail configs.
         static constexpr int kTailWorld = TailWorld;
-        static constexpr int kTailTpg = 2;
+        static constexpr int kTailTpg = NumTokens <= 8u ? 2 : 4;
         static constexpr int kTailGsize = 32;
         static constexpr int kTailThreads = 256;
         static constexpr int kTailStage = 1;
@@ -176,18 +177,6 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr int kTailXPad = 8;
         static constexpr int kTailMaxStageSmemBytes = 160 * 1024;
         static constexpr std::uint32_t kTailPrefetchChunk = 16384;
-    };
-};
-
-template <QuantConfig Config, bool UseLatent = true, int TailWorld = 4>
-struct Dims_BS16_E512_N512_K2048_SM100
-    : Dims_BS8_E512_N512_K2048_SM100<Config, UseLatent, TailWorld> {
-    static constexpr uint32_t kNumTokens = 16;
-    struct KernelConfig
-        : Dims_BS8_E512_N512_K2048_SM100<Config, UseLatent,
-                                         TailWorld>::KernelConfig {
-        // Tail configs
-        static constexpr int kTailTpg = 4;
     };
 };
 
@@ -209,30 +198,101 @@ struct DataType {
     using ElementOut = __nv_bfloat16;  // MoE output
 };
 
-// Width the experts reduce over (`up`) and produce (`down`).
-template <typename Dims>
-struct MoEInputSize {
-    static constexpr std::uint32_t value =
-        Dims::kUseLatent ? Dims::kLatentSize : Dims::kHiddenSize;
-};
-
 struct MoEProblemSize {
     constexpr MoEProblemSize() = default;
     __host__ __device__ constexpr MoEProblemSize(
         std::uint32_t num_tokens, std::uint32_t hidden_size,
-        std::uint32_t intermediate_size, std::uint32_t latent_size)
+        std::uint32_t intermediate_size, std::uint32_t latent_size,
+        std::uint32_t num_experts, std::uint32_t num_router_gates)
         : num_tokens(num_tokens),
           hidden_size(hidden_size),
           intermediate_size(intermediate_size),
-          latent_size(latent_size) {}
+          latent_size(latent_size),
+          num_experts(num_experts),
+          num_router_gates(num_router_gates),
+          use_latent(latent_size != 0u) {}
 
     std::uint32_t num_tokens = 0u;
     std::uint32_t hidden_size = 0u;
     std::uint32_t intermediate_size = 0u;
     std::uint32_t latent_size = 0u;
+    std::uint32_t num_experts = 0u;
+    std::uint32_t num_router_gates = 0u;
+    // The latent projection runs whenever a latent width is given.
+    bool use_latent = false;
 
     __host__ __device__ constexpr std::uint32_t input_size() const {
         return latent_size != 0u ? latent_size : hidden_size;
+    }
+};
+
+// The launch-time kernel layout: split groups, the phase CTA ranges, the
+// launch cluster and the router's gate count. The host fills it per call.
+struct MoERuntime {
+    static constexpr std::uint32_t kMaxClusterSize = 4u;
+    static constexpr std::uint32_t kMaxRouterGates = 2u;
+    // The fixed per-expert buffers (SMEM task grid, workspace counters) keep
+    // this capacity; the live count below may be smaller.
+    static constexpr std::uint32_t kMaxCtasPerExpert = 8u;
+
+    // Split-K groups: one GEMM reduction's consecutive CTAs.
+    std::uint32_t num_latent_splits = 1u;
+    std::uint32_t num_shared_splits = 1u;
+    // The launch cluster; a split group never crosses a cluster boundary.
+    std::uint32_t cluster_size = 1u;
+
+    // CTAs per router gate; the phase spans gates x this many blocks.
+    std::uint32_t num_router_gates = 0u;
+    std::uint32_t num_router_ctas = 0u;
+    // Blocks that share one routed-expert task; the divider must be
+    // initialised on the host from `num_ctas_per_expert`.
+    std::uint32_t num_ctas_per_expert = 1u;
+    cutlass::FastDivmod ctas_per_expert_divmod{};
+
+    // Host-precomputed dividers (see the helpers below).
+    cutlass::FastDivmod latent_splits_divmod{};
+    cutlass::FastDivmod shared_splits_divmod{};
+    cutlass::FastDivmod latent_tiles_divmod{};
+    cutlass::FastDivmod cluster_divmod{};
+    std::uint32_t num_latent_ctas = 0u;
+    std::uint32_t first_shared_cta = 0u;
+    std::uint32_t num_shared_ctas = 0u;
+    std::uint32_t num_tail_ctas = 0u;
+
+    constexpr MoERuntime() = default;
+
+    __host__ __device__ constexpr MoERuntime(
+        MoEProblemSize const& problem_size, const std::uint32_t num_router_ctas,
+        const std::uint32_t num_latent_ctas,
+        const std::uint32_t num_shared_ctas)
+        : num_router_gates(problem_size.num_router_gates),
+          num_router_ctas(num_router_ctas),
+          num_latent_ctas(num_latent_ctas),
+          first_shared_cta(num_router_ctas * problem_size.num_router_gates +
+                           num_latent_ctas),
+          num_shared_ctas(num_shared_ctas) {}
+
+    // The smallest grid in which every phase has its CTAs resident.
+    __host__ __device__ constexpr std::uint32_t get_min_grid() const {
+        return (first_shared_cta + num_shared_ctas) > num_tail_ctas
+                   ? (first_shared_cta + num_shared_ctas)
+                   : num_tail_ctas;
+    }
+
+    __device__ bool is_router_cta() const {
+        return blockIdx.x < num_router_ctas * num_router_gates;
+    }
+
+    __device__ bool is_latent_cta() const {
+        const std::uint32_t first_latent_cta =
+            num_router_ctas * num_router_gates;
+        return blockIdx.x >= first_latent_cta &&
+               blockIdx.x < first_latent_cta + num_latent_ctas;
+    }
+
+    __device__ bool is_shared_cta() const {
+        return blockIdx.x >= first_shared_cta &&
+               blockIdx.x < first_shared_cta + num_shared_ctas;
     }
 };
 

@@ -402,7 +402,7 @@ struct MoESharedStorage {
 
     static constexpr uint32_t kMaxDownTasks =
         MoERoutingTables<Dims>::kMaxActiveExperts *
-        Traits::RoutedDownGemm::kCtasPerExpert;
+        MoERuntime::kMaxCtasPerExpert;
     static constexpr uint32_t kNoDownTask = 0xFFFFu;
     static_assert(kMaxDownTasks < kNoDownTask,
                   "down grid task ids must fit in uint16 below the sentinel");

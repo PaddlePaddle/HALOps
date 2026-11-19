@@ -51,7 +51,7 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     assert(blockDim.x == Dims::KernelConfig::kBlockSize);
     assert(blockDim.y == 1 && blockDim.z == 1);
 
-    assert(gridDim.x >= Traits::kMinGrid);
+    assert(gridDim.x >= mainloop_params.runtime.get_min_grid());
     assert(gridDim.x <= Traits::kMaxGrid);
     assert(gridDim.y == 1 && gridDim.z == 1);
 
@@ -91,7 +91,7 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     }
 
     // Each thread follows the same projection task sequence.
-    TaskScheduler<Traits> sched(smem, workspace);
+    TaskScheduler<Traits> sched(smem, workspace, mainloop_params.runtime);
 
     // Run up-projection tasks assigned to this expert group and feature block.
     sched.begin_phase(BlockPhase::kUp, smem->routing.active_expert_count);
@@ -120,7 +120,8 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
 template <typename MoEDims>
 cudaError_t LaunchMoEKernel(
     typename CollectiveMainloopMoE<MoEKernelTraits<MoEDims>>::Arguments& args,
-    std::uint32_t grid_size, cudaStream_t stream, bool use_pdl) {
+    std::uint32_t grid_size, std::uint32_t cluster_size, cudaStream_t stream,
+    bool use_pdl) {
     using Dims = MoEDims;
     using Traits = MoEKernelTraits<Dims>;
     using Mainloop = CollectiveMainloopMoE<Traits>;
@@ -136,10 +137,9 @@ cudaError_t LaunchMoEKernel(
             static_cast<int>(smem_size));
         if (attribute != cudaSuccess) return attribute;
     }
-    constexpr std::uint32_t kClusterSize = Traits::kClusterSize;
     const cudaError_t launch_status = LaunchKernelWithPdl(
         kernel_ptr, dim3(grid_size, 1, 1), dim3(Traits::kThreads, 1, 1),
-        dim3(kClusterSize, 1, 1), smem_size, stream, use_pdl, params);
+        dim3(cluster_size, 1, 1), smem_size, stream, use_pdl, params);
     if (launch_status != cudaSuccess) return launch_status;
     return cudaGetLastError();
 }

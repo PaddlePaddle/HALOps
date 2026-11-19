@@ -31,93 +31,208 @@
 namespace halops {
 namespace moe {
 
-template <typename MoEDims>
-void CheckRouterWeightShape(const torch::Tensor& router_weight) {
-    TORCH_CHECK(router_weight.scalar_type() == at::kBFloat16,
-                "router_weight must be bfloat16.");
-    TORCH_CHECK(router_weight.dim() == 2 &&
-                    router_weight.size(0) ==
-                        MoEDims::kNumRouterGates * MoEDims::kNumExperts &&
-                    router_weight.size(1) == MoEDims::kHiddenSize,
-                "router_weight must be [G * E, H] = [",
-                MoEDims::kNumRouterGates * MoEDims::kNumExperts, ", ",
-                MoEDims::kHiddenSize, "].");
+moe::MoEProblemSize BuildProblem(const torch::Tensor& input,
+                                 const torch::Tensor& router_weight,
+                                 const torch::Tensor& shared_down_weight,
+                                 const torch::Tensor& latent_down_weight,
+                                 std::uint32_t num_router_gates) {
+    TORCH_CHECK(num_router_gates == 2, "Only support 2 router gates, got ",
+                num_router_gates, ".");
+    TORCH_CHECK(input.dim() == 2,
+                "The input's shape must be [tokens, hidden].");
+
+    const std::uint32_t num_tokens = static_cast<std::uint32_t>(input.size(0));
+    TORCH_CHECK(num_tokens >= 1 && num_tokens <= 16,
+                "num_tokens must be in [1, 16].");
+
+    const std::uint32_t hidden_size = static_cast<std::uint32_t>(input.size(1));
+    const std::uint32_t intermediate_size =
+        static_cast<std::uint32_t>(shared_down_weight.size(1));
+    const std::uint32_t latent_size =
+        latent_down_weight.defined()
+            ? static_cast<std::uint32_t>(latent_down_weight.size(0))
+            : 0u;
+    const std::uint32_t num_experts = static_cast<std::uint32_t>(
+        router_weight.size(0) / static_cast<std::int64_t>(num_router_gates));
+    return moe::MoEProblemSize(num_tokens, hidden_size, intermediate_size,
+                               latent_size, num_experts, num_router_gates);
 }
 
-template <typename MoEDims>
-void CheckLatentDownShape(const torch::Tensor& latent_down_weight) {
+void CheckRouterWeightShape(const torch::Tensor& router_weight,
+                            moe::MoEProblemSize const& problem_size) {
+    TORCH_CHECK(router_weight.scalar_type() == at::kBFloat16,
+                "router_weight must be bfloat16.");
+    TORCH_CHECK(
+        router_weight.dim() == 2 &&
+            router_weight.size(0) ==
+                static_cast<std::int64_t>(problem_size.num_router_gates) *
+                    problem_size.num_experts &&
+            router_weight.size(1) == problem_size.hidden_size,
+        "router_weight must be [G * E, H] = [",
+        problem_size.num_router_gates * problem_size.num_experts, ", ",
+        problem_size.hidden_size, "].");
+}
+
+void CheckLatentDownShape(const torch::Tensor& latent_down_weight,
+                          moe::MoEProblemSize const& problem_size) {
     TORCH_CHECK(latent_down_weight.dim() == 2 &&
-                    latent_down_weight.size(0) == MoEDims::kLatentSize &&
-                    latent_down_weight.size(1) == MoEDims::kHiddenSize,
-                "latent_down_weight must be [kLatentSize, kHiddenSize].");
+                    latent_down_weight.size(0) == problem_size.latent_size &&
+                    latent_down_weight.size(1) == problem_size.hidden_size,
+                "latent_down_weight must be [latent_size, hidden_size] = [",
+                problem_size.latent_size, ", ", problem_size.hidden_size, "].");
 }
 
 template <typename MoEDims>
 void CheckRoutedExpertShape(const torch::Tensor& expert_up_weights,
-                            const torch::Tensor& expert_down_weights) {
-    constexpr std::int64_t kExperts = MoEDims::kNumExperts;
-    constexpr std::int64_t kIntermediate = MoEDims::kIntermediateSize;
-    constexpr std::int64_t kExpertK = moe::MoEInputSize<MoEDims>::value;
-    constexpr std::int64_t kUpRows = 2 * kIntermediate;
+                            const torch::Tensor& expert_down_weights,
+                            moe::MoEProblemSize const& problem_size) {
+    std::int64_t num_experts = problem_size.num_experts;
+    std::int64_t input_size = problem_size.input_size();
+    std::int64_t intermediate_size = problem_size.intermediate_size;
     // A 4-bit weight packs two values per byte along K.
     constexpr std::int64_t kWeightBytes =
         MoEDims::kQuantConfig.kExpertsQuant == moe::QuantMethod::kMXFP4 ? 2 : 1;
     TORCH_CHECK(expert_up_weights.dim() == 3 &&
-                    expert_up_weights.size(0) == kExperts &&
-                    expert_up_weights.size(1) == kUpRows &&
-                    expert_up_weights.size(2) == kExpertK / kWeightBytes,
+                    expert_up_weights.size(0) == num_experts &&
+                    expert_up_weights.size(1) == 2 * intermediate_size &&
+                    expert_up_weights.size(2) == input_size / kWeightBytes,
                 "expert_up_weights must be [E, 2N, K / ", kWeightBytes, "].");
-    TORCH_CHECK(expert_down_weights.dim() == 3 &&
-                    expert_down_weights.size(0) == kExperts &&
-                    expert_down_weights.size(1) == kExpertK &&
-                    expert_down_weights.size(2) == kIntermediate / kWeightBytes,
-                "expert_down_weights must be [E, K, N / ", kWeightBytes, "].");
+    TORCH_CHECK(
+        expert_down_weights.dim() == 3 &&
+            expert_down_weights.size(0) == num_experts &&
+            expert_down_weights.size(1) == input_size &&
+            expert_down_weights.size(2) == intermediate_size / kWeightBytes,
+        "expert_down_weights must be [E, K, N / ", kWeightBytes, "].");
 }
 
-template <typename MoEDims>
 void CheckSharedExpertShape(const torch::Tensor& shared_up_weight,
-                            const torch::Tensor& shared_down_weight) {
-    constexpr std::int64_t kUpRows = 2 * MoEDims::kIntermediateSize;
+                            const torch::Tensor& shared_down_weight,
+                            moe::MoEProblemSize const& problem_size) {
+    std::int64_t hidden_size = problem_size.hidden_size;
+    std::int64_t intermediate_size = problem_size.intermediate_size;
     TORCH_CHECK(shared_up_weight.dim() == 2 &&
-                    shared_up_weight.size(0) == kUpRows &&
-                    shared_up_weight.size(1) == MoEDims::kHiddenSize,
-                "shared_up_weight must be [2N, H].");
+                    shared_up_weight.size(0) == 2 * intermediate_size &&
+                    shared_up_weight.size(1) == hidden_size,
+                "shared_up_weight must be [2N, H] = [", 2 * intermediate_size,
+                ", ", hidden_size, "].");
     TORCH_CHECK(shared_down_weight.dim() == 2 &&
-                    shared_down_weight.size(0) == MoEDims::kHiddenSize &&
-                    shared_down_weight.size(1) == MoEDims::kIntermediateSize,
-                "shared_down_weight must be [H, N].");
+                    shared_down_weight.size(0) == hidden_size &&
+                    shared_down_weight.size(1) == intermediate_size,
+                "shared_down_weight must be [H, N] = [", hidden_size, ", ",
+                intermediate_size, "].");
 }
 
-template <typename MoEDims>
 void CheckRoutingVectors(const std::optional<torch::Tensor>& correction_bias,
-                         const std::optional<torch::Tensor>& per_expert_scale) {
+                         const std::optional<torch::Tensor>& per_expert_scale,
+                         moe::MoEProblemSize const& problem_size) {
     for (const auto* v : {&correction_bias, &per_expert_scale}) {
-        TORCH_CHECK(!v->has_value() || (*v)->numel() == MoEDims::kNumExperts,
-                    "correction_bias and per_expert_scale must have "
-                    "num_experts elements, or be None.");
+        TORCH_CHECK(
+            !v->has_value() || (*v)->numel() == problem_size.num_experts,
+            "correction_bias and per_expert_scale must have "
+            "num_experts elements, or be None.");
     }
 }
 
 template <typename MoEDims>
 void CheckTailFc2Shape(const torch::Tensor& tail_fc2_weight,
-                       const torch::Tensor& tail_fc2_scale) {
+                       const torch::Tensor& tail_fc2_scale,
+                       moe::MoEProblemSize const& problem_size) {
     constexpr std::int64_t kBlock =
         moe::TailGeometryT<MoEDims>::WeightQuant::kBlockSize;
-    constexpr std::int64_t kScaleRows = moe::TailGeometryT<MoEDims>::kMxfp8
-                                            ? MoEDims::kHiddenSize
-                                            : MoEDims::kHiddenSize / kBlock;
-    constexpr std::int64_t kScaleCols = MoEDims::kLatentSize / kBlock;
+    const std::int64_t scale_rows = moe::TailGeometryT<MoEDims>::kMxfp8
+                                        ? problem_size.hidden_size
+                                        : problem_size.hidden_size / kBlock;
+    const std::int64_t scale_cols = problem_size.input_size() / kBlock;
     TORCH_CHECK(
         tail_fc2_weight.sizes() ==
-                at::IntArrayRef({MoEDims::kHiddenSize, MoEDims::kLatentSize}) &&
-            tail_fc2_scale.sizes() == at::IntArrayRef({kScaleRows, kScaleCols}),
-        "fc2_weight must be [H, L] and fc2_scale must be [", kScaleRows, ", ",
-        kScaleCols, "].");
+                at::IntArrayRef(
+                    {problem_size.hidden_size, problem_size.input_size()}) &&
+            tail_fc2_scale.sizes() == at::IntArrayRef({scale_rows, scale_cols}),
+        "fc2_weight must be [H, input_size] and fc2_scale must be [",
+        scale_rows, ", ", scale_cols, "].");
+}
+
+template <typename MoEDims>
+moe::MoERuntime BuildRuntimeConfig(const MoEProblemSize& problem) {
+    using Traits = moe::MoEKernelTraits<MoEDims>;
+    using UpGemm = typename Traits::RoutedUpGemm;
+    using DownGemm = typename Traits::RoutedDownGemm;
+    using LatentDownGemm = typename Traits::LatentDownGemm;
+    using SharedUpGemm = typename Traits::SharedUpGemm;
+    using SharedDownGemm = typename Traits::SharedDownGemm;
+    using TailGeometry = moe::TailGeometryT<MoEDims>;
+
+    // The schedule's CTA budget per phase; the split counts follow from it.
+    const std::uint32_t num_router_ctas =
+        MoEDims::KernelConfig::kNumCtasForRouter;
+    const std::uint32_t num_latent_ctas =
+        problem.use_latent ? MoEDims::KernelConfig::kNumCtasForLatentDown : 0u;
+    const std::uint32_t num_shared_ctas =
+        MoEDims::KernelConfig::kNumCtasForShared;
+
+    TORCH_CHECK(
+        problem.num_router_gates >= 1u &&
+            problem.num_router_gates <= moe::MoERuntime::kMaxRouterGates,
+        "the router runs 1..", moe::MoERuntime::kMaxRouterGates, " gates, got ",
+        problem.num_router_gates, ".");
+    // Every phase's CTA budget must cover whole tiles.
+    const std::uint32_t num_latent_tiles =
+        problem.latent_size / LatentDownGemm::kTileShapeM;
+    const std::uint32_t num_up_tiles =
+        2u * problem.intermediate_size / SharedUpGemm::kTileShapeM;
+    const std::uint32_t num_down_tiles =
+        problem.hidden_size / SharedDownGemm::kTileShapeM;
+    if (problem.use_latent) {
+        TORCH_CHECK(num_latent_ctas % num_latent_tiles == 0u,
+                    "the latent CTA budget (", num_latent_ctas,
+                    ") must cover whole 128-row M tiles of latent_size=",
+                    problem.latent_size, ".");
+    }
+    TORCH_CHECK(num_shared_ctas % num_up_tiles == 0u, "the shared CTA budget (",
+                num_shared_ctas,
+                ") must cover whole up-projection slabs of 2*intermediate=",
+                2u * problem.intermediate_size, ".");
+    TORCH_CHECK(num_shared_ctas == num_down_tiles,
+                "the shared up and down passes need the same CTA count (",
+                num_shared_ctas, " vs ", num_down_tiles, ").");
+    const std::uint32_t num_ctas_per_expert =
+        MoEDims::KernelConfig::kCtasPerExpert;
+    TORCH_CHECK(num_ctas_per_expert <= moe::MoERuntime::kMaxCtasPerExpert,
+                "the routed experts run on 1..",
+                moe::MoERuntime::kMaxCtasPerExpert, " blocks each, got ",
+                num_ctas_per_expert, ".");
+
+    const std::uint32_t num_latent_splits =
+        problem.use_latent ? num_latent_ctas / num_latent_tiles : 1u;
+    const std::uint32_t num_shared_splits = num_shared_ctas / num_up_tiles;
+    const std::uint32_t cluster_size = num_latent_splits > num_shared_splits
+                                           ? num_latent_splits
+                                           : num_shared_splits;
+
+    moe::MoERuntime runtime(problem, num_router_ctas, num_latent_ctas,
+                            num_shared_ctas);
+    runtime.num_latent_splits = num_latent_splits;
+    runtime.num_shared_splits = num_shared_splits;
+    runtime.cluster_size = cluster_size;
+    runtime.num_ctas_per_expert = num_ctas_per_expert;
+    runtime.ctas_per_expert_divmod =
+        cutlass::FastDivmod(static_cast<int>(num_ctas_per_expert));
+    runtime.latent_splits_divmod =
+        cutlass::FastDivmod(static_cast<int>(num_latent_splits));
+    runtime.shared_splits_divmod =
+        cutlass::FastDivmod(static_cast<int>(num_shared_splits));
+    runtime.latent_tiles_divmod =
+        cutlass::FastDivmod(static_cast<int>(std::max(1u, num_latent_tiles)));
+    runtime.cluster_divmod =
+        cutlass::FastDivmod(static_cast<int>(cluster_size));
+    runtime.num_tail_ctas = TailGeometry::kNumCtas;
+    return runtime;
 }
 
 // All CTAs must remain resident for the kernel lifetime.
 template <typename MoEDims>
 uint32_t CalculateGridSize(int device, cudaStream_t stream,
+                           moe::MoERuntime const& runtime,
                            std::uint32_t grid_cap = 0u) {
     using Traits = moe::MoEKernelTraits<MoEDims>;
     using Mainloop = moe::CollectiveMainloopMoE<Traits>;
@@ -128,8 +243,8 @@ uint32_t CalculateGridSize(int device, cudaStream_t stream,
     uint32_t grid_size =
         std::min(static_cast<std::uint32_t>(sm_count), Traits::kMaxGrid);
     if (grid_cap != 0u) grid_size = std::min(grid_size, grid_cap);
-    constexpr std::uint32_t kClusterSize = Traits::kClusterSize;
-    if constexpr (kClusterSize > 1u) {
+    const std::uint32_t kClusterSize = runtime.cluster_size;
+    if (kClusterSize > 1u) {
         // Limit the grid to clusters that can be resident together.
         grid_size -= grid_size % kClusterSize;
         cudaLaunchAttribute cluster_attr{};
@@ -164,8 +279,8 @@ uint32_t CalculateGridSize(int device, cudaStream_t stream,
             cudaGetLastError();
         }
     }
-    TORCH_CHECK(grid_size >= Traits::kMinGrid, "The kernel needs at least ",
-                Traits::kMinGrid,
+    TORCH_CHECK(grid_size >= runtime.get_min_grid(),
+                "The kernel needs at least ", runtime.get_min_grid(),
                 " co-resident blocks (router, latent and shared expert), but "
                 "the launch grid has only ",
                 grid_size,
@@ -174,96 +289,48 @@ uint32_t CalculateGridSize(int device, cudaStream_t stream,
 }
 
 template <typename MoEDims>
-void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
-             const torch::Tensor& expert_up_weights,
-             const torch::Tensor& expert_up_weights_scale,
-             const torch::Tensor& expert_down_weights,
-             const torch::Tensor& expert_down_weights_scale,
-             const torch::Tensor& shared_up_weight,
-             const torch::Tensor& shared_up_weight_scale,
-             const torch::Tensor& shared_down_weight,
-             const torch::Tensor& shared_down_weight_scale,
-             const torch::Tensor& latent_down_weight,
-             const torch::Tensor& latent_down_weight_scale,
-             const torch::Tensor& tail_fc2_weight,
-             const torch::Tensor& tail_fc2_scale,
-             const torch::Tensor& tail_norm_weight,
-             const std::optional<torch::Tensor>& correction_bias,
-             const std::optional<torch::Tensor>& per_expert_scale,
-             const torch::Tensor& tail_epochs,
-             const torch::Tensor& tail_uc_bases, const torch::Tensor& workspace,
-             const torch::Tensor& tail_out, int64_t top_k, int64_t scoring_func,
-             int64_t activation, int64_t tp_rank, int64_t tail_mc_base,
-             int64_t tail_grid_cap, bool renormalize, double situ_beta,
-             double situ_linear_beta, double tail_eps, bool use_pdl,
-             bool routed_use_swizzle, bool shared_use_swizzle,
-             bool latent_use_swizzle) {
-    const uint32_t num_tokens = static_cast<uint32_t>(input.size(0));
-    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MoEDims::kNumTokens,
-                "token count M=", num_tokens,
-                " out of range (this schedule serves 1 <= M <= ",
-                MoEDims::kNumTokens, ").");
+void MoEImpl(
+    const torch::Tensor& input, const torch::Tensor& router_weight,
+    moe::MoEProblemSize const& problem, const torch::Tensor& expert_up_weights,
+    const torch::Tensor& expert_up_weights_scale,
+    const torch::Tensor& expert_down_weights,
+    const torch::Tensor& expert_down_weights_scale,
+    const torch::Tensor& shared_up_weight,
+    const torch::Tensor& shared_up_weight_scale,
+    const torch::Tensor& shared_down_weight,
+    const torch::Tensor& shared_down_weight_scale,
+    const torch::Tensor& latent_down_weight,
+    const torch::Tensor& latent_down_weight_scale,
+    const torch::Tensor& tail_fc2_weight, const torch::Tensor& tail_fc2_scale,
+    const torch::Tensor& tail_norm_weight,
+    const std::optional<torch::Tensor>& correction_bias,
+    const std::optional<torch::Tensor>& per_expert_scale,
+    const torch::Tensor& tail_epochs, const torch::Tensor& tail_uc_bases,
+    const torch::Tensor& workspace, const torch::Tensor& tail_out,
+    int64_t top_k, int64_t scoring_func, int64_t activation, int64_t tp_rank,
+    int64_t tail_mc_base, int64_t tail_grid_cap, bool renormalize,
+    double situ_beta, double situ_linear_beta, double tail_eps, bool use_pdl,
+    bool routed_use_swizzle, bool shared_use_swizzle, bool latent_use_swizzle) {
+    TORCH_CHECK(
+        top_k >= 1 && top_k <= static_cast<std::int64_t>(MoEDims::kMaxTopk),
+        "top_k must be between 1 and ", MoEDims::kMaxTopk, ".");
 
-    constexpr std::int64_t kMaxTopk =
-        static_cast<std::int64_t>(MoEDims::kMaxTopk);
-    TORCH_CHECK(top_k >= 1 && top_k <= kMaxTopk, "top_k must be between 1 and ",
-                kMaxTopk, ".");
-
-    CheckRouterWeightShape<MoEDims>(router_weight);
-    CheckRoutedExpertShape<MoEDims>(expert_up_weights, expert_down_weights);
-    if constexpr (MoEDims::kUseLatent) {
-        CheckLatentDownShape<MoEDims>(latent_down_weight);
+    CheckRouterWeightShape(router_weight, problem);
+    CheckRoutedExpertShape<MoEDims>(expert_up_weights, expert_down_weights,
+                                    problem);
+    if (latent_down_weight.defined()) {
+        CheckLatentDownShape(latent_down_weight, problem);
     }
-    CheckSharedExpertShape<MoEDims>(shared_up_weight, shared_down_weight);
-    CheckTailFc2Shape<MoEDims>(tail_fc2_weight, tail_fc2_scale);
-    CheckRoutingVectors<MoEDims>(correction_bias, per_expert_scale);
+    CheckSharedExpertShape(shared_up_weight, shared_down_weight, problem);
+    CheckTailFc2Shape<MoEDims>(tail_fc2_weight, tail_fc2_scale, problem);
+    CheckRoutingVectors(correction_bias, per_expert_scale, problem);
 
     using Traits = moe::MoEKernelTraits<MoEDims>;
     using Mainloop = moe::CollectiveMainloopMoE<Traits>;
     using TailGeometry = moe::TailGeometryT<MoEDims>;
 
     typename Mainloop::Arguments args{};
-    args.num_tokens = num_tokens;
-    args.hidden_size = static_cast<uint32_t>(input.size(1));
-    args.latent_size = MoEDims::kUseLatent
-                           ? static_cast<uint32_t>(latent_down_weight.size(0))
-                           : 0u;
-    args.intermediate_size = static_cast<uint32_t>(shared_down_weight.size(1));
-
-    // The CTA grid is a compile-time tiling layout: the runtime widths must
-    // land on it exactly (the K widths only have to be whole K tiles).
-    using UpGemm = typename Traits::RoutedUpGemm;
-    using DownGemm = typename Traits::RoutedDownGemm;
-    using SharedUpGemm = typename Traits::SharedUpGemm;
-    using SharedDownGemm = typename Traits::SharedDownGemm;
-    using LatentDownGemm = typename Traits::LatentDownGemm;
-    TORCH_CHECK(args.hidden_size % LatentDownGemm::kTileShapeK == 0u &&
-                    args.hidden_size % SharedUpGemm::kTileShapeK == 0u,
-                "hidden_size must be a whole number of K tiles, got ",
-                args.hidden_size, ".");
-    TORCH_CHECK(
-        args.latent_size == DownGemm::kCtasPerExpert * DownGemm::kTileShapeM &&
-            args.latent_size ==
-                LatentDownGemm::kNumTilesM * LatentDownGemm::kTileShapeM &&
-            args.latent_size % UpGemm::kTileShapeK == 0u,
-        "latent_size must match the latent/routed grids (",
-        DownGemm::kCtasPerExpert * DownGemm::kTileShapeM,
-        " rows) and be whole K tiles, got ", args.latent_size, ".");
-    TORCH_CHECK(2u * args.intermediate_size ==
-                        UpGemm::kCtasPerExpert * UpGemm::kTileShapeM &&
-                    2u * args.intermediate_size ==
-                        (SharedUpGemm::kNumCtas / SharedUpGemm::kNumSplits) *
-                            SharedUpGemm::kTileShapeM,
-                "intermediate_size must match the gate/up grid (",
-                UpGemm::kCtasPerExpert * UpGemm::kTileShapeM, " rows), got ",
-                args.intermediate_size, ".");
-    TORCH_CHECK(args.hidden_size ==
-                    SharedDownGemm::kNumCtas * SharedDownGemm::kTileShapeM,
-                "hidden_size must match the shared-down grid, got ",
-                args.hidden_size, ".");
-    TORCH_CHECK(args.intermediate_size % DownGemm::kTileShapeK == 0u,
-                "intermediate_size must be a whole number of K tiles, got ",
-                args.intermediate_size, ".");
+    args.problem_size = problem;
     args.layouts = moe::MoELayouts(routed_use_swizzle, shared_use_swizzle,
                                    latent_use_swizzle);
     args.top_k = static_cast<uint32_t>(top_k);
@@ -308,7 +375,7 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
             shared_down_weight_scale.const_data_ptr());
 
     args.latent_down_weight =
-        MoEDims::kUseLatent
+        problem.use_latent
             ? static_cast<
                   const moe::LatentDownGemmTraits<MoEDims>::MmaElement*>(
                   latent_down_weight.const_data_ptr())
@@ -316,9 +383,9 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
     using LatentScale =
         typename moe::LatentDownGemmTraits<MoEDims>::ElementScale;
     args.latent_down_weight_scale =
-        MoEDims::kUseLatent ? static_cast<const LatentScale*>(
-                                  latent_down_weight_scale.const_data_ptr())
-                            : nullptr;
+        problem.use_latent ? static_cast<const LatentScale*>(
+                                 latent_down_weight_scale.const_data_ptr())
+                           : nullptr;
 
     args.workspace = static_cast<char*>(workspace.data_ptr());
 
@@ -348,11 +415,13 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
     args.tail_eps = static_cast<float>(tail_eps);
     args.tail_rank = static_cast<std::uint32_t>(tp_rank);
 
-    const uint32_t grid_size =
-        CalculateGridSize<MoEDims>(device, stream, grid_cap);
+    args.runtime = BuildRuntimeConfig<MoEDims>(problem);
 
-    const cudaError_t launch_status =
-        moe::LaunchMoEKernel<MoEDims>(args, grid_size, stream, use_pdl);
+    const uint32_t grid_size =
+        CalculateGridSize<MoEDims>(device, stream, args.runtime, grid_cap);
+
+    const cudaError_t launch_status = moe::LaunchMoEKernel<MoEDims>(
+        args, grid_size, args.runtime.cluster_size, stream, use_pdl);
     TORCH_CHECK(launch_status == cudaSuccess,
                 "kernel launch failed: ", cudaGetErrorString(launch_status));
 }
@@ -389,71 +458,157 @@ void PrintDimsKernelInfo(const char* tag) {
 
 }  // namespace moe
 
-int64_t GetWorkspaceSize(int64_t max_tokens) {
-    constexpr auto kBWFP8 = moe::QuantMethod::kBlockwiseFP8;
-    constexpr auto kMXFP8 = moe::QuantMethod::kMXFP8;
-    constexpr auto kMXFP4 = moe::QuantMethod::kMXFP4;
-    using QuantBWFP8 = moe::QuantConfig<kBWFP8, kBWFP8, kBWFP8>;
-    using QuantMXFP8 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP8>;
-    using QuantMXFP4 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP4>;
+struct MoEKernelDispatcher {
+    using QuantBWFP8 = moe::QuantConfig<moe::QuantMethod::kBlockwiseFP8,
+                                        moe::QuantMethod::kBlockwiseFP8,
+                                        moe::QuantMethod::kBlockwiseFP8>;
+    using QuantMXFP8 =
+        moe::QuantConfig<moe::QuantMethod::kMXFP8, moe::QuantMethod::kMXFP8,
+                         moe::QuantMethod::kMXFP8>;
+    using QuantMXFP4 =
+        moe::QuantConfig<moe::QuantMethod::kMXFP8, moe::QuantMethod::kMXFP8,
+                         moe::QuantMethod::kMXFP4>;
 
-    constexpr int64_t kBs8Bytes =
-        std::max({moe::WorkspaceBytesFor<
-                      moe::Dims_BS8_E512_N512_K2048_SM100<QuantBWFP8{}>>(),
-                  moe::WorkspaceBytesFor<
-                      moe::Dims_BS8_E512_N512_K2048_SM100<QuantMXFP8{}>>(),
-                  moe::WorkspaceBytesFor<
-                      moe::Dims_BS8_E512_N512_K2048_SM100<QuantMXFP4{}>>()});
-    constexpr int64_t kBs16Bytes =
-        std::max({moe::WorkspaceBytesFor<
-                      moe::Dims_BS16_E512_N512_K2048_SM100<QuantBWFP8{}>>(),
-                  moe::WorkspaceBytesFor<
-                      moe::Dims_BS16_E512_N512_K2048_SM100<QuantMXFP8{}>>(),
-                  moe::WorkspaceBytesFor<
-                      moe::Dims_BS16_E512_N512_K2048_SM100<QuantMXFP4{}>>()});
-    if (max_tokens <= 0) {
-        return kBs8Bytes > kBs16Bytes ? kBs8Bytes : kBs16Bytes;
+    enum class QuantRecipe : std::uint32_t { kBWFP8, kMXFP8, kW4A8 };
+
+    template <typename... Ts>
+    struct TypeList {};
+
+    template <typename... A, typename... B>
+    static constexpr TypeList<A..., B...> concat(TypeList<A...>,
+                                                 TypeList<B...>) {
+        return {};
     }
-    return max_tokens <= 8 ? kBs8Bytes : kBs16Bytes;
+
+    // The Dims one (TP world, token count) pair launches, one per recipe.
+    template <int WorldSize, std::uint32_t Tokens>
+    using DimsPerWorld =
+        TypeList<moe::MoEDims_E512_N512_K2048<QuantBWFP8{}, Tokens, WorldSize>,
+                 moe::MoEDims_E512_N512_K2048<QuantMXFP8{}, Tokens, WorldSize>,
+                 moe::MoEDims_E512_N512_K2048<QuantMXFP4{}, Tokens, WorldSize>>;
+
+    using DimsAll =
+        decltype(concat(concat(DimsPerWorld<1, 8>{}, DimsPerWorld<4, 8>{}),
+                        concat(DimsPerWorld<1, 16>{}, DimsPerWorld<4, 16>{})));
+
+    template <typename Dims>
+    static constexpr QuantRecipe recipe_of() {
+        if constexpr (Dims::kQuantConfig.kExpertsQuant ==
+                      moe::QuantMethod::kMXFP4) {
+            return QuantRecipe::kW4A8;
+        } else if constexpr (Dims::kQuantConfig.kLatentQuant ==
+                             moe::QuantMethod::kMXFP8) {
+            return QuantRecipe::kMXFP8;
+        } else {
+            return QuantRecipe::kBWFP8;
+        }
+    }
+
+    template <typename Dims>
+    static constexpr bool is_wide() {
+        return Dims::kNumTokens > 8u;
+    }
+
+    template <typename Dims>
+    static constexpr const char* tag() {
+        if constexpr (recipe_of<Dims>() == QuantRecipe::kW4A8) {
+            return is_wide<Dims>() ? "BS16-w4a8-mxfp4" : "BS8-w4a8-mxfp4";
+        } else if constexpr (recipe_of<Dims>() == QuantRecipe::kMXFP8) {
+            return is_wide<Dims>() ? "BS16-w8a8-mxfp8" : "BS8-w8a8-mxfp8";
+        } else {
+            return is_wide<Dims>() ? "BS16-w8a8-blockwise"
+                                   : "BS8-w8a8-blockwise";
+        }
+    }
+
+    // Largest workspace of a token class, over both TP worlds and recipes.
+    template <bool kWide, typename... Dims>
+    static constexpr int64_t max_workspace_bytes(TypeList<Dims...>) {
+        int64_t best = 0;
+        ((best =
+              (is_wide<Dims>() == kWide && static_cast<int64_t>(sizeof(
+                                               moe::MoEWorkspace<Dims>)) > best
+                   ? static_cast<int64_t>(sizeof(moe::MoEWorkspace<Dims>))
+                   : best)),
+         ...);
+        return best;
+    }
+
+    static int64_t workspace_size(int64_t max_tokens) {
+        constexpr int64_t kBs8Bytes = max_workspace_bytes<false>(DimsAll{});
+        constexpr int64_t kBs16Bytes = max_workspace_bytes<true>(DimsAll{});
+        if (max_tokens <= 0) {
+            return kBs8Bytes > kBs16Bytes ? kBs8Bytes : kBs16Bytes;
+        }
+        return max_tokens <= 8 ? kBs8Bytes : kBs16Bytes;
+    }
+
+    template <typename... Dims>
+    static constexpr int64_t tail_bytes_of(TypeList<Dims...>, bool wide,
+                                           int64_t tp_size) {
+        int64_t bytes = 0;
+        ((bytes = (is_wide<Dims>() == wide &&
+                           Dims::KernelConfig::kTailWorld == tp_size &&
+                           recipe_of<Dims>() == QuantRecipe::kBWFP8
+                       ? moe::tail_region_bytes<Dims>()
+                       : bytes)),
+         ...);
+        return bytes;
+    }
+
+    static int64_t tail_region_bytes(bool wide, int64_t tp_size) {
+        return tail_bytes_of(DimsAll{}, wide, tp_size);
+    }
+
+    template <typename... Dims>
+    static void print_matching(TypeList<Dims...>, const std::string& mode) {
+        const auto wanted = [&mode](const char* name) {
+            return mode.empty() ||
+                   std::string(name).find(mode) != std::string::npos;
+        };
+        ((wanted(tag<Dims>()) && Dims::KernelConfig::kTailWorld == 1
+              ? (moe::PrintDimsKernelInfo<Dims>(tag<Dims>()), 0)
+              : 0),
+         ...);
+    }
+
+    static void print(const std::string& quant_mode) {
+        print_matching(DimsAll{}, quant_mode);
+    }
+
+    // Invoke `launch(Dims{})` for the one matching schedule.
+    template <typename Launch, typename... Dims>
+    static bool launch_matching(TypeList<Dims...>, int64_t tp_size, bool wide,
+                                QuantRecipe recipe, Launch&& launch) {
+        return ((is_wide<Dims>() == wide &&
+                         Dims::KernelConfig::kTailWorld == tp_size &&
+                         recipe_of<Dims>() == recipe
+                     ? (launch(Dims{}), true)
+                     : false) ||
+                ...);
+    }
+
+    static QuantRecipe mode_to_recipe(const std::string& quant_mode) {
+        if (quant_mode == "w4a8-mxfp4") return QuantRecipe::kW4A8;
+        if (quant_mode == "w8a8-mxfp8") return QuantRecipe::kMXFP8;
+        return QuantRecipe::kBWFP8;
+    }
+
+    template <typename Launch>
+    static bool launch(int64_t tp_size, bool wide,
+                       const std::string& quant_mode, Launch&& launch) {
+        return launch_matching(DimsAll{}, tp_size, wide,
+                               mode_to_recipe(quant_mode),
+                               std::forward<Launch>(launch));
+    }
+};
+
+int64_t GetWorkspaceSize(int64_t max_tokens) {
+    return MoEKernelDispatcher::workspace_size(max_tokens);
 }
 
 void PrintMoEKernelInfo(const std::string& quant_mode) {
-    constexpr auto kBWFP8 = moe::QuantMethod::kBlockwiseFP8;
-    constexpr auto kMXFP8 = moe::QuantMethod::kMXFP8;
-    constexpr auto kMXFP4 = moe::QuantMethod::kMXFP4;
-    using QuantBWFP8 = moe::QuantConfig<kBWFP8, kBWFP8, kBWFP8>;
-    using QuantMXFP8 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP8>;
-    using QuantMXFP4 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP4>;
-
-    const auto wanted = [&quant_mode](const char* tag) {
-        return quant_mode.empty() ||
-               std::string(tag).find(quant_mode) != std::string::npos;
-    };
-
-    if (wanted("w8a8-blockwise")) {
-        moe::PrintDimsKernelInfo<
-            moe::Dims_BS8_E512_N512_K2048_SM100<QuantBWFP8{}>>(
-            "BS8-w8a8-blockwise");
-        moe::PrintDimsKernelInfo<
-            moe::Dims_BS16_E512_N512_K2048_SM100<QuantBWFP8{}>>(
-            "BS16-w8a8-blockwise");
-    }
-    if (wanted("w8a8-mxfp8")) {
-        moe::PrintDimsKernelInfo<
-            moe::Dims_BS8_E512_N512_K2048_SM100<QuantMXFP8{}>>(
-            "BS8-w8a8-mxfp8");
-        moe::PrintDimsKernelInfo<
-            moe::Dims_BS16_E512_N512_K2048_SM100<QuantMXFP8{}>>(
-            "BS16-w8a8-mxfp8");
-    }
-    if (wanted("w4a8-mxfp4")) {
-        moe::PrintDimsKernelInfo<
-            moe::Dims_BS8_E512_N512_K2048_SM100<QuantMXFP4{}>>(
-            "BS8-w4a8-mxfp4");
-        moe::PrintDimsKernelInfo<
-            moe::Dims_BS16_E512_N512_K2048_SM100<QuantMXFP4{}>>(
-            "BS16-w4a8-mxfp4");
-    }
+    MoEKernelDispatcher::print(quant_mode);
     fflush(stdout);
 }
 
@@ -488,13 +643,10 @@ void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,
             quant_mode == "w8a8-blockwise",
         "quant_mode must be w8a8-blockwise, w8a8-mxfp8 or w4a8-mxfp4, got ",
         quant_mode, ".");
-    TORCH_CHECK(num_router_gates == 2, "Only support 2 router gates, got ",
-                num_router_gates, ".");
-    TORCH_CHECK(input.dim() == 2, "The input' shape must be [tokens, hidden].");
 
-    const int64_t num_tokens = input.size(0);
-    TORCH_CHECK(num_tokens >= 1 && num_tokens <= 16,
-                "num_tokens must be in [1, 16].");
+    const moe::MoEProblemSize problem = moe::BuildProblem(
+        input, router_weight, shared_down_weight, latent_down_weight,
+        static_cast<std::uint32_t>(num_router_gates));
 
     TORCH_CHECK(scoring_func == "sigmoid" || scoring_func == "softmax",
                 "scoring_func must be sigmoid or softmax.");
@@ -515,10 +667,10 @@ void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,
     const auto launch_func = [&](auto dims_tag) {
         using MoEDims = decltype(dims_tag);
         moe::MoEImpl<MoEDims>(
-            input, router_weight, expert_up_weights, expert_up_weights_scale,
-            expert_down_weights, expert_down_weights_scale, shared_up_weight,
-            shared_up_weight_scale, shared_down_weight,
-            shared_down_weight_scale, latent_down_weight,
+            input, router_weight, problem, expert_up_weights,
+            expert_up_weights_scale, expert_down_weights,
+            expert_down_weights_scale, shared_up_weight, shared_up_weight_scale,
+            shared_down_weight, shared_down_weight_scale, latent_down_weight,
             latent_down_weight_scale, tail_fc2_weight, tail_fc2_scale,
             tail_norm_weight, correction_bias, per_expert_scale, tail_epochs,
             tail_uc_bases, workspace, tail_out, top_k, scoring_type,
@@ -527,61 +679,16 @@ void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,
             shared_use_swizzle, latent_use_swizzle);
     };
 
-    constexpr auto kBWFP8 = moe::QuantMethod::kBlockwiseFP8;
-    constexpr auto kMXFP8 = moe::QuantMethod::kMXFP8;
-    constexpr auto kMXFP4 = moe::QuantMethod::kMXFP4;
-    using QuantBWFP8 = moe::QuantConfig<kBWFP8, kBWFP8, kBWFP8>;
-    using QuantMXFP8 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP8>;
-    using QuantMXFP4 = moe::QuantConfig<kMXFP8, kMXFP8, kMXFP4>;
-
-    const auto launch_for_tp_size = [&](auto quant_tag) {
-        if (tp_size == 1) {
-            if (num_tokens <= 8) {
-                launch_func(
-                    moe::Dims_BS8_E512_N512_K2048_SM100<decltype(quant_tag){},
-                                                        true, 1>{});
-            } else {
-                launch_func(
-                    moe::Dims_BS16_E512_N512_K2048_SM100<decltype(quant_tag){},
-                                                         true, 1>{});
-            }
-        } else {
-            if (num_tokens <= 8) {
-                launch_func(
-                    moe::Dims_BS8_E512_N512_K2048_SM100<decltype(quant_tag){},
-                                                        true, 4>{});
-            } else {
-                launch_func(
-                    moe::Dims_BS16_E512_N512_K2048_SM100<decltype(quant_tag){},
-                                                         true, 4>{});
-            }
-        }
-    };
-
-    if (quant_mode == "w4a8-mxfp4") {
-        launch_for_tp_size(QuantMXFP4{});
-    } else if (quant_mode == "w8a8-mxfp8") {
-        launch_for_tp_size(QuantMXFP8{});
-    } else {
-        launch_for_tp_size(QuantBWFP8{});
-    }
+    const bool launched = MoEKernelDispatcher::launch(
+        tp_size, problem.num_tokens > 8, quant_mode,
+        [&](auto dims_tag) { launch_func(dims_tag); });
+    TORCH_CHECK(launched, "no schedule matches quant_mode=", quant_mode,
+                ", tp_size=", tp_size, ".");
 }
 
 int64_t MoETailRegionBytes(bool wide, int64_t tp_size) {
-    using QuantBWFP8 = moe::QuantConfig<>;
     TORCH_CHECK(tp_size == 1 || tp_size == 4, "tp_size must be 1 or 4.");
-    if (tp_size == 1) {
-        return wide
-                   ? moe::tail_region_bytes<
-                         moe::Dims_BS16_E512_N512_K2048_SM100<QuantBWFP8{},
-                                                              true, 1>>()
-                   : moe::tail_region_bytes<moe::Dims_BS8_E512_N512_K2048_SM100<
-                         QuantBWFP8{}, true, 1>>();
-    }
-    return wide ? moe::tail_region_bytes<moe::Dims_BS16_E512_N512_K2048_SM100<
-                      QuantBWFP8{}, true, 4>>()
-                : moe::tail_region_bytes<moe::Dims_BS8_E512_N512_K2048_SM100<
-                      QuantBWFP8{}, true, 4>>();
+    return MoEKernelDispatcher::tail_region_bytes(wide, tp_size);
 }
 
 }  // namespace halops

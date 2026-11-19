@@ -61,9 +61,7 @@ struct GemmTileShape {
                     cute::Int<kTileShapeK>>;
 };
 
-// Latent projection: N = tokens. Its M (the latent width) and K (the hidden
-// width) come from the runtime problem size; one split owns a fixed 128-row
-// M tile.
+// Latent projection: N = tokens, M = latent width and K = hidden width.
 template <typename Dims>
 struct LatentDownGemmTraits {
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
@@ -80,27 +78,12 @@ struct LatentDownGemmTraits {
     using MmaElement = typename WeightQuant::ElementType;
     using ElementScale = typename WeightQuant::ScaleType;
 
-    static constexpr std::uint32_t kNumCtas =
-        Dims::KernelConfig::kNumCtasForLatentDown;
-    static constexpr std::uint32_t kTileShapeN = Dims::kNumTokens;
-
-    static constexpr bool kUseSplitK = Dims::KernelConfig::kLatentDownUseSplitK;
-    static_assert(kUseSplitK, "the latent down projection is split-K only");
-    // The token width is one N tile, so the splits divide M only.
-    static constexpr std::uint32_t kNumSplits =
-        Dims::KernelConfig::kLatentDownSplits;
-
+    static constexpr std::uint32_t kTileShapeN = kGemmN;
     static constexpr std::uint32_t kTileShapeM = 128u;
     static constexpr std::uint32_t kTileShapeK = 256u;
     using TileShape =
         cute::Shape<cute::Int<kTileShapeM>, cute::Int<kTileShapeN>,
                     cute::Int<kTileShapeK>>;
-    // The CTA grid decides how many 128-row M tiles one split owns; the
-    // runtime latent width must match it.
-    static constexpr std::uint32_t kNumTilesM = kNumCtas / kNumSplits;
-
-    static constexpr std::uint32_t kClusterSize = cute::max(
-        (OutputQuant::kBlockSize + kTileShapeM - 1) / kTileShapeM, kNumSplits);
 
     using MmaCore = moe::UmmaCore<WeightQuant, InputQuant, float, TileShape>;
 
@@ -118,12 +101,6 @@ struct RouterGemmTraits {
         Dims::KernelConfig::kRouterMma == MmaKind::kUmma;
     static constexpr std::uint32_t kNumCtasForRouter =
         Dims::KernelConfig::kNumCtasForRouter;
-
-    static constexpr std::uint32_t kNumRouterGates = Dims::kNumRouterGates;
-    static_assert(kNumRouterGates == 1u || kNumRouterGates == 2u,
-                  "the router runs one or two gates");
-    static constexpr std::uint32_t kNumCtas =
-        kNumRouterGates * kNumCtasForRouter;
 
     static constexpr std::uint32_t kTileShapeN = 8u;
 
@@ -147,19 +124,16 @@ template <typename Dims>
 struct RoutedUpGemmTraits {
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
 
-    static constexpr std::uint32_t kCtasPerExpert =
-        Dims::KernelConfig::kCtasPerExpert;
-
     static constexpr std::uint32_t kTileShapeM = 128u;
     static constexpr std::uint32_t kTileShapeN = kGemmN;
-    static constexpr std::uint32_t kTileShapeK =
-        Dims::KernelConfig::kUpTileShapeK;
+    static constexpr std::uint32_t kTileShapeK = 256u;
 
     using WeightQuant = QuantSpec<Dims::kQuantConfig.kExpertsQuant>;
     using InputQuant = QuantSpec<Dims::kQuantConfig.kExpertsActQuant,
                                  Dims::kQuantConfig.kBlockSize>;
     using OutputQuant =
         QuantSpec<Dims::kQuantConfig.kExpertsActQuant, kTileShapeM / 2u>;
+    static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
 
     using MmaElement = typename WeightQuant::ElementType;
     using ElementScale = typename WeightQuant::ScaleType;
@@ -173,11 +147,6 @@ struct RoutedUpGemmTraits {
     using WeightSmemElement = typename MmaCore::SmemElementA;
     using ActElement = typename InputQuant::ElementType;
 
-    static constexpr std::uint32_t kNumSplits = 1u;
-
-    // The output's (the down's input) scale block.
-    static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
-
     static constexpr auto kWeightScaleShape =
         WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
 };
@@ -185,10 +154,6 @@ struct RoutedUpGemmTraits {
 template <typename Dims>
 struct RoutedDownGemmTraits {
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
-
-    static constexpr bool kUseLatent = Dims::kUseLatent;
-    static constexpr std::uint32_t kCtasPerExpert =
-        Dims::KernelConfig::kCtasPerExpert;
 
     static constexpr std::uint32_t kTileShapeM = 256u;
     static constexpr std::uint32_t kTileShapeN = kGemmN;
@@ -217,23 +182,16 @@ template <typename Dims>
 struct SharedUpGemmTraits {
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
 
-    // One block owns one 128-row M atom of the interleaved rows; the row count
-    // comes from the runtime problem size.
     static constexpr std::uint32_t kTileShapeM = 128u;
     static constexpr std::uint32_t kTileShapeN = kGemmN;
     static constexpr std::uint32_t kTileShapeK = 256u;
-
-    static constexpr std::uint32_t kNumSplits =
-        Dims::KernelConfig::kSharedUpSplits;
-    static constexpr std::uint32_t kNumCtas =
-        Dims::KernelConfig::kNumCtasForShared;
-    static constexpr std::uint32_t kClusterSize = kNumSplits;
 
     using WeightQuant = QuantSpec<Dims::kQuantConfig.kSharedQuant>;
     using InputQuant = QuantSpec<Dims::kQuantConfig.kSharedQuant,
                                  Dims::kQuantConfig.kBlockSize>;
     using OutputQuant =
         QuantSpec<Dims::kQuantConfig.kSharedQuant, kTileShapeM / 2u>;
+    static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
 
     using MmaElement = typename WeightQuant::ElementType;
     using ElementScale = typename WeightQuant::ScaleType;
@@ -244,9 +202,6 @@ struct SharedUpGemmTraits {
     using TiledMma = typename MmaCore::TiledMma;
     using ScaleTraits = typename MmaCore::ScaleTraits;
 
-    // The output's (the down's input) scale block.
-    static constexpr std::uint32_t kOutputQuantBlock = OutputQuant::kBlockSize;
-
     static constexpr auto kWeightScaleShape =
         WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
 };
@@ -256,10 +211,6 @@ template <typename Dims>
 struct SharedDownGemmTraits {
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
 
-    static constexpr std::uint32_t kNumCtas =
-        Dims::KernelConfig::kNumCtasForShared;
-    // One block owns one 128-row M tile; the runtime hidden width must cover
-    // the blocks exactly (checked on the host).
     static constexpr std::uint32_t kTileShapeM = 128u;
     static constexpr std::uint32_t kTileShapeN = kGemmN;
     static constexpr std::uint32_t kTileShapeK = 128u;
@@ -280,16 +231,6 @@ struct SharedDownGemmTraits {
         WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
 };
 
-// The accumulator columns one K step's tile needs in TMEM.
-template <class GemmTraits>
-constexpr std::uint32_t get_gemm_acc_columns() {
-    return GemmTraits::MmaCore::kUseBlockscaled
-               ? GemmTraits::MmaCore::kNumAtomMs * GemmTraits::kTileShapeN
-               : GemmTraits::MmaCore::kNumAtomMs *
-                     GemmTraits::MmaCore::kNumQuantBlocksB *
-                     GemmTraits::kTileShapeN;
-}
-
 template <typename Dims>
 struct MoEKernelTraits {
     using MoEDims = Dims;
@@ -307,33 +248,8 @@ struct MoEKernelTraits {
                   "the latent output recipe must be the up's input recipe");
 
     static constexpr std::uint32_t kThreads = Dims::KernelConfig::kBlockSize;
-    static constexpr std::uint32_t kCtasPerExpert =
-        Dims::KernelConfig::kCtasPerExpert;
-
-    static constexpr bool kUseLatent = Dims::kUseLatent;
-
-    static constexpr std::uint32_t kLatentClusterSize =
-        kUseLatent ? LatentDownGemm::kClusterSize : 1u;
-    static constexpr std::uint32_t kClusterSize =
-        cute::max(kLatentClusterSize, SharedUpGemmTraits<Dims>::kClusterSize);
-
-    // A cluster may not mix blocks of different phases.
-    static_assert(RouterGemm::kNumCtas % kClusterSize == 0u,
-                  "the router's blocks must end on a cluster boundary");
-    static_assert(LatentDownGemm::kNumCtas % kClusterSize == 0u,
-                  "the projection's blocks must be whole clusters");
-    static_assert(LatentDownGemm::kNumCtas % kLatentClusterSize == 0u,
-                  "the projection's groups must be whole blocks");
-
-    static constexpr std::uint32_t kMinGrid = cute::max(
-        RouterGemm::kNumCtas + (kUseLatent ? LatentDownGemm::kNumCtas : 0u) +
-            cute::max(SharedUpGemm::kNumCtas, SharedDownGemm::kNumCtas),
-        TailGeometry::kNumCtas);
 
     static constexpr std::uint32_t kMaxGrid = Dims::KernelConfig::kSpecMaxGrid;
-    static_assert(kMinGrid <= kMaxGrid,
-                  "Grid bounds must be ordered kCtasPerExpert <= kMinGrid <= "
-                  "kMaxGrid.");
 
     // Gate/up rows are interleaved in groups of kInterleaveGranularity.
     static constexpr std::uint32_t kInterleaveGranularity = 8u;

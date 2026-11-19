@@ -30,7 +30,7 @@ struct TailPhase {
     using SharedStorage = MoESharedStorage<Dims>;
     using Workspace = MoEWorkspace<Dims>;
     using Geometry = TailGeometryT<Dims>;
-    using Group = CtaGroup<Traits::kCtasPerExpert>;
+    using Group = CtaGroup;
 
     template <class P>
     __device__ static void prefetch_weights(P const& params) {

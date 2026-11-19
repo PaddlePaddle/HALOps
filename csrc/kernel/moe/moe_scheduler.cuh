@@ -36,16 +36,22 @@ struct TaskInfo {
     std::uint32_t task_id;
 };
 
-template <std::uint32_t kCtasPerExpert>
+// Blocks that share one routed-expert task; the width is a runtime value.
 struct CtaGroup {
     std::uint32_t group_idx;
     std::uint32_t cta_idx_in_group;
     std::uint32_t num_groups;
 
-    __device__ CtaGroup()
-        : group_idx(blockIdx.x / kCtasPerExpert),
-          cta_idx_in_group(blockIdx.x % kCtasPerExpert),
-          num_groups(gridDim.x / kCtasPerExpert) {}
+    __device__ explicit CtaGroup(MoERuntime const& runtime) {
+        int quotient = 0;
+        int remainder = 0;
+        runtime.ctas_per_expert_divmod.fast_divmod(
+            quotient, remainder, static_cast<int>(blockIdx.x));
+        group_idx = static_cast<std::uint32_t>(quotient);
+        cta_idx_in_group = static_cast<std::uint32_t>(remainder);
+        num_groups = static_cast<std::uint32_t>(
+            runtime.ctas_per_expert_divmod.div(static_cast<int>(gridDim.x)));
+    }
 
     __device__ bool in_whole_group() const { return group_idx < num_groups; }
 };
@@ -58,13 +64,17 @@ class TaskScheduler {
     using SharedStorage = MoESharedStorage<Dims>;
     using Workspace = MoEWorkspace<Dims>;
 
-    static constexpr std::uint32_t kCtasPerExpert = Traits::kCtasPerExpert;
-    using Group = CtaGroup<kCtasPerExpert>;
+    using Group = CtaGroup;
     // `down_grid_task` entry that ends a block's down task sequence.
     static constexpr std::uint32_t kNoTask = SharedStorage::kNoDownTask;
 
-    __device__ TaskScheduler(SharedStorage* smem, Workspace* workspace)
-        : smem_(smem), workspace_(workspace) {}
+    __device__ TaskScheduler(SharedStorage* smem, Workspace* workspace,
+                             MoERuntime const& runtime)
+        : cta_group_(runtime),
+          num_ctas_per_expert_(runtime.num_ctas_per_expert),
+          ctas_per_expert_divmod_(runtime.ctas_per_expert_divmod),
+          smem_(smem),
+          workspace_(workspace) {}
 
     // Open the sequence for `phase`; `expert_count` is a runtime upper bound.
     __device__ void begin_phase(BlockPhase phase, std::uint32_t expert_count) {
@@ -79,9 +89,9 @@ class TaskScheduler {
     __device__ void claim_next_task() {
         // claim_first_down_task may have published this task during up.
         if (smem_->down_tasks_claimed > task_count_) return;
-        const std::uint32_t num_tasks = expert_count_ * kCtasPerExpert;
+        const std::uint32_t num_tasks = expert_count_ * num_ctas_per_expert_;
         const std::uint32_t num_static_tasks =
-            cta_group_.num_groups * kCtasPerExpert;
+            cta_group_.num_groups * num_ctas_per_expert_;
         std::uint32_t grid_task = kNoTask;
         if (task_count_ == 0u && cta_group_.in_whole_group()) {
             grid_task = static_down_task();
@@ -139,9 +149,9 @@ class TaskScheduler {
 
     // Block m of group g starts down on m-block m of the group's first expert.
     __device__ std::uint32_t static_down_task() const {
-        const std::uint32_t task =
-            cta_group_.group_idx * kCtasPerExpert + cta_group_.cta_idx_in_group;
-        return task < expert_count_ * kCtasPerExpert ? task : kNoTask;
+        const std::uint32_t task = cta_group_.group_idx * num_ctas_per_expert_ +
+                                   cta_group_.cta_idx_in_group;
+        return task < expert_count_ * num_ctas_per_expert_ ? task : kNoTask;
     }
 
     __device__ void store_claim(std::uint32_t idx, std::uint32_t grid_task) {
@@ -155,14 +165,20 @@ class TaskScheduler {
         }
         const std::uint32_t grid_task = smem_->down_grid_task[task_count_];
         if (grid_task == kNoTask) return false;
-        task.local_expert_idx = grid_task / kCtasPerExpert;
-        task.m_block_idx = grid_task % kCtasPerExpert;
+        int quotient = 0;
+        int remainder = 0;
+        ctas_per_expert_divmod_.fast_divmod(quotient, remainder,
+                                            static_cast<int>(grid_task));
+        task.local_expert_idx = static_cast<std::uint32_t>(quotient);
+        task.m_block_idx = static_cast<std::uint32_t>(remainder);
         task.next_expert_idx = kNoExpert;
         task.task_id = task_count_++;
         return true;
     }
 
     Group cta_group_;
+    std::uint32_t num_ctas_per_expert_ = 1u;
+    cutlass::FastDivmod ctas_per_expert_divmod_{};
     SharedStorage* smem_ = nullptr;
     Workspace* workspace_ = nullptr;
     BlockPhase phase_ = BlockPhase::kNone;

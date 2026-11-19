@@ -16,40 +16,42 @@
 
 #include <cstdint>
 
+#include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/ptx_utils.cuh"
 
 namespace halops::moe {
 
-// Split-K groups inside a launch cluster: `NumSplits` CTAs that reduce one
-// GEMM.
-template <std::uint32_t ClusterSize, std::uint32_t NumSplits>
+// Split-K groups inside a launch cluster.
 struct ClusterSplitK {
-    static_assert(NumSplits >= 1u, "a group needs one split or more");
-    static_assert(ClusterSize % NumSplits == 0u,
-                  "a split group is a whole run of the launch cluster");
+    __device__ ClusterSplitK(std::uint32_t cluster_size,
+                             std::uint32_t num_splits)
+        : cluster_size_(cluster_size), num_splits_(num_splits) {}
 
-    // This CTA's rank inside the launch cluster.
-    __device__ static std::uint32_t rank() {
-        return static_cast<std::uint32_t>(blockIdx.x) % ClusterSize;
+    // This CTA's rank inside its launch cluster.
+    __device__ static std::uint32_t rank(std::uint32_t cluster_size) {
+        return static_cast<std::uint32_t>(blockIdx.x) % cluster_size;
     }
 
-    __device__ static std::uint32_t split_idx() { return rank() % NumSplits; }
-    __device__ static std::uint32_t group_base() {
-        return rank() - split_idx();
+    __device__ std::uint32_t split_idx() const {
+        return rank(cluster_size_) % num_splits_;
+    }
+    __device__ std::uint32_t group_base() const {
+        return rank(cluster_size_) - split_idx();
     }
 
-    // A cluster-wide barrier: release on arrive, acquire on wait.
     __device__ static void sync() { cluster_arrive_and_wait(); }
     __device__ static void arrive() { cluster_arrive(); }
     __device__ static void wait() { cluster_wait(); }
 
-    __device__ ClusterSplitK() : group_base_(group_base()) {}
-
-    // Point the split addresses at `local`'s copies in every split.
     __device__ void map(const void* local) {
+        const std::uint32_t base = group_base();
+
+        // Unrolled to keep `peers_` stays in registers.
 #pragma unroll
-        for (std::uint32_t r = 0; r < NumSplits; ++r) {
-            peers_[r] = cluster_map_shared_rank(local, group_base_ + r);
+        for (std::uint32_t r = 0; r < MoERuntime::kMaxClusterSize; ++r) {
+            if (r < num_splits_) {
+                peers_[r] = cluster_map_shared_rank(local, base + r);
+            }
         }
     }
 
@@ -57,15 +59,18 @@ struct ClusterSplitK {
     __device__ float split_sum(std::uint32_t index) const {
         float v = 0.0f;
 #pragma unroll
-        for (std::uint32_t r = 0; r < NumSplits; ++r) {
-            v += cluster_load_f32(peers_[r] + 4u * index);
+        for (std::uint32_t r = 0; r < MoERuntime::kMaxClusterSize; ++r) {
+            if (r < num_splits_) {
+                v += cluster_load_f32(peers_[r] + 4u * index);
+            }
         }
         return v;
     }
 
   private:
-    std::uint32_t group_base_;
-    std::uint32_t peers_[NumSplits];
+    std::uint32_t cluster_size_;
+    std::uint32_t num_splits_;
+    std::uint32_t peers_[MoERuntime::kMaxClusterSize];
 };
 
 }  // namespace halops::moe

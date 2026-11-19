@@ -47,7 +47,7 @@ struct PackedTokenCounts {
 };
 
 template <std::uint32_t kSpecMaxGrid, std::uint32_t kMaxRoutedRows,
-          std::uint32_t kUpOutScaleCols, std::uint32_t kCtasPerExpert>
+          std::uint32_t kUpOutScaleCols, std::uint32_t kMaxCtasPerExpert>
 struct MoECtaComm {
     // Per-block launch counter; its parity selects the double-buffer half.
     std::uint32_t launch_flip[kSpecMaxGrid];
@@ -61,7 +61,7 @@ struct MoECtaComm {
     // Parity-buffered down-task cursor and packed per-token completion counts.
     // Each token completes after top_k tasks.
     std::uint32_t down_task_next[2];
-    std::uint64_t down_tasks_done[2][kCtasPerExpert];
+    std::uint64_t down_tasks_done[2][kMaxCtasPerExpert];
 
     // Published router-task count, double-buffered by launch parity.
     std::uint32_t router_tasks_done[2];
@@ -90,7 +90,7 @@ struct MoECtaComm {
         if (rank < kMaxRoutedRows) {
             up_out_ready[inactive][rank] = 0u;
         }
-        if (rank < kCtasPerExpert) {
+        if (rank < kMaxCtasPerExpert) {
             down_tasks_done[inactive][rank] = 0;
         }
         if (rank < kRouterTableSlices) {

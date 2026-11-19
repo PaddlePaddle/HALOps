@@ -562,7 +562,7 @@ __device__ static void topk_weights_from_scores_fp32(
 template <typename Dims, uint32_t kExpertsPerThread>
 __device__ static void topk_one_token(
     uint32_t token_idx, uint32_t top_k, ScoringFunc scoring_func,
-    bool renormalize,
+    bool renormalize, uint32_t num_router_gates,
     const cutlass::Array<float, kExpertsPerThread>& correction_bias,
     const float* __restrict__ per_expert_scale,
     const MoEWorkspace<Dims>* __restrict__ workspace,
@@ -576,13 +576,12 @@ __device__ static void topk_one_token(
                   "per-thread arrays register-resident).");
 
     constexpr uint32_t kMaxTopk = Dims::kMaxTopk;
-    constexpr uint32_t kNumGates = RouterGemmTraits<Dims>::kNumRouterGates;
     const uint32_t lane_idx = WarpRole::get_lane_idx();
 
     const cutlass::Array<float, kExpertsPerThread> logits =
         load_logits_one_token<Dims, kExpertsPerThread>(workspace, 0u,
                                                        token_idx);
-    if constexpr (kNumGates > 1u) {
+    if (num_router_gates > 1u) {
         // DualRouter: select on the sum of the two gates' scores.
         const cutlass::Array<float, kExpertsPerThread> other =
             load_logits_one_token<Dims, kExpertsPerThread>(workspace, 1u,

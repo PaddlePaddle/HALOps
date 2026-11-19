@@ -54,15 +54,9 @@ struct LatentDownProjectionBase {
     static_assert(kTileShapeM <= 128u,
                   "a CTA's rows must sit inside one 128-row weight block");
 
-    static constexpr std::uint32_t kNumCtas = LatentDownGemm::kNumCtas;
-    static constexpr std::uint32_t kNumTilesM = LatentDownGemm::kNumTilesM;
-
     // The weight, input and scale rings share one depth.
     static constexpr std::uint32_t kNumSlots =
         GemmSlots<Dims, LatentDownGemm>::kNumSlots;
-
-    static constexpr std::uint32_t kNumSplits = LatentDownGemm::kNumSplits;
-    using Cluster = ClusterSplitK<Traits::kClusterSize, kNumSplits>;
 
     static constexpr std::uint32_t kOutChunkK =
         LatentDownSmem<Dims, LatentDownGemm>::kOutLboChunkK;
@@ -88,37 +82,41 @@ struct LatentDownProjectionBase {
     // A 128-row atom interleaves 16-row groups across warp sub-partitions.
     static constexpr bool kNarrowAtom = MmaCore::kAtomShapeM == 64u;
 
-    __device__ static bool is_latent_cta() {
-        return blockIdx.x >= RouterGemm::kNumCtas &&
-               blockIdx.x < RouterGemm::kNumCtas + kNumCtas;
+    __device__ static std::uint32_t cta_idx(MoERuntime const& runtime) {
+        return blockIdx.x - runtime.num_router_ctas * runtime.num_router_gates;
     }
 
-    __device__ static std::uint32_t cta_idx() {
-        return blockIdx.x - RouterGemm::kNumCtas;
-    }
-
-    __device__ static std::uint32_t split_idx() {
-        return cta_idx() % kNumSplits;
-    }
-
-    __device__ static std::uint32_t k_tile(std::uint32_t k_iter_id,
-                                           std::uint32_t num_k_tiles) {
-        return split_idx() * num_k_tiles + k_iter_id;
-    }
-
-    // K tiles of this block's split: the reduction is `hidden` wide.
-    __device__ static std::uint32_t num_k_tiles_per_cta(
-        MoEProblemSize const& problem_size) {
+    __device__ static std::uint32_t k_tiles_per_split(
+        MoEProblemSize const& problem_size, MoERuntime const& runtime) {
         return problem_size.hidden_size / LatentDownGemm::kTileShapeK /
-               kNumSplits;
+               runtime.num_latent_splits;
     }
 
-    __device__ static std::uint32_t latent_row_base() {
-        return ((cta_idx() / kNumSplits) % kNumTilesM) * kTileShapeM;
-    }
+    // The per-task constants every K tile reuses: the runtime split count
+    // makes its divisions and modulos too costly to repeat per tile.
+    struct SplitView {
+        std::uint32_t split;
+        std::uint32_t k_tile_base;
+        std::uint32_t row_base;
+        std::uint32_t scale_block;
+    };
 
-    __device__ static std::uint32_t scale_block_idx() {
-        return latent_row_base() / 128u;
+    __device__ static SplitView make_view(MoERuntime const& runtime,
+                                          std::uint32_t num_k_tiles) {
+        const std::uint32_t cta =
+            blockIdx.x - runtime.num_router_ctas * runtime.num_router_gates;
+        int quotient = 0;
+        int remainder = 0;
+        runtime.latent_splits_divmod.fast_divmod(quotient, remainder,
+                                                 static_cast<int>(cta));
+        const std::uint32_t split = static_cast<std::uint32_t>(remainder);
+        const std::uint32_t cta_per_split =
+            static_cast<std::uint32_t>(quotient);
+        const std::uint32_t row_base =
+            static_cast<std::uint32_t>(runtime.latent_tiles_divmod.rem(
+                static_cast<int>(cta_per_split))) *
+            kTileShapeM;
+        return SplitView{split, split * num_k_tiles, row_base, row_base / 128u};
     }
 
     __device__ static Element* input_slot(SharedStorage* smem,
@@ -130,7 +128,7 @@ struct LatentDownProjectionBase {
 
     __device__ static void run_load_input_k_loop(
         CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem,
-        std::uint32_t num_k_tiles) {
+        std::uint32_t num_k_tiles, SplitView const& view) {
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
@@ -140,7 +138,7 @@ struct LatentDownProjectionBase {
             smem->barriers.latent_down.input_ready.arrive(k_iter_id,
                                                           kInputTileTxBytes);
             load_input_tile_chunks<kTileShapeN>(
-                tma_input_desc, k_tile(k_iter_id, num_k_tiles),
+                tma_input_desc, view.k_tile_base + k_iter_id,
                 /*token_start=*/0u, smem->latent_down.input.data[slot],
                 smem->barriers.latent_down.input_ready.raw(slot));
         }
@@ -149,15 +147,15 @@ struct LatentDownProjectionBase {
     __device__ static void load_weight_tile(
         CUtensorMap const& tma_latent_down_weight_desc,
         SharedStorage* __restrict__ smem, std::uint32_t k_iter_id,
-        std::uint32_t transaction_bytes, std::uint32_t num_k_tiles) {
+        std::uint32_t transaction_bytes, SplitView const& view) {
         const std::uint32_t slot = k_iter_id % kNumSlots;
         smem->barriers.latent_down.weight_ready.arrive(k_iter_id,
                                                        transaction_bytes);
         constexpr std::uint32_t kChunkK = LatentDownGemm::MmaCore::kSwizzleBoxK;
         const std::uint32_t k_start =
-            k_tile(k_iter_id, num_k_tiles) * LatentDownGemm::kTileShapeK;
+            (view.k_tile_base + k_iter_id) * LatentDownGemm::kTileShapeK;
         tma_load_3d(tma_latent_down_weight_desc, /*coord0=*/0u,
-                    /*coord1=*/latent_row_base(), /*coord2=*/k_start / kChunkK,
+                    /*coord1=*/view.row_base, /*coord2=*/k_start / kChunkK,
                     &smem->latent_down.w_latent_down[slot][0][0][0],
                     smem->barriers.latent_down.weight_ready.raw(slot));
     }
@@ -182,7 +180,7 @@ struct LatentDownProjectionBase {
     __device__ static void quantize_input_tile(SharedStorage* __restrict__ smem,
                                                std::uint32_t batch_size,
                                                std::uint32_t k_iter_id,
-                                               std::uint32_t num_k_tiles) {
+                                               SplitView const& view) {
         const std::uint32_t slot = k_iter_id % kNumSlots;
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
         if constexpr (LatentDownGemm::InputQuant::kMethod ==
@@ -191,8 +189,8 @@ struct LatentDownProjectionBase {
             smem->barriers.latent_down.wait_weight_empty(k_iter_id);
         }
         smem->barriers.latent_down.input_ready.wait(k_iter_id);
-        const std::uint32_t block_base =
-            k_tile(k_iter_id, num_k_tiles) * MmaCore::kNumSwizzleBoxKs;
+        const std::uint32_t k_tile = view.k_tile_base + k_iter_id;
+        const std::uint32_t block_base = k_tile * MmaCore::kNumSwizzleBoxKs;
         // The source offset follows the tile's global K block; a blockwise
         // tile's scale rows live in its staging slot.
         const SmemTileQuantizer<
@@ -207,11 +205,11 @@ struct LatentDownProjectionBase {
         for (std::uint32_t i = warp_idx;
              i < kTileShapeN * MmaCore::kNumSwizzleBoxKs;
              i += WarpRole::kCalcWarpCount) {
-            tile.quantize(
-                i / MmaCore::kNumSwizzleBoxKs, i % MmaCore::kNumSwizzleBoxKs,
-                act, &smem->latent_down.quantized_input.data[0],
-                smem->latent_down.quantized_input.scale_ptr(),
-                k_tile(k_iter_id, num_k_tiles) * LatentDownGemm::kTileShapeK);
+            tile.quantize(i / MmaCore::kNumSwizzleBoxKs,
+                          i % MmaCore::kNumSwizzleBoxKs, act,
+                          &smem->latent_down.quantized_input.data[0],
+                          smem->latent_down.quantized_input.scale_ptr(),
+                          k_tile * LatentDownGemm::kTileShapeK);
         }
         // Make FP8 stores visible to the async proxy before signaling
         // readiness.
@@ -223,27 +221,11 @@ struct LatentDownProjectionBase {
         }
     }
 
-    // Write one output scale entry for `tok`.
-    __device__ static void store_scale(
-        Workspace* __restrict__ workspace, std::uint32_t tok,
-        std::uint32_t group,
-        typename LatentDownGemm::OutputQuant::ScaleType scale) {
-        using OutputQuant = typename LatentDownGemm::OutputQuant;
-        const std::uint32_t k_group =
-            latent_row_base() / OutputQuant::kBlockSize + group;
-        if constexpr (OutputQuant::kMethod == QuantMethod::kMXFP8) {
-            workspace->latent_down_out.sf_atom(
-                k_group)[sf_atom_offset(tok, k_group % 4u)] =
-                static_cast<std::uint8_t>(scale);
-        } else {
-            workspace->latent_down_out.scale_row(k_group)[tok] = scale;
-        }
-    }
-
     // Quantize this block's staged latent output into the workspace.
     __device__ static void quantize_output(Workspace* __restrict__ workspace,
                                            SharedStorage* __restrict__ smem,
-                                           std::uint32_t batch_size) {
+                                           std::uint32_t batch_size,
+                                           SplitView const& view) {
         using OutputQuant = typename LatentDownGemm::OutputQuant;
         using Scale = QuantScale<OutputQuant>;
         using Quantizer = RegisterQuantizer<OutputQuant, kTileShapeM>;
@@ -253,7 +235,7 @@ struct LatentDownProjectionBase {
             static_assert(Traits::RoutedUpGemm::kTileShapeK % kTileShapeM == 0u,
                           "an MXFP8 CTA's rows must sit inside one up K tile");
         }
-        const std::uint32_t chunk_base = latent_row_base() / kOutChunkK;
+        const std::uint32_t chunk_base = view.row_base / kOutChunkK;
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         // One warp quantizes one token, lane `L` owning the rows `L + 32 * i`.
         if (WarpRole::is_calc_warp(warp_idx)) {
@@ -283,8 +265,33 @@ struct LatentDownProjectionBase {
                         scales[g] = Scale::kPadding;
                     }
                 }
-                if (lane_idx < Quantizer::kNumGroups) {
-                    store_scale(workspace, tok, lane_idx, scales[lane_idx]);
+
+                const std::uint32_t k_group_base =
+                    view.row_base / OutputQuant::kBlockSize;
+                if constexpr (OutputQuant::kMethod == QuantMethod::kMXFP8) {
+                    static_assert(Quantizer::kNumGroups <= 8u,
+                                  "the group scales must pack into one word");
+                    std::uint64_t scale_bits = 0u;
+#pragma unroll
+                    for (std::uint32_t g = 0; g < Quantizer::kNumGroups; ++g) {
+                        scale_bits |= static_cast<std::uint64_t>(scales[g])
+                                      << (8u * g);
+                    }
+                    if (lane_idx < Quantizer::kNumGroups) {
+                        const std::uint32_t k_group = k_group_base + lane_idx;
+                        workspace->latent_down_out.sf_atom(
+                            k_group)[sf_atom_offset(tok, k_group % 4u)] =
+                            static_cast<std::uint8_t>(scale_bits >>
+                                                      (8u * lane_idx));
+                    }
+                } else {
+#pragma unroll
+                    for (std::uint32_t g = 0; g < Quantizer::kNumGroups; ++g) {
+                        if (lane_idx == g) {
+                            workspace->latent_down_out.scale_row(
+                                k_group_base + g)[tok] = scales[g];
+                        }
+                    }
                 }
 #pragma unroll
                 for (std::uint32_t i = 0; i < Quantizer::kValuesPerThread;
@@ -307,46 +314,49 @@ struct LatentDownProjectionBase {
     __device__ static void epilogue(Workspace* __restrict__ workspace,
                                     SharedStorage* __restrict__ smem,
                                     std::uint32_t batch_size,
-                                    float const (&acc)[kTokenWindows][4]) {
+                                    float const (&acc)[kTokenWindows][4],
+                                    SplitView const& view,
+                                    MoERuntime const& runtime) {
         if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
-            if constexpr (kNumSplits > 1u) {
+            if (runtime.num_latent_splits > 1u) {
                 store_splited_mma_out(smem, acc);
             } else {
-                writeback(workspace, smem, acc);
+                writeback(workspace, smem, acc, view);
                 WarpRole::sync_calc_threads();
             }
         }
-        if constexpr (kNumSplits > 1u) {
-            join_split_k(workspace, smem);
+        if (runtime.num_latent_splits > 1u) {
+            join_split_k(workspace, smem, view, runtime);
         }
-        if (split_idx() == 0u) {
-            quantize_output(workspace, smem, batch_size);
+        if (view.split == 0u) {
+            quantize_output(workspace, smem, batch_size, view);
             if (threadIdx.x == 0u) {
                 workspace->cta_comm.publish_latent_tasks(smem->launch_parity,
                                                          1u);
             }
         }
-        if constexpr (kNumSplits > 1u) {
-            if (split_idx() == 0u) Cluster::wait();
+        if (runtime.num_latent_splits > 1u) {
+            if (view.split == 0u) ClusterSplitK::wait();
         }
     }
 
     __device__ static void writeback(Workspace* __restrict__ workspace,
                                      SharedStorage* __restrict__ smem,
-                                     float const (&acc)[kTokenWindows][4]) {
+                                     float const (&acc)[kTokenWindows][4],
+                                     SplitView const& view) {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         constexpr std::uint32_t kWriterWarps = kTileShapeM / 16u;
         if (warp_idx >= kWriterWarps) return;
+        const std::uint32_t base = view.row_base;
         const std::uint32_t row =
-            latent_row_base() + 16u * group_idx(warp_idx) + lane_idx / 4u;
+            base + 16u * group_idx(warp_idx) + lane_idx / 4u;
 #pragma unroll
         for (std::uint32_t g = 0; g < kTokenWindows; ++g) {
             const std::uint32_t tok_local = 8u * g + 2u * (lane_idx & 3u);
 #pragma unroll
             for (std::uint32_t i = 0; i < 4u; ++i) {
-                const std::uint32_t row_local =
-                    row + 8u * (i / 2u) - latent_row_base();
+                const std::uint32_t row_local = row + 8u * (i / 2u) - base;
                 smem->latent_down
                     .act_out[row_local / kOutChunkK][tok_local + i % 2u]
                             [row_local % kOutChunkK] =
@@ -378,11 +388,13 @@ struct LatentDownProjectionBase {
 
     // Split 0 reduces peer outputs and quantizes output.
     __device__ static void join_split_k(Workspace* __restrict__ workspace,
-                                        SharedStorage* __restrict__ smem) {
+                                        SharedStorage* __restrict__ smem,
+                                        SplitView const& view,
+                                        MoERuntime const& runtime) {
         // Every thread joins: the cluster barrier is block-collective.
         __syncthreads();
-        Cluster::sync();
-        if (split_idx() == 0u) {
+        ClusterSplitK::sync();
+        if (view.split == 0u) {
             const std::uint32_t warp_idx = WarpRole::get_warp_idx();
             if (WarpRole::is_calc_warp(warp_idx)) {
                 if (warp_idx < kTileShapeM / 16u) {
@@ -390,7 +402,8 @@ struct LatentDownProjectionBase {
                     const std::uint32_t row =
                         16u * group_idx(warp_idx) + lane_idx / 4u;
                     const std::uint32_t t0 = lane_idx & 3u;
-                    Cluster cluster;
+                    ClusterSplitK cluster(runtime.cluster_size,
+                                          runtime.num_latent_splits);
                     cluster.map(&smem->latent_down.splited_mma_out[0][0]);
                     float acc[kTokenWindows][4] = {};
 #pragma unroll
@@ -403,15 +416,15 @@ struct LatentDownProjectionBase {
                             acc[g][i] = cluster.split_sum(at);
                         }
                     }
-                    writeback(workspace, smem, acc);
+                    writeback(workspace, smem, acc, view);
                 }
                 WarpRole::sync_calc_threads();
             }
             // Release peer reads now; wait after output quantization.
-            Cluster::arrive();
+            ClusterSplitK::arrive();
         } else {
-            Cluster::arrive();
-            Cluster::wait();
+            ClusterSplitK::arrive();
+            ClusterSplitK::wait();
         }
     }
 };
@@ -426,7 +439,6 @@ template <typename KernelTraits>
 struct LatentDownProjection<KernelTraits, true>
     : LatentDownProjectionBase<KernelTraits> {
     using Base = LatentDownProjectionBase<KernelTraits>;
-    using Cluster = typename Base::Cluster;
     using typename Base::Dims;
     using typename Base::LatentDownGemm;
     using typename Base::MmaCore;
@@ -467,11 +479,10 @@ struct LatentDownProjection<KernelTraits, true>
     __device__ static void build_plain_scale_tile(
         const std::uint8_t* __restrict__ natural,
         SharedStorage* __restrict__ smem, std::uint32_t k_tile,
-        std::uint32_t slot, std::uint32_t blocks_k) {
+        std::uint32_t slot, std::uint32_t blocks_k, std::uint32_t scale_block) {
         const std::uint32_t lane = WarpRole::get_lane_idx();
         const std::uint8_t* const src =
-            natural +
-            static_cast<std::size_t>(Base::scale_block_idx()) * 128u * blocks_k;
+            natural + static_cast<std::size_t>(scale_block) * 128u * blocks_k;
         std::uint8_t* const dst = smem->latent_down.w_scale[slot];
 #pragma unroll
         for (std::uint32_t q = 0; q < 2u; ++q) {
@@ -494,34 +505,37 @@ struct LatentDownProjection<KernelTraits, true>
         const typename LatentDownGemm::
             ElementScale* __restrict__ latent_down_weight_scale,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        ScaleLayout latent_scale_layout, MoEProblemSize const& problem_size) {
-        if (!Base::is_latent_cta()) return;
+        ScaleLayout latent_scale_layout, MoEProblemSize const& problem_size,
+        MoERuntime const& runtime) {
+        if (!runtime.is_latent_cta()) return;
 
         const std::uint32_t batch_size = problem_size.num_tokens;
         zero_sf_slots(smem);
 
         const std::uint32_t num_k_tiles =
-            Base::num_k_tiles_per_cta(problem_size);
+            Base::k_tiles_per_split(problem_size, runtime);
+        const auto view = Base::make_view(runtime, num_k_tiles);
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         float acc[Base::kTokenWindows][4] = {};
         if (WarpRole::is_other_loader_thread()) {
-            Base::run_load_input_k_loop(tma_input_desc, smem, num_k_tiles);
+            Base::run_load_input_k_loop(tma_input_desc, smem, num_k_tiles,
+                                        view);
         } else if (WarpRole::is_weight_loader_warp(warp_idx)) {
             run_load_weight_k_loop(
                 tma_latent_down_weight_desc,
                 reinterpret_cast<const std::uint8_t*>(latent_down_weight_scale),
-                smem, num_k_tiles, latent_scale_layout);
+                smem, num_k_tiles, latent_scale_layout, view, runtime);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
             run_mma_k_loop(smem, smem->tmem_ptr, num_k_tiles);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
 #pragma unroll 1
             for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
                  ++k_iter_id) {
-                quantize_input_tile(smem, batch_size, k_iter_id, num_k_tiles);
+                quantize_input_tile(smem, batch_size, k_iter_id, view);
             }
             load_accumulators(smem, acc);
         }
-        epilogue(workspace, smem, batch_size, acc);
+        epilogue(workspace, smem, batch_size, acc, view, runtime);
     }
 
     // Stream one weight tile and its scale SfAtom through the ring per K tile.
@@ -529,39 +543,44 @@ struct LatentDownProjection<KernelTraits, true>
         CUtensorMap const& tma_latent_down_weight_desc,
         const std::uint8_t* __restrict__ scale,
         SharedStorage* __restrict__ smem, std::uint32_t num_k_tiles,
-        ScaleLayout scale_layout) {
+        ScaleLayout scale_layout, Base::SplitView const& view,
+        MoERuntime const& runtime) {
         const std::uint32_t lane = WarpRole::get_lane_idx();
-        const std::uint32_t blocks_k = num_k_tiles * Base::kNumSplits *
-                                       (LatentDownGemm::kTileShapeK / 32u);
+        const std::uint32_t k_tiles_total =
+            num_k_tiles * runtime.num_latent_splits;
+        const std::uint32_t blocks_k =
+            k_tiles_total * (LatentDownGemm::kTileShapeK / 32u);
+        // SfAtom rows hold one slab per K tile; the plain table counts 32-wide
+        // K blocks instead.
+        const std::size_t sfa_base =
+            static_cast<std::size_t>(view.scale_block) * k_tiles_total;
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
             const std::uint32_t slot = k_iter_id % Base::kNumSlots;
-            const std::uint32_t k_tile = Base::k_tile(k_iter_id, num_k_tiles);
+            const std::uint32_t k_tile = view.k_tile_base + k_iter_id;
             smem->barriers.latent_down.wait_weight_empty(k_iter_id);
             if (scale_layout == ScaleLayout::kSfAtom) {
                 if (lane != 0u) continue;
                 Base::load_weight_tile(
                     tma_latent_down_weight_desc, smem, k_iter_id,
                     MmaCore::kWeightTileBytes + ScaleTraits::kSfaSmemBytes,
-                    num_k_tiles);
+                    view);
                 tma_load_1d(
-                    scale + (static_cast<std::size_t>(Base::scale_block_idx()) *
-                                 num_k_tiles * Base::kNumSplits +
-                             k_tile) *
-                                ScaleTraits::kSfaSmemBytes,
+                    scale + (sfa_base + k_tile) * ScaleTraits::kSfaSmemBytes,
                     ScaleTraits::kSfaSmemBytes, smem->latent_down.w_scale[slot],
                     smem->barriers.latent_down.weight_ready.raw(slot));
                 continue;
             }
-            build_plain_scale_tile(scale, smem, k_tile, slot, blocks_k);
+            build_plain_scale_tile(scale, smem, k_tile, slot, blocks_k,
+                                   view.scale_block);
             // The MMA reads the tile through the async proxy.
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncwarp();
             if (lane == 0u) {
                 Base::load_weight_tile(tma_latent_down_weight_desc, smem,
                                        k_iter_id, MmaCore::kWeightTileBytes,
-                                       num_k_tiles);
+                                       view);
             }
         }
     }
@@ -632,7 +651,6 @@ template <typename KernelTraits>
 struct LatentDownProjection<KernelTraits, false>
     : LatentDownProjectionBase<KernelTraits> {
     using Base = LatentDownProjectionBase<KernelTraits>;
-    using Cluster = typename Base::Cluster;
     using typename Base::Dims;
     using typename Base::LatentDownGemm;
     using typename Base::MmaCore;
@@ -657,37 +675,41 @@ struct LatentDownProjection<KernelTraits, false>
             ElementScale* __restrict__ latent_down_weight_scale,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         [[maybe_unused]] ScaleLayout latent_scale_layout,
-        MoEProblemSize const& problem_size) {
-        if (!Base::is_latent_cta()) return;
+        MoEProblemSize const& problem_size, MoERuntime const& runtime) {
+        if (!runtime.is_latent_cta()) return;
 
         const std::uint32_t batch_size = problem_size.num_tokens;
         const std::uint32_t num_k_tiles =
-            Base::num_k_tiles_per_cta(problem_size);
+            Base::k_tiles_per_split(problem_size, runtime);
+        const auto view = Base::make_view(runtime, num_k_tiles);
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         float acc[Base::kTokenWindows][4] = {};
         if (WarpRole::is_other_loader_thread()) {
-            Base::run_load_input_k_loop(tma_input_desc, smem, num_k_tiles);
+            Base::run_load_input_k_loop(tma_input_desc, smem, num_k_tiles,
+                                        view);
         } else if (WarpRole::is_weight_loader_thread()) {
             run_load_weight_k_loop(tma_latent_down_weight_desc, smem,
-                                   num_k_tiles);
+                                   num_k_tiles, view);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
             run_mma_k_loop(smem, smem->tmem_ptr, num_k_tiles);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
             run_quantize_and_dequant_k_loop(smem, latent_down_weight_scale,
-                                            batch_size, num_k_tiles, acc);
+                                            batch_size, num_k_tiles, acc, view,
+                                            runtime);
         }
-        epilogue(workspace, smem, batch_size, acc);
+        epilogue(workspace, smem, batch_size, acc, view, runtime);
     }
 
     __device__ static void run_load_weight_k_loop(
         CUtensorMap const& tma_latent_down_weight_desc,
-        SharedStorage* __restrict__ smem, std::uint32_t num_k_tiles) {
+        SharedStorage* __restrict__ smem, std::uint32_t num_k_tiles,
+        Base::SplitView const& view) {
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
             smem->barriers.latent_down.wait_weight_empty(k_iter_id);
             Base::load_weight_tile(tma_latent_down_weight_desc, smem, k_iter_id,
-                                   MmaCore::kWeightTileBytes, num_k_tiles);
+                                   MmaCore::kWeightTileBytes, view);
         }
     }
 
@@ -724,18 +746,25 @@ struct LatentDownProjection<KernelTraits, false>
         SharedStorage* __restrict__ smem,
         const typename LatentDownGemm::ElementScale* __restrict__ w_scale,
         std::uint32_t batch_size, std::uint32_t num_k_tiles,
-        float (&acc)[Base::kTokenWindows][4]) {
+        float (&acc)[Base::kTokenWindows][4], Base::SplitView const& view,
+        MoERuntime const& runtime) {
         constexpr std::uint32_t kStageAhead = 1u;
-        quantize_input_tile(smem, batch_size, 0u, num_k_tiles);
+        quantize_input_tile(smem, batch_size, 0u, view);
+        // Each split owns an equal slice of the K blocks.
+        const std::uint32_t blocks_per_split =
+            num_k_tiles * (LatentDownGemm::kTileShapeK / 128u);
+        const std::uint32_t scale_base =
+            view.scale_block * blocks_per_split * runtime.num_latent_splits +
+            view.split * blocks_per_split;
 
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
             if (k_iter_id + kStageAhead < num_k_tiles) {
                 quantize_input_tile(smem, batch_size, k_iter_id + kStageAhead,
-                                    num_k_tiles);
+                                    view);
             }
-            dequant(smem, w_scale, acc, k_iter_id, num_k_tiles);
+            dequant(smem, w_scale, acc, k_iter_id, scale_base);
         }
     }
 
@@ -743,24 +772,18 @@ struct LatentDownProjection<KernelTraits, false>
         SharedStorage* __restrict__ smem,
         const typename LatentDownGemm::ElementScale* __restrict__ w_scale,
         float (&acc)[Base::kTokenWindows][4], std::uint32_t k_iter_id,
-        std::uint32_t num_k_tiles) {
+        std::uint32_t scale_base) {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         // Each warp reads its 16-row TMEM fragment.
         constexpr std::uint32_t kReaderWarps = Base::kTileShapeM / 16u;
         const std::uint32_t t0 = lane_idx & 3u;
         smem->barriers.latent_down.accumulator_ready.wait(k_iter_id);
-        // Each split owns an equal slice of the K blocks.
-        const std::uint32_t blocks_per_split =
-            num_k_tiles * (LatentDownGemm::kTileShapeK / 128u);
-        const std::uint32_t total_blocks = blocks_per_split * Base::kNumSplits;
 #pragma unroll
         for (std::uint32_t sub = 0; sub < MmaCore::kNumSwizzleBoxKs; ++sub) {
             const std::uint32_t ws_block =
                 k_iter_id * MmaCore::kNumSwizzleBoxKs + sub;
-            const float ws =
-                w_scale[Base::scale_block_idx() * total_blocks +
-                        Base::split_idx() * blocks_per_split + ws_block];
+            const float ws = w_scale[scale_base + ws_block];
             float as[2] = {1.0f, 1.0f};
 #pragma unroll
             for (std::uint32_t g = 0; g < Base::kTokenWindows; ++g) {
