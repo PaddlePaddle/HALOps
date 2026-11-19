@@ -357,9 +357,48 @@ inline int PickTile(const TileSpec* tiles, int count, MmaKind kind,
 // Dispatch
 using TileLauncher = void (*)(GemmParams&, const GemmShape&, cudaStream_t);
 
-// Candidates is any type exposing `static constexpr tiles`:
-// CandidateTiles<Kind> for the cost-model tables, or the per-mode BF16 tables
-// below.
+// Candidates is any type exposing `static constexpr tiles`. Every kind draws
+// from one table; BF16 has a separate one per mode.
+template <MmaKind Kind, KernelMode Mode>
+struct CandidateTilesFor {
+    static constexpr const auto& tiles = CandidateTiles<Kind>::tiles;
+};
+template <>
+struct CandidateTilesFor<MmaKind::BF16, KernelMode::Dense> {
+    static constexpr const auto& tiles = kBF16DenseTiles;
+};
+template <>
+struct CandidateTilesFor<MmaKind::BF16, KernelMode::Contiguous> {
+    static constexpr const auto& tiles = kBF16ContiguousTiles;
+};
+template <>
+struct CandidateTilesFor<MmaKind::BF16, KernelMode::Masked> {
+    static constexpr const auto& tiles = kBF16MaskedTiles;
+};
+template <>
+struct CandidateTilesFor<MmaKind::BF16, KernelMode::Batch> {
+    static constexpr const auto& tiles = kBF16BatchTiles;
+};
+
+// Divisibility contract of a selected tile: the output M/N tile multiples
+// (N relaxes to %64 for predicated tails and %32 for non-power-of-2 widths),
+// K a KBlockK multiple. SwapAB swaps the roles: KBlockM tiles the weight
+// (output N), KBlockN the activation (output M).
+inline void CheckBF16TileShape(const char* what, const TileSpec& t, int m,
+                               int n, int k) {
+    const int n_mod =
+        t.force_ntail ? 64
+                      : (((t.block_n & (t.block_n - 1)) != 0) ? 32 : t.block_n);
+    const int m_div = t.swap_ab ? t.block_n : t.block_m;
+    const int n_div = t.swap_ab ? t.block_m : n_mod;
+    TORCH_CHECK(m % m_div == 0, what, " requires M to be divisible by ", m_div,
+                ", got ", m);
+    TORCH_CHECK(n % n_div == 0, what, " requires N to be divisible by ", n_div,
+                ", got ", n);
+    TORCH_CHECK(k % t.block_k == 0, what, " requires K to be divisible by ",
+                t.block_k, ", got ", k);
+}
+
 template <MmaKind Kind, KernelMode Mode, class Candidates, std::size_t I,
           EpilogueOp Op>
 void LaunchTile(GemmParams& params, const GemmShape& shape,
@@ -368,6 +407,9 @@ void LaunchTile(GemmParams& params, const GemmShape& shape,
     if constexpr (TileAllowedFor(S, Mode) &&
                   (!IsQuantOp(Op) ||
                    (Kind == MmaKind::MXFP8 && S.quantizes()))) {
+        if constexpr (Kind == MmaKind::BF16) {
+            CheckBF16TileShape("BF16 GEMM", S, shape.m, shape.n, shape.k);
+        }
         using T = MmaTraits<Kind>;
         using TypeD = cute::conditional_t<IsQuantOp(Op), cutlass::float_e4m3_t,
                                           typename T::Output>;
@@ -389,7 +431,7 @@ constexpr std::array<TileLauncher, sizeof...(I)> MakeTileLaunchers(
 }
 
 template <MmaKind Kind, KernelMode Mode, EpilogueOp Op,
-          class Candidates = CandidateTiles<Kind>>
+          class Candidates = CandidateTilesFor<Kind, Mode>>
 inline constexpr auto kTileLaunchers =
     MakeTileLaunchers<Kind, Mode, Op, Candidates>(
         std::make_index_sequence<Candidates::tiles.size()>{});
@@ -399,13 +441,21 @@ inline bool GemmTraceEnabled() {
     return on;
 }
 
+// BF16 picks from its rule ladder instead of the cost model; defined with the
+// ladder below.
+namespace bf16 {
+int PickBf16Tile(KernelMode mode, const GemmShape& shape);
+}  // namespace bf16
+
 template <KernelMode Mode, MmaKind Kind, EpilogueOp Op = EpilogueOp::Identity>
 void LaunchCfg(GemmParams& params, GemmShape shape, cudaStream_t stream) {
     shape.op = Op;
-    constexpr auto& candidates = CandidateTiles<Kind>::tiles;
+    constexpr auto& candidates = CandidateTilesFor<Kind, Mode>::tiles;
     const int pick =
-        PickTile(candidates.data(), static_cast<int>(candidates.size()), Kind,
-                 shape, Mode);
+        Kind == MmaKind::BF16
+            ? bf16::PickBf16Tile(Mode, shape)
+            : PickTile(candidates.data(), static_cast<int>(candidates.size()),
+                       Kind, shape, Mode);
     TORCH_CHECK(pick >= 0, "No ", ModeName(Mode), " ", MmaTraits<Kind>::kName,
                 " tile for M=", shape.m, " (grid M=", shape.m_grid,
                 "), N=", shape.n, ", K=", shape.k,
@@ -429,8 +479,8 @@ void LaunchCfg(GemmParams& params, GemmShape shape, cudaStream_t stream) {
 // BF16 dispatch. Rule-based rather than cost-model based: the ladder below
 // encodes measured launch-shape bands (pair-UMMA gates, wave-fill judgements,
 // K-tile depth gates). A selector returns an index into the per-mode tile
-// tables in gemm_tile.cuh, or -1 when no tile supports the shape; the launch
-// helpers validate the selected tile and run it.
+// tables in gemm_tile.cuh, or -1 when no tile supports the shape;
+// PickBf16Tile feeds that index to the shared LaunchCfg.
 // ===========================================================================
 namespace bf16 {
 
@@ -467,7 +517,7 @@ inline bool SkipSwapForThinM(int m, int n, int k, int sm_count) {
     if (m % 64 != 0 || k % 64 != 0) {
         return false;
     }
-    const int target = ResolveSmCount(sm_count);
+    const int target = sm_count > 0 ? sm_count : GetSmCount();
     const int mt = CeilDiv(m, 64);
     const bool narrow_ok = (n % 32 == 0) && (CeilDiv(n, 32) * mt <= target);
     const bool square_ok = (n % 64 == 0);
@@ -826,7 +876,7 @@ inline int SelectSwapABTile(int m, int n, int k, int target) {
 
 // The dense ladder; -1 when no tile supports the shape.
 inline int SelectBF16Cfg(int m, int n, int k, int sm_count) {
-    const int target = ResolveSmCount(sm_count);
+    const int target = sm_count > 0 ? sm_count : GetSmCount();
     if (m >= 4096) {
         return SelectLargeMTile(m, n, k, target);
     }
@@ -862,7 +912,7 @@ inline int SelectBF16ContiguousCfg(int m, int n, int k, int sm_count) {
     if (m >= 128) {
         // M stays 128 (the 1-CTA MMA requires M == 128); step finer on N
         // only while the coarser tile underfills the grid.
-        const int target = ResolveSmCount(sm_count);
+        const int target = sm_count > 0 ? sm_count : GetSmCount();
         auto tiles = [&](int tm, int tn) {
             return CeilDiv(m, tm) * CeilDiv(n, tn);
         };
@@ -909,7 +959,7 @@ inline int SelectBF16MaskedCfg(int num_experts, int mm, int n, int k,
         return kMaskPair256x256;
     }
     if (mm >= 128) {
-        const int target = ResolveSmCount(sm_count);
+        const int target = sm_count > 0 ? sm_count : GetSmCount();
         auto tiles = [&](int tm, int tn) {
             return num_experts * CeilDiv(mm, tm) * CeilDiv(n, tn);
         };
@@ -955,100 +1005,21 @@ inline int SelectBF16BatchCfg(int m, int n, int k) {
     return -1;
 }
 
-// ---- Tile tables as launcher policies --------------------------------------
-
-struct DenseTiles {
-    static constexpr const auto& tiles = kBF16DenseTiles;
-};
-struct ContiguousTiles {
-    static constexpr const auto& tiles = kBF16ContiguousTiles;
-};
-struct MaskedTiles {
-    static constexpr const auto& tiles = kBF16MaskedTiles;
-};
-struct BatchTiles {
-    static constexpr const auto& tiles = kBF16BatchTiles;
-};
-
-// Divisibility contract of a selected tile: the output M/N tile multiples
-// (N relaxes to %64 for predicated tails and %32 for non-power-of-2 widths),
-// K a KBlockK multiple. SwapAB swaps the roles: KBlockM tiles the weight
-// (output N), KBlockN the activation (output M).
-inline void CheckBF16TileShape(const char* what, const TileSpec& t, int m,
-                               int n, int k) {
-    const int n_mod =
-        t.force_ntail ? 64
-                      : (((t.block_n & (t.block_n - 1)) != 0) ? 32 : t.block_n);
-    const int m_div = t.swap_ab ? t.block_n : t.block_m;
-    const int n_div = t.swap_ab ? t.block_m : n_mod;
-    TORCH_CHECK(m % m_div == 0, what, " requires M to be divisible by ", m_div,
-                ", got ", m);
-    TORCH_CHECK(n % n_div == 0, what, " requires N to be divisible by ", n_div,
-                ", got ", n);
-    TORCH_CHECK(k % t.block_k == 0, what, " requires K to be divisible by ",
-                t.block_k, ", got ", k);
-}
-
-template <class Tiles, KernelMode Mode>
-inline void LaunchSelected(int cfg, const char* what, int m_check,
-                           GemmParams& params, int sm_count,
-                           cudaStream_t stream) {
-    CheckBF16TileShape(what, Tiles::tiles[cfg], m_check, params.n, params.k);
-    const GemmShape shape = {.m = params.m,
-                             .n = params.n,
-                             .k = params.k,
-                             .m_grid = params.m,
-                             .sm_count = sm_count,
-                             .has_bias = false};
-    kTileLaunchers<MmaKind::BF16, Mode, EpilogueOp::Identity, Tiles>[cfg](
-        params, shape, stream);
-}
-
-// Selects, validates and launches. The .cu mode branches call these.
-inline void LaunchDense(GemmParams& params, int sm_count, cudaStream_t stream) {
-    const int cfg = SelectBF16Cfg(params.m, params.n, params.k, sm_count);
-    TORCH_CHECK(cfg >= 0, "No BF16 dense GEMM tile supports M=", params.m,
-                ", N=", params.n, ", K=", params.k);
-    LaunchSelected<DenseTiles, KernelMode::Dense>(
-        cfg, "BF16 dense GEMM", params.m, params, sm_count, stream);
-}
-
-inline void LaunchContiguous(GemmParams& params, int sm_count,
-                             cudaStream_t stream) {
-    const int cfg =
-        SelectBF16ContiguousCfg(params.m, params.n, params.k, sm_count);
-    TORCH_CHECK(cfg >= 0,
-                "bf16 contiguous GEMM: unsupported shape M=", params.m,
-                " N=", params.n, " K=", params.k);
-    LaunchSelected<ContiguousTiles, KernelMode::Contiguous>(
-        cfg, "bf16 contiguous GEMM", params.m, params, sm_count, stream);
-}
-
-inline void LaunchMasked(GemmParams& params, int sm_count,
-                         cudaStream_t stream) {
-    const int cfg =
-        SelectBF16MaskedCfg(params.num_experts, params.max_m_per_expert,
-                            params.n, params.k, sm_count);
-    TORCH_CHECK(cfg >= 0,
-                "bf16 masked GEMM: unsupported shape E=", params.num_experts,
-                " max_m_per_expert=", params.max_m_per_expert, " N=", params.n,
-                " K=", params.k);
-    LaunchSelected<MaskedTiles, KernelMode::Masked>(cfg, "bf16 masked GEMM",
-                                                    params.max_m_per_expert,
-                                                    params, sm_count, stream);
-}
-
-inline void LaunchBatch(GemmParams& params, int sm_count, cudaStream_t stream) {
-    const int cfg =
-        SelectBF16BatchCfg(params.max_m_per_expert, params.n, params.k);
-    TORCH_CHECK(
-        cfg >= 0, "bf16 batch GEMM: unsupported shape B=", params.num_experts,
-        " M=", params.max_m_per_expert, " N=", params.n, " K=", params.k,
-        ". Need one of: (M%256==0 && N%256==0), "
-        "(M%128==0 && N%256==0), or (M%64==0 && N%128==0).");
-    LaunchSelected<BatchTiles, KernelMode::Batch>(cfg, "bf16 batch GEMM",
-                                                  params.max_m_per_expert,
-                                                  params, sm_count, stream);
+// BF16 picks from the rule ladder above, one table per mode.
+inline int PickBf16Tile(KernelMode mode, const GemmShape& shape) {
+    switch (mode) {
+        case KernelMode::Dense:
+            return SelectBF16Cfg(shape.m, shape.n, shape.k, shape.sm_count);
+        case KernelMode::Contiguous:
+            return SelectBF16ContiguousCfg(shape.m, shape.n, shape.k,
+                                           shape.sm_count);
+        case KernelMode::Masked:
+            return SelectBF16MaskedCfg(shape.m_grid / shape.m, shape.m, shape.n,
+                                       shape.k, shape.sm_count);
+        case KernelMode::Batch:
+            return SelectBF16BatchCfg(shape.m, shape.n, shape.k);
+    }
+    return -1;
 }
 
 }  // namespace bf16

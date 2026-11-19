@@ -518,7 +518,7 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
     using ClusterShape_MNK = typename KernelTraits::ClusterShape_MNK;
     static constexpr int KCTAsPerCluster = cute::size(ClusterShape_MNK{});
     // Same SM-count resolution as the dispatch-site tile heuristics.
-    const int raw_sm_count = ResolveSmCount(sm_count);
+    const int raw_sm_count = sm_count > 0 ? sm_count : GetSmCount();
     // Round down to a multiple of KCTAsPerCluster.
     const int runtime_sm_count =
         (raw_sm_count / KCTAsPerCluster) * KCTAsPerCluster;

@@ -727,11 +727,6 @@ class CollectiveEpilogue {
         }
     }
 
-
-    // BF16 path: TMEM -> registers -> cast -> GMEM through CuTe tiled copies,
-    // which follow the 16dp (64-row CTA) and 2SM "2x2" accumulator layouts.
-    // KStreamK: compile-time stream-K instantiation; a runtime branch here
-    // would spill the data-parallel store path.
     template <bool KStreamK, class TmemStorage>
     CUTLASS_DEVICE void epilogue_bf16(Params const& epilogue_params,
                                       AccumulatorPipeline& acc_pipeline,
