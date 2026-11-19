@@ -50,15 +50,8 @@ struct SharedUpProjectionBase
     using SharedUpGemm = typename Base::UpGemm;
     using SharedDownGemm = SharedDownGemmTraits<Dims>;
 
-    static constexpr std::uint32_t kNumDownCtas = SharedDownGemm::kNumCtas;
-    static constexpr std::uint32_t kNumUpCtas = SharedUpGemm::kNumCtas;
-    static constexpr std::uint32_t kFirstCtaIdx =
-        Traits::RouterGemm::kNumCtas + Traits::LatentDownGemm::kNumCtas;
-    static_assert(kFirstCtaIdx % Traits::kClusterSize == 0u,
-                  "the shared-expert blocks must start on a cluster boundary");
-    static constexpr std::uint32_t kNumUpPublishers =
-        kNumUpCtas / Base::kNumSplits;
-    static constexpr std::uint32_t kCluster = Traits::kClusterSize;
+    static_assert(SharedDownGemm::kTileShapeM == SharedUpGemm::kTileShapeM,
+                  "the shared up and down passes share the phase's CTA range");
 
     static constexpr std::uint32_t kLboChunk =
         Workspace::SharedUpOut::kLboChunk;
@@ -71,22 +64,24 @@ struct SharedUpProjectionBase
         SharedUpGemm::kTileShapeN * SharedUpGemm::kTileShapeK *
         static_cast<std::uint32_t>(sizeof(DataType::ElementA));
 
-    __device__ static std::uint32_t cta_idx() {
-        return blockIdx.x - kFirstCtaIdx;
-    }
-
-    __device__ static bool is_shared_cta() {
-        return blockIdx.x >= kFirstCtaIdx &&
-               blockIdx.x < kFirstCtaIdx + kNumDownCtas;
+    __device__ static std::uint32_t cta_idx(MoERuntime const& runtime) {
+        return blockIdx.x - runtime.first_shared_cta;
     }
 
     // The M slab whose splits this CTA's block belongs to.
-    __device__ static std::uint32_t slab_idx() {
-        return cta_idx() / Base::kNumSplits;
+    __device__ static std::uint32_t slab_idx(MoERuntime const& runtime) {
+        return cta_idx(runtime) / runtime.num_shared_splits;
     }
 
-    __device__ static std::uint32_t split_idx() {
-        return Base::Cluster::split_idx();
+    __device__ static std::uint32_t split_idx(MoERuntime const& runtime) {
+        return ClusterSplitK::rank(runtime.cluster_size) %
+               runtime.num_shared_splits;
+    }
+
+    // Up-pass slabs: one CTA publishes each of them.
+    __device__ static std::uint32_t num_up_publishers(
+        MoERuntime const& runtime) {
+        return runtime.num_shared_ctas / runtime.num_shared_splits;
     }
 
     __device__ static void publish_up_output(Workspace* __restrict__ workspace,
@@ -97,23 +92,22 @@ struct SharedUpProjectionBase
     __device__ static void combine_gated_activation(
         SharedStorage* __restrict__ smem, Activation activation,
         float situ_beta, float situ_linear_beta, const Accumulator& gate,
-        const Accumulator& up) {
+        const Accumulator& up, MoERuntime const& runtime) {
         auto& partial = smem->shared_expert.splited_mma_out;
-        Base::join_up_split_k(partial, gate, up);
-        if (split_idx() == 0u &&
+        Base::join_up_split_k(partial, gate, up, runtime.num_shared_splits);
+        if (split_idx(runtime) == 0u &&
             WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
             Base::combine_gated_activation(
                 partial, smem->shared_expert.act_up_out, gate, up, activation,
-                situ_beta, situ_linear_beta);
+                situ_beta, situ_linear_beta, runtime.num_shared_splits,
+                runtime.cluster_size);
             WarpRole::sync_calc_threads();
         }
     }
 
     __device__ static void run_load_input_k_loop(
         CUtensorMap const& tma_input_desc, SharedStorage* __restrict__ smem,
-        std::uint32_t num_k_tiles) {
-        const std::uint32_t k_tile_base = split_idx() * num_k_tiles;
-
+        std::uint32_t num_k_tiles, std::uint32_t k_tile_base) {
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
@@ -133,23 +127,24 @@ struct SharedUpProjectionBase
                                                SharedStorage* __restrict__ smem,
                                                std::uint32_t k_iter_id,
                                                std::uint32_t transaction_bytes,
-                                               std::uint32_t num_k_tiles) {
+                                               std::uint32_t k_tile_base,
+                                               std::uint32_t slab) {
         const std::uint32_t slot = k_iter_id % kNumUpSlots;
         smem->barriers.shared_up.wait_weight_empty(k_iter_id);
-        const std::uint32_t k_tile = split_idx() * num_k_tiles + k_iter_id;
+        const std::uint32_t k_tile = k_tile_base + k_iter_id;
         smem->barriers.shared_up.weight_ready.arrive(k_iter_id,
                                                      transaction_bytes);
         Base::load_weight_tile(tma_up_desc,
                                &smem->shared_expert.w_up[slot][0][0][0],
                                smem->barriers.shared_up.weight_ready.raw(slot),
-                               slab_idx() * SharedUpGemm::kTileShapeM, k_tile);
+                               slab * SharedUpGemm::kTileShapeM, k_tile);
     }
 
     // Quantize one staged input K tile and hand its slot back to the loader.
     __device__ static void quantize_input_tile(SharedStorage* __restrict__ smem,
                                                std::uint32_t gemm_n,
                                                std::uint32_t k_iter_id,
-                                               std::uint32_t num_k_tiles) {
+                                               std::uint32_t k_tile_base) {
         constexpr std::uint32_t kBlocksPerTile =
             SharedUpGemm::MmaCore::kNumSwizzleBoxKs;
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
@@ -157,7 +152,7 @@ struct SharedUpProjectionBase
         const std::uint32_t slot = k_iter_id % kNumUpSlots;
         smem->barriers.shared_up.wait_weight_empty(k_iter_id);
         smem->barriers.shared_up.input_ready.wait(k_iter_id);
-        const std::uint32_t k_tile = split_idx() * num_k_tiles + k_iter_id;
+        const std::uint32_t k_tile = k_tile_base + k_iter_id;
         const std::uint32_t blocks_base = k_tile * kBlocksPerTile;
         // A blockwise tile's scale rows live in its staging slot.
         const SmemTileQuantizer<typename SharedUpGemm::InputQuant,
@@ -186,15 +181,15 @@ struct SharedUpProjectionBase
     // Quantize the slab's gated activations into the down's staging layout.
     __device__ static void quantize_output(Workspace* __restrict__ workspace,
                                            SharedStorage* __restrict__ smem,
-                                           std::uint32_t gemm_n) {
+                                           std::uint32_t gemm_n,
+                                           std::uint32_t slab) {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         constexpr std::uint32_t kQuantGroups = Base::kOutputFeatureBlock / 32u;
         // The MXFP8 slab's groups share one 128-feature SfAtom.
-        const std::uint32_t sf_tile =
-            slab_idx() / (128u / Base::kOutputFeatureBlock);
+        const std::uint32_t sf_tile = slab / (128u / Base::kOutputFeatureBlock);
         const std::uint32_t sf_group =
-            (slab_idx() * Base::kOutputFeatureBlock % 128u) / 32u;
+            (slab * Base::kOutputFeatureBlock % 128u) / 32u;
 #pragma unroll 1
         for (std::uint32_t tok = warp_idx; tok < gemm_n;
              tok += WarpRole::kCalcWarpCount) {
@@ -216,15 +211,14 @@ struct SharedUpProjectionBase
                         sf[sf_atom_offset(tok, sf_group + i)] = scales[i];
                     }
                 } else {
-                    workspace->shared_up_out.scale_row(slab_idx())[tok] =
-                        scales[0];
+                    workspace->shared_up_out.scale_row(slab)[tok] = scales[0];
                 }
             }
 #pragma unroll
             for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
                 const std::uint32_t feat = lane_idx + i * 32u;
                 const std::uint32_t feature =
-                    slab_idx() * Base::kOutputFeatureBlock + feat;
+                    slab * Base::kOutputFeatureBlock + feat;
                 workspace->shared_up_out.cell(
                     feature / kLboChunk, tok)[feat % kLboChunk] = quantized[i];
             }
@@ -260,7 +254,6 @@ struct SharedDownProjectionBase
     using Shared = SharedUpProjectionBase<KernelTraits>;
     using SharedUpGemm = typename Shared::SharedUpGemm;
 
-    static constexpr std::uint32_t kNumUpPublishers = Shared::kNumUpPublishers;
     static constexpr std::uint32_t kDownActChunks =
         SharedDownGemm::kTileShapeK / Workspace::SharedUpOut::kLboChunk;
     static constexpr std::uint32_t kNumDownSlots =
@@ -280,13 +273,16 @@ struct SharedDownProjectionBase
             cute::_0{},
             cute::Int<2u * (SharedDownGemm::kTileShapeN + 1u) * 16u>{})));
 
-    __device__ static std::uint32_t cta_idx() { return Shared::cta_idx(); }
+    __device__ static std::uint32_t cta_idx(MoERuntime const& runtime) {
+        return Shared::cta_idx(runtime);
+    }
 
     __device__ static void run_load_input_k_loop(
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        const void* __restrict__ scales, std::uint32_t num_k_tiles) {
-        workspace->cta_comm.wait_shared_up_out(smem->launch_parity,
-                                               kNumUpPublishers);
+        const void* __restrict__ scales, std::uint32_t num_k_tiles,
+        MoERuntime const& runtime) {
+        workspace->cta_comm.wait_shared_up_out(
+            smem->launch_parity, Shared::num_up_publishers(runtime));
         // Order cross-CTA stores before TMA reads.
         fence_proxy_async_global();
 
@@ -334,26 +330,27 @@ struct SharedDownProjectionBase
 
     __device__ static void load_down_weight_tile(
         CUtensorMap const& tma_down_desc, SharedStorage* __restrict__ smem,
-        std::uint32_t k_iter_id, std::uint32_t transaction_bytes) {
+        std::uint32_t k_iter_id, std::uint32_t transaction_bytes,
+        std::uint32_t row_base) {
         const std::uint32_t slot = k_iter_id % kNumDownSlots;
         smem->barriers.shared_down.wait_weight_empty(k_iter_id);
         smem->barriers.shared_down.weight_ready.arrive(k_iter_id,
                                                        transaction_bytes);
         Base::template load_weight_tile<SharedDownGemm::kTileShapeM>(
             tma_down_desc, &smem->shared_expert.w_down[slot][0][0],
-            smem->barriers.shared_down.weight_ready.raw(slot), row_base(),
+            smem->barriers.shared_down.weight_ready.raw(slot), row_base,
             k_iter_id);
     }
 
-    __device__ static std::uint32_t row_base() {
-        return cta_idx() * SharedDownGemm::kTileShapeM;
+    __device__ static std::uint32_t row_base(MoERuntime const& runtime) {
+        return cta_idx(runtime) * SharedDownGemm::kTileShapeM;
     }
 
     // Store one warp fragment of the completed down projection.
     __device__ static void store_down_output(
         DataType::ElementOut* __restrict__ out, std::uint32_t gemm_n,
         std::uint32_t gemm_m, std::uint32_t atom, std::uint32_t group,
-        const float (&values)[4]) {
+        const float (&values)[4], std::uint32_t row_base) {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         const std::uint32_t lane_base =
@@ -362,7 +359,7 @@ struct SharedDownProjectionBase
         const std::uint32_t t1 = lane_idx >> 2;
         for (std::uint32_t r = 0; r < 2u; ++r) {
             const std::uint32_t col =
-                row_base() + atom * 128u + lane_base + t1 + 8u * r;
+                row_base + atom * 128u + lane_base + t1 + 8u * r;
             for (std::uint32_t i = 0; i < 2u; ++i) {
                 const std::uint32_t tok = group * 8u + 2u * t0 + i;
                 if (tok >= gemm_n) continue;
@@ -416,7 +413,7 @@ struct SharedUpProjection<KernelTraits, true>
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         MoEProblemSize const& problem_size, Activation activation,
-        float situ_beta, float situ_linear_beta) {
+        float situ_beta, float situ_linear_beta, MoERuntime const& runtime) {
         const std::uint32_t gemm_m = 2u * problem_size.intermediate_size;
         const std::uint32_t gemm_n = problem_size.num_tokens;
         const std::uint32_t gemm_k = problem_size.hidden_size;
@@ -426,31 +423,36 @@ struct SharedUpProjection<KernelTraits, true>
         Accumulator up;
 
         const std::uint32_t num_k_tiles =
-            gemm_k / SharedUpGemm::kTileShapeK / Base::kNumSplits;
+            gemm_k / SharedUpGemm::kTileShapeK / runtime.num_shared_splits;
+        const std::uint32_t split = Base::split_idx(runtime);
+        const std::uint32_t slab = Base::slab_idx(runtime);
+        const std::uint32_t k_tile_base = split * num_k_tiles;
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         if (WarpRole::is_other_loader_thread()) {
-            Base::run_load_input_k_loop(tma_input_desc, smem, num_k_tiles);
+            Base::run_load_input_k_loop(tma_input_desc, smem, num_k_tiles,
+                                        k_tile_base);
         } else if (WarpRole::is_weight_loader_thread()) {
-            run_load_weight_k_loop(tma_up_desc, up_scale, smem, num_k_tiles);
+            run_load_weight_k_loop(tma_up_desc, up_scale, smem, num_k_tiles,
+                                   k_tile_base, slab, runtime);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
             run_mma_k_loop(smem, num_k_tiles);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
 #pragma unroll 1
             for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
                  ++k_iter_id) {
-                quantize_input_tile(smem, gemm_n, k_iter_id, num_k_tiles);
+                quantize_input_tile(smem, gemm_n, k_iter_id, k_tile_base);
             }
             load_accumulators(smem, gate, up);
         }
         Base::combine_gated_activation(smem, activation, situ_beta,
-                                       situ_linear_beta, gate, up);
-        if (Base::split_idx() == 0u && WarpRole::is_calc_warp(warp_idx)) {
-            quantize_output(workspace, smem, gemm_n);
+                                       situ_linear_beta, gate, up, runtime);
+        if (split == 0u && WarpRole::is_calc_warp(warp_idx)) {
+            quantize_output(workspace, smem, gemm_n, slab);
         }
         // All split readers and publishers finish before the next phase.
         __syncthreads();
-        Base::Cluster::sync();
-        if (Base::split_idx() == 0u && threadIdx.x == 0u) {
+        ClusterSplitK::sync();
+        if (split == 0u && threadIdx.x == 0u) {
             Base::publish_up_output(workspace, smem);
         }
     }
@@ -458,21 +460,23 @@ struct SharedUpProjection<KernelTraits, true>
     __device__ static void run_load_weight_k_loop(
         CUtensorMap const& tma_up_desc,
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
-        SharedStorage* __restrict__ smem, std::uint32_t num_k_tiles) {
+        SharedStorage* __restrict__ smem, std::uint32_t num_k_tiles,
+        std::uint32_t k_tile_base, std::uint32_t slab,
+        MoERuntime const& runtime) {
+        const std::uint32_t scale_slabs =
+            (num_k_tiles * runtime.num_shared_splits) *
+            (SharedUpGemm::kTileShapeK / 128u);
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
             Base::load_up_weight_tile(tma_up_desc, smem, k_iter_id,
-                                      Base::kUpWeightTxBytes, num_k_tiles);
+                                      Base::kUpWeightTxBytes, k_tile_base,
+                                      slab);
             const std::uint32_t slot = k_iter_id % Base::kNumUpSlots;
-            const std::uint32_t k_tile =
-                Base::split_idx() * num_k_tiles + k_iter_id;
             Base::load_weight_scale_tile(
-                up_scale, Base::slab_idx(), k_tile,
+                up_scale, slab, k_tile_base + k_iter_id,
                 smem->shared_expert.w_up_scale[slot],
-                smem->barriers.shared_up.weight_ready.raw(slot),
-                (num_k_tiles * Base::kNumSplits) *
-                    (SharedUpGemm::kTileShapeK / 128u));
+                smem->barriers.shared_up.weight_ready.raw(slot), scale_slabs);
         }
     }
 
@@ -534,46 +538,54 @@ struct SharedUpProjection<KernelTraits, false>
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         MoEProblemSize const& problem_size, Activation activation,
-        float situ_beta, float situ_linear_beta) {
+        float situ_beta, float situ_linear_beta, MoERuntime const& runtime) {
         const std::uint32_t gemm_m = 2u * problem_size.intermediate_size;
         const std::uint32_t gemm_n = problem_size.num_tokens;
         const std::uint32_t gemm_k = problem_size.hidden_size;
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t num_k_tiles =
-            gemm_k / SharedUpGemm::kTileShapeK / Base::kNumSplits;
+            gemm_k / SharedUpGemm::kTileShapeK / runtime.num_shared_splits;
+        const std::uint32_t split = Base::split_idx(runtime);
+        const std::uint32_t slab = Base::slab_idx(runtime);
+        const std::uint32_t k_tile_base = split * num_k_tiles;
         Accumulator gate{};
         Accumulator up{};
         if (WarpRole::is_other_loader_thread()) {
-            Base::run_load_input_k_loop(tma_input_desc, smem, num_k_tiles);
+            Base::run_load_input_k_loop(tma_input_desc, smem, num_k_tiles,
+                                        k_tile_base);
         } else if (WarpRole::is_weight_loader_thread()) {
-            run_load_weight_k_loop(tma_up_desc, smem, num_k_tiles);
+            run_load_weight_k_loop(tma_up_desc, smem, num_k_tiles, k_tile_base,
+                                   slab);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
             run_mma_k_loop(smem, num_k_tiles);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
             run_quantize_and_dequant_k_loop(up_scale, smem, gemm_n, gate, up,
-                                            num_k_tiles, gemm_m);
+                                            num_k_tiles, gemm_m, slab,
+                                            k_tile_base, runtime);
         }
         Base::combine_gated_activation(smem, activation, situ_beta,
-                                       situ_linear_beta, gate, up);
-        if (Base::split_idx() == 0u && WarpRole::is_calc_warp(warp_idx)) {
-            quantize_output(workspace, smem, gemm_n);
+                                       situ_linear_beta, gate, up, runtime);
+        if (split == 0u && WarpRole::is_calc_warp(warp_idx)) {
+            quantize_output(workspace, smem, gemm_n, slab);
         }
         // All split readers and publishers finish before the next phase.
         __syncthreads();
-        Base::Cluster::sync();
-        if (Base::split_idx() == 0u && threadIdx.x == 0u) {
+        ClusterSplitK::sync();
+        if (split == 0u && threadIdx.x == 0u) {
             Base::publish_up_output(workspace, smem);
         }
     }
 
     __device__ static void run_load_weight_k_loop(
         CUtensorMap const& tma_up_desc, SharedStorage* __restrict__ smem,
-        std::uint32_t num_k_tiles) {
+        std::uint32_t num_k_tiles, std::uint32_t k_tile_base,
+        std::uint32_t slab) {
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
             Base::load_up_weight_tile(tma_up_desc, smem, k_iter_id,
-                                      Base::kUpWeightTxBytes, num_k_tiles);
+                                      Base::kUpWeightTxBytes, k_tile_base,
+                                      slab);
         }
     }
 
@@ -604,24 +616,36 @@ struct SharedUpProjection<KernelTraits, false>
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
         SharedStorage* __restrict__ smem, std::uint32_t gemm_n,
         Accumulator& gate, Accumulator& up, std::uint32_t num_k_tiles,
-        std::uint32_t gemm_m) {
-        quantize_input_tile(smem, gemm_n, 0u, num_k_tiles);
+        std::uint32_t gemm_m, std::uint32_t slab, std::uint32_t k_tile_base,
+        MoERuntime const& runtime) {
+        const std::uint32_t k_blocks_base =
+            k_tile_base *
+            (SharedUpGemm::kTileShapeK / SharedUpGemm::WeightQuant::kBlockSize);
+        const std::uint32_t scale_blocks =
+            num_k_tiles * runtime.num_shared_splits *
+            (SharedUpGemm::kTileShapeK / SharedUpGemm::WeightQuant::kBlockSize);
+        const std::uint32_t gate_row = slab * Base::kOutputFeatureBlock /
+                                       SharedUpGemm::WeightQuant::kBlockSize;
+        const std::uint32_t up_row =
+            gemm_m / 2u / SharedUpGemm::WeightQuant::kBlockSize + gate_row;
+        quantize_input_tile(smem, gemm_n, 0u, k_tile_base);
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 1; k_iter_id < num_k_tiles;
              ++k_iter_id) {
-            quantize_input_tile(smem, gemm_n, k_iter_id, num_k_tiles);
-            dequant(up_scale, smem, k_iter_id - 1u, gate, up, num_k_tiles,
-                    gemm_m);
+            quantize_input_tile(smem, gemm_n, k_iter_id, k_tile_base);
+            dequant(up_scale, smem, k_iter_id - 1u, gate, up, gate_row, up_row,
+                    k_blocks_base, scale_blocks);
         }
-        dequant(up_scale, smem, num_k_tiles - 1u, gate, up, num_k_tiles,
-                gemm_m);
+        dequant(up_scale, smem, num_k_tiles - 1u, gate, up, gate_row, up_row,
+                k_blocks_base, scale_blocks);
     }
 
     __device__ static void dequant(
         const typename SharedUpGemm::ElementScale* __restrict__ up_scale,
         SharedStorage* __restrict__ smem, std::uint32_t k_iter_id,
-        Accumulator& gate, Accumulator& up, std::uint32_t num_k_tiles,
-        std::uint32_t gemm_m) {
+        Accumulator& gate, Accumulator& up, std::uint32_t gate_row,
+        std::uint32_t up_row, std::uint32_t k_blocks_base,
+        std::uint32_t scale_blocks) {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         const std::uint32_t acc_slot = k_iter_id % kTmemAccSlots;
@@ -629,23 +653,16 @@ struct SharedUpProjection<KernelTraits, false>
         tcgen05_fence_after_thread_sync();
 
         const bool reads_tile = Base::owns_up_rows(warp_idx);
-        const std::uint32_t gate_row = Base::slab_idx() *
-                                       Base::kOutputFeatureBlock /
-                                       SharedUpGemm::WeightQuant::kBlockSize;
-        const std::uint32_t up_row =
-            gemm_m / 2u / SharedUpGemm::WeightQuant::kBlockSize + gate_row;
         constexpr std::uint32_t kBlocksPerTile =
             SharedUpGemm::kTileShapeK / SharedUpGemm::WeightQuant::kBlockSize;
-        const std::uint32_t kScaleBlocksK =
-            num_k_tiles * Base::kNumSplits * kBlocksPerTile;
         const std::uint32_t kblk_base =
-            (Base::split_idx() * num_k_tiles + k_iter_id) * kBlocksPerTile;
+            k_blocks_base + k_iter_id * kBlocksPerTile;
         const std::uint32_t act_slot = k_iter_id % Base::kNumUpSlots;
 #pragma unroll 1
         for (std::uint32_t s = 0; reads_tile && s < 2u; ++s) {
             const std::uint32_t kblk = kblk_base + s;
-            const float ws_gate = up_scale[gate_row * kScaleBlocksK + kblk];
-            const float ws_up = up_scale[up_row * kScaleBlocksK + kblk];
+            const float ws_gate = up_scale[gate_row * scale_blocks + kblk];
+            const float ws_up = up_scale[up_row * scale_blocks + kblk];
             Base::dequant(smem->tmem_ptr,
                           acc_slot * get_gemm_acc_columns<SharedUpGemm>() +
                               s * SharedUpGemm::kTileShapeN,
@@ -687,24 +704,27 @@ struct SharedDownProjection<KernelTraits, true>
         const typename SharedDownGemm::ElementScale* __restrict__ down_scale,
         DataType::ElementOut* __restrict__ out,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        ScaleLayout down_scale_layout, MoEProblemSize const& problem_size) {
+        ScaleLayout down_scale_layout, MoEProblemSize const& problem_size,
+        MoERuntime const& runtime) {
         const std::uint32_t gemm_m = problem_size.hidden_size;
         const std::uint32_t gemm_n = problem_size.num_tokens;
         const std::uint32_t gemm_k = problem_size.intermediate_size;
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t num_k_tiles = gemm_k / SharedDownGemm::kTileShapeK;
+        const std::uint32_t row_base = Base::row_base(runtime);
         if (WarpRole::is_other_loader_thread()) {
             Base::run_load_input_k_loop(workspace, smem,
                                         workspace->shared_up_out.scale_bytes(),
-                                        num_k_tiles);
+                                        num_k_tiles, runtime);
         } else if (WarpRole::is_weight_loader_thread()) {
             run_load_weight_k_loop(tma_down_desc, tma_down_scale_desc,
                                    down_scale, smem, down_scale_layout,
-                                   num_k_tiles);
+                                   num_k_tiles, row_base);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
-            run_mma_k_loop(smem, down_scale, down_scale_layout, num_k_tiles);
+            run_mma_k_loop(smem, down_scale, down_scale_layout, num_k_tiles,
+                           row_base);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
-            epilogue(out, smem, gemm_n, gemm_m);
+            epilogue(out, smem, gemm_n, gemm_m, runtime);
         }
     }
 
@@ -713,8 +733,8 @@ struct SharedDownProjection<KernelTraits, true>
         CUtensorMap const& tma_down_scale_desc,
         const typename SharedDownGemm::ElementScale* __restrict__ down_scale,
         SharedStorage* __restrict__ smem, ScaleLayout down_scale_layout,
-        std::uint32_t num_k_tiles) {
-        const std::uint32_t row_atom = Base::row_base() / 128u;
+        std::uint32_t num_k_tiles, std::uint32_t row_base) {
+        const std::uint32_t row_atom = row_base / 128u;
         const std::uint32_t tx_bytes =
             Base::down_weight_tx_bytes(down_scale_layout);
         const CUtensorMap* const scale_desc =
@@ -724,7 +744,7 @@ struct SharedDownProjection<KernelTraits, true>
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
             Base::load_down_weight_tile(tma_down_desc, smem, k_iter_id,
-                                        tx_bytes);
+                                        tx_bytes, row_base);
             const std::uint32_t slot = k_iter_id % Base::kNumDownSlots;
             Base::load_weight_scale_tile(
                 down_scale, row_atom, k_iter_id,
@@ -737,7 +757,8 @@ struct SharedDownProjection<KernelTraits, true>
     __device__ static void run_mma_k_loop(
         SharedStorage* __restrict__ smem,
         const typename SharedDownGemm::ElementScale* __restrict__ down_scale,
-        ScaleLayout down_scale_layout, std::uint32_t num_k_tiles) {
+        ScaleLayout down_scale_layout, std::uint32_t num_k_tiles,
+        std::uint32_t row_base) {
         typename SharedDownGemm::TiledMma tiled_mma{};
         auto cta_mma = tiled_mma.get_slice(cute::_0{});
         auto tCt = Base::make_accumulator_fragment(cta_mma);
@@ -749,8 +770,8 @@ struct SharedDownProjection<KernelTraits, true>
             if (down_scale_layout == ScaleLayout::kPlain) {
                 Base::build_plain_scale(
                     smem->shared_expert.w_down_scale[slot],
-                    reinterpret_cast<const std::uint8_t*>(down_scale),
-                    Base::row_base(), k_iter_id,
+                    reinterpret_cast<const std::uint8_t*>(down_scale), row_base,
+                    k_iter_id,
                     num_k_tiles * (SharedDownGemm::kTileShapeK / 32u));
             }
             const auto sfa_tmem =
@@ -775,8 +796,10 @@ struct SharedDownProjection<KernelTraits, true>
     // One readout of the final TMEM sum, followed by the output conversion.
     __device__ static void epilogue(DataType::ElementOut* __restrict__ out,
                                     SharedStorage* __restrict__ smem,
-                                    std::uint32_t gemm_n,
-                                    std::uint32_t gemm_m) {
+                                    std::uint32_t gemm_n, std::uint32_t gemm_m,
+                                    MoERuntime const& runtime) {
+        const std::uint32_t row_base =
+            Base::cta_idx(runtime) * SharedDownGemm::kTileShapeM;
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_base =
             32u * (warp_idx & 3u) + 16u * (warp_idx >> 2);
@@ -795,7 +818,7 @@ struct SharedDownProjection<KernelTraits, true>
                     atom * SharedDownGemm::kTileShapeN + group * 8u, lane_base,
                     values);
                 Base::store_down_output(out, gemm_n, gemm_m, atom, group,
-                                        values);
+                                        values, row_base);
             }
         }
     }
@@ -826,34 +849,36 @@ struct SharedDownProjection<KernelTraits, false>
         DataType::ElementOut* __restrict__ out,
         Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
         [[maybe_unused]] ScaleLayout down_scale_layout,
-        MoEProblemSize const& problem_size) {
+        MoEProblemSize const& problem_size, MoERuntime const& runtime) {
         const std::uint32_t gemm_m = problem_size.hidden_size;
         const std::uint32_t gemm_n = problem_size.num_tokens;
         const std::uint32_t gemm_k = problem_size.intermediate_size;
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t num_k_tiles = gemm_k / SharedDownGemm::kTileShapeK;
+        const std::uint32_t row_base = Base::row_base(runtime);
         if (WarpRole::is_other_loader_thread()) {
             Base::run_load_input_k_loop(workspace, smem,
                                         workspace->shared_up_out.scale_ptr(),
-                                        num_k_tiles);
+                                        num_k_tiles, runtime);
         } else if (WarpRole::is_weight_loader_thread()) {
-            run_load_weight_k_loop(tma_down_desc, smem, num_k_tiles);
+            run_load_weight_k_loop(tma_down_desc, smem, num_k_tiles, row_base);
         } else if (WarpRole::is_mma_issuer_warp(warp_idx)) {
             run_mma_k_loop(smem, num_k_tiles);
         } else if (WarpRole::is_calc_warp(warp_idx)) {
-            epilogue(down_scale, out, smem, gemm_n, num_k_tiles, gemm_m);
+            epilogue(down_scale, out, smem, gemm_n, num_k_tiles, gemm_m,
+                     runtime);
         }
     }
 
     __device__ static void run_load_weight_k_loop(
         CUtensorMap const& tma_down_desc, SharedStorage* __restrict__ smem,
-        std::uint32_t num_k_tiles) {
+        std::uint32_t num_k_tiles, std::uint32_t row_base) {
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
             Base::load_down_weight_tile(
                 tma_down_desc, smem, k_iter_id,
-                SharedDownGemm::MmaCore::kWeightTileTxBytes);
+                SharedDownGemm::MmaCore::kWeightTileTxBytes, row_base);
         }
     }
 
@@ -884,7 +909,10 @@ struct SharedDownProjection<KernelTraits, false>
         const typename SharedDownGemm::ElementScale* __restrict__ down_scale,
         DataType::ElementOut* __restrict__ out,
         SharedStorage* __restrict__ smem, std::uint32_t gemm_n,
-        std::uint32_t num_k_tiles, std::uint32_t gemm_m) {
+        std::uint32_t num_k_tiles, std::uint32_t gemm_m,
+        MoERuntime const& runtime) {
+        const std::uint32_t cta_idx = Base::cta_idx(runtime);
+        const std::uint32_t row_base = cta_idx * SharedDownGemm::kTileShapeM;
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         // The routed down's readout: warp w covers lanes 32*(w&3)+16*(w>>2).
@@ -914,8 +942,7 @@ struct SharedDownProjection<KernelTraits, false>
                                 s * SharedDownGemm::kTileShapeN + group * 8u,
                             lane_base, v);
                         const float ws = down_scale
-                            [(Base::cta_idx() *
-                                  SharedDownGemm::MmaCore::kNumAtomMs +
+                            [(cta_idx * SharedDownGemm::MmaCore::kNumAtomMs +
                               atom) *
                                  num_k_tiles +
                              t];
@@ -927,7 +954,8 @@ struct SharedDownProjection<KernelTraits, false>
                             ws, acc);
                     }
                 }
-                Base::store_down_output(out, gemm_n, gemm_m, atom, group, acc);
+                Base::store_down_output(out, gemm_n, gemm_m, atom, group, acc,
+                                        row_base);
             }
         }
     }

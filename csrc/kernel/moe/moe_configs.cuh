@@ -147,7 +147,6 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
     static constexpr uint32_t kNumExperts = 512;
     static constexpr uint32_t kMaxTopk = 10;
     static constexpr bool kUseLatent = UseLatent;
-    static constexpr std::uint32_t kNumRouterGates = 2;
     static constexpr QuantConfig kQuantConfig = Config;
     struct KernelConfig {
         static constexpr std::uint32_t kBlockSize = 384;
@@ -163,8 +162,7 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
         static constexpr bool kSharedUseSplitK = true;
         // MoE configs.
         static constexpr std::uint32_t kCtasPerExpert = 8;
-        static constexpr std::uint32_t kUpTileShapeK = 256;
-        // Tail configs
+        // Tail configs.
         static constexpr int kTailWorld = TailWorld;
         static constexpr int kTailTpg = 2;
         static constexpr int kTailGsize = 32;
@@ -220,19 +218,79 @@ struct MoEProblemSize {
     constexpr MoEProblemSize() = default;
     __host__ __device__ constexpr MoEProblemSize(
         std::uint32_t num_tokens, std::uint32_t hidden_size,
-        std::uint32_t intermediate_size, std::uint32_t latent_size)
+        std::uint32_t intermediate_size, std::uint32_t latent_size,
+        std::uint32_t num_router_gates)
         : num_tokens(num_tokens),
           hidden_size(hidden_size),
           intermediate_size(intermediate_size),
-          latent_size(latent_size) {}
+          latent_size(latent_size),
+          num_router_gates(num_router_gates) {}
 
     std::uint32_t num_tokens = 0u;
     std::uint32_t hidden_size = 0u;
     std::uint32_t intermediate_size = 0u;
     std::uint32_t latent_size = 0u;
+    std::uint32_t num_router_gates = 0u;
 
     __host__ __device__ constexpr std::uint32_t input_size() const {
         return latent_size != 0u ? latent_size : hidden_size;
+    }
+};
+
+// The launch-time kernel layout: split groups, the phase CTA ranges, the
+// launch cluster and the router's gate count. The host fills it per call.
+struct MoERuntime {
+    static constexpr std::uint32_t kMaxClusterSize = 4u;
+    static constexpr std::uint32_t kMaxRouterGates = 2u;
+
+    // Split-K groups: one GEMM reduction's consecutive CTAs.
+    std::uint32_t num_latent_splits = 1u;
+    std::uint32_t num_shared_splits = 1u;
+    // The launch cluster; a split group never crosses a cluster boundary.
+    std::uint32_t cluster_size = 1u;
+
+    // CTAs per router gate; the phase spans gates x this many blocks.
+    std::uint32_t num_router_gates = 0u;
+    std::uint32_t num_router_ctas = 0u;
+    std::uint32_t num_latent_ctas = 0u;
+    std::uint32_t first_shared_cta = 0u;
+    std::uint32_t num_shared_ctas = 0u;
+    std::uint32_t num_tail_ctas = 0u;
+
+    constexpr MoERuntime() = default;
+
+    __host__ __device__ constexpr MoERuntime(
+        MoEProblemSize const& problem_size, const std::uint32_t num_router_ctas,
+        const std::uint32_t num_latent_ctas,
+        const std::uint32_t num_shared_ctas)
+        : num_router_gates(problem_size.num_router_gates),
+          num_router_ctas(num_router_ctas),
+          num_latent_ctas(num_latent_ctas),
+          first_shared_cta(num_router_ctas * problem_size.num_router_gates +
+                           num_latent_ctas),
+          num_shared_ctas(num_shared_ctas) {}
+
+    // The smallest grid in which every phase has its CTAs resident.
+    __host__ __device__ constexpr std::uint32_t get_min_grid() const {
+        return (first_shared_cta + num_shared_ctas) > num_tail_ctas
+                   ? (first_shared_cta + num_shared_ctas)
+                   : num_tail_ctas;
+    }
+
+    __device__ bool is_router_cta() const {
+        return blockIdx.x < num_router_ctas * num_router_gates;
+    }
+
+    __device__ bool is_latent_cta() const {
+        const std::uint32_t first_latent_cta =
+            num_router_ctas * num_router_gates;
+        return blockIdx.x >= first_latent_cta &&
+               blockIdx.x < first_latent_cta + num_latent_ctas;
+    }
+
+    __device__ bool is_shared_cta() const {
+        return blockIdx.x >= first_shared_cta &&
+               blockIdx.x < first_shared_cta + num_shared_ctas;
     }
 };
 

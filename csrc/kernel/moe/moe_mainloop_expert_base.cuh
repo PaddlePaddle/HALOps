@@ -75,16 +75,16 @@ struct UpProjectionBase {
     using SharedStorage = MoESharedStorage<Dims>;
     using Workspace = MoEWorkspace<Dims>;
     using UpGemm = GemmTraits;
-    using Cluster = ClusterSplitK<Traits::kClusterSize, UpGemm::kNumSplits>;
     using MmaCore = typename UpGemm::MmaCore;
     using WeightElement = typename MmaCore::SmemElementA;
     using ActElement = typename UpGemm::InputQuant::ElementType;
     using TiledMma = typename UpGemm::TiledMma;
     using UpScaleTraits = typename UpGemm::ScaleTraits;
 
-    static constexpr std::uint32_t kNumSplits = UpGemm::kNumSplits;
     static constexpr std::uint32_t kNumSlots =
         GemmSlots<Dims, UpGemm>::kNumSlots;
+    // A phase that never splits compile-time-eliminates the split path.
+    static constexpr bool kUseSplitK = UpGemm::kUseSplitK;
     static constexpr std::uint32_t kTmemAccSlots =
         GemmSlots<Dims, UpGemm>::kTmemAccSlots;
     static constexpr std::uint32_t kAccColumns = get_gemm_acc_columns<UpGemm>();
@@ -270,8 +270,10 @@ struct UpProjectionBase {
     // Every CTA thread joins when partial sums are shared across splits.
     __device__ static void join_up_split_k(
         float (*partial)[kOutputFeatureBlock][UpGemm::kTileShapeN],
-        const Accumulator& gate, const Accumulator& up) {
-        if constexpr (kNumSplits > 1u) {
+        const Accumulator& gate, const Accumulator& up,
+        std::uint32_t num_splits) {
+        if constexpr (kUseSplitK) {
+            if (num_splits <= 1u) return;
             // Stage this split's sums: plane 0 holds gate, plane 1 holds up.
             const std::uint32_t warp = WarpRole::get_warp_idx();
             if (WarpRole::is_calc_warp(warp) && owns_up_rows(warp)) {
@@ -290,7 +292,7 @@ struct UpProjectionBase {
                 }
             }
             __syncthreads();
-            Cluster::sync();
+            ClusterSplitK::sync();
         }
     }
 
@@ -300,15 +302,18 @@ struct UpProjectionBase {
         const float (*partial)[kOutputFeatureBlock][UpGemm::kTileShapeN],
         float (*act)[UpGemm::kTileShapeN + 1u], const Accumulator& gate,
         const Accumulator& up, Activation activation, float situ_beta,
-        float situ_linear_beta, const Accumulator* weights = nullptr,
+        float situ_linear_beta, std::uint32_t num_splits = 1u,
+        std::uint32_t cluster_size = 1u, const Accumulator* weights = nullptr,
         std::uint32_t token_mask = 0xFFFFFFFFu) {
         if (activation == Activation::kSitu) {
             combine_gated_activation_impl(
-                partial, act, gate, up, weights, token_mask,
+                partial, act, gate, up, weights, token_mask, num_splits,
+                cluster_size,
                 GatedActFunctor<true>{situ_beta, situ_linear_beta});
         } else {
             combine_gated_activation_impl(
-                partial, act, gate, up, weights, token_mask,
+                partial, act, gate, up, weights, token_mask, num_splits,
+                cluster_size,
                 GatedActFunctor<false>{situ_beta, situ_linear_beta});
         }
     }
@@ -318,16 +323,19 @@ struct UpProjectionBase {
         const float (*partial)[kOutputFeatureBlock][UpGemm::kTileShapeN],
         float (*act)[UpGemm::kTileShapeN + 1u], const Accumulator& acc_gate,
         const Accumulator& acc_up, const Accumulator* weights,
-        std::uint32_t token_mask, const ActFunctor& act_functor) {
+        std::uint32_t token_mask, std::uint32_t num_splits,
+        std::uint32_t cluster_size, const ActFunctor& act_functor) {
         const std::uint32_t warp = WarpRole::get_warp_idx();
         if (!owns_up_rows(warp)) return;
         const std::uint32_t lane = WarpRole::get_lane_idx();
         const std::uint32_t feature = 8u * up_group_idx(warp) + (lane >> 2);
         constexpr std::uint32_t kPlaneElems =
             kOutputFeatureBlock * UpGemm::kTileShapeN;
-        Cluster cluster;
-        if constexpr (kNumSplits > 1u) {
-            cluster.map(&partial[0][0][0]);
+        ClusterSplitK cluster(cluster_size, num_splits);
+        if constexpr (kUseSplitK) {
+            if (num_splits > 1u) {
+                cluster.map(&partial[0][0][0]);
+            }
         }
 #pragma unroll
         for (std::uint32_t group = 0; group < kTokenGroups; ++group) {
@@ -338,11 +346,16 @@ struct UpProjectionBase {
                 const float rw = weights ? (*weights)[group * 2u + i] : 1.0f;
                 float gate;
                 float up;
-                if constexpr (kNumSplits > 1u) {
-                    const std::uint32_t at =
-                        feature * UpGemm::kTileShapeN + token;
-                    gate = cluster.split_sum(at);
-                    up = cluster.split_sum(kPlaneElems + at);
+                if constexpr (kUseSplitK) {
+                    if (num_splits > 1u) {
+                        const std::uint32_t at =
+                            feature * UpGemm::kTileShapeN + token;
+                        gate = cluster.split_sum(at);
+                        up = cluster.split_sum(kPlaneElems + at);
+                    } else {
+                        gate = acc_gate[group * 2u + i];
+                        up = acc_up[group * 2u + i];
+                    }
                 } else {
                     gate = acc_gate[group * 2u + i];
                     up = acc_up[group * 2u + i];

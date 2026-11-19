@@ -30,7 +30,7 @@ template <typename Dims>
 struct RouterLogits {
     using RouterGemm = RouterGemmTraits<Dims>;
 
-    static constexpr std::uint32_t kNumGates = RouterGemm::kNumRouterGates;
+    static constexpr std::uint32_t kNumGates = MoERuntime::kMaxRouterGates;
     static constexpr bool kStoreScores = kNumGates > 1u;
 
     using ResultType = std::conditional_t<kStoreScores, float, __nv_bfloat16>;

@@ -74,11 +74,6 @@ struct RouterProjectionBase {
     static constexpr std::uint32_t kWeightTileChunks =
         MmaCore::kNumSwizzleBoxKs;
 
-    // The router runs on the first kNumCtas blocks, one task each.
-    __device__ static bool is_router_cta() {
-        return blockIdx.x < RouterGemm::kNumCtas;
-    }
-
     // Every slot's first tile, which can be in flight before any slot drains.
     static constexpr std::uint32_t kNumSlots =
         GemmSlots<Dims, RouterGemm>::kNumSlots;
@@ -265,9 +260,6 @@ struct RouterProjection<KernelTraits, true>
                                ScoringFunc scoring,
                                MoEProblemSize const& problem_size) {
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
-        if (!Base::is_router_cta()) {
-            return;
-        }
 
         // The router Linear's B operand, in both modes.
         if (WarpRole::is_other_loader_thread()) {
@@ -407,10 +399,6 @@ struct RouterProjection<KernelTraits, false>
                                ScoringFunc scoring,
                                MoEProblemSize const& problem_size) {
         // Split-K is UMMA-only, so every block owns one whole M tile here.
-        if (!Base::is_router_cta()) {
-            return;
-        }
-
         // The router Linear's B operand, in both modes.
         if (WarpRole::is_other_loader_thread()) {
             run_load_input_k_loop(tma_input_desc, smem, problem_size);

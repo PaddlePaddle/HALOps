@@ -126,9 +126,10 @@ struct RoutedUpProjectionBase
                     expert_weights[__popc(token_mask & ((1u << token) - 1u))];
             }
         }
-        Base::combine_gated_activation(nullptr, smem->routed_experts.act_up_out,
-                                       acc_gate, acc_up, activation, situ_beta,
-                                       situ_linear_beta, &weights, token_mask);
+        Base::combine_gated_activation(
+            nullptr, smem->routed_experts.act_up_out, acc_gate, acc_up,
+            activation, situ_beta, situ_linear_beta, /*num_splits=*/1u,
+            /*cluster_size=*/1u, &weights, token_mask);
         WarpRole::sync_calc_threads();
 
         constexpr std::uint32_t kTokensPerWarp =

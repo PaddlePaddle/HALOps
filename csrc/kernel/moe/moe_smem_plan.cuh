@@ -453,6 +453,16 @@ using RoutedExpertsSmem =
                        GemmSlots<Dims, UpGemmTraits>::kNumSlots,
                        GemmSlots<Dims, DownGemmTraits>::kNumSlots>;
 
+// The accumulator columns one K step's tile needs in TMEM.
+template <class GemmTraits>
+constexpr std::uint32_t get_gemm_acc_columns() {
+    return GemmTraits::MmaCore::kUseBlockscaled
+               ? GemmTraits::MmaCore::kNumAtomMs * GemmTraits::kTileShapeN
+               : GemmTraits::MmaCore::kNumAtomMs *
+                     GemmTraits::MmaCore::kNumQuantBlocksB *
+                     GemmTraits::kTileShapeN;
+}
+
 // One GEMM phase's TMEM columns: its accumulators plus its SFA/SFB sets.
 template <typename Dims, class GemmTraits>
 constexpr std::uint32_t get_gemm_tmem_columns() {
