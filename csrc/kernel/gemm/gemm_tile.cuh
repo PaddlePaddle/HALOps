@@ -16,6 +16,7 @@
 
 #include <array>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 
 #include "common/mx_quant.cuh"
@@ -479,11 +480,10 @@ struct CandidateTiles<MmaKind::MXFP8FP4> {
 // can mirror the FP8 configs. epi_warp_groups=1 marks the 1-epilogue-warp-
 // group layouts (narrow tiles, 2SM "2x2" TMEM layout); force_ntail marks the
 // predicated N-tail store (N only has to divide 64, or 32 for non-power-of-2
-// widths). dense_only stays false on every BF16 tile: each mode picks from
-// its own table below, so the flag is never consulted.
+// widths). dense_only stays false on every BF16 tile: the mode selectors in
+// gemm_dispatch.cuh pick the tile, so the flag is never consulted.
 //
-// Dense table. Order defines the id the dense selector returns
-// (SelectBF16Cfg in gemm_dispatch.cuh); keep the two in sync.
+// One tile table serves all four modes; ids are derived from it below.
 // ---------------------------------------------------------------------------
 constexpr TileSpec kBF16_256x256_pair = {.block_m = 256,
                                          .block_n = 256,
@@ -597,22 +597,6 @@ constexpr TileSpec kBF16_128x64x128_swap = {.block_m = 128,
                                             .main_stages = 4,
                                             .swap_ab = true};
 
-inline constexpr std::array<TileSpec, 25> kBF16DenseTiles = {
-    kBF16_256x256_pair,    kBF16_256x256_pair_p7,
-    kBF16_256x128_pair,    kBF16_256x128_pair_ntail,
-    kBF16_256x128_pair_p9, kBF16_256x128_pair_p9_ntail,
-    kBF16_256x192_pair,    kBF16_256x64_pair,
-    kBF16_128x256,         kBF16_128x128,
-    kBF16_128x64,          kBF16_128x32,
-    kBF16_128x64_pair_p18, kBF16_64x128,
-    kBF16_64x96_p11,       kBF16_64x224,
-    kBF16_64x64,           kBF16_64x64_1wg,
-    kBF16_64x64_1wg_p14,   kBF16_64x32_1wg,
-    kBF16_64x32_1wg_p18,   kBF16_128x64_swap,
-    kBF16_128x32_swap,     kBF16_256x64_swap_pair,
-    kBF16_128x64x128_swap,
-};
-
 // Grouped/batch tiles: deeper / TMEM-overlapped variants of the dense shapes.
 constexpr TileSpec kBF16_128x256_ovlp16 = {.block_m = 128,
                                            .block_n = 256,
@@ -627,31 +611,45 @@ constexpr TileSpec kBF16_128x64_ovlp16 = {.block_m = 128,
                                           .main_stages = 8,
                                           .tmem_overlap = 16};
 
-// Order defines the id the per-mode selectors return (gemm_dispatch.cuh).
-inline constexpr std::array<TileSpec, 6> kBF16ContiguousTiles = {
-    kBF16_256x256_pair_p7,  // 0
-    kBF16_256x128_pair_p9,  // 1
-    kBF16_128x256_ovlp16,   // 2
-    kBF16_128x128_p6,       // 3
-    kBF16_128x64_ovlp16,    // 4
-    kBF16_128x64_swap,      // 5
+// Every BF16 launch draws from this one table; the per-mode ids in
+// gemm_dispatch.cuh index it directly, so a tile several modes share appears
+// once. Order is free apart from keeping the dense block first, which is what
+// the historical id order was.
+inline constexpr std::array<TileSpec, 28> kBF16Tiles = {
+    kBF16_256x256_pair,    kBF16_256x256_pair_p7,
+    kBF16_256x128_pair,    kBF16_256x128_pair_ntail,
+    kBF16_256x128_pair_p9, kBF16_256x128_pair_p9_ntail,
+    kBF16_256x192_pair,    kBF16_256x64_pair,
+    kBF16_128x256,         kBF16_128x128,
+    kBF16_128x64,          kBF16_128x32,
+    kBF16_128x64_pair_p18, kBF16_64x128,
+    kBF16_64x96_p11,       kBF16_64x224,
+    kBF16_64x64,           kBF16_64x64_1wg,
+    kBF16_64x64_1wg_p14,   kBF16_64x32_1wg,
+    kBF16_64x32_1wg_p18,   kBF16_128x64_swap,
+    kBF16_128x32_swap,     kBF16_256x64_swap_pair,
+    kBF16_128x64x128_swap,
+    // Grouped/batch: deeper or TMEM-overlapped variants of the dense shapes.
+    kBF16_128x256_ovlp16,  kBF16_128x128_p6,
+    kBF16_128x64_ovlp16,
 };
 
-inline constexpr std::array<TileSpec, 6> kBF16MaskedTiles = {
-    kBF16_128x256_ovlp16,   // 0
-    kBF16_128x64_swap,      // 1
-    kBF16_128x128_p6,       // 2
-    kBF16_128x64_ovlp16,    // 3
-    kBF16_256x256_pair_p7,  // 4
-    kBF16_256x128_pair_p9,  // 5
-};
+// Index of a tile in kBF16Tiles. The per-mode ids in gemm_dispatch.cuh are
+// derived from it, so an id cannot point at the wrong tile and a tile missing
+// from the table fails to compile.
+consteval int Bf16TileId(const TileSpec& t) {
+    for (std::size_t i = 0; i < kBF16Tiles.size(); ++i) {
+        if (kBF16Tiles[i] == t) {
+            return static_cast<int>(i);
+        }
+    }
+    throw "BF16 tile missing from kBF16Tiles";
+}
 
-inline constexpr std::array<TileSpec, 3> kBF16BatchTiles = {
-    kBF16_256x256_pair,    // 0
-    kBF16_128x256_ovlp16,  // 1
-    kBF16_128x64_swap,     // 2
+template <>
+struct CandidateTiles<MmaKind::BF16> {
+    static constexpr const auto& tiles = kBF16Tiles;
 };
-
 // ---------------------------------------------------------------------------
 // Field-lock asserts: guard the designated-initializer tables above against
 // drift. These tables replaced hand-written GemmTile structs; the locks pin
