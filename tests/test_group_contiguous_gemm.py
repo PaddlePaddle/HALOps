@@ -25,6 +25,7 @@ from halops import group_contiguous_gemm
 from tests.utils.fp4_utils import MXFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE
 
 from tests.utils.gemm_utils import (
+    BF16_TOL,
     W4A4_TOL,
     W8A8_MXFP8_TOL,
     per_block_cast_to_nvfp4,
@@ -130,6 +131,20 @@ def ref_group_contiguous_gemm_w4a4(x_fp4_float, w_fp4_float, expert_ids, num_exp
         for i, idx in enumerate(indices.cpu().numpy()):
             ref_out[idx] = result[i]
 
+    return ref_out
+
+
+def ref_group_contiguous_gemm_bf16(x, w, expert_ids, num_experts):
+    """
+    Reference implementation of BF16 grouped contiguous GEMM.
+    x: (M, K) bfloat16, w: (num_experts, N, K) bfloat16, expert_ids: (M,) int32
+    """
+    ref_out = torch.zeros([x.shape[0], w.shape[1]], dtype=torch.bfloat16)
+    for expert_id in range(num_experts):
+        rows = expert_ids == expert_id
+        ref_out[rows] = torch.matmul(
+            x[rows].to(torch.float32), w[expert_id].to(torch.float32).T
+        ).to(torch.bfloat16)
     return ref_out
 
 
@@ -484,6 +499,26 @@ def test_group_contiguous_w4a8_mxfp4(m, n, k, num_experts, tile_m):
         mode=inp.mode,
     )
     assert_close_per_expert(output, ref_out, inp.token_nums, W4A4_TOL)
+
+
+# =====================================================================
+# BF16 accuracy tests
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "m, n, k, num_experts, tile_m",
+    [pytest.param(512, 256, 128, 2, 128, id="mid_m_e2")],
+)
+def test_group_contiguous_bf16(m, n, k, num_experts, tile_m):
+    expert_ids, token_nums, num_experts = make_contiguous_expert_ids(
+        m, num_experts, tile_m
+    )
+    x = torch.randn([m, k], dtype=torch.bfloat16)
+    w = torch.randn([num_experts, n, k], dtype=torch.bfloat16)
+    ref_out = ref_group_contiguous_gemm_bf16(x, w, expert_ids, num_experts)
+    output = group_contiguous_gemm_wrapper(x, w, None, None, expert_ids, mode="bf16")
+    assert_close_per_expert(output, ref_out, token_nums, BF16_TOL)
 
 
 # =====================================================================

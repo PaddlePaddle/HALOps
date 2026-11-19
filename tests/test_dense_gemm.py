@@ -23,6 +23,7 @@ from halops import EpilogueOp, dense_gemm, interleave_gate_up
 from tests.utils.fp4_utils import MXFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE
 
 from tests.utils.gemm_utils import (
+    BF16_TOL,
     W4A4_TOL,
     W8A8_MXFP8_TOL,
     per_block_cast_to_nvfp4,
@@ -72,6 +73,11 @@ def ref_gemm_w4a4(x_fp4_float, w_fp4_float):
     pass values already dequantized with their own scale factors.
     """
     return torch.matmul(x_fp4_float, w_fp4_float.T).to(torch.bfloat16)
+
+
+def ref_gemm_bf16(x, w):
+    """Reference BF16 GEMM: fp32 matmul of x (m, k) and w (n, k), rounded to bf16."""
+    return torch.matmul(x.to(torch.float32), w.to(torch.float32).T).to(torch.bfloat16)
 
 
 # =====================================================================
@@ -172,6 +178,10 @@ def make_empty_inputs(m, n, k, mode, x_shape=None, out_shape=None):
         sfa = torch.empty([m, k // 16], dtype=torch.uint8)
         sfb = torch.empty([n, k // 16], dtype=torch.uint8)
         alpha = torch.ones([1], dtype=torch.float32)
+    elif mode == "bf16":
+        x = torch.empty(x_shape or [m, k], dtype=torch.bfloat16)
+        w = torch.empty([n, k], dtype=torch.bfloat16)
+        sfa = sfb = alpha = None
     else:
         raise ValueError(f"Unsupported mode for empty inputs: {mode!r}")
     out = torch.empty(out_shape or [m, n], dtype=torch.bfloat16)
@@ -426,6 +436,69 @@ def test_gemm_mxfp4_bad_scale_shape():
 
 
 # =====================================================================
+# BF16 tests
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "m, n, k",
+    [
+        pytest.param(4096, 256, 256, id="large_m-4096x256x256"),
+        # 1600 % 128 == 64: the 256x128 predicated N-tail tile, at every M rung.
+        pytest.param(1024, 1600, 4096, id="ntail-1024x1600x4096"),
+        pytest.param(2048, 1600, 4096, id="ntail-2048x1600x4096"),
+        pytest.param(4096, 1600, 4096, id="ntail-4096x1600x4096"),
+        pytest.param(8192, 1600, 4096, id="ntail-8192x1600x4096"),
+        pytest.param(16384, 1600, 4096, id="ntail-16384x1600x4096"),
+        # The 256-wide family underfills a wave, so large M steps down to 64xN.
+        pytest.param(4096, 128, 4096, id="large_m_n128-4096x128x4096"),
+        pytest.param(8192, 128, 4096, id="large_m_n128-8192x128x4096"),
+        pytest.param(128, 256, 256, id="mid_m-128x256x256"),
+        pytest.param(1024, 1536, 4096, id="mid_m_odd_n-1024x1536x4096"),
+        pytest.param(64, 256, 256, id="small_m_swapab-64x256x256"),
+        pytest.param(64, 4096, 8192, id="small_m_deep_k-64x4096x8192"),
+    ],
+)
+def test_gemm_bf16(m, n, k):
+    output, ref_out, tol = run_mode_gemm("bf16", m, n, k)
+    torch.testing.assert_close(
+        output.to(torch.float32),
+        ref_out.to(torch.float32),
+        **tol,
+        msg=lambda s: f"BF16 dense_gemm m={m}, n={n}, k={k}: {s}",
+    )
+
+
+def test_gemm_bf16_rejects_non_bf16_input():
+    x, w, _, _, out, _ = make_empty_inputs(128, 256, 256, "bf16")
+    with pytest.raises(RuntimeError, match=re.escape("input must be bfloat16")):
+        dense_gemm(x.half(), w, None, None, out, None, None, -1, "bf16")
+
+
+def test_gemm_bf16_rejects_epilogue_op():
+    x, w, _, _, out, _ = make_empty_inputs(128, 256, 256, "bf16")
+    with pytest.raises(
+        RuntimeError, match=re.escape("supports EpilogueOp.Identity only")
+    ):
+        dense_gemm(
+            x, w, None, None, out, None, None, -1, "bf16", False, EpilogueOp.Sigmoid
+        )
+
+
+@pytest.mark.parametrize(
+    "mode, expected",
+    [
+        ("w8a8-mxfp8", "w8a8-mxfp8 dense GEMM requires sfa/sfb scale factors"),
+        ("w4a4-nvfp4", "W4A4 dense GEMM requires sfa/sfb scale factors"),
+    ],
+)
+def test_gemm_quant_requires_scale_factors(mode, expected):
+    x, w, _, _, out, alpha = make_empty_inputs(128, 256, 256, mode)
+    with pytest.raises(RuntimeError, match=re.escape(expected)):
+        dense_gemm(x, w, None, None, out, None, alpha, -1, mode)
+
+
+# =====================================================================
 # Unsupported shapes
 # =====================================================================
 
@@ -463,6 +536,16 @@ def test_gemm_mxfp4_bad_scale_shape():
             None,
             "No dense w4a4-nvfp4 tile for M=128 (grid M=128), N=256, K=48",
             id="nvfp4_bad_k",
+        ),
+        pytest.param(
+            "bf16",
+            128,
+            256,
+            96,
+            None,
+            None,
+            "BF16 GEMM mid M K must be divisible by 64",
+            id="bf16_bad_k",
         ),
         pytest.param(
             "w8a8-mxfp8",
@@ -531,6 +614,12 @@ def test_gemm_nvfp4_determinism():
 
 def make_mode_inputs(mode, m, n, k):
     """Build the kernel arguments, reference output and tolerance for ``mode``."""
+    if mode == "bf16":
+        x = torch.randn([m, k], dtype=torch.bfloat16)
+        w = torch.randn([n, k], dtype=torch.bfloat16)
+        ref_out = ref_gemm_bf16(x, w)
+        return (x, w, None, None), {}, ref_out, BF16_TOL
+
     if mode == "w8a8-mxfp8":
         inp = make_w8a8_mxfp8_inputs(m, n, k)
         ref_out = ref_gemm(inp["x"], inp["w"], inp["sfa_logical"], inp["sfb_logical"])
