@@ -25,6 +25,7 @@ from halops import group_masked_gemm
 from tests.utils.fp4_utils import MXFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE
 
 from tests.utils.gemm_utils import (
+    BF16_TOL,
     W4A4_TOL,
     W8A8_MXFP8_TOL,
     per_block_cast_to_nvfp4,
@@ -179,6 +180,26 @@ def ref_group_masked_gemm_w4a4(
             result = result * alpha[expert_id]
         ref_out[start : start + m, :] = result
 
+    return ref_out
+
+
+def ref_group_masked_gemm_bf16(x, w, masked_m, max_m_per_expert, num_experts):
+    """
+    Reference implementation of BF16 grouped masked GEMM.
+    Each expert's valid rows get an fp32 matmul rounded to bf16; masked rows stay 0.
+
+    Parameters:
+      x: (M_total, K), bfloat16
+      w: (num_experts, N, K), bfloat16
+      masked_m: (num_experts,), int
+    """
+    ref_out = torch.zeros([x.shape[0], w.shape[1]], dtype=torch.bfloat16)
+    for expert_id in range(num_experts):
+        start = expert_id * max_m_per_expert
+        end = start + int(masked_m[expert_id])
+        ref_out[start:end] = torch.matmul(
+            x[start:end].to(torch.float32), w[expert_id].to(torch.float32).T
+        ).to(torch.bfloat16)
     return ref_out
 
 
@@ -674,6 +695,26 @@ def test_group_masked_w4a8_mxfp4(max_m_per_expert, num_experts, n, k, full_x, ma
     assert_close_per_expert(
         output, ref_out, inp.masked_m, inp.max_m_per_expert, W4A4_TOL
     )
+
+
+# =====================================================================
+# BF16 accuracy tests
+# =====================================================================
+
+
+@pytest.mark.parametrize(
+    "max_m_per_expert, num_experts, n, k, masked_m",
+    [pytest.param(128, 2, 256, 128, [100, 128], id="mid_m_partial_mask")],
+)
+def test_group_masked_bf16(max_m_per_expert, num_experts, n, k, masked_m):
+    x = torch.randn([num_experts * max_m_per_expert, k], dtype=torch.bfloat16)
+    w = torch.randn([num_experts, n, k], dtype=torch.bfloat16)
+    masked_m = torch.tensor(masked_m, dtype=torch.int32)
+    ref_out = ref_group_masked_gemm_bf16(x, w, masked_m, max_m_per_expert, num_experts)
+    output = group_masked_gemm_wrapper(
+        x, w, None, None, masked_m, max_m_per_expert, mode="bf16"
+    )
+    assert_close_per_expert(output, ref_out, masked_m, max_m_per_expert, BF16_TOL)
 
 
 # =====================================================================
