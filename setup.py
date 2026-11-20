@@ -99,6 +99,7 @@ setup(
                 "csrc/kernel/mla/mla_output_proj.cu",
                 "csrc/kernel/mla/combine_with_rope_quant.cu",
                 "csrc/kernel/mla/vha_postmix_quant.cu",
+                "csrc/kernel/mla/prefill_pair_mla.cu",
                 "csrc/kernel/moe/mega_ll_moe.cu",
                 "csrc/kernel/mhc/megallmhc.cu",
                 "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
