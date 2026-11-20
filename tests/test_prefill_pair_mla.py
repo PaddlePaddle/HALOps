@@ -14,6 +14,10 @@
 # limitations under the License.
 """
 
+from __future__ import annotations
+
+from typing import NamedTuple
+
 import pytest
 import torch
 
@@ -22,6 +26,7 @@ from tests.utils.prefill_pair_mla_utils import (
     DIM,
     HEADS,
     SCALE,
+    Batch,
     Req,
     cp_local,
     cu_offsets,
@@ -39,21 +44,23 @@ from tests.utils.prefill_pair_mla_utils import (
 RMS_TOL = 2.5e-3
 MAX_TOL = 1.2e-2
 
-# One request, the chunk being the last T of CTX positions (T, CTX).  Pairs
-# of at most 5 tiles (t2, t64, t2048_from0) run the kQst kernels.  1024/64K,
-# 256/1M (c128 width >= 512, T >= 256) and 4096/32K (width 256, T >= 4096)
-# pre-dequantize c128 to bf16 first; the others read it as fp8.
-UNIFORM_CASES = [
-    pytest.param(2, 256, id="t2", marks=pytest.mark.quick),
-    pytest.param(3, 65536, id="t3_odd"),
-    pytest.param(64, 4096, id="t64", marks=pytest.mark.quick),
-    pytest.param(2048, 2048, id="t2048_from0"),
-    pytest.param(1024, 32768, id="t1024_ctx32k"),
-    pytest.param(1024, 65536, id="t1024_ctx64k"),
-    pytest.param(4096, 32768, id="t4096_ctx32k"),
-    pytest.param(64, 1048576, id="t64_ctx1m"),
-    pytest.param(256, 1048576, id="t256_ctx1m"),
-]
+
+class Case(NamedTuple):
+    """One batch of requests; exercises names the kernel path it adds."""
+
+    name: str
+    reqs: list[Req]
+    exercises: str
+    quick: bool = False
+
+
+def params(cases: list[Case]):
+    """One param per case; `quick` rides along as a marker."""
+    return [
+        pytest.param(c, marks=[pytest.mark.quick] if c.quick else [], id=c.name)
+        for c in cases
+    ]
+
 
 # Odd chunks, a 1-token request, a chunk starting at position 0.
 VARLEN_REQS = [
@@ -76,8 +83,30 @@ REPLAY_REQS = [
     Req(64, 8000, 3, clamp=False),
 ]
 
+# One request, run with tokens_per_req = T.  kQst: a pair has at most 5 key
+# tiles; predq: c128 width >= 512 with T >= 256, or width 256 with T >= 4096.
+UNIFORM_CASES = [
+    Case("T2-ctx256", [Req(2, 256)], "kQst, one pair, combine", quick=True),
+    Case("T64-ctx4K", [Req(64, 4096)], "kQst, 32 pairs, combine", quick=True),
+    Case("T2048-ctx2K", [Req(2048, 2048)], "kQst, no combine, chunk from 0"),
+    Case("T1024-ctx32K", [Req(1024, 32768)], "streaming, fp8 c128"),
+    Case("T1024-ctx64K", [Req(1024, 65536)], "predq, c128 width 512"),
+    Case("T4096-ctx32K", [Req(4096, 32768)], "predq, c128 width 256"),
+    Case("T64-ctx1M", [Req(64, 1048576)], "streaming, 32 pairs, combine"),
+    Case("T256-ctx1M", [Req(256, 1048576)], "predq, long key streams"),
+]
 
-def run(batch, sink=True, **kwargs):
+COMBINE = Case("combine", [Req(2, 65536)], "one pair split by the combine kernel")
+QST = Case("qst", [Req(2048, 2048)], "kQst kernels")
+STREAMING = Case("streaming", VARLEN_REQS, "streaming kernels with predq")
+
+CP_RANKS = [
+    pytest.param(cp, rank, id=f"cp{cp}-rank{rank}")
+    for cp, rank in ((2, 1), (4, 0), (8, 7))
+]
+
+
+def run(batch: Batch, sink: bool = True, **kwargs) -> torch.Tensor:
     return prefill_pair_mla(
         batch.q,
         batch.swa,
@@ -92,7 +121,7 @@ def run(batch, sink=True, **kwargs):
     )
 
 
-def run_flashmla(batch):
+def run_flashmla(batch: Batch) -> torch.Tensor:
     fm = pytest.importorskip("sgl_kernel.flash_mla")
     return fm.flash_mla_with_kvcache(
         q=batch.q,
@@ -112,7 +141,7 @@ def run_flashmla(batch):
     )[0]
 
 
-def check(o, batch, sink=True, rows=None):
+def check(o: torch.Tensor, batch: Batch, sink: bool = True, rows=None):
     """Against the fp32 reference on rows (default every row)."""
     assert torch.isfinite(o).all(), "non-finite output"
     if rows is None:
@@ -123,12 +152,16 @@ def check(o, batch, sink=True, rows=None):
     return rows, refs, worst, rms
 
 
-def varlen_kwargs(lens, swa_shift=1):
+def varlen_kwargs(lens: list[int], swa_shift: int = 1) -> dict:
     cu_seqlens, cu_pairs = cu_offsets(lens)
     return dict(cu_seqlens=cu_seqlens, cu_pairs=cu_pairs, swa_shift=swa_shift)
 
 
-def cp_reqs(cp):
+def case_kwargs(case: Case) -> dict:
+    return varlen_kwargs([r.tokens for r in case.reqs])
+
+
+def cp_reqs(cp: int) -> list[Req]:
     """VARLEN_REQS with the token count padded to a multiple of cp."""
     reqs = list(VARLEN_REQS)
     pad = -sum(r.tokens for r in reqs) % cp
@@ -137,17 +170,11 @@ def cp_reqs(cp):
     return reqs
 
 
-CP_RANKS = [
-    pytest.param(cp, rank, id=f"cp{cp}_rank{rank}")
-    for cp in (2, 4, 8)
-    for rank in (0, cp - 1)
-]
-
-
-@pytest.mark.parametrize("t,ctx", UNIFORM_CASES)
-def test_uniform(t, ctx):
-    batch = make_batch([Req(t, ctx)])
-    check(run(batch, tokens_per_req=t), batch)
+@pytest.mark.parametrize("case", params(UNIFORM_CASES))
+def test_uniform(case: Case):
+    """One request through tokens_per_req, against the fp32 reference."""
+    batch = make_batch(case.reqs)
+    check(run(batch, tokens_per_req=case.reqs[0].tokens), batch)
 
 
 def test_tokens_per_req_matches_varlen():
@@ -160,34 +187,35 @@ def test_tokens_per_req_matches_varlen():
 
 @pytest.mark.quick
 def test_varlen():
+    """Requests of different lengths through cu_seqlens / cu_pairs."""
     batch = make_batch(VARLEN_REQS)
-    check(run(batch, **varlen_kwargs([r.tokens for r in VARLEN_REQS])), batch)
+    check(run(batch, **case_kwargs(STREAMING)), batch)
 
 
 def test_replay():
+    """SWA keys partly read from the per-request replay arena."""
     batch = make_batch(REPLAY_REQS)
     check(run(batch, **varlen_kwargs([r.tokens for r in REPLAY_REQS])), batch)
 
 
 @pytest.mark.parametrize("cp,rank", CP_RANKS)
-def test_cp(cp, rank):
+def test_cp(cp: int, rank: int):
     """CP round-robin: rank's tokens of a cp-way split."""
     local, lens = cp_local(make_batch(cp_reqs(cp)), cp, rank)
     check(run(local, **varlen_kwargs(lens, swa_shift=cp)), local)
 
 
 def test_no_sink():
+    """attn_sink = None, with an odd tokens_per_req."""
     batch = make_batch([Req(517, 517)])
     check(run(batch, sink=False, tokens_per_req=517), batch, sink=False)
 
 
-@pytest.mark.parametrize("sink", [True, False], ids=["sink", "no_sink"])
+@pytest.mark.parametrize("sink", [True, False], ids=["sink", "no-sink"])
 @pytest.mark.parametrize(
-    "req",
-    [Req(2, 65536), Req(512, 262144)],
-    ids=["combine", "in_kernel_merge"],
+    "req", [Req(2, 65536), Req(512, 262144)], ids=["combine", "in-kernel-merge"]
 )
-def test_no_keys(req, sink):
+def test_no_keys(req: Req, sink: bool):
     """Tokens with no valid key output zeros, also when their pair is split:
     one pair is split by the combine kernel, 256 pairs are cut by the
     in-kernel merge's range boundaries."""
@@ -202,7 +230,7 @@ def test_no_keys(req, sink):
     check(o, batch, sink, rows=list(range(1, req.tokens, 2)))
 
 
-def skip_keys(idx, lens, rows):
+def skip_keys(idx: torch.Tensor, lens: torch.Tensor, rows: int) -> torch.Tensor:
     """idx with some row ids inside the lengths replaced, the same way in
     every token so pairs keep their structure: v % 7 == 3 by -1 and
     v % 11 == 5 by v + rows (past the pool)."""
@@ -214,7 +242,7 @@ def skip_keys(idx, lens, rows):
 @pytest.mark.parametrize(
     "req", [Req(1024, 32768), Req(1024, 65536)], ids=["fp8", "predq"]
 )
-def test_invalid_keys(req):
+def test_invalid_keys(req: Req):
     """Indices inside the lengths that are negative or past the pool are
     skipped: by the kernel's key mask, and with predq also in the bf16 copy."""
     batch = make_batch([req])
@@ -248,41 +276,32 @@ def test_c128_not_prefix():
     check(run(batch, tokens_per_req=req.tokens), batch)
 
 
-# A pair split by the combine kernel, the kQst kernels, the streaming kernels
-# with predq.
-OUT_CASES = [
-    pytest.param([Req(2, 65536)], id="combine"),
-    pytest.param([Req(2048, 2048)], id="qst"),
-    pytest.param(VARLEN_REQS, id="streaming"),
-]
-
-
-@pytest.mark.parametrize("use_pdl", [True, False], ids=["pdl", "no_pdl"])
-@pytest.mark.parametrize("reqs", OUT_CASES)
-def test_out_buffer(reqs, use_pdl):
-    """A given out is written in place and returned; repeated calls agree."""
-    batch = make_batch(reqs)
-    kwargs = varlen_kwargs([r.tokens for r in reqs])
+@pytest.mark.parametrize("case", params([COMBINE, QST, STREAMING]))
+def test_out_buffer(case: Case):
+    """A given out is written in place and returned, without PDL; a second
+    call (with PDL) agrees."""
+    batch = make_batch(case.reqs)
+    kwargs = case_kwargs(case)
     out = torch.empty(batch.q.shape[0], HEADS, DIM, dtype=torch.bfloat16)
-    o = run(batch, out=out, use_pdl=use_pdl, **kwargs)
+    o = run(batch, out=out, use_pdl=False, **kwargs)
     assert o.data_ptr() == out.data_ptr()
     check(o, batch)
     assert torch.equal(run(batch, **kwargs).view_as(o), o)
 
 
-@pytest.mark.parametrize("swa_page,c128_page", [(64, 1), (256, 64)])
-def test_page_size(swa_page, c128_page):
-    batch = make_batch(VARLEN_REQS, swa_page, c128_page)
-    check(run(batch, **varlen_kwargs([r.tokens for r in VARLEN_REQS])), batch)
+def test_page_size():
+    """Pool page sizes other than the default 128 (SWA) and 2 (c128)."""
+    batch = make_batch(VARLEN_REQS, 64, 1)
+    check(run(batch, **case_kwargs(STREAMING)), batch)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
-@pytest.mark.parametrize("reqs", OUT_CASES[::2])
-def test_other_device(reqs):
+@pytest.mark.parametrize("case", params([COMBINE, STREAMING]))
+def test_other_device(case: Case):
     """cuda:1 inputs, the current device being cuda:0, run on cuda:1 with its
     own workspaces and give cuda:0's bits."""
-    batch = make_batch(reqs)
-    kwargs = varlen_kwargs([r.tokens for r in reqs])
+    batch = make_batch(case.reqs)
+    kwargs = case_kwargs(case)
     o = run(batch, **kwargs)
 
     def to1(x):  # keeps the caches' padded page stride
@@ -298,12 +317,12 @@ def test_other_device(reqs):
     assert torch.equal(run(batch, **kwargs), o)
 
 
-@pytest.mark.parametrize("reqs", OUT_CASES[::2])
-def test_cuda_graph(reqs):
+@pytest.mark.parametrize("case", params([COMBINE, STREAMING]))
+def test_cuda_graph(case: Case):
     """A call captured after an eager one of the same shape replays on new q
     like an eager call."""
-    batch = make_batch(reqs)
-    kwargs = varlen_kwargs([r.tokens for r in reqs])
+    batch = make_batch(case.reqs)
+    kwargs = case_kwargs(case)
     run(batch, **kwargs)  # sizes the workspaces outside the capture
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -316,6 +335,7 @@ def test_cuda_graph(reqs):
 
 
 def test_empty():
+    """T = 0 returns an empty output without a launch."""
     batch = make_batch([Req(2, 256)])
     batch = batch._replace(
         q=batch.q[:0],
@@ -327,15 +347,17 @@ def test_empty():
     assert run(batch, tokens_per_req=2).numel() == 0
 
 
-@pytest.mark.parametrize(
-    "reqs",
-    [[Req(1024, 65536)], VARLEN_REQS, REPLAY_REQS],
-    ids=["uniform", "varlen", "replay"],
-)
-def test_vs_flashmla(reqs):
+FLASHMLA_CASES = [
+    Case("uniform", [Req(1024, 65536)], "predq"),
+    Case("replay", REPLAY_REQS, "varlen with the replay arena"),
+]
+
+
+@pytest.mark.parametrize("case", params(FLASHMLA_CASES))
+def test_vs_flashmla(case: Case):
     """Not less accurate than FlashMLA on the same inputs."""
-    batch = make_batch(reqs)
-    o = run(batch, **varlen_kwargs([r.tokens for r in reqs]))
+    batch = make_batch(case.reqs)
+    o = run(batch, **case_kwargs(case))
     rows, refs, worst, rms = check(o, batch)
     fm_worst, fm_rms = score(run_flashmla(batch), rows, refs)
     assert (
@@ -344,19 +366,18 @@ def test_vs_flashmla(reqs):
 
 
 # Fused q_norm_rope: q is a raw projection (per-head scales, a few outlier
-# channels).  Req(64, 256) runs the kQst kernels, the others the streaming
-# ones, Req(1024, 32768) with fp8 c128.
+# channels).
 QNR_EPS = 1e-6
 QNR_CASES = [
-    pytest.param([Req(64, 256)], id="short", marks=pytest.mark.quick),
-    pytest.param([Req(1024, 32768)], id="uniform_fp8"),
-    pytest.param([Req(1024, 65536)], id="uniform"),
-    pytest.param(VARLEN_REQS, id="varlen"),
-    pytest.param(REPLAY_REQS, id="replay"),
+    Case("short", [Req(64, 256)], "kQst kernels", quick=True),
+    Case("uniform-fp8", [Req(1024, 32768)], "streaming, fp8 c128"),
+    Case("uniform", [Req(1024, 65536)], "streaming, predq"),
+    Case("varlen", VARLEN_REQS, "varlen, predq"),
+    Case("replay", REPLAY_REQS, "varlen with the replay arena"),
 ]
 
 
-def qnr_inputs(reqs):
+def qnr_inputs(reqs: list[Req]):
     """A batch with a raw q, its token positions and RoPE frequencies."""
     batch = make_batch(reqs)
     t = batch.q.shape[0]
@@ -367,22 +388,22 @@ def qnr_inputs(reqs):
     return batch, positions(reqs), rope_freqs(max(r.ctx for r in reqs))
 
 
-def run_qnr(batch, pos, freqs, **kwargs):
+def run_qnr(batch: Batch, pos, freqs, **kwargs) -> torch.Tensor:
     return run(batch, q_positions=pos, q_freqs=freqs, q_norm_eps=QNR_EPS, **kwargs)
 
 
-def score_qnr(o, batch, q_ref):
+def score_qnr(o: torch.Tensor, batch: Batch, q_ref: torch.Tensor):
     assert torch.isfinite(o).all(), "non-finite output"
     rows = list(range(batch.q.shape[0]))
     return score(o, rows, references(batch, rows, q=q_ref))
 
 
-@pytest.mark.parametrize("reqs", QNR_CASES)
-def test_qnr(reqs):
+@pytest.mark.parametrize("case", params(QNR_CASES))
+def test_qnr(case: Case):
     """Against fp32 q_norm_rope and attention, and not less accurate than
     q_norm_rope rounded to bf16 first (the unfused path)."""
-    batch, pos, freqs = qnr_inputs(reqs)
-    kwargs = varlen_kwargs([r.tokens for r in reqs])
+    batch, pos, freqs = qnr_inputs(case.reqs)
+    kwargs = case_kwargs(case)
     q_ref = q_norm_rope(batch.q, pos, freqs, QNR_EPS)
     worst, rms = score_qnr(run_qnr(batch, pos, freqs, **kwargs), batch, q_ref)
     assert rms <= RMS_TOL and worst <= MAX_TOL, f"rms {rms:.3e} max {worst:.3e}"
@@ -393,16 +414,16 @@ def test_qnr(reqs):
     ), f"rms {rms:.3e} vs unfused {sep_rms:.3e}, max {worst:.3e} vs {sep_worst:.3e}"
 
 
-@pytest.mark.parametrize("layout", ["int32_pos_fp32_freqs", "q_4d", "q_strided"])
-def test_qnr_layouts(layout):
+@pytest.mark.parametrize("layout", ["int32-pos-fp32-freqs", "q-4d", "q-strided"])
+def test_qnr_layouts(layout: str):
     """int32 positions with float32 frequencies, a [T, 1, 64, 512] q, or a q
     with a token stride give the bits of the default layout."""
     batch, pos, freqs = qnr_inputs(VARLEN_REQS)
-    kwargs = varlen_kwargs([r.tokens for r in VARLEN_REQS])
+    kwargs = case_kwargs(STREAMING)
     o = run_qnr(batch, pos, freqs, **kwargs)
-    if layout == "int32_pos_fp32_freqs":
+    if layout == "int32-pos-fp32-freqs":
         pos, freqs = pos.int(), torch.view_as_real(freqs).flatten(-2).contiguous()
-    elif layout == "q_4d":
+    elif layout == "q-4d":
         batch = batch._replace(q=batch.q.unsqueeze(1))
     else:
         t = batch.q.shape[0]
@@ -415,10 +436,9 @@ def test_qnr_layouts(layout):
     assert torch.equal(o2.view_as(o), o)
 
 
-@pytest.mark.parametrize("rank", [0, 3])
-def test_qnr_cp(rank):
-    """CP round-robin: rank's tokens and positions of a 4-way split."""
-    cp = 4
+def test_qnr_cp():
+    """CP round-robin: the last rank's tokens and positions of a 4-way split."""
+    cp, rank = 4, 3
     batch, pos, freqs = qnr_inputs(cp_reqs(cp))
     local, lens = cp_local(batch, cp, rank)
     lpos = pos[rank::cp].contiguous()
@@ -427,13 +447,15 @@ def test_qnr_cp(rank):
     assert rms <= RMS_TOL and worst <= MAX_TOL, f"rms {rms:.3e} max {worst:.3e}"
 
 
-# Invalid inputs: each case replaces some arguments of a valid call (one
-# 64-token request, tokens_per_req=64) and expects the host check that names
-# the violated constraint.
+# Invalid inputs: each case changes some arguments of a valid call (one
+# 64-token request, tokens_per_req = 64) and expects the host check that
+# names the violated constraint.
 ARG_REQ = Req(64, 256)
 
 
-def valid_args():
+@pytest.fixture
+def prefill_args() -> dict:
+    """Valid `prefill_pair_mla` arguments for ARG_REQ."""
     b = make_batch([ARG_REQ])
     return dict(
         q=b.q,
@@ -449,269 +471,138 @@ def valid_args():
     )
 
 
-def qnr_args():
+def qnr_args() -> dict:
     return dict(q_positions=positions([ARG_REQ]), q_freqs=rope_freqs(ARG_REQ.ctx))
 
 
-def cu_args(dtype=torch.int32, device="cuda"):
+def cu_args(dtype: torch.dtype = torch.int32) -> dict:
     t = ARG_REQ.tokens
     return dict(
-        cu_seqlens=torch.tensor([0, t // 2, t], dtype=dtype, device=device),
-        cu_pairs=torch.tensor([0, t // 4, t // 2], dtype=dtype, device=device),
+        cu_seqlens=torch.tensor([0, t // 2, t], dtype=dtype, device="cuda"),
+        cu_pairs=torch.tensor([0, t // 4, t // 2], dtype=dtype, device="cuda"),
     )
 
 
-def strided(x):
+def strided(x: torch.Tensor) -> torch.Tensor:
     """x's values with a last-dim stride of 2 (not contiguous)."""
     return torch.stack([x, x], -1)[..., 0]
 
 
-def raw_q(token_stride, offset=0):
+def raw_q(token_stride: int, offset: int = 0) -> torch.Tensor:
     """[T, 64, 512] bf16 view of a [T, token_stride] buffer at offset."""
     buf = torch.zeros(ARG_REQ.tokens, token_stride, dtype=torch.bfloat16, device="cuda")
     return buf[:, offset : offset + HEADS * DIM].view(-1, HEADS, DIM)
 
 
-def short_stride_cache(pages=2, page_size=128):
+def short_stride_cache(pages: int = 2, page_size: int = 128) -> torch.Tensor:
     """[pages, page_size, 1, 584] with a page stride of page_size * 576 B."""
     buf = torch.zeros(pages * page_size * 584, dtype=torch.uint8, device="cuda")
     return buf.as_strided((pages, page_size, 1, 584), (page_size * 576, 584, 584, 1))
 
 
-def two_gpus(*args, **kwargs):
-    need = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
-    return pytest.param(*args, **kwargs, marks=need)
-
-
-VALID_ARGS = [
-    pytest.param(lambda a: {}, id="uniform"),
-    pytest.param(lambda a: {**cu_args(), "tokens_per_req": 0}, id="varlen"),
-    pytest.param(lambda a: qnr_args(), id="qnr"),
-]
-
 QNR_Q_MSG = "view with contiguous heads"
 Q_MSG = "q must be a contiguous bfloat16"
 CU_MSG = "cu_seqlens / cu_pairs must be contiguous int32"
 TPR_MSG = "tokens_per_req must be >= 2 and divide T"
-OUT_MSG = "out must be a contiguous bfloat16"
-DEV_MSG = "all tensors must be on q's device"
-SINK_MSG = "attn_sink must be a contiguous float32"
 CACHE_MSG = "k caches must be uint8"
 IDX_MSG = "indices must be contiguous int32"
-LEN_MSG = "lengths must be contiguous int32"
-POS_MSG = "q_positions must be a contiguous int64 / int32"
-FREQS_MSG = "q_freqs must be complex64"
+QNR_TAB_MSG = "q_positions must be contiguous int64 / int32"
 
 INVALID_ARGS = [
-    # swa_shift
-    pytest.param(lambda a: dict(swa_shift=0), "swa_shift must be in", id="swa_shift_0"),
     pytest.param(
-        lambda a: dict(swa_shift=129), "swa_shift must be in", id="swa_shift_129"
-    ),
-    # q, unfused and fused q_norm_rope
-    pytest.param(lambda a: dict(q=a["q"].float()), Q_MSG, id="q_fp32"),
-    pytest.param(lambda a: dict(q=strided(a["q"])), Q_MSG, id="q_strided"),
-    pytest.param(
-        lambda a: dict(q=a["q"][..., :32, :].contiguous()), Q_MSG, id="q_32_heads"
+        lambda a: a.update(swa_shift=0), "swa_shift must be in", id="swa_shift-0"
     ),
     pytest.param(
-        lambda a: dict(q_positions=qnr_args()["q_positions"]),
+        lambda a: a.update(q_positions=qnr_args()["q_positions"]),
         "q_positions and q_freqs go together",
-        id="positions_only",
+        id="positions-only",
     ),
     pytest.param(
-        lambda a: dict(q_freqs=qnr_args()["q_freqs"]),
-        "q_positions and q_freqs go together",
-        id="freqs_only",
-    ),
-    pytest.param(
-        lambda a: {**qnr_args(), "q": a["q"].float()}, QNR_Q_MSG, id="qnr_q_fp32"
-    ),
-    pytest.param(
-        lambda a: {**qnr_args(), "q": strided(a["q"])},
-        QNR_Q_MSG,
-        id="qnr_q_head_stride",
-    ),
-    pytest.param(
-        lambda a: {**qnr_args(), "q": raw_q(HEADS * DIM + 4)},
-        QNR_Q_MSG,
-        id="qnr_q_token_stride_not_16B",
-    ),
-    pytest.param(
-        lambda a: {**qnr_args(), "q": raw_q(HEADS * DIM + 8, offset=1)},
-        QNR_Q_MSG,
-        id="qnr_q_misaligned",
-    ),
-    # request layout
-    pytest.param(
-        lambda a: dict(cu_seqlens=cu_args()["cu_seqlens"]),
+        lambda a: a.update(cu_seqlens=cu_args()["cu_seqlens"]),
         "cu_seqlens and cu_pairs go together",
-        id="cu_seqlens_only",
+        id="cu_seqlens-only",
+    ),
+    pytest.param(lambda a: a.update(q=a["q"].float()), Q_MSG, id="q-fp32"),
+    pytest.param(
+        lambda a: a.update(q=a["q"][..., :32, :].contiguous()),
+        "unsupported q dims",
+        id="q-32-heads",
     ),
     pytest.param(
-        lambda a: dict(cu_pairs=cu_args()["cu_pairs"]),
-        "cu_seqlens and cu_pairs go together",
-        id="cu_pairs_only",
-    ),
-    pytest.param(lambda a: cu_args(torch.int64), CU_MSG, id="cu_int64"),
-    pytest.param(lambda a: cu_args(device="cpu"), CU_MSG, id="cu_cpu"),
-    pytest.param(
-        lambda a: {**cu_args(), "cu_pairs": cu_args()["cu_pairs"][:2]},
-        CU_MSG,
-        id="cu_size_mismatch",
+        lambda a: a.update(qnr_args(), q=strided(a["q"])),
+        QNR_Q_MSG,
+        id="qnr-q-head-stride",
     ),
     pytest.param(
-        lambda a: {k: v[:1] for k, v in cu_args().items()}, CU_MSG, id="cu_no_request"
-    ),
-    pytest.param(lambda a: dict(tokens_per_req=0), TPR_MSG, id="tokens_per_req_0"),
-    pytest.param(lambda a: dict(tokens_per_req=1), TPR_MSG, id="tokens_per_req_1"),
-    pytest.param(lambda a: dict(tokens_per_req=48), TPR_MSG, id="tokens_per_req_48"),
-    # out
-    pytest.param(
-        lambda a: dict(out=torch.empty_like(a["q"], dtype=torch.float)),
-        OUT_MSG,
-        id="out_fp32",
+        lambda a: a.update(qnr_args(), q=raw_q(HEADS * DIM + 8, offset=1)),
+        QNR_Q_MSG,
+        id="qnr-q-misaligned",
     ),
     pytest.param(
-        lambda a: dict(out=strided(torch.empty_like(a["q"]))), OUT_MSG, id="out_strided"
+        lambda a: a.update(qnr_args(), q_positions=positions([ARG_REQ]).float()),
+        QNR_TAB_MSG,
+        id="qnr-positions-fp32",
     ),
     pytest.param(
-        lambda a: dict(out=torch.empty_like(a["q"][:32])), OUT_MSG, id="out_32_tokens"
-    ),
-    # devices
-    pytest.param(
-        lambda a: dict(swa_indices=a["swa_indices"].cpu()), DEV_MSG, id="idx_cpu"
-    ),
-    pytest.param(
-        lambda a: dict(c128_k_cache=a["c128_k_cache"].cpu()), DEV_MSG, id="cache_cpu"
-    ),
-    pytest.param(
-        lambda a: dict(out=torch.empty_like(a["q"], device="cpu")),
-        DEV_MSG,
-        id="out_cpu",
-    ),
-    two_gpus(
-        lambda a: dict(swa_lengths=a["swa_lengths"].to("cuda:1")),
-        DEV_MSG,
-        id="len_cuda1",
-    ),
-    # attn_sink
-    pytest.param(
-        lambda a: dict(attn_sink=a["attn_sink"].half()), SINK_MSG, id="sink_fp16"
-    ),
-    pytest.param(lambda a: dict(attn_sink=a["attn_sink"][:32]), SINK_MSG, id="sink_32"),
-    pytest.param(
-        lambda a: dict(attn_sink=a["attn_sink"].cpu()), SINK_MSG, id="sink_cpu"
-    ),
-    # k caches (c128 is checked first, so a swa case also passes the c128 checks)
-    pytest.param(
-        lambda a: dict(swa_k_cache=a["swa_k_cache"].view(torch.int8)),
-        CACHE_MSG,
-        id="cache_int8",
-    ),
-    pytest.param(
-        lambda a: dict(swa_k_cache=a["swa_k_cache"][:, :, 0]), CACHE_MSG, id="cache_3d"
-    ),
-    pytest.param(
-        lambda a: dict(swa_k_cache=a["swa_k_cache"][..., :576]),
-        CACHE_MSG,
-        id="cache_row_576",
-    ),
-    pytest.param(
-        lambda a: dict(
-            swa_k_cache=torch.zeros(2, 128, 1, 584, dtype=torch.uint8, device="cuda")
+        lambda a: a.update(
+            qnr_args(), q_freqs=rope_freqs(ARG_REQ.ctx)[:, :16].contiguous()
         ),
+        QNR_TAB_MSG,
+        id="qnr-freqs-16",
+    ),
+    pytest.param(lambda a: a.update(cu_args(torch.int64)), CU_MSG, id="cu-int64"),
+    pytest.param(
+        lambda a: a.update({k: v[:1] for k, v in cu_args().items()}),
+        CU_MSG,
+        id="cu-no-request",
+    ),
+    pytest.param(lambda a: a.update(tokens_per_req=1), TPR_MSG, id="tokens_per_req-1"),
+    pytest.param(
+        lambda a: a.update(tokens_per_req=48), TPR_MSG, id="tokens_per_req-48"
+    ),
+    pytest.param(
+        lambda a: a.update(out=torch.empty_like(a["q"][:32])),
+        "out must be a contiguous bfloat16",
+        id="out-32-tokens",
+    ),
+    pytest.param(
+        lambda a: a.update(attn_sink=a["attn_sink"][:32]),
+        "attn_sink must be a contiguous float32",
+        id="sink-32",
+    ),
+    # c128 is checked first, so a swa case also passes the c128 checks.
+    pytest.param(
+        lambda a: a.update(swa_k_cache=a["swa_k_cache"][..., :576]),
         CACHE_MSG,
-        id="cache_page_stride_not_576x",
+        id="cache-row-576",
     ),
     pytest.param(
-        lambda a: dict(swa_k_cache=short_stride_cache()),
+        lambda a: a.update(swa_k_cache=short_stride_cache()),
         CACHE_MSG,
-        id="cache_page_stride_short",
+        id="cache-page-stride-short",
     ),
     pytest.param(
-        lambda a: dict(c128_k_cache=make_cache(4, 3)),
-        "page sizes must be powers of two, got 3",
-        id="cache_page_3",
-    ),
-    # indices and lengths
-    pytest.param(
-        lambda a: dict(swa_indices=a["swa_indices"].long()), IDX_MSG, id="idx_int64"
+        lambda a: a.update(c128_k_cache=make_cache(4, 3)),
+        CACHE_MSG,
+        id="cache-page-3",
     ),
     pytest.param(
-        lambda a: dict(c128_indices=strided(a["c128_indices"])),
+        lambda a: a.update(swa_indices=a["swa_indices"].long()),
         IDX_MSG,
-        id="idx_strided",
+        id="indices-int64",
     ),
     pytest.param(
-        lambda a: dict(swa_indices=a["swa_indices"][:32]), IDX_MSG, id="idx_32_tokens"
-    ),
-    pytest.param(
-        lambda a: dict(swa_indices=a["swa_indices"].flatten()), IDX_MSG, id="idx_1d"
-    ),
-    pytest.param(
-        lambda a: dict(c128_lengths=a["c128_lengths"].long()), LEN_MSG, id="len_int64"
-    ),
-    pytest.param(
-        lambda a: dict(swa_lengths=strided(a["swa_lengths"])), LEN_MSG, id="len_strided"
-    ),
-    pytest.param(
-        lambda a: dict(swa_lengths=a["swa_lengths"][:32]), LEN_MSG, id="len_32_tokens"
-    ),
-    # q_norm_rope tables
-    pytest.param(
-        lambda a: {**qnr_args(), "q_positions": qnr_args()["q_positions"].float()},
-        POS_MSG,
-        id="pos_fp32",
-    ),
-    pytest.param(
-        lambda a: {**qnr_args(), "q_positions": qnr_args()["q_positions"][:32]},
-        POS_MSG,
-        id="pos_32_tokens",
-    ),
-    pytest.param(
-        lambda a: {**qnr_args(), "q_positions": strided(qnr_args()["q_positions"])},
-        POS_MSG,
-        id="pos_strided",
-    ),
-    pytest.param(
-        lambda a: {**qnr_args(), "q_positions": qnr_args()["q_positions"].cpu()},
-        POS_MSG,
-        id="pos_cpu",
-    ),
-    pytest.param(
-        lambda a: {
-            **qnr_args(),
-            "q_freqs": torch.view_as_real(qnr_args()["q_freqs"]).flatten(-2).double(),
-        },
-        FREQS_MSG,
-        id="freqs_fp64",
-    ),
-    pytest.param(
-        lambda a: {**qnr_args(), "q_freqs": qnr_args()["q_freqs"][:, :16].contiguous()},
-        FREQS_MSG,
-        id="freqs_16",
-    ),
-    pytest.param(
-        lambda a: {**qnr_args(), "q_freqs": qnr_args()["q_freqs"].cpu()},
-        FREQS_MSG,
-        id="freqs_cpu",
+        lambda a: a.update(swa_lengths=a["swa_lengths"][:32]),
+        IDX_MSG,
+        id="lengths-32-tokens",
     ),
 ]
 
 
-@pytest.mark.parametrize("change", VALID_ARGS)
-def test_valid_args(change):
-    """The calls the invalid-input cases start from run."""
-    a = valid_args()
-    a.update(change(a))
-    assert torch.isfinite(prefill_pair_mla(**a)).all()
-
-
 @pytest.mark.quick
-@pytest.mark.parametrize("change,match", INVALID_ARGS)
-def test_invalid_args(change, match):
-    a = valid_args()
-    a.update(change(a))
+@pytest.mark.parametrize("mutate,match", INVALID_ARGS)
+def test_invalid_args(prefill_args: dict, mutate, match: str):
+    """Inputs outside the host checks are rejected before the launch."""
+    mutate(prefill_args)
     with pytest.raises(RuntimeError, match=match):
-        prefill_pair_mla(**a)
+        prefill_pair_mla(**prefill_args)

@@ -23,17 +23,6 @@
 
 namespace halops::mhc {
 
-CUTE_DEVICE float bf16_lo(uint32_t u) { return __uint_as_float(u << 16); }
-
-CUTE_DEVICE float bf16_hi(uint32_t u) {
-    return __uint_as_float(u & 0xffff0000u);
-}
-
-CUTE_DEVICE uint32_t pack_bf16_rn(float lo, float hi) {
-    const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
-    return reinterpret_cast<const uint32_t&>(v);
-}
-
 CUTE_DEVICE float2 bf16x2_to_float2(uint32_t u) {
     return make_float2(bf16_lo(u), bf16_hi(u));
 }
