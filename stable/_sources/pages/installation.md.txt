@@ -19,7 +19,7 @@ See the [NVIDIA CUDA compatibility matrix](https://docs.nvidia.com/deploy/cuda-c
 Prebuilt wheels are available for Python 3.12 with CUDA 13.2 on Linux x86_64 and aarch64. With a CUDA 13.2 build of PyTorch installed, install the [prebuilt HALOps package](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/) directly:
 
 ```bash
-python -m pip install halops==0.1.0 -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
+python -m pip install halops==0.2.0 -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
 ```
 
 For other Python or CUDA versions, [build from source](#build-from-source).

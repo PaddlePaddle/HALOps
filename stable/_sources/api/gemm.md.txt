@@ -8,11 +8,15 @@
 
    batch_gemm
    dense_gemm
+   interleave_gate_up
    fused_swiglu_quant
    group_contiguous_gemm
    group_masked_gemm
    group_wise_quant
+   low_latency_mma_gemm
    prefill_permute_to_masked_gemm
+   rms_norm_quant
+   sigmoid_gate_mul_group_quant
 ```
 
 ```{rst-class} api-entry
@@ -35,6 +39,17 @@
 .. currentmodule:: halops
 
 .. autofunction:: dense_gemm
+```
+
+```{rst-class} api-entry
+```
+
+## interleave_gate_up
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: interleave_gate_up
 ```
 
 ```{rst-class} api-entry
@@ -84,10 +99,43 @@
 ```{rst-class} api-entry
 ```
 
+## low_latency_mma_gemm
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: low_latency_mma_gemm
+```
+
+```{rst-class} api-entry
+```
+
 ## prefill_permute_to_masked_gemm
 
 ```{eval-rst}
 .. currentmodule:: halops
 
 .. autofunction:: prefill_permute_to_masked_gemm
+```
+
+```{rst-class} api-entry
+```
+
+## rms_norm_quant
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: rms_norm_quant
+```
+
+```{rst-class} api-entry
+```
+
+## sigmoid_gate_mul_group_quant
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: sigmoid_gate_mul_group_quant
 ```

@@ -10,6 +10,8 @@
    mla_attention_plan
    mla_output_proj
    mla_workspace
+   prefill_pair_mla
+   vha_postmix_quant
 ```
 
 ```{rst-class} api-entry
@@ -54,4 +56,26 @@
 .. currentmodule:: halops
 
 .. autofunction:: mla_workspace
+```
+
+```{rst-class} api-entry
+```
+
+## prefill_pair_mla
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: prefill_pair_mla
+```
+
+```{rst-class} api-entry
+```
+
+## vha_postmix_quant
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: vha_postmix_quant
 ```

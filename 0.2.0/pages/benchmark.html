@@ -3,7 +3,7 @@
   <head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <meta name="color-scheme" content="light dark"><meta name="viewport" content="width=device-width, initial-scale=1" />
-<link rel="index" title="Index" href="../genindex.html"><link rel="search" title="Search" href="../search.html"><link rel="next" title="Contributing" href="contributing.html"><link rel="prev" title="MLA" href="../api/mla.html">
+<link rel="index" title="Index" href="../genindex.html"><link rel="search" title="Search" href="../search.html"><link rel="next" title="Contributing" href="contributing.html"><link rel="prev" title="MOE" href="../api/moe.html">
         <link rel="prefetch" href="../_static/halops-logo-light.svg" as="image">
 
     <!-- Generated with Sphinx 8.2.3 and Furo 2025.09.25 -->
@@ -210,7 +210,9 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="../api/attention.html">Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../api/gemm.html">GEMM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/mhc.html">MHC</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../api/mla.html">MLA</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../api/moe.html">MOE</a></li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">Development</span></p>
 <ul class="current">
@@ -267,10 +269,13 @@ python<span class="w"> </span>benchmark.py<span class="w"> </span>--config<span 
 
 <span class="c1"># A single backend (must be in the YAML `backends` list; one --config only)</span>
 python<span class="w"> </span>benchmark.py<span class="w"> </span>--config<span class="o">=</span>gemm/dense_w8a8.yaml<span class="w"> </span>--backend<span class="o">=</span>halops<span class="w"> </span>--gpu<span class="o">=</span><span class="m">0</span>
+
+<span class="c1"># Full latent MoE: quantized HALOps accuracy and latency</span>
+python<span class="w"> </span>benchmark.py<span class="w"> </span>--config<span class="o">=</span>moe/mega_ll_moe_w8a8_blockwise.yaml<span class="w"> </span>--gpu<span class="o">=</span><span class="m">0</span>
 </pre></div>
 </div>
 <ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">--config</span></code> takes a path relative to <code class="docutils literal notranslate"><span class="pre">configs/</span></code> (recommended), a file name unique across <code class="docutils literal notranslate"><span class="pre">configs/&lt;op&gt;/</span></code>, or an absolute path. Bundled configs live in <code class="docutils literal notranslate"><span class="pre">configs/attention/</span></code> and <code class="docutils literal notranslate"><span class="pre">configs/gemm/</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--config</span></code> takes a path relative to <code class="docutils literal notranslate"><span class="pre">configs/</span></code> (recommended), a file name unique across <code class="docutils literal notranslate"><span class="pre">configs/&lt;op&gt;/</span></code>, or an absolute path. Bundled configs live in <code class="docutils literal notranslate"><span class="pre">configs/attention/</span></code>, <code class="docutils literal notranslate"><span class="pre">configs/gemm/</span></code> and <code class="docutils literal notranslate"><span class="pre">configs/moe/</span></code>.</p></li>
 <li><p>Common options: <code class="docutils literal notranslate"><span class="pre">--gpu</span></code> (default <code class="docutils literal notranslate"><span class="pre">0</span></code>, sets <code class="docutils literal notranslate"><span class="pre">CUDA_VISIBLE_DEVICES</span></code>), <code class="docutils literal notranslate"><span class="pre">--timing-method</span></code> (<code class="docutils literal notranslate"><span class="pre">profiler</span></code> or <code class="docutils literal notranslate"><span class="pre">cupti</span></code>, default <code class="docutils literal notranslate"><span class="pre">profiler</span></code>), <code class="docutils literal notranslate"><span class="pre">--dry-run-iters</span></code> (default <code class="docutils literal notranslate"><span class="pre">10</span></code>), <code class="docutils literal notranslate"><span class="pre">--repeat-iters</span></code> (default <code class="docutils literal notranslate"><span class="pre">50</span></code>), <code class="docutils literal notranslate"><span class="pre">--refcheck-reference</span></code>. See <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">benchmark.py</span> <span class="pre">--help</span></code>.</p></li>
 <li><p>Outputs share one timestamp <code class="docutils literal notranslate"><span class="pre">{ts}</span></code>: <code class="docutils literal notranslate"><span class="pre">results/{ts}_{config}.csv</span></code>, <code class="docutils literal notranslate"><span class="pre">reports/{ts}_{scenario}_{case_tag}.md</span></code>, <code class="docutils literal notranslate"><span class="pre">logs/{ts}_{op}_{config}.log</span></code>.</p></li>
 <li><p>Speedup is <code class="docutils literal notranslate"><span class="pre">other_backend_median_us</span> <span class="pre">/</span> <span class="pre">halops_median_us</span></code>; above <code class="docutils literal notranslate"><span class="pre">1.00x</span></code> means HALOps is faster.</p></li>
@@ -291,14 +296,14 @@ python<span class="w"> </span>benchmark.py<span class="w"> </span>--config<span 
               </div>
               <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
             </a>
-          <a class="prev-page" href="../api/mla.html">
+          <a class="prev-page" href="../api/moe.html">
               <svg class="furo-related-icon"><use href="#svg-arrow-right"></use></svg>
               <div class="page-info">
                 <div class="context">
                   <span>Previous</span>
                 </div>
                 
-                <div class="title">MLA</div>
+                <div class="title">MOE</div>
                 
               </div>
             </a>
@@ -326,7 +331,7 @@ python<span class="w"> </span>benchmark.py<span class="w"> </span>--config<span 
       
     </aside>
   </div>
-</div><script src="../_static/documentation_options.js?v=01f34227"></script>
+</div><script src="../_static/documentation_options.js?v=938c9ccc"></script>
     <script src="../_static/doctools.js?v=9bcbadda"></script>
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/scripts/furo.js?v=46bd48cc"></script>
