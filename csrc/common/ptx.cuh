@@ -64,6 +64,24 @@ CUTE_DEVICE float rcp_approx(float x) {
     return r;
 }
 
+// Without .ftz, unlike rsqrtf under --use_fast_math.
+CUTE_DEVICE float rsqrt_approx(float x) {
+    float r;
+    asm("rsqrt.approx.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+
+CUTE_DEVICE float bf16_lo(uint32_t u) { return __uint_as_float(u << 16); }
+
+CUTE_DEVICE float bf16_hi(uint32_t u) {
+    return __uint_as_float(u & 0xffff0000u);
+}
+
+CUTE_DEVICE uint32_t pack_bf16_rn(float lo, float hi) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return reinterpret_cast<const uint32_t&>(v);
+}
+
 // bf16x2 to (lo, hi) floats in asm, so the compiler cannot share the unpack
 // with other conversions of the same word and keeps the packed value live.
 CUTE_DEVICE float2 bf16x2_to_float2_opaque(uint32_t u) {
