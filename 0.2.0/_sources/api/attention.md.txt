@@ -1,0 +1,69 @@
+# Attention
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autosummary::
+   :nosignatures:
+
+   decoder_attention
+   encoder_attention
+   get_qk_token
+   write_cache_kv_decoder
+   write_cache_kv_encoder
+```
+
+```{rst-class} api-entry
+```
+
+## decoder_attention
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: decoder_attention
+```
+
+```{rst-class} api-entry
+```
+
+## encoder_attention
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: encoder_attention
+```
+
+```{rst-class} api-entry
+```
+
+## get_qk_token
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: get_qk_token
+```
+
+```{rst-class} api-entry
+```
+
+## write_cache_kv_decoder
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: write_cache_kv_decoder
+```
+
+```{rst-class} api-entry
+```
+
+## write_cache_kv_encoder
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: write_cache_kv_encoder
+```

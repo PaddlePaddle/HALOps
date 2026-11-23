@@ -1,0 +1,3 @@
+# Acknowledgement
+
+HALOps is built on [CUTLASS](https://github.com/NVIDIA/cutlass) and [CuTe](https://github.com/NVIDIA/cutlass/tree/main/include/cute); we thank the CUTLASS developers for their work. We are also grateful to [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [FlashMLA](https://github.com/deepseek-ai/FlashMLA) and [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM), whose prior work on LLM inference kernels inspired many of our designs and served as valuable references for validating them.

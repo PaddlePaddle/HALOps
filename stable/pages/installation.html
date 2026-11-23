@@ -7,7 +7,7 @@
         <link rel="prefetch" href="../_static/halops-logo-light.svg" as="image">
 
     <!-- Generated with Sphinx 8.2.3 and Furo 2025.09.25 -->
-        <title>Installation and Quick Start - HALOps 0.1.0</title>
+        <title>Installation and Quick Start - HALOps 0.2.0</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=d75fae25" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/furo.css?v=580074bf" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
@@ -170,7 +170,7 @@
       </label>
     </div>
     <div class="header-center">
-      <a href="../index.html"><div class="brand">HALOps 0.1.0</div></a>
+      <a href="../index.html"><div class="brand">HALOps 0.2.0</div></a>
     </div>
     <div class="header-right">
       <div class="theme-toggle-container theme-toggle-header">
@@ -417,7 +417,7 @@ document.addEventListener("DOMContentLoaded", () => {
   box.className = "halops-version";
   box.textContent = "Version";
   const select = document.createElement("select");
-  select.innerHTML = `<option>${"0.1.0"}</option>`;
+  select.innerHTML = `<option>${"0.2.0"}</option>`;
   box.appendChild(select);
   brand.after(box);
   const root = new URL(document.documentElement.dataset.content_root, location.href);
@@ -426,7 +426,7 @@ document.addEventListener("DOMContentLoaded", () => {
     .then((r) => r.json())
     .then((versions) => {
       select.innerHTML = versions
-        .map((v) => `<option value="${v.version}"${v.version === "0.1.0" ? " selected" : ""}>${v.title}</option>`)
+        .map((v) => `<option value="${v.version}"${v.version === "0.2.0" ? " selected" : ""}>${v.title}</option>`)
         .join("");
       select.onchange = () => { location.href = new URL(`../${select.value}/${page}`, root).href; };
     })

@@ -1,0 +1,20 @@
+# Benchmark
+
+Kernel-level benchmark. Each run executes the same set of cases for every backend listed in the YAML config and writes a CSV, a Markdown report and a log. Results only hold for the stated hardware, software versions, config and measurement method; public performance claims must also pass the correctness check.
+
+Install HALOps first ([Build Guide](../build_guide.md)), then the benchmark dependencies. Reference backends (FlashAttention, FlashInfer, DeepGEMM, SGLang, cuDNN) are not installed by this file; install only what the YAML `backends` list uses; the SGLang backend reads its local source tree from `SGLANG_PATH`. Run all commands from `benchmark/`.
+
+```bash
+python -m pip install -r requirements.txt
+
+# All backends listed in the YAML
+python benchmark.py --config=attention/prefill_chunked_c16_gqa14-1.yaml --gpu=0
+
+# A single backend (must be in the YAML `backends` list; one --config only)
+python benchmark.py --config=gemm/dense_w8a8.yaml --backend=halops --gpu=0
+```
+
+- `--config` takes a path relative to `configs/` (recommended), a file name unique across `configs/<op>/`, or an absolute path. Bundled configs live in `configs/attention/` and `configs/gemm/`.
+- Common options: `--gpu` (default `0`, sets `CUDA_VISIBLE_DEVICES`), `--timing-method` (`profiler` or `cupti`, default `profiler`), `--dry-run-iters` (default `10`), `--repeat-iters` (default `50`), `--refcheck-reference`. See `python benchmark.py --help`.
+- Outputs share one timestamp `{ts}`: `results/{ts}_{config}.csv`, `reports/{ts}_{scenario}_{case_tag}.md`, `logs/{ts}_{op}_{config}.log`.
+- Speedup is `other_backend_median_us / halops_median_us`; above `1.00x` means HALOps is faster.

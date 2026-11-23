@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 24 600 136" role="img" aria-label="HALOps">
+  <g>
+    <rect x="21" y="42" width="42" height="28" rx="4" fill="#1D4ED8"/>
+    <rect x="65" y="42" width="28" height="28" rx="4" fill="#2563EB"/>
+    <rect x="95" y="42" width="54" height="28" rx="4" fill="#3B82F6"/>
+    <rect x="151" y="42" width="28" height="28" rx="4" fill="#2563EB"/>
+    <rect x="35" y="76" width="50" height="28" rx="4" fill="#0284C7"/>
+    <rect x="87" y="76" width="36" height="28" rx="4" fill="#0EA5E9"/>
+    <rect x="125" y="76" width="54" height="28" rx="4" fill="#0284C7"/>
+    <rect x="49" y="110" width="34" height="28" rx="4" fill="#0D9488"/>
+    <rect x="85" y="110" width="58" height="28" rx="4" fill="#14B8A6"/>
+    <rect x="145" y="110" width="34" height="28" rx="4" fill="#0D9488"/>
+  </g>
+  <text x="206" y="116" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="78" font-weight="800" letter-spacing="-1"><tspan fill="#F3F4F6">HAL</tspan><tspan fill="#38BDF8">Ops</tspan></text>
+</svg>

@@ -15,7 +15,7 @@ python -m pip install pre-commit
 pre-commit install
 ```
 
-See the [Build Guide](../build_guide.md) for CUDA, PyTorch, compiler and hardware requirements. Python rules live in [`pyproject.toml`](https://github.com/PaddlePaddle/HALOps/blob/release/0.1.0/pyproject.toml), CUDA/C++ formatting in [`.clang-format`](https://github.com/PaddlePaddle/HALOps/blob/release/0.1.0/.clang-format), and all checks run through [`.pre-commit-config.yaml`](https://github.com/PaddlePaddle/HALOps/blob/release/0.1.0/.pre-commit-config.yaml).
+See the [Build Guide](../build_guide.md) for CUDA, PyTorch, compiler and hardware requirements. Python rules live in [`pyproject.toml`](https://github.com/PaddlePaddle/HALOps/blob/release/0.2.0/pyproject.toml), CUDA/C++ formatting in [`.clang-format`](https://github.com/PaddlePaddle/HALOps/blob/release/0.2.0/.clang-format), and all checks run through [`.pre-commit-config.yaml`](https://github.com/PaddlePaddle/HALOps/blob/release/0.2.0/.pre-commit-config.yaml).
 
 ## Development Conventions
 

@@ -1,0 +1,57 @@
+# MLA
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autosummary::
+   :nosignatures:
+
+   mla_attention
+   mla_attention_plan
+   mla_output_proj
+   mla_workspace
+```
+
+```{rst-class} api-entry
+```
+
+## mla_attention
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: mla_attention
+```
+
+```{rst-class} api-entry
+```
+
+## mla_attention_plan
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: mla_attention_plan
+```
+
+```{rst-class} api-entry
+```
+
+## mla_output_proj
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: mla_output_proj
+```
+
+```{rst-class} api-entry
+```
+
+## mla_workspace
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: mla_workspace
+```

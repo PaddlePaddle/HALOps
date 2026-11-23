@@ -7,7 +7,7 @@
         <link rel="prefetch" href="../_static/halops-logo-light.svg" as="image">
 
     <!-- Generated with Sphinx 8.2.3 and Furo 2025.09.25 -->
-        <title>Contributing - HALOps 0.1.0</title>
+        <title>Contributing - HALOps 0.2.0</title>
       <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=d75fae25" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/furo.css?v=580074bf" />
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
@@ -170,7 +170,7 @@
       </label>
     </div>
     <div class="header-center">
-      <a href="../index.html"><div class="brand">HALOps 0.1.0</div></a>
+      <a href="../index.html"><div class="brand">HALOps 0.2.0</div></a>
     </div>
     <div class="header-right">
       <div class="theme-toggle-container theme-toggle-header">
@@ -269,7 +269,7 @@ python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </sp
 pre-commit<span class="w"> </span>install
 </pre></div>
 </div>
-<p>See the <a class="reference internal" href="../build_guide.html"><span class="std std-doc">Build Guide</span></a> for CUDA, PyTorch, compiler and hardware requirements. Python rules live in <a class="reference external" href="https://github.com/PaddlePaddle/HALOps/blob/release/0.1.0/pyproject.toml"><code class="docutils literal notranslate"><span class="pre">pyproject.toml</span></code></a>, CUDA/C++ formatting in <a class="reference external" href="https://github.com/PaddlePaddle/HALOps/blob/release/0.1.0/.clang-format"><code class="docutils literal notranslate"><span class="pre">.clang-format</span></code></a>, and all checks run through <a class="reference external" href="https://github.com/PaddlePaddle/HALOps/blob/release/0.1.0/.pre-commit-config.yaml"><code class="docutils literal notranslate"><span class="pre">.pre-commit-config.yaml</span></code></a>.</p>
+<p>See the <a class="reference internal" href="../build_guide.html"><span class="std std-doc">Build Guide</span></a> for CUDA, PyTorch, compiler and hardware requirements. Python rules live in <a class="reference external" href="https://github.com/PaddlePaddle/HALOps/blob/release/0.2.0/pyproject.toml"><code class="docutils literal notranslate"><span class="pre">pyproject.toml</span></code></a>, CUDA/C++ formatting in <a class="reference external" href="https://github.com/PaddlePaddle/HALOps/blob/release/0.2.0/.clang-format"><code class="docutils literal notranslate"><span class="pre">.clang-format</span></code></a>, and all checks run through <a class="reference external" href="https://github.com/PaddlePaddle/HALOps/blob/release/0.2.0/.pre-commit-config.yaml"><code class="docutils literal notranslate"><span class="pre">.pre-commit-config.yaml</span></code></a>.</p>
 </section>
 <section id="development-conventions">
 <h2>Development Conventions<a class="headerlink" href="#development-conventions" title="Link to this heading">¶</a></h2>
@@ -429,7 +429,7 @@ document.addEventListener("DOMContentLoaded", () => {
   box.className = "halops-version";
   box.textContent = "Version";
   const select = document.createElement("select");
-  select.innerHTML = `<option>${"0.1.0"}</option>`;
+  select.innerHTML = `<option>${"0.2.0"}</option>`;
   box.appendChild(select);
   brand.after(box);
   const root = new URL(document.documentElement.dataset.content_root, location.href);
@@ -438,7 +438,7 @@ document.addEventListener("DOMContentLoaded", () => {
     .then((r) => r.json())
     .then((versions) => {
       select.innerHTML = versions
-        .map((v) => `<option value="${v.version}"${v.version === "0.1.0" ? " selected" : ""}>${v.title}</option>`)
+        .map((v) => `<option value="${v.version}"${v.version === "0.2.0" ? " selected" : ""}>${v.title}</option>`)
         .join("");
       select.onchange = () => { location.href = new URL(`../${select.value}/${page}`, root).href; };
     })

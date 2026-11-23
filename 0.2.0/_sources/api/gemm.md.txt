@@ -1,0 +1,93 @@
+# GEMM
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autosummary::
+   :nosignatures:
+
+   batch_gemm
+   dense_gemm
+   fused_swiglu_quant
+   group_contiguous_gemm
+   group_masked_gemm
+   group_wise_quant
+   prefill_permute_to_masked_gemm
+```
+
+```{rst-class} api-entry
+```
+
+## batch_gemm
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: batch_gemm
+```
+
+```{rst-class} api-entry
+```
+
+## dense_gemm
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: dense_gemm
+```
+
+```{rst-class} api-entry
+```
+
+## fused_swiglu_quant
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: fused_swiglu_quant
+```
+
+```{rst-class} api-entry
+```
+
+## group_contiguous_gemm
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: group_contiguous_gemm
+```
+
+```{rst-class} api-entry
+```
+
+## group_masked_gemm
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: group_masked_gemm
+```
+
+```{rst-class} api-entry
+```
+
+## group_wise_quant
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: group_wise_quant
+```
+
+```{rst-class} api-entry
+```
+
+## prefill_permute_to_masked_gemm
+
+```{eval-rst}
+.. currentmodule:: halops
+
+.. autofunction:: prefill_permute_to_masked_gemm
+```

@@ -1,0 +1,57 @@
+
+.theme-toggle-container { display: none !important; }
+body { line-height: 1.65; color: #1F2937; }
+h1, h2, h3 { font-weight: 700; letter-spacing: -0.015em; color: #0F172A; }
+code.literal, p code.literal { border: none; border-radius: 4px; font-size: 0.86em; }
+pre, div.highlight { border-radius: 8px; }
+
+/* one section per API: deep-blue heading over its signature card */
+section.api-entry { margin-top: 3rem; padding-top: 0.5rem;
+  border-top: 1px solid var(--color-background-border); }
+section.api-entry > h2 { font-family: var(--font-stack--monospace); font-size: 1.35rem;
+  font-weight: 700; color: #1E3A8A; margin-bottom: 0.8rem; }
+dl.py.function { margin: 0 0 1rem; }
+dl.py.function > dt.sig { margin: 0 0 1rem; padding: 0.6rem 1rem 0.6rem 3em;
+  line-height: 1.7; font-size: 0.86rem; background: #F1F5F9;
+  border-left: 3px solid var(--color-brand-primary); border-radius: 0 6px 6px 0; }
+dl.py.function > dt.sig .sig-name { color: var(--color-brand-primary); }
+dl.py.function > dt.sig .sig-param { font-weight: 400; color: #334155; }
+dl.py.function > dt.sig .default_value { color: #9333EA; }
+dl.py.function > dd { margin-left: 0; }
+
+/* the one-line summary reads as a lead paragraph */
+dl.py.function > dd > p:first-child { font-size: 1.05rem; font-weight: 500; color: #0F172A; }
+
+/* "Parameters" / "Returns" / "Example" section labels */
+dl.field-list > dt, dl.py.function p.rubric { display: block; margin: 1.4rem 0 0.6rem;
+  padding: 0.15rem 0 0.15rem 0.6rem; font-size: 0.95rem; font-weight: 700;
+  letter-spacing: 0.02em; text-transform: none; color: #1E40AF;
+  border-left: 3px solid #93C5FD; background: none; }
+dl.field-list { display: block; }
+dl.field-list > dd { margin-left: 0.9rem; }
+dl.field-list .colon { display: none; }
+
+/* parameter name / type / description */
+dl.field-list > dd > ul > li { margin-bottom: 0.55rem; }
+dl.field-list > dd strong { font-family: var(--font-stack--monospace); font-size: 0.9em;
+  color: #B45309; }
+dl.field-list > dd > ul > li > p > em,
+dl.field-list > dd > ul > li > em { color: #64748B; }
+dl.field-list > dd ul ul { margin-top: 0.3rem; font-size: 0.93em; color: #475569; }
+
+/* version switcher under the sidebar logo */
+.halops-version { margin: -0.4rem var(--sidebar-item-spacing-horizontal) 0.8rem;
+  font-size: 0.8rem; color: var(--color-foreground-secondary); }
+.halops-version select { margin-left: 0.3rem; padding: 0.1rem 0.3rem; font: inherit;
+  color: var(--color-brand-primary); border: 1px solid var(--color-background-border);
+  border-radius: 4px; background: #fff; }
+
+/* summary table at the top of each API page */
+table.autosummary { width: 100%; border: 1px solid var(--color-background-border);
+  border-radius: 8px; border-collapse: separate; border-spacing: 0; box-shadow: none; }
+table.autosummary td { padding: 0.45rem 0.9rem;
+  border-top: 1px solid var(--color-background-border); }
+table.autosummary tr:first-child td { border-top: none; }
+table.autosummary td:first-child { white-space: nowrap; }
+table.autosummary code.literal { background: none; padding: 0; font-weight: 600;
+  color: var(--color-brand-primary); }
