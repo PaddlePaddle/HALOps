@@ -269,6 +269,7 @@
 <li><p><strong>GQA attention</strong>: variable-length prefill and paged-KV decode across BF16 / FP8 KV cache, GQA and speculative decoding; split-KV parallelism, adaptive reduction and fused pre/post-processing make full use of SM100 compute and bandwidth in long-context and small-batch decode.</p></li>
 <li><p><strong>Multi-precision GEMM</strong>: FP8 (MXFP8) and FP4 (NVFP4 / MXFP4) block-scaled GEMM for dense, batched and MoE grouped workloads; with ultra-lightweight flexible tile configurations and pre-mapped tile scheduling, it delivers industry-leading performance in most scenarios on SM100.</p></li>
 <li><p><strong>MegaKernel sparse MLA</strong>: high-performance MegaKernel sparse attention for HCA and SWA, removing kernel scheduling and intermediate memory round trips, with tile-level pipelining that hides compute and memory latency to push GPU utilization further.</p></li>
+<li><p><strong>Low-latency decode operators</strong>: for low-concurrency, small-workload decode, provides low-latency GEMM, the MegaLLMoE MegaKernel and One-Pass mHC, with supporting quantization operators.</p></li>
 </ul>
 </section>
 <section id="performance">
@@ -354,7 +355,7 @@
       
     </aside>
   </div>
-</div><script src="_static/documentation_options.js?v=01f34227"></script>
+</div><script src="_static/documentation_options.js?v=938c9ccc"></script>
     <script src="_static/doctools.js?v=9bcbadda"></script>
     <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/scripts/furo.js?v=46bd48cc"></script>
