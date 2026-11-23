@@ -275,7 +275,10 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#halops.mla_workspace" title="halops.mla_workspace"><code class="xref py py-obj docutils literal notranslate"><span class="pre">mla_workspace</span></code></a></p></td>
 <td><p>Allocate the gmem workspace of <code class="docutils literal notranslate"><span class="pre">mla_attention_plan</span></code>, <code class="docutils literal notranslate"><span class="pre">mla_attention</span></code> and <code class="docutils literal notranslate"><span class="pre">mla_output_proj</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#halops.vha_postmix_quant" title="halops.vha_postmix_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">vha_postmix_quant</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#halops.prefill_pair_mla" title="halops.prefill_pair_mla"><code class="xref py py-obj docutils literal notranslate"><span class="pre">prefill_pair_mla</span></code></a></p></td>
+<td><p>Sparse fp8 MLA prefill attention over a SWA and a compressed segment.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#halops.vha_postmix_quant" title="halops.vha_postmix_quant"><code class="xref py py-obj docutils literal notranslate"><span class="pre">vha_postmix_quant</span></code></a></p></td>
 <td><p>Inverse RoPE + VHA cross-head postmix + W8A8-MXFP8 quantization.</p></td>
 </tr>
 </tbody>
@@ -577,6 +580,105 @@ reads its KV runs and work list); per layer <code class="docutils literal notran
 </dd></dl>
 
 </section>
+<section class="api-entry" id="prefill-pair-mla">
+<h2>prefill_pair_mla<a class="headerlink" href="#prefill-pair-mla" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="halops.prefill_pair_mla">
+<span class="sig-name descname"><span class="pre">prefill_pair_mla</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">q</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">swa_k_cache</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">swa_indices</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">swa_lengths</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_k_cache</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_indices</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">c128_lengths</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">attn_sink</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">softmax_scale</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cu_seqlens</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cu_pairs</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_pdl</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">swa_shift</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">q_positions</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">q_freqs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">q_norm_eps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-06</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#halops.prefill_pair_mla" title="Link to this definition">¶</a></dt>
+<dd><p>Sparse fp8 MLA prefill attention over a SWA and a compressed segment.</p>
+<p>Each token attends its SWA rows plus its compressed (<code class="docutils literal notranslate"><span class="pre">c128_*</span></code>) rows with
+an optional per-head sink, like FlashMLA’s sparse fp8
+<code class="docutils literal notranslate"><span class="pre">flash_mla_with_kvcache</span></code> with <code class="docutils literal notranslate"><span class="pre">extra_k_cache</span></code>.  A 2-CTA cluster
+attends two consecutive tokens <code class="docutils literal notranslate"><span class="pre">a</span> <span class="pre">=</span> <span class="pre">2j</span></code>, <code class="docutils literal notranslate"><span class="pre">b</span> <span class="pre">=</span> <span class="pre">2j</span> <span class="pre">+</span> <span class="pre">1</span></code> of a request
+over the union of their lists, so each KV row is dequantized once for
+both.  The lists must therefore have the structure of a causal prefill
+chunk, or the result is wrong (no out-of-bounds reads):</p>
+<ul class="simple">
+<li><p>SWA: newest first, <code class="docutils literal notranslate"><span class="pre">a</span></code>’s list is <code class="docutils literal notranslate"><span class="pre">b</span></code>’s shifted by <code class="docutils literal notranslate"><span class="pre">swa_shift</span></code>.</p></li>
+<li><p>compressed: <code class="docutils literal notranslate"><span class="pre">a</span></code>’s list is a prefix of <code class="docutils literal notranslate"><span class="pre">b</span></code>’s.  This holds for HCA
+and dense C4 but not for top-k lists (sparse C4); only HCA is tested.</p></li>
+</ul>
+<p>Under CP round-robin pass the local request boundaries and
+<code class="docutils literal notranslate"><span class="pre">swa_shift</span> <span class="pre">=</span> <span class="pre">cp</span></code>; padding rows go in one extra trailing request.</p>
+<p>With <code class="docutils literal notranslate"><span class="pre">q_positions</span></code> and <code class="docutils literal notranslate"><span class="pre">q_freqs</span></code>, <code class="docutils literal notranslate"><span class="pre">q</span></code> is the raw projection and the
+kernel applies DSv4’s <code class="docutils literal notranslate"><span class="pre">q_norm_rope</span></code> (weightless RMS norm, RoPE on dims
+448..511).  It is more accurate than, but not bit-exact with,
+<code class="docutils literal notranslate"><span class="pre">fused_q_norm_rope</span></code> followed by this kernel.</p>
+<p>The first call on a device allocates a persistent workspace, grown to the
+largest call: run the largest call before capturing a CUDA graph, and do
+not run calls concurrently on one device.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>q</strong> (<em>torch.Tensor</em>) – [T, 64, 512] or [T, 1, 64, 512] bfloat16, contiguous; with
+<code class="docutils literal notranslate"><span class="pre">q_positions</span></code> any 16 B aligned token stride is allowed (each
+token’s heads contiguous).</p></li>
+<li><p><strong>swa_k_cache</strong> (<em>torch.Tensor</em>) – [pages, page_size, 1, 584] uint8 V4 fp8 cache (448 e4m3
+nope + 64 bf16 rope + 8 B UE8M0 scales per row, scales after a
+page’s rows); power-of-two <code class="docutils literal notranslate"><span class="pre">page_size</span></code>, page stride a multiple
+of 576 B.</p></li>
+<li><p><strong>swa_indices</strong> (<em>torch.Tensor</em>) – [T, W] or [T, 1, W] int32 contiguous SWA row ids.</p></li>
+<li><p><strong>swa_lengths</strong> (<em>torch.Tensor</em>) – [T] int32 valid SWA rows per token.</p></li>
+<li><p><strong>c128_k_cache</strong> (<em>torch.Tensor</em>) – Compressed cache, same layout as <code class="docutils literal notranslate"><span class="pre">swa_k_cache</span></code>.</p></li>
+<li><p><strong>c128_indices</strong> (<em>torch.Tensor</em>) – [T, Wc] or [T, 1, Wc] int32 contiguous row ids.</p></li>
+<li><p><strong>c128_lengths</strong> (<em>torch.Tensor</em>) – [T] int32 valid compressed rows per token.</p></li>
+<li><p><strong>attn_sink</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional [64] float32 per-head sink logits.</p></li>
+<li><p><strong>softmax_scale</strong> (<em>float</em>) – Scale of <code class="docutils literal notranslate"><span class="pre">q</span> <span class="pre">k^T</span></code>.</p></li>
+<li><p><strong>cu_seqlens</strong> (<em>torch.Tensor</em>) – [R + 1] int32 request token offsets, from 0 to T.</p></li>
+<li><p><strong>cu_pairs</strong> (<em>torch.Tensor</em>) – [R + 1] int32 request pair offsets (<code class="docutils literal notranslate"><span class="pre">ceil(len</span> <span class="pre">/</span> <span class="pre">2)</span></code> per
+request).</p></li>
+<li><p><strong>use_pdl</strong> (<em>bool</em>) – Enable Programmatic Dependent Launch.</p></li>
+<li><p><strong>swa_shift</strong> (<em>int</em>) – Position gap of a pair’s tokens, in [1, 128].</p></li>
+<li><p><strong>q_positions</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – Optional [T] int32 / int64 token positions; enables the
+fused q_norm_rope.</p></li>
+<li><p><strong>q_freqs</strong> (<em>torch.Tensor</em><em> | </em><em>None</em>) – [P, 32] complex64 or [P, 64] float32 RoPE table,
+<code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">&gt;</span> <span class="pre">max(q_positions)</span></code>.</p></li>
+<li><p><strong>q_norm_eps</strong> (<em>float</em>) – Epsilon of the fused RMS norm.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A new contiguous bfloat16 tensor shaped like <code class="docutils literal notranslate"><span class="pre">q</span></code>.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>torch.Tensor</p>
+</dd>
+</dl>
+<p class="rubric">Example</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">halops</span><span class="w"> </span><span class="kn">import</span> <span class="n">prefill_pair_mla</span>
+
+<span class="n">lens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">1023</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2048</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">)</span>
+<span class="n">cu_seqlens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">pad</span><span class="p">(</span><span class="n">lens</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span><span class="o">.</span><span class="n">int</span><span class="p">()</span>
+<span class="n">cu_pairs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">pad</span><span class="p">(</span>
+    <span class="p">((</span><span class="n">lens</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span><span class="o">.</span><span class="n">int</span><span class="p">()</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">prefill_pair_mla</span><span class="p">(</span>
+    <span class="n">q</span><span class="p">,</span> <span class="n">swa_cache</span><span class="p">,</span> <span class="n">swa_idx</span><span class="p">,</span> <span class="n">swa_len</span><span class="p">,</span> <span class="n">c128_cache</span><span class="p">,</span> <span class="n">c_idx</span><span class="p">,</span> <span class="n">c_len</span><span class="p">,</span>
+    <span class="n">sink</span><span class="p">,</span> <span class="mi">512</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span><span class="p">,</span> <span class="n">cu_seqlens</span><span class="o">=</span><span class="n">cu_seqlens</span><span class="p">,</span> <span class="n">cu_pairs</span><span class="o">=</span><span class="n">cu_pairs</span><span class="p">)</span>
+</pre></div>
+</div>
+</dd></dl>
+
+</section>
 <section class="api-entry" id="vha-postmix-quant">
 <h2>vha_postmix_quant<a class="headerlink" href="#vha-postmix-quant" title="Link to this heading">¶</a></h2>
 <dl class="py function">
@@ -710,6 +812,7 @@ SfAtom layout (padding rows hold 0).</p>
 <li><a class="reference internal" href="#mla-attention-plan">mla_attention_plan</a></li>
 <li><a class="reference internal" href="#mla-output-proj">mla_output_proj</a></li>
 <li><a class="reference internal" href="#mla-workspace">mla_workspace</a></li>
+<li><a class="reference internal" href="#prefill-pair-mla">prefill_pair_mla</a></li>
 <li><a class="reference internal" href="#vha-postmix-quant">vha_postmix_quant</a></li>
 </ul>
 </li>
