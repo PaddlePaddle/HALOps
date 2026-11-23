@@ -33,11 +33,9 @@ def prefill_pair_mla(
     c128_lengths: torch.Tensor,
     attn_sink: Optional[torch.Tensor],
     softmax_scale: float,
-    tokens_per_req: int = 0,
-    out: Optional[torch.Tensor] = None,
+    cu_seqlens: torch.Tensor,
+    cu_pairs: torch.Tensor,
     use_pdl: bool = True,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    cu_pairs: Optional[torch.Tensor] = None,
     swa_shift: int = 1,
     q_positions: Optional[torch.Tensor] = None,
     q_freqs: Optional[torch.Tensor] = None,
@@ -84,13 +82,10 @@ def prefill_pair_mla(
         c128_lengths: [T] int32 valid compressed rows per token.
         attn_sink: Optional [64] float32 per-head sink logits.
         softmax_scale: Scale of ``q k^T``.
-        tokens_per_req: Tokens per request (``>= 2``, divides T) when
-            ``cu_seqlens`` is not given.
-        out: Optional contiguous bfloat16 output with ``q``'s element count.
-        use_pdl: Enable Programmatic Dependent Launch.
-        cu_seqlens: Optional [R + 1] int32 request token offsets.
+        cu_seqlens: [R + 1] int32 request token offsets, from 0 to T.
         cu_pairs: [R + 1] int32 request pair offsets (``ceil(len / 2)`` per
-            request), given with ``cu_seqlens``.
+            request).
+        use_pdl: Enable Programmatic Dependent Launch.
         swa_shift: Position gap of a pair's tokens, in [1, 128].
         q_positions: Optional [T] int32 / int64 token positions; enables the
             fused q_norm_rope.
@@ -99,7 +94,7 @@ def prefill_pair_mla(
         q_norm_eps: Epsilon of the fused RMS norm.
 
     Returns:
-        ``out``, or a new tensor shaped like ``q``.
+        A new contiguous bfloat16 tensor shaped like ``q``.
 
     Example:
         >>> from halops import prefill_pair_mla
@@ -122,11 +117,9 @@ def prefill_pair_mla(
         c128_lengths,
         attn_sink,
         softmax_scale,
-        tokens_per_req,
-        out,
-        use_pdl,
         cu_seqlens,
         cu_pairs,
+        use_pdl,
         swa_shift,
         q_positions,
         q_freqs,

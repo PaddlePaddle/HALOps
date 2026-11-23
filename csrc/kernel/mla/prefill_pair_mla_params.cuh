@@ -115,8 +115,8 @@ struct PairMlaParams {
     float* lse_part;  // [2 * clusters][2][64] their log2 sums
     int* counter;     // [clusters][2] parts published of a cluster's split pair
     int tokens;
-    int tokens_per_req;  // t; tokens are paired within a request, not globally
-    // Varlen: [R + 1] token and pair offsets of the requests.
+    // [R + 1] token and pair offsets of the requests; tokens are paired
+    // within a request, not globally.
     const int* cu_seqlens;
     const int* cu_pairs;
     int n_req;

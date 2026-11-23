@@ -35,36 +35,39 @@ struct PairMap {
     bool has_b;
 };
 
+template <class C>
 CUTE_DEVICE PairMap pair_map(const PairMlaParams& p, int pair) {
     PairMap m;
-    if (p.cu_pairs) {
-        // Last request r with cu_pairs[r] <= pair (empty requests are skipped).
-        int lo = 0, hi = p.n_req;
-        while (hi - lo > 1) {
-            const int mid = (lo + hi) / 2;
-            if (__ldg(p.cu_pairs + mid) <= pair)
-                lo = mid;
-            else
-                hi = mid;
-        }
-        m.a = __ldg(p.cu_seqlens + lo) + 2 * (pair - __ldg(p.cu_pairs + lo));
-        m.has_b = m.a + 1 < __ldg(p.cu_seqlens + lo + 1);
+    // One request (cu_seqlens = [0, T]): no search. kQnr only.
+    if (C::kQnr && p.n_req == 1) {
+        m.a = 2 * pair;
+        m.has_b = m.a + 1 < p.tokens;
         return m;
     }
-    const int ppr = (p.tokens_per_req + 1) / 2;  // pairs per request
-    const int r = pair / ppr, k = pair - r * ppr;
-    m.a = r * p.tokens_per_req + 2 * k;
-    m.has_b = 2 * k + 1 < p.tokens_per_req;
+    // Last request r with cu_pairs[r] <= pair (empty requests are skipped).
+    int lo = 0, hi = p.n_req;
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) / 2;
+        if (__ldg(p.cu_pairs + mid) <= pair)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    m.a = __ldg(p.cu_seqlens + lo) + 2 * (pair - __ldg(p.cu_pairs + lo));
+    m.has_b = m.a + 1 < __ldg(p.cu_seqlens + lo + 1);
     return m;
 }
 
 CUTE_DEVICE int num_pairs(const PairMlaParams& p) {
-    if (p.cu_pairs) return __ldg(p.cu_pairs + p.n_req);
-    return (p.tokens / p.tokens_per_req) * ((p.tokens_per_req + 1) / 2);
+    // cu_pairs is never null; without this check ptxas spills more in the
+    // kQnr = false kernels (52 B spill stores instead of 4).
+    if (!p.cu_pairs) return 0;
+    return __ldg(p.cu_pairs + p.n_req);
 }
 
+template <class C>
 CUTE_DEVICE PairLens load_lens(const PairMlaParams& p, int pair) {
-    const PairMap m = pair_map(p, pair);
+    const PairMap m = pair_map<C>(p, pair);
     PairLens l;
     CUTLASS_PRAGMA_UNROLL
     for (int seg = 0; seg < 2; ++seg) {
@@ -78,7 +81,7 @@ template <class C>
 CUTE_DEVICE PairGeom pair_geom(const PairMlaParams& p, int pair,
                                const PairLens& l) {
     PairGeom g;
-    const PairMap m = pair_map(p, pair);
+    const PairMap m = pair_map<C>(p, pair);
     g.a = m.a;
     g.has_b = m.has_b;
     CUTLASS_PRAGMA_UNROLL
@@ -134,7 +137,7 @@ struct UnitCursor {
             const int4 v = table[rel];
             lens = {{{v.x, v.y}, {v.z, v.w}}};
         } else {
-            lens = load_lens(p, pair);
+            lens = load_lens<C>(p, pair);
         }
         u.g = pair_geom<C>(p, pair, lens);
         u.off = off;
@@ -172,7 +175,7 @@ CUTE_DEVICE void find_range(const PairMlaParams& p, typename C::Smem& sm,
     // Pass 1: the tile total and the cost of this thread's pairs.
     int sum = 0, csum = 0;
     for (int q = first, j = 0; q < min(first + per, pairs); ++q, ++j) {
-        const PairLens l = load_lens(p, q);
+        const PairLens l = load_lens<C>(p, q);
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < kKeep; ++k) {
             if (j == k)
@@ -255,7 +258,7 @@ CUTE_DEVICE void find_range(const PairMlaParams& p, typename C::Smem& sm,
         int c = max(int((uint64_t(cs) * sched + ctotal - 1) / ctotal), 1);
         if (csum > 0 && c < sched && x_of(c) < cs + csum) {
             for (int q = first; q < min(first + per, pairs) && c < sched; ++q) {
-                const int n = pair_geom<C>(p, q, load_lens(p, q)).n_tiles;
+                const int n = pair_geom<C>(p, q, load_lens<C>(p, q)).n_tiles;
                 const int ce = cs + pair_cost<C>(n);
                 const bool lng = ce - cs == PairSchedTraits::kTileCost * n;
                 for (; c < sched && x_of(c) < ce; ++c) {
@@ -276,7 +279,7 @@ CUTE_DEVICE void find_range(const PairMlaParams& p, typename C::Smem& sm,
                       sm.bound[threadIdx.x + 1] <= sm.bound[threadIdx.x];
     if (sum > 0 && pre <= lo && lo < pre + sum) {
         for (int q = first;; ++q) {
-            const int w = pair_geom<C>(p, q, load_lens(p, q)).n_tiles;
+            const int w = pair_geom<C>(p, q, load_lens<C>(p, q)).n_tiles;
             if (lo < pre + w) {
                 sm.start[0] = q;
                 sm.wstart = pre;
@@ -312,7 +315,7 @@ CUTE_DEVICE void find_range(const PairMlaParams& p, typename C::Smem& sm,
         } else if (threadIdx.x < PairSchedTraits::kTableUnits &&
                    sm.start[0] + int(threadIdx.x) < pairs) {
             const int q = sm.start[0] + threadIdx.x;
-            const PairLens l = load_lens(p, q);
+            const PairLens l = load_lens<C>(p, q);
             sm.unit_lens[threadIdx.x] =
                 make_int4(l.v[0][0], l.v[0][1], l.v[1][0], l.v[1][1]);
         }

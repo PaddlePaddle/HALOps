@@ -83,7 +83,7 @@ REPLAY_REQS = [
     Req(64, 8000, 3, clamp=False),
 ]
 
-# One request, run with tokens_per_req = T.  kQst: a pair has at most 5 key
+# One request of T tokens.  kQst: a pair has at most 5 key
 # tiles; predq: c128 width >= 512 with T >= 256, or width 256 with T >= 4096.
 UNIFORM_CASES = [
     Case("T2-ctx256", [Req(2, 256)], "kQst, one pair, combine", quick=True),
@@ -172,17 +172,9 @@ def cp_reqs(cp: int) -> list[Req]:
 
 @pytest.mark.parametrize("case", params(UNIFORM_CASES))
 def test_uniform(case: Case):
-    """One request through tokens_per_req, against the fp32 reference."""
+    """One request, against the fp32 reference."""
     batch = make_batch(case.reqs)
-    check(run(batch, tokens_per_req=case.reqs[0].tokens), batch)
-
-
-def test_tokens_per_req_matches_varlen():
-    """tokens_per_req = t is the varlen batch of T / t requests of t tokens."""
-    batch = make_batch([Req(256, 8192)] * 4)
-    o = run(batch, tokens_per_req=256)
-    check(o, batch)
-    assert torch.equal(o, run(batch, **varlen_kwargs([256] * 4)))
+    check(run(batch, **case_kwargs(case)), batch)
 
 
 @pytest.mark.quick
@@ -206,9 +198,9 @@ def test_cp(cp: int, rank: int):
 
 
 def test_no_sink():
-    """attn_sink = None, with an odd tokens_per_req."""
+    """attn_sink = None, with an odd request length."""
     batch = make_batch([Req(517, 517)])
-    check(run(batch, sink=False, tokens_per_req=517), batch, sink=False)
+    check(run(batch, sink=False, **varlen_kwargs([517])), batch, sink=False)
 
 
 @pytest.mark.parametrize("sink", [True, False], ids=["sink", "no-sink"])
@@ -224,7 +216,7 @@ def test_no_keys(req: Req, sink: bool):
     swa_len[0::2] = 0
     c_len[0::2] = 0
     batch = batch._replace(swa_len=swa_len, c_len=c_len)
-    o = run(batch, sink, tokens_per_req=req.tokens).view(-1, HEADS, DIM)
+    o = run(batch, sink, **varlen_kwargs([req.tokens])).view(-1, HEADS, DIM)
     assert torch.isfinite(o).all(), "non-finite output"
     assert not o[0::2].any(), "a token with no keys has non-zero output"
     check(o, batch, sink, rows=list(range(1, req.tokens, 2)))
@@ -254,7 +246,7 @@ def test_invalid_keys(req: Req):
             batch.c_idx, batch.c_len, batch.c128.shape[0] * batch.c128.shape[1]
         ),
     )
-    check(run(batch, tokens_per_req=req.tokens), batch)
+    check(run(batch, **varlen_kwargs([req.tokens])), batch)
 
 
 def test_c128_not_prefix():
@@ -273,20 +265,17 @@ def test_c128_not_prefix():
     c_idx[600, 0] = torch.where(cols < 448, cols, -1)
     c_idx[601, 0] = torch.where(cols < 448, cols, cols + 1)
     batch = batch._replace(c_idx=c_idx, c_len=c_len)
-    check(run(batch, tokens_per_req=req.tokens), batch)
+    check(run(batch, **varlen_kwargs([req.tokens])), batch)
 
 
 @pytest.mark.parametrize("case", params([COMBINE, QST, STREAMING]))
-def test_out_buffer(case: Case):
-    """A given out is written in place and returned, without PDL; a second
-    call (with PDL) agrees."""
+def test_no_pdl(case: Case):
+    """Without PDL; the default call (with PDL) agrees."""
     batch = make_batch(case.reqs)
     kwargs = case_kwargs(case)
-    out = torch.empty(batch.q.shape[0], HEADS, DIM, dtype=torch.bfloat16)
-    o = run(batch, out=out, use_pdl=False, **kwargs)
-    assert o.data_ptr() == out.data_ptr()
+    o = run(batch, use_pdl=False, **kwargs)
     check(o, batch)
-    assert torch.equal(run(batch, **kwargs).view_as(o), o)
+    assert torch.equal(run(batch, **kwargs), o)
 
 
 def test_page_size():
@@ -344,7 +333,7 @@ def test_empty():
         c_idx=batch.c_idx[:0],
         c_len=batch.c_len[:0],
     )
-    assert run(batch, tokens_per_req=2).numel() == 0
+    assert run(batch, **varlen_kwargs([0])).numel() == 0
 
 
 FLASHMLA_CASES = [
@@ -447,9 +436,9 @@ def test_qnr_cp():
     assert rms <= RMS_TOL and worst <= MAX_TOL, f"rms {rms:.3e} max {worst:.3e}"
 
 
-# Invalid inputs: each case changes some arguments of a valid call (one
-# 64-token request, tokens_per_req = 64) and expects the host check that
-# names the violated constraint.
+# Invalid inputs: each case changes some arguments of a valid call (the
+# 64 tokens of ARG_REQ as two 32-token requests) and expects the host check
+# that names the violated constraint.
 ARG_REQ = Req(64, 256)
 
 
@@ -467,7 +456,7 @@ def prefill_args() -> dict:
         c128_lengths=b.c_len,
         attn_sink=b.sink,
         softmax_scale=SCALE,
-        tokens_per_req=ARG_REQ.tokens,
+        **cu_args(),
     )
 
 
@@ -503,7 +492,6 @@ def short_stride_cache(pages: int = 2, page_size: int = 128) -> torch.Tensor:
 QNR_Q_MSG = "view with contiguous heads"
 Q_MSG = "q must be a contiguous bfloat16"
 CU_MSG = "cu_seqlens / cu_pairs must be contiguous int32"
-TPR_MSG = "tokens_per_req must be >= 2 and divide T"
 CACHE_MSG = "k caches must be uint8"
 IDX_MSG = "indices must be contiguous int32"
 QNR_TAB_MSG = "q_positions must be contiguous int64 / int32"
@@ -516,11 +504,6 @@ INVALID_ARGS = [
         lambda a: a.update(q_positions=qnr_args()["q_positions"]),
         "q_positions and q_freqs go together",
         id="positions-only",
-    ),
-    pytest.param(
-        lambda a: a.update(cu_seqlens=cu_args()["cu_seqlens"]),
-        "cu_seqlens and cu_pairs go together",
-        id="cu_seqlens-only",
     ),
     pytest.param(lambda a: a.update(q=a["q"].float()), Q_MSG, id="q-fp32"),
     pytest.param(
@@ -556,14 +539,13 @@ INVALID_ARGS = [
         CU_MSG,
         id="cu-no-request",
     ),
-    pytest.param(lambda a: a.update(tokens_per_req=1), TPR_MSG, id="tokens_per_req-1"),
     pytest.param(
-        lambda a: a.update(tokens_per_req=48), TPR_MSG, id="tokens_per_req-48"
+        lambda a: a.update(cu_pairs=a["cu_pairs"][:2]), CU_MSG, id="cu-pairs-short"
     ),
     pytest.param(
-        lambda a: a.update(out=torch.empty_like(a["q"][:32])),
-        "out must be a contiguous bfloat16",
-        id="out-32-tokens",
+        lambda a: a.update(cu_seqlens=strided(a["cu_seqlens"])),
+        CU_MSG,
+        id="cu-strided",
     ),
     pytest.param(
         lambda a: a.update(attn_sink=a["attn_sink"][:32]),

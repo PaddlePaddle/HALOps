@@ -235,13 +235,10 @@ CUTE_DEVICE int c128_len(const PairMlaParams& p, int t) {
 }
 
 CUTE_DEVICE int2 request_tokens(const PairMlaParams& p, int r) {
-    if (!p.cu_seqlens)
-        return {r * p.tokens_per_req, (r + 1) * p.tokens_per_req};
     return {__ldg(p.cu_seqlens + r), __ldg(p.cu_seqlens + r + 1)};
 }
 
 CUTE_DEVICE int request_of(const PairMlaParams& p, int t) {
-    if (!p.cu_seqlens) return t / p.tokens_per_req;
     int lo = 0, hi = p.n_req;  // last request r with cu_seqlens[r] <= t
     while (hi - lo > 1) {
         const int mid = (lo + hi) / 2;

@@ -32,24 +32,22 @@ namespace halops::mla::prefill_pair {
 
 // The layouts the kernels and their TMA maps rely on.
 template <class T>
-void check_inputs(
-    const torch::Tensor& q, const torch::Tensor& swa_k_cache,
-    const torch::Tensor& swa_indices, const torch::Tensor& swa_lengths,
-    const torch::Tensor& c128_k_cache, const torch::Tensor& c128_indices,
-    const torch::Tensor& c128_lengths,
-    const std::optional<torch::Tensor>& attn_sink, const int64_t tokens_per_req,
-    const std::optional<torch::Tensor>& out_opt,
-    const std::optional<torch::Tensor>& cu_seqlens,
-    const std::optional<torch::Tensor>& cu_pairs, const int64_t swa_shift,
-    const std::optional<torch::Tensor>& q_positions,
-    const std::optional<torch::Tensor>& q_freqs) {
+void check_inputs(const torch::Tensor& q, const torch::Tensor& swa_k_cache,
+                  const torch::Tensor& swa_indices,
+                  const torch::Tensor& swa_lengths,
+                  const torch::Tensor& c128_k_cache,
+                  const torch::Tensor& c128_indices,
+                  const torch::Tensor& c128_lengths,
+                  const std::optional<torch::Tensor>& attn_sink,
+                  const torch::Tensor& cu_seqlens,
+                  const torch::Tensor& cu_pairs, const int64_t swa_shift,
+                  const std::optional<torch::Tensor>& q_positions,
+                  const std::optional<torch::Tensor>& q_freqs) {
     const int64_t tokens = q.size(0);
     TORCH_CHECK(swa_shift >= 1 && swa_shift <= 128,
                 "swa_shift must be in [1, 128]");
     TORCH_CHECK(q_positions.has_value() == q_freqs.has_value(),
                 "q_positions and q_freqs go together");
-    TORCH_CHECK(cu_seqlens.has_value() == cu_pairs.has_value(),
-                "cu_seqlens and cu_pairs go together");
     if (q_positions.has_value()) {
         // Fused q_norm_rope: q is the raw projection, heads contiguous.
         TORCH_CHECK(
@@ -75,22 +73,12 @@ void check_inputs(
                         q.numel() == tokens * T::kHeads * T::kDim,
                     "q must be a contiguous bfloat16 [T, 64, 512] tensor");
     }
-    if (cu_seqlens.has_value()) {
-        for (const torch::Tensor* x : {&*cu_seqlens, &*cu_pairs}) {
-            TORCH_CHECK(
-                x->scalar_type() == torch::kInt && x->is_contiguous() &&
-                    x->dim() == 1 && x->numel() == cu_seqlens->numel() &&
-                    x->numel() >= 2,
-                "cu_seqlens / cu_pairs must be contiguous int32 [R + 1]");
-        }
-    } else {
-        TORCH_CHECK(tokens_per_req >= 2 && tokens % tokens_per_req == 0,
-                    "tokens_per_req must be >= 2 and divide T");
+    for (const torch::Tensor* x : {&cu_seqlens, &cu_pairs}) {
+        TORCH_CHECK(x->scalar_type() == torch::kInt && x->is_contiguous() &&
+                        x->dim() == 1 && x->numel() == cu_seqlens.numel() &&
+                        x->numel() >= 2,
+                    "cu_seqlens / cu_pairs must be contiguous int32 [R + 1]");
     }
-    TORCH_CHECK(!out_opt.has_value() ||
-                    (out_opt->scalar_type() == torch::kBFloat16 &&
-                     out_opt->is_contiguous() && out_opt->numel() == q.numel()),
-                "out must be a contiguous bfloat16 [T, 64, 512] tensor");
     TORCH_CHECK(
         !attn_sink.has_value() ||
             (attn_sink->scalar_type() == torch::kFloat &&
@@ -193,15 +181,14 @@ Workspace& workspace(const torch::Tensor& q, int clusters, int64_t c128_rows,
 // Rows of the bf16 c128 copy, or 0 when pre-dequant does not pay off.
 template <class T>
 int64_t predq_rows(const PairMlaParams& p) {
-    const int n_req = p.cu_seqlens ? p.n_req : p.tokens / p.tokens_per_req;
     const int64_t per_req =
         (int64_t(p.ld[0]) + T::kTile - 1) / T::kTile * T::kTile;
-    const int64_t rows = int64_t(n_req) * per_req;
+    const int64_t rows = int64_t(p.n_req) * per_req;
     const bool worth = (p.ld[0] >= PredqTraits::kMinLd &&
                         p.tokens >= PredqTraits::kMinTokens) ||
                        (p.ld[0] >= PredqTraits::kShortLd &&
                         p.tokens >= PredqTraits::kShortTokens);
-    if (p.pool_tokens[0] == 0 || n_req == 0 || !worth ||
+    if (p.pool_tokens[0] == 0 || p.n_req == 0 || !worth ||
         rows * T::kDim * int64_t(sizeof(__nv_bfloat16)) >
             PredqTraits::kMaxBytes) {
         return 0;
@@ -239,10 +226,8 @@ void launch_attention(PairMlaParams& p, const PairMlaMaps& maps,
                       cudaStream_t stream,
                       void (*kernel)(PairMlaParams, PairMlaMaps),
                       int smem_bytes, bool use_pdl) {
-    // Varlen: (T + R) / 2 bounds the pair count.
-    const int64_t pairs = p.cu_pairs ? (int64_t(p.tokens) + p.n_req) / 2
-                                     : int64_t(p.tokens) / p.tokens_per_req *
-                                           ((p.tokens_per_req + 1) / 2);
+    // (T + R) / 2 bounds the pair count.
+    const int64_t pairs = (int64_t(p.tokens) + p.n_req) / 2;
     p.combine = 2 * pairs <= max_clusters ? 1 : 0;
     p.clusters =
         p.combine ? max_clusters : int(std::min<int64_t>(pairs, max_clusters));
@@ -288,23 +273,19 @@ torch::Tensor prefill_pair_mla(
     const torch::Tensor& c128_k_cache, const torch::Tensor& c128_indices,
     const torch::Tensor& c128_lengths,
     const std::optional<torch::Tensor>& attn_sink, const double softmax_scale,
-    const int64_t tokens_per_req, const std::optional<torch::Tensor>& out_opt,
-    const bool use_pdl, const std::optional<torch::Tensor>& cu_seqlens,
-    const std::optional<torch::Tensor>& cu_pairs, const int64_t swa_shift,
+    const torch::Tensor& cu_seqlens, const torch::Tensor& cu_pairs,
+    const bool use_pdl, const int64_t swa_shift,
     const std::optional<torch::Tensor>& q_positions,
     const std::optional<torch::Tensor>& q_freqs, const double q_norm_eps) {
     using T = PairMlaTraits<Dims>;
     const CudaDeviceGuard device_guard(q.device());
     check_inputs<T>(q, swa_k_cache, swa_indices, swa_lengths, c128_k_cache,
-                    c128_indices, c128_lengths, attn_sink, tokens_per_req,
-                    out_opt, cu_seqlens, cu_pairs, swa_shift, q_positions,
-                    q_freqs);
-    torch::Tensor out =
-        out_opt.has_value() ? *out_opt : torch::empty(q.sizes(), q.options());
+                    c128_indices, c128_lengths, attn_sink, cu_seqlens, cu_pairs,
+                    swa_shift, q_positions, q_freqs);
+    torch::Tensor out = torch::empty(q.sizes(), q.options());
     const int64_t tokens = q.size(0);
     if (tokens == 0) return out;
     const bool qnr = q_positions.has_value();
-    const bool varlen = cu_seqlens.has_value();
 
     PairMlaParams p{};
     PairMlaMaps maps{};
@@ -314,13 +295,10 @@ torch::Tensor prefill_pair_mla(
     p.sink = attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr;
     p.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
     p.tokens = tokens;
-    p.tokens_per_req = varlen ? 0 : int(tokens_per_req);
     p.swa_shift = int(swa_shift);
-    if (varlen) {
-        p.cu_seqlens = cu_seqlens->data_ptr<int>();
-        p.cu_pairs = cu_pairs->data_ptr<int>();
-        p.n_req = int(cu_seqlens->numel() - 1);
-    }
+    p.cu_seqlens = cu_seqlens.data_ptr<int>();
+    p.cu_pairs = cu_pairs.data_ptr<int>();
+    p.n_req = int(cu_seqlens.numel() - 1);
     p.scale_log2 = float(softmax_scale) * CUDART_L2E_F;
     if (qnr) {
         p.q_stride = q.stride(0);
@@ -388,9 +366,8 @@ torch::Tensor PrefillPairMla(
     const torch::Tensor& c128_k_cache, const torch::Tensor& c128_indices,
     const torch::Tensor& c128_lengths,
     const std::optional<torch::Tensor>& attn_sink, const double softmax_scale,
-    const int64_t tokens_per_req, const std::optional<torch::Tensor>& out_opt,
-    const bool use_pdl, const std::optional<torch::Tensor>& cu_seqlens,
-    const std::optional<torch::Tensor>& cu_pairs, const int64_t swa_shift,
+    const torch::Tensor& cu_seqlens, const torch::Tensor& cu_pairs,
+    const bool use_pdl, const int64_t swa_shift,
     const std::optional<torch::Tensor>& q_positions,
     const std::optional<torch::Tensor>& q_freqs, const double q_norm_eps) {
     // Model dims from q; only [64, 512] is instantiated.
@@ -401,9 +378,8 @@ torch::Tensor PrefillPairMla(
                 ", ", dim, "], supported: [64, 512]");
     return mla::prefill_pair::prefill_pair_mla<mla::ModelDims>(
         q, swa_k_cache, swa_indices, swa_lengths, c128_k_cache, c128_indices,
-        c128_lengths, attn_sink, softmax_scale, tokens_per_req, out_opt,
-        use_pdl, cu_seqlens, cu_pairs, swa_shift, q_positions, q_freqs,
-        q_norm_eps);
+        c128_lengths, attn_sink, softmax_scale, cu_seqlens, cu_pairs, use_pdl,
+        swa_shift, q_positions, q_freqs, q_norm_eps);
 }
 
 }  // namespace halops
