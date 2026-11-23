@@ -30,3 +30,14 @@ repos:
   - id: clang-format
     files: \.(c|cc|cpp|cxx|cu|h|hpp|cuh|m|mm)$
     args: ['-style=file', '-i']
+
+# Code-shape rules from the HALOps reviews: tools/lint/halops_lint.py.
+# PRs check the lines they add; a full run checks the tree minus tools/lint/baseline.json.
+- repo: local
+  hooks:
+  - id: halops-lint
+    name: halops-lint
+    entry: python3 tools/lint/halops_lint.py --pre-commit
+    language: system
+    pass_filenames: false
+    always_run: true

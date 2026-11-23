@@ -1,0 +1,1755 @@
+{
+ "note": "pre-existing findings on main; only shrink this file",
+ "entries": [
+  {
+   "path": "csrc/common/mx_quant.cuh",
+   "rule": "type-alias",
+   "code": "using E4m3 = cutlass::float_e4m3_t;"
+  },
+  {
+   "path": "csrc/kernel/attention/decoder_attention.cu",
+   "rule": "ns-static",
+   "code": "static int GetMaxNumPartitions(const int max_seq_len_kv, const int batch_size,"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "type-alias",
+   "code": "using ElementAcc = float;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "type-alias",
+   "code": "using Element = cutlass::float_e4m3_t;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "type-alias",
+   "code": "using ElementAcc = float;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "type-alias",
+   "code": "using OutputType = cutlass::bfloat16_t;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"prefetch.global.L2 [%0];\" ::\"l\"("
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"prefetch.global.L2 [%0];\" ::\"l\"("
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "ns-static",
+   "code": "static int GetAttentionReduceSmCount() {"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "ns-static",
+   "code": "static int SelectAttentionReduceRowsPerCta(const int total_rows,"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"mul.rn.f32x2 %0, %1, %2;\\n\""
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fma.rn.f32x2 %0, %1, %2, %3;\\n\""
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "ns-static",
+   "code": "CUTLASS_DEVICE static void tmem_load(uint32_t src_addr, uint32_t *arr,"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "ns-static",
+   "code": "CUTLASS_DEVICE static void tmem_store(uint32_t dst_addr, uint32_t *arr,"
+  },
+  {
+   "path": "csrc/kernel/gemm/batch_gemm.cu",
+   "rule": "check-budget",
+   "code": "TORCH_CHECK("
+  },
+  {
+   "path": "csrc/kernel/gemm/dense_gemm.cu",
+   "rule": "check-budget",
+   "code": "TORCH_CHECK(sfb.scalar_type() == torch::kUInt8,"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr float kEpsilon = 1e-10f;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr float kFP4Max = 6.f;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "ns-collision",
+   "code": "__device__ __forceinline__ uint8_t float32_to_ue4m3(float val) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "ns-collision",
+   "code": "__device__ __forceinline__ float ue4m3_to_float32(uint8_t bits) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "ns-static",
+   "code": "static inline int64_t compute_kb_dim(int64_t hidden_size,"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "check-budget",
+   "code": "TORCH_CHECK(token_nums_per_expert.is_contiguous(),"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_dispatch.cuh",
+   "rule": "new-namespace",
+   "code": "namespace cost {"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_dispatch.cuh",
+   "rule": "getenv",
+   "code": "static const bool on = std::getenv(\"IR_GEMM_TRACE\") != nullptr;"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_kernel.cuh",
+   "rule": "check-budget",
+   "code": "TORCH_CHECK(params.ptr_b != nullptr,"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_tile.cuh",
+   "rule": "type-alias",
+   "code": "using Operand = cutlass::float_e4m3_t;"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_tile.cuh",
+   "rule": "type-alias",
+   "code": "using Output = cutlass::bfloat16_t;"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_tile.cuh",
+   "rule": "type-alias",
+   "code": "using Output = cutlass::bfloat16_t;"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_tile.cuh",
+   "rule": "type-alias",
+   "code": "using Output = cutlass::bfloat16_t;"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_tile.cuh",
+   "rule": "type-alias",
+   "code": "using OperandA = cutlass::float_e4m3_t;"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_tile.cuh",
+   "rule": "type-alias",
+   "code": "using Output = cutlass::bfloat16_t;"
+  },
+  {
+   "path": "csrc/kernel/gemm/group_contiguous_gemm.cu",
+   "rule": "check-budget",
+   "code": "TORCH_CHECK(expert_ids.size(0) == m, \"expert_ids shape must be [M], got \","
+  },
+  {
+   "path": "csrc/kernel/gemm/group_masked_gemm.cu",
+   "rule": "check-budget",
+   "code": "TORCH_CHECK(max_m_per_expert > 0,"
+  },
+  {
+   "path": "csrc/kernel/gemm/group_wise_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr float FP4_E2M1_MAX = 6.0f;"
+  },
+  {
+   "path": "csrc/kernel/gemm/group_wise_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr bool IsFp4(QuantMode mode) { return mode != QuantMode::W8A8MXFP8; }"
+  },
+  {
+   "path": "csrc/kernel/gemm/group_wise_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int GroupSize(QuantMode mode) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/group_wise_quant.cu",
+   "rule": "ns-collision",
+   "code": "__device__ __forceinline__ uint8_t float32_to_ue4m3(float val) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/group_wise_quant.cu",
+   "rule": "ns-collision",
+   "code": "__device__ __forceinline__ float ue4m3_to_float32(uint8_t bits) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int FUSED_BLOCK_THREADS = 256;"
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr uintptr_t kFusedAlignment = 128;"
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "ns-static",
+   "code": "static inline bool IsFusedAlignedTo(const void* ptr, uintptr_t alignment) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/rms_norm_quant.cu",
+   "rule": "anon-namespace",
+   "code": "namespace {"
+  },
+  {
+   "path": "csrc/kernel/gemm/rms_norm_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kRmsMaxThreads = 256;"
+  },
+  {
+   "path": "csrc/kernel/gemm/rms_norm_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kRmsVec = sizeof(uint4) / sizeof(__nv_bfloat16);"
+  },
+  {
+   "path": "csrc/kernel/gemm/utils.cuh",
+   "rule": "ns-static",
+   "code": "static constexpr int get_num_warps(int load_c_warp_id, bool add_bias) {"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc_utils.cuh",
+   "rule": "reuse-helper",
+   "code": "CUTE_DEVICE float sigmoid(float z) { return 1.0f / (1.0f + expf(0.0f - z)); }"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "anon-namespace",
+   "code": "namespace {"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kHeads = 64;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDim = 512;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kNope = 448;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kRowBytes = 576;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kSfBytes = 8;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kBf16Mant = 7;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kBlockDims = 64;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kHalfDims = kDim / 2;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kTile = 64;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kHcaTile = kTile;  // Cfg alias (member kTile would shadow this)"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kHalf = kTile / 2;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kLocalBlocks = kHalfDims / kBlockDims;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kAtomRows = 8;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kAtomBytes = 1024;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kRowPitch = kAtomBytes / kAtomRows;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kChunk = 16;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kElemsPerChunk = kChunk / sizeof(__nv_bfloat16);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kBlockBytes = kTile * kRowPitch;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kStageBytes = kLocalBlocks * kBlockBytes;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kUmmaK = 16;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kKStepBytes = kUmmaK * sizeof(__nv_bfloat16);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kKStepsPerBlock = kBlockDims / kUmmaK;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kQkSteps = kHalfDims / kUmmaK;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kPvSteps = kTile / kUmmaK;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kPvN = 256;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kPvMmas = kDim / kPvN;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kPvBlocksPerMma = kLocalBlocks / kPvMmas;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kKvStages = 5;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kMergeBuf = 4;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kMergeShared = 1 << 16;  // fused merge: counter flag, see store_o"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kTableUnits = 32;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kIdxStages = 8;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kIndexDepth = 4;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kGather = 4;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kWarp = 32;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kWarpGroup = 128;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kWarpsPerGroup = kWarpGroup / kWarp;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kIndexWarps = kTile / kWarp;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kGroupsPerWarp = kWarp / kGather;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kThreads = 4 * kWarpGroup;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kQkWarp = 12, kPvWarp = 13, kIndexWarp = 14, kAllocWarp = 15;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kSoftmaxRegs = 152, kQoRegs = 200, kDequantRegs = 104,"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kTmemCols = 512;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kTmemO = 0;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kTmemQ = kHalfDims;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kTmemS = kTmemQ + kHalfDims / 2;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kTmemSCols = kTile;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kTmemLd = 32;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr uint16_t kBothCtas = 0b11;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr uint32_t kPairBar = 1, kDequantBar = 3, kQoBar = 4;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr float kMaxInit = -1e30f;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr float kRescaleLog2 = 6.0f;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kNopeBytes1 = kNope - kHalfDims;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kQBoxDims = 64;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kQBoxBytes = kHeads * kQBoxDims * sizeof(__nv_bfloat16);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kChunksPerBox = kQBoxDims * sizeof(__nv_bfloat16) / kChunk;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kQoRounds = kHalfDims / kQBoxDims;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaNope = 512;                // fp8 latent dims / row"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaRope = 64;                 // bf16 rope dims / row"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaQk = kDsaNope + kDsaRope;  // 576 contraction"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaScaleGroup = 128;          // latent dims per f32 scale"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaScales = kDsaNope / kDsaScaleGroup;                    // 4"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaScaleBytes = kDsaScales * sizeof(float);               // 16"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaRopeBytes = kDsaRope * sizeof(__nv_bfloat16);          // 128"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaRowBytes = kDsaNope + kDsaScaleBytes + kDsaRopeBytes;  // 656"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaNopeHalf = kDsaNope / 2;  // 256 fp8 nope dims / CTA"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaScaleOff = kDsaNope;      // 512: first f32 scale byte"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaRopeOff = kDsaNope + kDsaScaleBytes;  // 528: first rope byte"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaQRopeBytes ="
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaRopeSteps = kDsaRope / kUmmaK;  // 64/16 = 4 K-steps"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaTile = 64;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaHalf = kDsaTile / 2;                         // 32"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaIndexWarps = kDsaTile / kWarp;               // 2"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaBlockBytes = kDsaTile * kRowPitch;           // 8 KB"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaStageBytes = kLocalBlocks * kDsaBlockBytes;  // 32 KB"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaKvStages = 4;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaRopeStageBytes ="
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kSmemBytes = sizeof(HcaSmem) + kAtomBytes;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDsaSmemBytes = sizeof(DsaSmem) + kAtomBytes;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// otherwise slow (2-6% at P > 76, measured)."
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kNoCap = 0x7fffffff;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDefaultSmax ="
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kCapFloor = 8;    // never cap below this many tiles"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kDefaultTpc = 3;  // work-aware target tiles per scheduled cluster"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// correction.  Integer division is a ~0.1 us dependent chain in find_range."
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// capped at smax, inline merge) costs ~14.5 + 1.18 us per tile of its"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// eff 1 (wide split, combine kernel) ~14.3 + 0.55 us per pair + 1.31"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// sweep, in quarter tiles: eff 1 iff 4 (h0 - h1) > 3P - 8 (3.2 us"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// the cheapest wins (0.5 us total loss over 40 shapes; 8K always"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// aligned, ~5 us faster than the 2-cluster split at T32-76)."
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "const int cu = 1005 + 114 * n_max + 3 * pp;  // 10 ns units"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// 0.08 P us (0.5 us margin), which beats the fused merge's"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// fan-in at long KV (512K-1M T56-64 1-3 us)."
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// pairs unless sched is a multiple of P, ~1-3.5 us more.  Fit on"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// non-empty.  Float math: integer divisions are ~0.1 us each here."
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// (~1.2 us each), enough to repay the split's merge (~5 us); measured"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// on 8K-512K x P40-76 (512K P40 85 -> 59 us, short KV stays put)."
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// -- was built + measured 2026-11-08: relerr identical but perf"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kQVecs = kHalfDims * sizeof(__nv_bfloat16) / sizeof(uint4);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "reuse-asm",
+   "code": "asm volatile(\"cp.async.bulk.wait_group 0;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kPlaneCols = 4;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kPlanes = kHalfDims / kPlaneCols;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kPlaneBytes = kWarpGroup * kPlaneCols * sizeof(float);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kPartBoxPlanes = 16;  // planes per 32 KB bulk copy"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kPartBoxes = kPlanes / kPartBoxPlanes;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kOHalf = kPvN / 2;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kMergeCols = 32;  // TMEM columns per step of the merge"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kRoundWords = kQBoxDims / 2;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// no round waits for the previous one's box to be read (~1 us at 8K)."
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"cp.async.bulk.prefetch.L2.global [%0], %1;\" ::\"l\"(src),"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fence.proxy.async.global;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kMergeWgs = 2;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr uint32_t kMergeBar = 5;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kMergeThreads = kMergeWgs * kWarpGroup;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// inlined copies cost the no-merge launches ~0.3 us (code placement)."
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kCombSplit = 4;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kCombJobs = 8;  // job-axis cap of the combine grid"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "torch-zeros",
+   "code": "ws.counter = torch::zeros({clusters, 2}, i32);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "torch-zeros",
+   "code": "ws.total_g = torch::zeros({1}, i32);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "torch-zeros",
+   "code": "ws.eff_g = torch::zeros({1}, i32);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// low batch (measured crossover pairs<=~9), where idle SMs >> tokens and a"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "debug-comment",
+   "code": "// split-pair merge (eff=0) is 14-30% faster (measured T=16..38), since it"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "getenv",
+   "code": "if (const char* e = getenv(\"HCA_EFF\")) p.eff = atoi(e);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "getenv",
+   "code": "if (const char* e = getenv(\"HCA_TPC\")) p.tpc = atoi(e);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "getenv",
+   "code": "if (const char* e = getenv(\"HCA_CLUSTERS\"))"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "getenv",
+   "code": "if (const char* e = getenv(\"HCA_SMAX\")) p.smax = atoi(e);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "getenv",
+   "code": "if (const char* e = getenv(\"HCA_NOMERGE\")) p.nomerge = atoi(e);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "getenv",
+   "code": "if (const char* e = getenv(\"HCA_PIPE\")) p.pipe = atoi(e);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "getenv",
+   "code": "if (const char* e = getenv(\"HCA_COMBINE\")) p.combine = atoi(e);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "getenv",
+   "code": "if (const char* e = getenv(\"HCA_FUSE\")) p.fuse = atoi(e);"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "reuse-launch",
+   "code": "cudaLaunchAttribute attrs[2];"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "reuse-launch",
+   "code": "HALOPS_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, p, maps));"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "reuse-launch",
+   "code": "cudaLaunchAttribute cattr = PdlLaunchAttribute();"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "reuse-launch",
+   "code": "HALOPS_CUDA_CHECK(cudaLaunchKernelEx(&ccfg, hca_combine_kernel, p));"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_attention.cu",
+   "rule": "anon-namespace",
+   "code": "namespace {"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_attention.cu",
+   "rule": "check-budget",
+   "code": "TORCH_CHECK(!(args.c128_page_table && args.c128_attn_len) || args.c128_pool,"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_host_utils.h",
+   "rule": "reuse-launch",
+   "code": "cudaLaunchAttribute attr[2] = {};"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_host_utils.h",
+   "rule": "reuse-launch",
+   "code": "HALOPS_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, args...));"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_intrinsics.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"cp.async.bulk.prefetch.L2.global [%0], %1;\" ::\"l\"(ptr),"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_intrinsics.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fence.proxy.async.global;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_intrinsics.cuh",
+   "rule": "reuse-asm",
+   "code": "asm volatile(\"cp.async.bulk.wait_group 0;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_intrinsics.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"mul.rn.f32x2 %0, %1, %2;\\n\""
+  },
+  {
+   "path": "csrc/kernel/mla/mla_intrinsics.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fma.rn.f32x2 %0, %1, %2, %3;\\n\""
+  },
+  {
+   "path": "csrc/kernel/mla/mla_intrinsics.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"tcgen05.fence::before_thread_sync;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_intrinsics.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"tcgen05.fence::after_thread_sync;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_output_proj.cu",
+   "rule": "anon-namespace",
+   "code": "namespace {"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_plan.cu",
+   "rule": "anon-namespace",
+   "code": "namespace {"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_plan.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kPlanThreads = 256;"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_plan.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kPlanWarps = kPlanThreads / KernelBase::WarpSize;"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_prequant_x.cu",
+   "rule": "anon-namespace",
+   "code": "namespace {"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_prequant_x.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kPrequantThreads = 256;"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_traits.cuh",
+   "rule": "type-alias",
+   "code": "using PartialT = cutlass::bfloat16_t;"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_traits.cuh",
+   "rule": "type-alias",
+   "code": "using PartialT = float;"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_traits.cuh",
+   "rule": "type-alias",
+   "code": "using PartialT = float;"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_utils.cuh",
+   "rule": "reuse-helper",
+   "code": "CUTE_DEVICE Ue8m0Scale ue8m0_scale(float amax) {"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_utils.cuh",
+   "rule": "reuse-helper",
+   "code": "CUTE_DEVICE float abs_max(const float (&vals)[N]) {"
+  },
+  {
+   "path": "csrc/kernel/mla/output_proj_pair.cuh",
+   "rule": "new-namespace",
+   "code": "namespace halops::mla::pair_umma {"
+  },
+  {
+   "path": "csrc/kernel/mla/output_proj_swapab.cuh",
+   "rule": "new-namespace",
+   "code": "namespace halops::mla::swapab {"
+  },
+  {
+   "path": "csrc/kernel/mla/output_proj_swapab.cuh",
+   "rule": "type-alias",
+   "code": "using PartialT = cutlass::bfloat16_t;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "anon-namespace",
+   "code": "namespace {"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaHeads = 64;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaHeadDim = 512;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaRopeDim = 64;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaCols = 128;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaQuarters = kVhaHeadDim / kVhaCols;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaThreads = 128;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaWarps = kVhaThreads / cutlass::NumThreadsPerWarp;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaElems = sizeof(uint4) / sizeof(__nv_bfloat16);"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaChunks = kVhaCols / kVhaElems;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaRopeChunk ="
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaLoads = kVhaHeads * kVhaChunks / kVhaThreads;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaRopeChunks = kVhaRopeDim / kVhaElems;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaRopeLoads = kVhaHeads * kVhaRopeChunks / kVhaThreads;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaTileChunks = kVhaHeads * kVhaChunks;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaMmaM = 16;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaMmaN = 8;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaMmaK = 16;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaKSteps = kVhaHeads / kVhaMmaK;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaNTiles = kVhaCols / kVhaMmaN;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaBlocksPerSm = 4;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaFreqChunks = kVhaRopeDim * sizeof(float) / sizeof(uint4);"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaStageChunks = kVhaTileChunks + kVhaFreqChunks;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaSmemBytes = 2 * kVhaStageChunks * sizeof(uint4);"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaGroupTiles = mxfp8::kGroup / kVhaMmaN;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaNHalves = 2;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaHalfTiles = kVhaNTiles / kVhaNHalves;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaHalfGroups = kVhaHalfTiles / kVhaGroupTiles;"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int kVhaRowBytes = kVhaCols * sizeof(__nv_bfloat16);"
+  },
+  {
+   "path": "csrc/kernel/mla/vha_postmix_quant.cu",
+   "rule": "check-budget",
+   "code": "TORCH_CHECK(sf.is_contiguous() && sf.scalar_type() == torch::kByte &&"
+  },
+  {
+   "path": "csrc/kernel/moe/mega_ll_moe.cu",
+   "rule": "reuse-launch",
+   "code": "cudaLaunchAttribute cluster_attr{};"
+  },
+  {
+   "path": "csrc/kernel/moe/mega_ll_moe.cu",
+   "rule": "reuse-stream",
+   "code": "const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device).stream();"
+  },
+  {
+   "path": "csrc/kernel/moe/mega_ll_moe.cu",
+   "rule": "ns-constexpr-in-cu",
+   "code": "constexpr int64_t WorkspaceBytesFor() {"
+  },
+  {
+   "path": "csrc/kernel/moe/mega_ll_moe.cu",
+   "rule": "check-budget",
+   "code": "TORCH_CHECK(std::isfinite(situ_beta) && std::isfinite(situ_linear_beta),"
+  },
+  {
+   "path": "csrc/kernel/moe/mma_core.cuh",
+   "rule": "type-alias",
+   "code": "using Element = __nv_bfloat16;"
+  },
+  {
+   "path": "csrc/kernel/moe/mma_core.cuh",
+   "rule": "type-alias",
+   "code": "using ElementAcc = float;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_configs.cuh",
+   "rule": "type-alias",
+   "code": "using ElementType = __nv_bfloat16;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_configs.cuh",
+   "rule": "type-alias",
+   "code": "using ScaleType = float;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_configs.cuh",
+   "rule": "type-alias",
+   "code": "using ScaleType = std::uint8_t;  // one UE8M0 byte per 32-K group"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_configs.cuh",
+   "rule": "type-alias",
+   "code": "using ScaleType = std::uint8_t;  // one UE8M0 byte per 32-K group"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_configs.cuh",
+   "rule": "type-alias",
+   "code": "using ElementA = __nv_bfloat16;    // activations as they go into the GEMM"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_configs.cuh",
+   "rule": "type-alias",
+   "code": "using ElementOut = __nv_bfloat16;  // MoE output"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_configs.cuh",
+   "rule": "reuse-helper",
+   "code": "__host__ __device__ static constexpr std::uint32_t sf_atom_offset("
+  },
+  {
+   "path": "csrc/kernel/moe/moe_cta_comm.cuh",
+   "rule": "type-alias",
+   "code": "using Word = std::uint64_t;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_shared_storage.cuh",
+   "rule": "type-alias",
+   "code": "using ExpertId = std::uint32_t;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "new-namespace",
+   "code": "namespace tail {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "type-alias",
+   "code": "using Scale = float;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "type-alias",
+   "code": "using Frag = uint4;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "type-alias",
+   "code": "using Frag = uint4;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_prims.cuh",
+   "rule": "new-namespace",
+   "code": "namespace tail {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_workspace.cuh",
+   "rule": "type-alias",
+   "code": "using Element = float;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_workspace.cuh",
+   "rule": "type-alias",
+   "code": "using Element = std::uint8_t;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_workspace.cuh",
+   "rule": "type-alias",
+   "code": "using ScaleType = float;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_workspace.cuh",
+   "rule": "type-alias",
+   "code": "using ScaleType = float;"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fence.proxy.async.global;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"tcgen05.fence::after_thread_sync;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"tcgen05.fence::before_thread_sync;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"cp.async.bulk.prefetch.L2.global [%0], %1;\" ::\"l\"(ptr),"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"prefetch.global.L2 [%0];\" ::\"l\"(ptr));"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "dup-asm",
+   "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
+  },
+  {
+   "path": "halops/__init__.py",
+   "rule": "py-defensive",
+   "code": "raise AttributeError(f\"module 'halops' has no attribute {name!r}\")"
+  },
+  {
+   "path": "halops/attention/decoder_attention.py",
+   "rule": "py-alloc",
+   "code": ">>> cache_k = torch.zeros(num_blocks, kv_head_num, block_size, head_dim,"
+  },
+  {
+   "path": "halops/attention/decoder_attention.py",
+   "rule": "py-alloc",
+   "code": ">>> rotary_embs = torch.zeros(2, max_seq_len, head_dim // 2,"
+  },
+  {
+   "path": "halops/attention/decoder_attention.py",
+   "rule": "py-alloc",
+   "code": ">>> seq_len_dec_t = torch.zeros(batch, dtype=torch.int32, device=\"cuda\")"
+  },
+  {
+   "path": "halops/attention/decoder_attention.py",
+   "rule": "py-alloc",
+   "code": ">>> q_enc = torch.zeros(batch * seq_len_enc, head_num, head_dim,"
+  },
+  {
+   "path": "halops/attention/decoder_attention.py",
+   "rule": "py-alloc",
+   "code": ">>> k_enc = torch.zeros(batch * seq_len_enc, kv_head_num, head_dim,"
+  },
+  {
+   "path": "halops/attention/decoder_attention.py",
+   "rule": "py-alloc",
+   "code": ">>> seq_len_enc_t2 = torch.zeros(batch, dtype=torch.int32, device=\"cuda\")"
+  },
+  {
+   "path": "halops/attention/decoder_attention.py",
+   "rule": "py-alloc",
+   "code": ">>> attn_out = torch.zeros(batch, head_num * head_dim,"
+  },
+  {
+   "path": "halops/attention/encoder_attention.py",
+   "rule": "py-alloc",
+   "code": ">>> attn_out = torch.empty(seq_len, head_num, head_dim,"
+  },
+  {
+   "path": "halops/attention/get_qk_token.py",
+   "rule": "py-alloc",
+   "code": ">>> cu_seq_k = torch.zeros(batch + 1, dtype=torch.int32, device=\"cuda\")"
+  },
+  {
+   "path": "halops/attention/get_qk_token.py",
+   "rule": "py-alloc",
+   "code": ">>> actual_cu_seq_k = torch.zeros("
+  },
+  {
+   "path": "halops/attention/get_qk_token.py",
+   "rule": "py-alloc",
+   "code": ">>> seq_lens_kv = torch.zeros(max_batch, dtype=torch.int32, device=\"cuda\")"
+  },
+  {
+   "path": "halops/attention/write_cache_kv_decoder.py",
+   "rule": "py-alloc",
+   "code": ">>> seq_len_encoder = torch.zeros(batch, dtype=torch.int32, device=\"cuda\")"
+  },
+  {
+   "path": "halops/attention/write_cache_kv_decoder.py",
+   "rule": "py-alloc",
+   "code": ">>> rotary_embs = torch.zeros(2, max_input_len, head_dim // 2,"
+  },
+  {
+   "path": "halops/attention/write_cache_kv_decoder.py",
+   "rule": "py-alloc",
+   "code": ">>> cache_k = torch.zeros(num_blocks, kv_head_num, block_size, head_dim,"
+  },
+  {
+   "path": "halops/attention/write_cache_kv_encoder.py",
+   "rule": "py-alloc",
+   "code": ">>> rotary_embs = torch.zeros(2, max_seq_len, head_dim // 4,"
+  },
+  {
+   "path": "halops/attention/write_cache_kv_encoder.py",
+   "rule": "py-alloc",
+   "code": ">>> seq_len_decoder = torch.zeros(batch, dtype=torch.int32, device=\"cuda\")"
+  },
+  {
+   "path": "halops/attention/write_cache_kv_encoder.py",
+   "rule": "py-alloc",
+   "code": ">>> cache_k = torch.zeros(num_blocks, kv_head_num, block_size, head_dim,"
+  },
+  {
+   "path": "halops/attention/write_cache_kv_encoder.py",
+   "rule": "py-alloc",
+   "code": ">>> q_out = torch.zeros(total_q, head_num, head_dim,"
+  },
+  {
+   "path": "halops/attention/write_cache_kv_encoder.py",
+   "rule": "py-alloc",
+   "code": ">>> k_out = torch.zeros(total_q, kv_head_num, head_dim,"
+  },
+  {
+   "path": "halops/gemm/batch_gemm.py",
+   "rule": "py-alloc",
+   "code": ">>> out = torch.empty(m, b * n, dtype=torch.bfloat16, device=\"cuda\")"
+  },
+  {
+   "path": "halops/gemm/dense_gemm.py",
+   "rule": "py-alloc",
+   "code": ">>> out = torch.empty(m, n, dtype=torch.bfloat16, device=\"cuda\")"
+  },
+  {
+   "path": "halops/gemm/fused_swiglu_quant.py",
+   "rule": "py-alloc",
+   "code": ">>> token_nums_per_expert = torch.full((e,), m,"
+  },
+  {
+   "path": "halops/gemm/group_contiguous_gemm.py",
+   "rule": "py-alloc",
+   "code": ">>> out = torch.empty(m, n, dtype=torch.bfloat16, device=\"cuda\")"
+  },
+  {
+   "path": "halops/gemm/group_masked_gemm.py",
+   "rule": "py-alloc",
+   "code": ">>> out = torch.empty(m, n, dtype=torch.bfloat16, device=\"cuda\")"
+  },
+  {
+   "path": "halops/gemm/low_latency_mma_gemm.py",
+   "rule": "py-alloc",
+   "code": ">>> out = torch.empty(m, n, dtype=torch.bfloat16, device=\"cuda\")"
+  },
+  {
+   "path": "halops/gemm/prefill_permute_to_masked_gemm.py",
+   "rule": "py-alloc",
+   "code": ">>> scale = torch.zeros(num_tokens, hidden // 128 // 4,"
+  },
+  {
+   "path": "halops/gemm/rms_norm_quant.py",
+   "rule": "py-alloc",
+   "code": ">>> w = torch.ones(1024, dtype=torch.bfloat16, device=\"cuda\")"
+  },
+  {
+   "path": "halops/indexer/__init__.py",
+   "rule": "py-defensive",
+   "code": "raise AttributeError(f\"module {__name__!r} has no attribute {name!r}\")"
+  },
+  {
+   "path": "halops/indexer/mqa_logits_fused_topk.py",
+   "rule": "py-defensive",
+   "code": "raise ValueError(\"q must be packed int8/uint8 MXFP4 or float8_e4m3fn FP8/MXFP8\")"
+  },
+  {
+   "path": "halops/indexer/mqa_logits_fused_topk.py",
+   "rule": "py-defensive",
+   "code": "raise ValueError(\"MXFP4 requires q_sf\")"
+  },
+  {
+   "path": "halops/indexer/mqa_logits_fused_topk.py",
+   "rule": "py-defensive",
+   "code": "raise ValueError(\"Q and KV must use the same quantized dtype and head width\")"
+  },
+  {
+   "path": "halops/indexer/mqa_logits_fused_topk.py",
+   "rule": "py-defensive",
+   "code": "raise ValueError(f\"Unsupported Q/KV dtype: {qkv_dtype}\")"
+  },
+  {
+   "path": "halops/indexer/mqa_logits_fused_topk.py",
+   "rule": "py-alloc",
+   "code": "q = torch.zeros((rows, num_heads, dim), dtype=dtype, device=device)"
+  },
+  {
+   "path": "halops/indexer/mqa_logits_fused_topk.py",
+   "rule": "py-alloc",
+   "code": "k = torch.zeros((kv_rows, dim), dtype=dtype, device=device)"
+  },
+  {
+   "path": "halops/indexer/mqa_logits_fused_topk.py",
+   "rule": "py-alloc",
+   "code": "torch.full((rows, num_heads), 0x7F7F7F7F, dtype=torch.int32, device=device)"
+  },
+  {
+   "path": "halops/indexer/mqa_logits_fused_topk.py",
+   "rule": "py-alloc",
+   "code": "k_scale = torch.full("
+  },
+  {
+   "path": "halops/indexer/mqa_logits_fused_topk.py",
+   "rule": "py-alloc",
+   "code": "weights = torch.ones("
+  },
+  {
+   "path": "halops/indexer/mqa_logits_fused_topk.py",
+   "rule": "py-alloc",
+   "code": "ks = torch.zeros(rows, dtype=torch.int32, device=device)"
+  },
+  {
+   "path": "halops/indexer/mqa_logits_fused_topk.py",
+   "rule": "py-alloc",
+   "code": "ke = torch.full((rows,), kv_rows, dtype=torch.int32, device=device)"
+  },
+  {
+   "path": "halops/indexer/mqa_logits_fused_topk.py",
+   "rule": "py-alloc",
+   "code": "topk_indices = torch.empty((rows, top_k), dtype=torch.int32, device=device)"
+  },
+  {
+   "path": "halops/mla/mla_workspace.py",
+   "rule": "py-alloc",
+   "code": "workspace = torch.empty(total, dtype=torch.uint8, device=wq_a_weight.device)"
+  },
+  {
+   "path": "halops/moe/mega_ll_moe.py",
+   "rule": "py-defensive",
+   "code": "raise ValueError(f\"tp_size must be 1 or 4, got {tp_size}\")"
+  },
+  {
+   "path": "halops/moe/mega_ll_moe.py",
+   "rule": "py-defensive",
+   "code": "raise ValueError(f\"tp_size must be 1 or 4, got {tp_size}\")"
+  },
+  {
+   "path": "halops/moe/mega_ll_moe.py",
+   "rule": "py-alloc",
+   "code": "region = torch.zeros(nbytes, dtype=torch.uint8, device=device)"
+  },
+  {
+   "path": "halops/moe/mega_ll_moe.py",
+   "rule": "py-alloc",
+   "code": "epochs = torch.zeros(1, dtype=torch.int32, device=device)"
+  },
+  {
+   "path": "halops/moe/mega_ll_moe.py",
+   "rule": "py-defensive",
+   "code": "raise RuntimeError(\"the fused tail needs an NVLS multicast-capable region\")"
+  },
+  {
+   "path": "halops/moe/mega_ll_moe.py",
+   "rule": "py-alloc",
+   "code": "epochs = torch.zeros(1, dtype=torch.int32, device=device)"
+  },
+  {
+   "path": "halops/moe/mega_ll_moe.py",
+   "rule": "py-defensive",
+   "code": "raise ValueError("
+  },
+  {
+   "path": "halops/moe/mega_ll_moe_utils.py",
+   "rule": "py-defensive",
+   "code": "raise ValueError(f\"expected rows = 2*N, got rows={rows}\")"
+  },
+  {
+   "path": "halops/moe/mega_ll_moe_utils.py",
+   "rule": "py-defensive",
+   "code": "raise ValueError(f\"N (half of rows) must be a multiple of {gran}; got N={half}\")"
+  },
+  {
+   "path": "halops/moe/mega_ll_moe_utils.py",
+   "rule": "py-defensive",
+   "code": "raise ValueError("
+  },
+  {
+   "path": "halops/moe/mega_ll_moe_utils.py",
+   "rule": "py-defensive",
+   "code": "raise ValueError(f\"num_tokens must be in [1, {_MAX_TOKENS}], got {num_tokens}\")"
+  },
+  {
+   "path": "halops/moe/mega_ll_moe_utils.py",
+   "rule": "py-defensive",
+   "code": "raise ValueError("
+  },
+  {
+   "path": "tests/test_decoder_attention_bf16.py",
+   "rule": "test-tol-literal",
+   "code": "atol = 0.1 if seq_len >= 32768 else 0.05"
+  },
+  {
+   "path": "tests/test_decoder_attention_bf16.py",
+   "rule": "test-tol-literal",
+   "code": "torch.testing.assert_close(kernel_out, ref_out, rtol=0.0, atol=atol)"
+  },
+  {
+   "path": "tests/test_decoder_attention_fp8.py",
+   "rule": "test-tol-literal",
+   "code": "torch.testing.assert_close(out, torch.from_numpy(ref), rtol=0.0, atol=ATOL)"
+  },
+  {
+   "path": "tests/test_dense_gemm.py",
+   "rule": "test-tol-literal",
+   "code": "output.float(), torch.sigmoid(ref.float()), rtol=1e-2, atol=4e-3"
+  },
+  {
+   "path": "tests/test_dense_gemm.py",
+   "rule": "test-tol-literal",
+   "code": "output.float(), torch.sigmoid(ref.float()), rtol=1e-2, atol=8e-3"
+  },
+  {
+   "path": "tests/test_encoder_attention.py",
+   "rule": "test-tol-literal",
+   "code": "rtol=2e-2,"
+  },
+  {
+   "path": "tests/test_encoder_attention.py",
+   "rule": "test-tol-literal",
+   "code": "atol=2e-2,"
+  },
+  {
+   "path": "tests/test_group_wise_quant.py",
+   "rule": "test-tol-literal",
+   "code": "FP8_EXACT_TOL = dict(rtol=0, atol=0)"
+  },
+  {
+   "path": "tests/test_group_wise_quant.py",
+   "rule": "test-tol-literal",
+   "code": "NVFP4_DEQUANT_TOL = dict(rtol=0.01, atol=0.01)"
+  },
+  {
+   "path": "tests/test_latent_moe.py",
+   "rule": "test-seed",
+   "code": "torch.manual_seed(1)"
+  },
+  {
+   "path": "tests/test_latent_moe.py",
+   "rule": "test-seed",
+   "code": "torch.cuda.manual_seed_all(1)"
+  },
+  {
+   "path": "tests/test_mqa_logits_fused.py",
+   "rule": "test-seed",
+   "code": "torch.manual_seed(2026)"
+  },
+  {
+   "path": "tests/test_mqa_logits_fused.py",
+   "rule": "test-seed",
+   "code": "torch.manual_seed(2027)"
+  },
+  {
+   "path": "tests/test_mqa_logits_fused.py",
+   "rule": "test-seed",
+   "code": "torch.manual_seed(2028)"
+  },
+  {
+   "path": "tests/test_write_cache_kv.py",
+   "rule": "test-tol-literal",
+   "code": "SCALE_TOL = dict(rtol=1e-3, atol=1e-6)"
+  },
+  {
+   "path": "tests/test_write_cache_kv.py",
+   "rule": "test-tol-literal",
+   "code": "torch.from_numpy(kernel_k), torch.from_numpy(k_deq), rtol=0.0, atol=atol"
+  },
+  {
+   "path": "tests/test_write_cache_kv.py",
+   "rule": "test-tol-literal",
+   "code": "torch.from_numpy(kernel_v), torch.from_numpy(v_deq), rtol=0.0, atol=atol"
+  },
+  {
+   "path": "tests/test_write_cache_kv.py",
+   "rule": "test-tol-literal",
+   "code": "rtol=0.0,"
+  },
+  {
+   "path": "tests/test_write_cache_kv.py",
+   "rule": "test-tol-literal",
+   "code": "rtol=0.0,"
+  },
+  {
+   "path": "tests/utils/gemm_utils.py",
+   "rule": "test-tol-literal",
+   "code": "W8A8_MXFP8_TOL = dict(rtol=2e-2, atol=2e-3)"
+  },
+  {
+   "path": "tests/utils/gemm_utils.py",
+   "rule": "test-tol-literal",
+   "code": "W4A4_TOL = dict(rtol=5e-2, atol=5e-2)"
+  },
+  {
+   "path": "tests/utils/mla_reference.py",
+   "rule": "test-tol-literal",
+   "code": "torch.testing.assert_close(out, ref, rtol=0, atol=atol)"
+  }
+ ]
+}

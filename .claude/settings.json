@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [{"type": "command", "command": "python3 -I \"$CLAUDE_PROJECT_DIR/tools/agent/hooks.py\" pre"}]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [{"type": "command", "command": "python3 -I \"$CLAUDE_PROJECT_DIR/tools/agent/hooks.py\" post"}]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{"type": "command", "command": "python3 -I \"$CLAUDE_PROJECT_DIR/tools/agent/hooks.py\" stop"}]
+      }
+    ]
+  }
+}
