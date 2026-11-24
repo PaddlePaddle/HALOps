@@ -222,10 +222,10 @@ struct LatentDownProjectionBase {
     }
 
     // Quantize this block's staged latent output into the workspace.
-    __device__ static void quantize_output(Workspace* __restrict__ workspace,
-                                           SharedStorage* __restrict__ smem,
-                                           std::uint32_t batch_size,
-                                           SplitView const& view) {
+    __device__ static void quantize_output(
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem, std::uint32_t batch_size,
+        SplitView const& view) {
         using OutputQuant = typename LatentDownGemm::OutputQuant;
         using Scale = QuantScale<OutputQuant>;
         using Quantizer = RegisterQuantizer<OutputQuant, kTileShapeM>;
@@ -279,8 +279,7 @@ struct LatentDownProjectionBase {
                     }
                     if (lane_idx < Quantizer::kNumGroups) {
                         const std::uint32_t k_group = k_group_base + lane_idx;
-                        workspace->latent_down_out.sf_atom(
-                            k_group)[sf_atom_offset(tok, k_group % 4u)] =
+                        workspace->latent_down_out.scale(tok, k_group) =
                             static_cast<std::uint8_t>(scale_bits >>
                                                       (8u * lane_idx));
                     }
@@ -288,8 +287,8 @@ struct LatentDownProjectionBase {
 #pragma unroll
                     for (std::uint32_t g = 0; g < Quantizer::kNumGroups; ++g) {
                         if (lane_idx == g) {
-                            workspace->latent_down_out.scale_row(
-                                k_group_base + g)[tok] = scales[g];
+                            workspace->latent_down_out.scale(
+                                tok, k_group_base + g) = scales[g];
                         }
                     }
                 }
@@ -298,8 +297,7 @@ struct LatentDownProjectionBase {
                      ++i) {
                     const std::uint32_t row =
                         i * WarpRole::kThreadsPerWarp + lane_idx;
-                    workspace->latent_down_out.cell(
-                        chunk_base + row / kOutChunkK, tok)[row % kOutChunkK] =
+                    workspace->latent_down_out.value(tok, view.row_base + row) =
                         quantized[i];
                 }
             }
@@ -311,7 +309,7 @@ struct LatentDownProjectionBase {
         __syncthreads();
     }
 
-    __device__ static void epilogue(Workspace* __restrict__ workspace,
+    __device__ static void epilogue(Workspace const* __restrict__ workspace,
                                     SharedStorage* __restrict__ smem,
                                     std::uint32_t batch_size,
                                     float const (&acc)[kTokenWindows][4],
@@ -331,8 +329,8 @@ struct LatentDownProjectionBase {
         if (view.split == 0u) {
             quantize_output(workspace, smem, batch_size, view);
             if (threadIdx.x == 0u) {
-                workspace->cta_comm.publish_latent_tasks(smem->launch_parity,
-                                                         1u);
+                workspace->cta_comm->publish_latent_tasks(smem->launch_parity,
+                                                          1u);
             }
         }
         if (runtime.num_latent_splits > 1u) {
@@ -340,7 +338,7 @@ struct LatentDownProjectionBase {
         }
     }
 
-    __device__ static void writeback(Workspace* __restrict__ workspace,
+    __device__ static void writeback(Workspace const* __restrict__ workspace,
                                      SharedStorage* __restrict__ smem,
                                      float const (&acc)[kTokenWindows][4],
                                      SplitView const& view) {
@@ -387,7 +385,7 @@ struct LatentDownProjectionBase {
     }
 
     // Split 0 reduces peer outputs and quantizes output.
-    __device__ static void join_split_k(Workspace* __restrict__ workspace,
+    __device__ static void join_split_k(Workspace const* __restrict__ workspace,
                                         SharedStorage* __restrict__ smem,
                                         SplitView const& view,
                                         MoERuntime const& runtime) {
@@ -504,9 +502,9 @@ struct LatentDownProjection<KernelTraits, true>
         CUtensorMap const& tma_input_desc,
         const typename LatentDownGemm::
             ElementScale* __restrict__ latent_down_weight_scale,
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        ScaleLayout latent_scale_layout, MoEProblemSize const& problem_size,
-        MoERuntime const& runtime) {
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem, ScaleLayout latent_scale_layout,
+        MoEProblemSize const& problem_size, MoERuntime const& runtime) {
         if (!runtime.is_latent_cta()) return;
 
         const std::uint32_t batch_size = problem_size.num_tokens;
@@ -673,7 +671,8 @@ struct LatentDownProjection<KernelTraits, false>
         CUtensorMap const& tma_input_desc,
         const typename LatentDownGemm::
             ElementScale* __restrict__ latent_down_weight_scale,
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem,
         [[maybe_unused]] ScaleLayout latent_scale_layout,
         MoEProblemSize const& problem_size, MoERuntime const& runtime) {
         if (!runtime.is_latent_cta()) return;

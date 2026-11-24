@@ -77,9 +77,9 @@ load_logits_one_token(const MoEWorkspace<Dims>* __restrict__ workspace,
     const std::uint32_t lane_base =
         WarpRole::get_lane_idx() * kExpertsPerThread;
 
-    if constexpr (MoEWorkspace<Dims>::kRouterStoreScores) {
+    if constexpr (RouterGemm::kStoreScores) {
         const float4* src = reinterpret_cast<const float4*>(
-            workspace->router_logits.row(gate, token_idx) + lane_base);
+            &workspace->router_logits(gate, token_idx, lane_base));
 #pragma unroll
         for (std::uint32_t v = 0; v < kExpertsPerThread / 4u; ++v) {
             const float4 raw = src[v];
@@ -90,7 +90,7 @@ load_logits_one_token(const MoEWorkspace<Dims>* __restrict__ workspace,
         }
     } else {
         const uint4* src = reinterpret_cast<const uint4*>(
-            workspace->router_logits.row(gate, token_idx) + lane_base);
+            &workspace->router_logits(gate, token_idx, lane_base));
 #pragma unroll
         for (std::uint32_t v = 0; v < kExpertsPerThread / 8u; ++v) {
             const uint4 raw = src[v];
@@ -581,52 +581,33 @@ __device__ static void topk_one_token(
     const cutlass::Array<float, kExpertsPerThread> logits =
         load_logits_one_token<Dims, kExpertsPerThread>(workspace, 0u,
                                                        token_idx);
+    float scores[kExpertsPerThread];
+    uint32_t expert_id[kExpertsPerThread];
+    fp32_candidates<kExpertsPerThread>(lane_idx, logits, scores, expert_id);
+    if (scoring_func == ScoringFunc::kSoftmax) {
+        warp_softmax_inplace<kExpertsPerThread>(scores);
+    }
     if (num_router_gates > 1u) {
-        // DualRouter: select on the sum of the two gates' scores.
-        const cutlass::Array<float, kExpertsPerThread> other =
-            load_logits_one_token<Dims, kExpertsPerThread>(workspace, 1u,
-                                                           token_idx);
-        float hi[kExpertsPerThread];
-        float lo[kExpertsPerThread];
-        uint32_t expert_id[kExpertsPerThread];
-        fp32_candidates<kExpertsPerThread>(lane_idx, logits, hi, expert_id);
-        fp32_candidates<kExpertsPerThread>(lane_idx, other, lo, expert_id);
+        const auto other = load_logits_one_token<Dims, kExpertsPerThread>(
+            workspace, 1u, token_idx);
+        float second[kExpertsPerThread];
+        fp32_candidates<kExpertsPerThread>(lane_idx, other, second, expert_id);
         if (scoring_func == ScoringFunc::kSoftmax) {
-            // Each gate's row is normalized on its own, then the scores add.
-            warp_softmax_inplace<kExpertsPerThread>(hi);
-            warp_softmax_inplace<kExpertsPerThread>(lo);
+            warp_softmax_inplace<kExpertsPerThread>(second);
         }
-        // Sigmoid scores were applied where the rows were published.
 #pragma unroll
         for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
-            hi[i] += lo[i];
+            scores[i] += second[i];
         }
-
-        float choice[kExpertsPerThread];
+    }
+    float choice[kExpertsPerThread];
 #pragma unroll
-        for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
-            choice[i] = hi[i] + correction_bias[i];
-        }
-        topk_weights_from_scores_fp32<kExpertsPerThread, kMaxTopk>(
-            token_idx, top_k, renormalize, per_expert_scale, choice, hi,
-            smem->routing_scratch.topk_ids, smem->routing_scratch.topk_weights);
-        return;
+    for (uint32_t i = 0; i < kExpertsPerThread; ++i) {
+        choice[i] = scores[i] + correction_bias[i];
     }
-
-    if (scoring_func == ScoringFunc::kSoftmax && !renormalize) {
-        float scores[kExpertsPerThread];
-        uint32_t expert_id[kExpertsPerThread];
-        fp32_candidates<kExpertsPerThread>(lane_idx, logits, scores, expert_id);
-        topk_weights_from_softmax_probs<kExpertsPerThread, kMaxTopk>(
-            token_idx, top_k, scores, expert_id, smem->routing_scratch.topk_ids,
-            smem->routing_scratch.topk_weights);
-    } else {
-        uint32_t packed_scores[kExpertsPerThread];
-        packed_candidates<kExpertsPerThread>(lane_idx, logits, packed_scores);
-        topk_weights_from_logits<kExpertsPerThread, kMaxTopk>(
-            token_idx, top_k, scoring_func, renormalize, packed_scores,
-            smem->routing_scratch.topk_ids, smem->routing_scratch.topk_weights);
-    }
+    topk_weights_from_scores_fp32<kExpertsPerThread, kMaxTopk>(
+        token_idx, top_k, renormalize, per_expert_scale, choice, scores,
+        smem->routing_scratch.topk_ids, smem->routing_scratch.topk_weights);
 }
 
 }  // namespace halops::moe

@@ -85,7 +85,7 @@ struct CollectiveMainloopMoE {
         std::uint8_t* tail_mc_base;
         std::uint32_t* tail_epochs;
         DataType::ElementOut* tail_out;
-        void* workspace;
+        Workspace workspace;
         std::uint32_t top_k;
         std::uint32_t tail_rank;
         ScoringFunc scoring_func;
@@ -132,9 +132,8 @@ struct CollectiveMainloopMoE {
         std::uint8_t* tail_uc_base[TailGeometryT<Dims>::kWorld];
         std::uint8_t* tail_mc_base;
         std::uint32_t* tail_epochs;
-        DataType::ElementOut* __restrict__ shared_out;
         DataType::ElementOut* tail_out;
-        void* __restrict__ scratchpad;
+        Workspace workspace;
         std::uint32_t top_k;
         ScoringFunc scoring_func;
         bool renormalize;
@@ -181,12 +180,8 @@ struct CollectiveMainloopMoE {
         params.tail_fc2_w8 = args.tail_fc2_w8;
         params.tail_fc2_scale = args.tail_fc2_scale;
         params.tail_norm_weight = args.tail_norm_weight;
-        // The shared expert's partial output lives in the workspace.
-        params.shared_out = reinterpret_cast<DataType::ElementOut*>(
-            static_cast<char*>(args.workspace) +
-            offsetof(Workspace, shared_down_out));
+        params.workspace = args.workspace;
         params.tail_out = args.tail_out;
-        params.scratchpad = args.workspace;
         for (int r = 0; r < TailGeometryT<Dims>::kWorld; ++r) {
             params.tail_uc_base[r] = args.tail_uc_base[r];
         }
@@ -307,15 +302,13 @@ struct CollectiveMainloopMoE {
                     {128u, 1u, DownGemm::ScaleTraits::kNumSfaAtoms}, false);
             }
         }
-        std::uint64_t down_x_shape[2] = {problem.intermediate_size,
-                                         Workspace::kMaxRoutedRows};
-        params.tma_down_activations_desc = CreateTmaDesc<2>(
-            "routed_down input",
-            reinterpret_cast<const DataType::ElementQA*>(
-                static_cast<const char*>(args.workspace) +
-                Workspace::kUpOutFp8Offset),
-            down_x_shape, {std::uint64_t{problem.intermediate_size}},
-            {128u, problem.num_tokens});
+        const auto& routed_up_out = args.workspace.routed_up_out.values;
+        params.tma_down_activations_desc =
+            CreateTmaDesc<2>("routed_down input", routed_up_out.data,
+                             {routed_up_out.shape[1], routed_up_out.shape[0]},
+                             {std::uint64_t{routed_up_out.shape[1]} *
+                              sizeof(*routed_up_out.data)},
+                             {128u, problem.num_tokens});
 
         using SharedUp = typename Traits::SharedUpGemm;
         constexpr std::uint64_t kSharedUpElemBytes =
@@ -393,7 +386,7 @@ struct CollectiveMainloopMoE {
         if (params.problem_size.use_latent) {
             Latent::run(params.tma_latent_down_weight_desc,
                         params.tma_input_desc, params.latent_down_weight_scale,
-                        reinterpret_cast<Workspace*>(params.scratchpad), smem,
+                        &params.workspace, smem,
                         params.layouts.latent_down_scale, params.problem_size,
                         params.runtime);
         }
@@ -408,29 +401,27 @@ struct CollectiveMainloopMoE {
 
         if (!params.runtime.is_shared_cta()) return;
 
-        auto* workspace = reinterpret_cast<Workspace*>(params.scratchpad);
+        auto* workspace = &params.workspace;
         Up::run(params.tma_shared_up_desc, params.tma_input_desc,
                 params.shared_up_scale, workspace, smem, params.problem_size,
                 params.activation, params.situ_beta, params.situ_linear_beta,
                 params.runtime);
         Down::run(params.tma_shared_down_desc,
                   params.tma_shared_down_scale_desc, params.shared_down_scale,
-                  params.shared_out, workspace, smem,
-                  params.layouts.shared_down_scale, params.problem_size,
-                  params.runtime);
+                  workspace, smem, params.layouts.shared_down_scale,
+                  params.problem_size, params.runtime);
         __syncthreads();
         if (threadIdx.x == 0u) {
             __threadfence();
-            workspace->cta_comm.publish_shared_down_done(smem->launch_parity,
-                                                         1u);
+            workspace->cta_comm->publish_shared_down_tasks(smem->launch_parity,
+                                                           1u);
         }
     }
 
     // Compute router logits and build routing tables.
-    __device__ static void run_router_topk(Params const& params,
-                                           Workspace* __restrict__ workspace,
-                                           SharedStorage* __restrict__ smem,
-                                           std::uint32_t lane_idx) {
+    __device__ static void run_router_topk(
+        Params const& params, Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem, std::uint32_t lane_idx) {
         constexpr std::uint32_t kExpertsPerThread = Dims::kNumExperts / 32u;
 
         // Use one warp per token; cluster pairs divide wider token batches.
@@ -440,7 +431,7 @@ struct CollectiveMainloopMoE {
         const auto correction_bias =
             load_correction_bias<kExpertsPerThread>(params.correction_bias);
         if (threadIdx.x == 0u) {
-            workspace->cta_comm.wait_router_tasks(
+            workspace->cta_comm->wait_router_tasks(
                 smem->launch_parity, params.runtime.num_router_ctas *
                                          params.runtime.num_router_gates);
         }
@@ -512,8 +503,7 @@ struct CollectiveMainloopMoE {
 
     __device__ void run_router(Params const& params,
                                SharedStorage* __restrict__ smem) {
-        Workspace* __restrict__ workspace =
-            reinterpret_cast<Workspace*>(params.scratchpad);
+        Workspace const* __restrict__ workspace = &params.workspace;
         if (params.runtime.is_router_cta()) {
             Router::run(params.tma_router_weights_desc,
                         params.tma_router_input_desc, workspace, smem,
@@ -542,15 +532,15 @@ struct CollectiveMainloopMoE {
 
     // CTA 0 publishes routing tables in lane-strided word slices.
     __device__ static __forceinline__ void publish_routing_tables(
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t lane_idx) {
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem, std::uint32_t lane_idx) {
         constexpr std::uint32_t kPerLane =
             (kRoutingTableWords + WarpRole::kThreadsPerWarp - 1u) /
             WarpRole::kThreadsPerWarp;
         const std::uint32_t* src =
             reinterpret_cast<const std::uint32_t*>(&smem->routing);
         std::uint32_t* dst =
-            reinterpret_cast<std::uint32_t*>(&workspace->router_tables);
+            reinterpret_cast<std::uint32_t*>(workspace->router_tables);
         // Every lane's build stores land before the copy reads them.
         __syncwarp();
         std::uint32_t words[kPerLane];
@@ -564,8 +554,8 @@ struct CollectiveMainloopMoE {
             const std::uint32_t i = lane_idx + j * WarpRole::kThreadsPerWarp;
             if (i < kRoutingTableWords) dst[i] = words[j];
         }
-        workspace->cta_comm.publish_router_table_slice(smem->launch_parity,
-                                                       lane_idx);
+        workspace->cta_comm->publish_router_table_slice(smem->launch_parity,
+                                                        lane_idx);
     }
 
     // Each lane acquires and copies its routing-table slice before storing it.
@@ -575,10 +565,10 @@ struct CollectiveMainloopMoE {
         constexpr std::uint32_t kPerLane =
             (kRoutingTableWords + WarpRole::kThreadsPerWarp - 1u) /
             WarpRole::kThreadsPerWarp;
-        workspace->cta_comm.wait_router_table_slice(smem->launch_parity,
-                                                    lane_idx);
+        workspace->cta_comm->wait_router_table_slice(smem->launch_parity,
+                                                     lane_idx);
         const std::uint32_t* src =
-            reinterpret_cast<const std::uint32_t*>(&workspace->router_tables);
+            reinterpret_cast<const std::uint32_t*>(workspace->router_tables);
         std::uint32_t* dst = reinterpret_cast<std::uint32_t*>(&smem->routing);
         std::uint32_t words[kPerLane];
 #pragma unroll
@@ -598,11 +588,10 @@ struct CollectiveMainloopMoE {
     __device__ void run_up(Params const& params,
                            SharedStorage* __restrict__ smem,
                            TaskScheduler<KernelTraits>& sched) {
-        Workspace* __restrict__ workspace =
-            reinterpret_cast<Workspace*>(params.scratchpad);
+        Workspace const* __restrict__ workspace = &params.workspace;
         if (WarpRole::is_other_loader_thread()) {
             if (params.problem_size.use_latent) {
-                workspace->cta_comm.wait_latent_tasks(
+                workspace->cta_comm->wait_latent_tasks(
                     smem->launch_parity,
                     params.problem_size.latent_size /
                         Traits::LatentDownGemm::kTileShapeM);
@@ -623,8 +612,7 @@ struct CollectiveMainloopMoE {
                              SharedStorage* __restrict__ smem,
                              TaskScheduler<KernelTraits>& sched) {
         RoutedDownProjection<KernelTraits>::run(
-            params.expert_scales_down,
-            reinterpret_cast<Workspace*>(params.scratchpad), smem,
+            params.expert_scales_down, &params.workspace, smem,
             params.layouts.routed_down_scale, params.tma_down_weights_desc,
             params.tma_down_scale_desc, params.tma_down_activations_desc, sched,
             params.problem_size,
@@ -650,8 +638,7 @@ struct CollectiveMainloopMoE {
     // Initialize barriers, TMEM, descriptor cache and launch parity.
     __device__ void initialize(Params const& params,
                                SharedStorage* __restrict__ smem) {
-        Workspace* __restrict__ workspace =
-            reinterpret_cast<Workspace*>(params.scratchpad);
+        Workspace const* __restrict__ workspace = &params.workspace;
         const std::uint32_t warp_idx = WarpRole::get_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
 
@@ -691,7 +678,7 @@ struct CollectiveMainloopMoE {
                                                smem, params.problem_size);
         }
         if (warp_idx == 3 && lane_idx == 0) {
-            smem->launch_parity = workspace->cta_comm.claim_parity();
+            smem->launch_parity = workspace->cta_comm->claim_parity();
             smem->down_tasks_claimed = 0u;
             smem->down_task_stores = 0u;
         }
@@ -703,7 +690,7 @@ struct CollectiveMainloopMoE {
             for (std::uint32_t rank = lane_idx;
                  rank < Workspace::kMaxRoutedRows;
                  rank += WarpRole::kThreadsPerWarp) {
-                workspace->cta_comm.reset_inactive(launch_parity, rank);
+                workspace->cta_comm->reset_inactive(launch_parity, rank);
             }
         }
     }
@@ -712,8 +699,7 @@ struct CollectiveMainloopMoE {
     __device__ void combine(Params const& params,
                             SharedStorage* __restrict__ smem,
                             CtaGroup const& cta_group) {
-        Workspace* __restrict__ workspace =
-            reinterpret_cast<Workspace*>(params.scratchpad);
+        Workspace const* __restrict__ workspace = &params.workspace;
         const std::uint32_t batch_size = params.problem_size.num_tokens;
         constexpr std::uint32_t kDownOutputColsPerCta =
             Traits::RoutedDownGemm::MmaCore::kTileShapeM;
@@ -734,7 +720,7 @@ struct CollectiveMainloopMoE {
         for (std::uint32_t flat = first_cell; flat < num_cells;
              flat += cell_stride) {
             const std::uint32_t tok = flat / kDownOutputColsPerCta;
-            workspace->cta_comm.wait_down_out_field(
+            workspace->cta_comm->wait_down_out_field(
                 smem->launch_parity, m_block,
                 tok * PackedTokenCounts<Dims>::kBits,
                 PackedTokenCounts<Dims>::kMask, top_k);
@@ -752,19 +738,18 @@ struct CollectiveMainloopMoE {
     __device__ void run_tail(Params const& params,
                              SharedStorage* __restrict__ smem,
                              CtaGroup const& cta_group) {
-        Tail::run(params, reinterpret_cast<Workspace*>(params.scratchpad), smem,
-                  cta_group);
+        Tail::run(params, &params.workspace, smem, cta_group);
     }
 
     // Sum a token's top-k output slots in rank order using FP32.
     __device__ static __forceinline__ float gather_value(
-        Workspace* __restrict__ workspace, std::uint32_t tok, std::uint32_t col,
-        std::uint32_t top_k) {
+        Workspace const* __restrict__ workspace, std::uint32_t tok,
+        std::uint32_t col, std::uint32_t top_k) {
         DataType::ElementOut slot_v[Dims::kMaxTopk];
 #pragma unroll
         for (std::uint32_t k = 0; k < Dims::kMaxTopk; ++k) {
             slot_v[k] =
-                workspace->routed_down_out.row(tok * Dims::kMaxTopk + k)[col];
+                workspace->routed_down_out(tok * Dims::kMaxTopk + k, col);
         }
         float v = 0.f;
 #pragma unroll
@@ -774,12 +759,10 @@ struct CollectiveMainloopMoE {
         return v;
     }
 
-    __device__ __forceinline__ void emit_cell(Params const& params,
-                                              Workspace* __restrict__ workspace,
-                                              std::uint32_t tok,
-                                              std::uint32_t col,
-                                              std::uint32_t top_k,
-                                              std::uint32_t tail_parity) {
+    __device__ __forceinline__ void emit_cell(
+        Params const& params, Workspace const* __restrict__ workspace,
+        std::uint32_t tok, std::uint32_t col, std::uint32_t top_k,
+        std::uint32_t tail_parity) {
         const DataType::ElementOut b = static_cast<DataType::ElementOut>(
             gather_value(workspace, tok, col, top_k));
         Tail::push_cell(params, tok, col, b, tail_parity);

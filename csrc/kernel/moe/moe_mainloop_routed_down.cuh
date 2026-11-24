@@ -49,6 +49,12 @@ struct RoutedDownProjectionBase
     using typename Base::Workspace;
     using RoutingTables = MoERoutingTables<Dims>;
 
+    __device__ static std::uint32_t up_ready_mask(std::uint32_t down_k_tiles) {
+        constexpr auto up_width = Traits::RoutedUpGemm::kTileShapeM / 2u;
+        const auto bits = down_k_tiles * (DownGemm::kTileShapeK / up_width);
+        return bits >= 32u ? UINT32_MAX : (1u << bits) - 1u;
+    }
+
     __device__ static constexpr std::uint32_t down_act_tx_bytes(
         std::uint32_t gemm_n) {
         return DownGemm::kTileShapeK * gemm_n *
@@ -93,7 +99,7 @@ struct RoutedDownProjectionBase
     // Publisher lane 0 fences each task's stores and increments its completion
     // count.
     __device__ static void publish_down_tasks(
-        MoEWorkspace<Dims>* __restrict__ workspace,
+        MoEWorkspace<Dims> const* __restrict__ workspace,
         MoESharedStorage<Dims>* __restrict__ smem,
         TaskScheduler<Traits>& sched) {
         TaskInfo task;
@@ -103,13 +109,13 @@ struct RoutedDownProjectionBase
             while (shared_load_acquire_u32(&smem->down_task_stores) <
                    WarpRole::kCalcWarpCount * (task.task_id + 1u)) {
             }
-            workspace->cta_comm.publish_down_task(smem->launch_parity,
-                                                  task.m_block_idx, done_inc);
+            workspace->cta_comm->publish_down_task(smem->launch_parity,
+                                                   task.m_block_idx, done_inc);
         }
     }
 
     // Store each routed row in its combine slot, then notify the publisher.
-    __device__ static void epilogue(Workspace* __restrict__ workspace,
+    __device__ static void epilogue(Workspace const* __restrict__ workspace,
                                     SharedStorage* __restrict__ smem,
                                     const Accumulator& acc_out,
                                     std::uint32_t base_m,
@@ -124,7 +130,7 @@ struct RoutedDownProjectionBase
             if (j >= routed_count) break;
             const std::uint32_t slot =
                 smem->routing.expert_row_slot[expert_start + j];
-            workspace->routed_down_out.row(slot)[out_col] =
+            workspace->routed_down_out(slot, out_col) =
                 static_cast<DataType::ElementOut>(acc_out[j]);
         }
         __syncwarp();
@@ -209,8 +215,9 @@ struct RoutedDownProjection<KernelTraits, true>
     // Run down-projection over this block's dynamically claimed tasks.
     __device__ static void run(
         const typename DownGemm::ElementScale* __restrict__ expert_scales_down,
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        ScaleLayout down_scale_layout, CUtensorMap const& tma_down_weights_desc,
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem, ScaleLayout down_scale_layout,
+        CUtensorMap const& tma_down_weights_desc,
         CUtensorMap const& tma_down_scale_desc,
         CUtensorMap const& tma_down_activations_desc,
         TaskScheduler<Traits>& sched, MoEProblemSize const& problem_size,
@@ -319,15 +326,16 @@ struct RoutedDownProjection<KernelTraits, true>
 
     // Acquire up's output, then stream activation tiles and their scales.
     __device__ static void run_load_input_k_loop(
-        SharedStorage* __restrict__ smem, Workspace* __restrict__ workspace,
+        SharedStorage* __restrict__ smem,
+        Workspace const* __restrict__ workspace,
         const CUtensorMap& tma_down_activations_desc, std::uint32_t local_id,
         std::uint32_t expert_id, std::uint32_t expert_start,
         std::uint32_t routed_count, std::uint32_t gemm_n,
         std::uint32_t num_k_tiles) {
         const unsigned lane_idx = WarpRole::get_lane_idx();
-        workspace->cta_comm.wait_up_out(smem->launch_parity, expert_start,
-                                        routed_count,
-                                        Workspace::kUpOutReadyFull);
+        workspace->cta_comm->wait_up_out(smem->launch_parity, expert_start,
+                                         routed_count,
+                                         Base::up_ready_mask(num_k_tiles));
         // Order cross-CTA stores before TMA reads.
         if (lane_idx == 0u) {
             fence_proxy_async_global();
@@ -441,9 +449,10 @@ struct RoutedDownProjection<KernelTraits, true>
 
     // One lane per token loads its scale word and writes it in SfAtom layout.
     __device__ static void load_input_scale_tile(
-        SharedStorage* __restrict__ smem, Workspace* __restrict__ workspace,
-        std::uint32_t expert_start, std::uint32_t routed_count,
-        std::uint32_t step_local, std::uint32_t k_iter_id) {
+        SharedStorage* __restrict__ smem,
+        Workspace const* __restrict__ workspace, std::uint32_t expert_start,
+        std::uint32_t routed_count, std::uint32_t step_local,
+        std::uint32_t k_iter_id) {
         if (routed_count == 0u) return;
         constexpr std::uint32_t kGroups = DownGemm::kTileShapeK / 32u;
         static_assert(
@@ -452,11 +461,11 @@ struct RoutedDownProjection<KernelTraits, true>
         const std::uint32_t row = WarpRole::get_lane_idx();
         if (row < DownGemm::kTileShapeN) {
             const std::uint32_t word =
-                row < routed_count ? *reinterpret_cast<const std::uint32_t*>(
-                                         workspace->routed_up_out.mx_scale_row(
-                                             expert_start + row) +
-                                         k_iter_id * kGroups)
-                                   : 0u;
+                row < routed_count
+                    ? *reinterpret_cast<const std::uint32_t*>(
+                          &workspace->routed_up_out.scales(expert_start + row,
+                                                           k_iter_id * kGroups))
+                    : 0u;
             const std::uint32_t slot = step_local % Base::kNumSlots;
             std::uint8_t* const sf = smem->routed_experts.act_down_scale[slot];
             *reinterpret_cast<std::uint32_t*>(sf + sf_atom_offset(row, 0u)) =
@@ -541,7 +550,8 @@ struct RoutedDownProjection<KernelTraits, false>
     // Run down-projection over this block's dynamically claimed tasks.
     __device__ static void run(
         const typename DownGemm::ElementScale* __restrict__ expert_scales_down,
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem,
         [[maybe_unused]] ScaleLayout down_scale_layout,
         CUtensorMap const& tma_down_weights_desc,
         CUtensorMap const& tma_down_scale_desc,
@@ -689,15 +699,16 @@ struct RoutedDownProjection<KernelTraits, false>
 
     // Acquire up's output, then stage each tile's scales and activation tile.
     __device__ static void run_load_input_k_loop(
-        SharedStorage* __restrict__ smem, Workspace* __restrict__ workspace,
+        SharedStorage* __restrict__ smem,
+        Workspace const* __restrict__ workspace,
         const CUtensorMap& tma_down_activations_desc, std::uint32_t id_base,
         std::uint32_t local_id, std::uint32_t expert_start,
         std::uint32_t routed_count, std::uint32_t gemm_n,
         std::uint32_t num_k_tiles) {
         const unsigned lane_idx = WarpRole::get_lane_idx();
-        workspace->cta_comm.wait_up_out(smem->launch_parity, expert_start,
-                                        routed_count,
-                                        Workspace::kUpOutReadyFull);
+        workspace->cta_comm->wait_up_out(smem->launch_parity, expert_start,
+                                         routed_count,
+                                         Base::up_ready_mask(num_k_tiles));
         // Order cross-CTA stores before TMA reads.
         if (lane_idx == 0u) {
             fence_proxy_async_global();
@@ -773,9 +784,10 @@ struct RoutedDownProjection<KernelTraits, false>
 
     // One lane per (row, K block) stages the tile's activation scale rows.
     __device__ static void load_input_scale_tile(
-        SharedStorage* __restrict__ smem, Workspace* __restrict__ workspace,
-        std::uint32_t expert_start, std::uint32_t routed_count,
-        std::uint32_t step_local, std::uint32_t nb) {
+        SharedStorage* __restrict__ smem,
+        Workspace const* __restrict__ workspace, std::uint32_t expert_start,
+        std::uint32_t routed_count, std::uint32_t step_local,
+        std::uint32_t nb) {
         if (routed_count == 0u) return;
         const std::uint32_t lane = WarpRole::get_lane_idx();
         const std::uint32_t row = lane % DownGemm::kTileShapeN;
@@ -785,9 +797,8 @@ struct RoutedDownProjection<KernelTraits, false>
             const std::uint32_t block = nb * kBlocksPerTile + sub;
             float scale = 0.f;
             if (row < routed_count) {
-                const float* const rows =
-                    workspace->routed_up_out.scale_row(expert_start + row);
-                scale = rows[block];
+                scale =
+                    workspace->routed_up_out.scales(expert_start + row, block);
             }
             smem->routed_experts.act_down_scale[slot][sub][row] = scale;
         }

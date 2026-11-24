@@ -197,12 +197,8 @@ struct RouterProjectionBase {
         }
     }
 
-    // A score when a two-gate router publishes scores, else the bf16 logit.
-    static constexpr bool kStoreScores =
-        decltype(std::declval<Workspace>().router_logits)::kStoreScores;
-
     __device__ static float to_stored(float logit, ScoringFunc scoring) {
-        if constexpr (kStoreScores) {
+        if constexpr (RouterGemm::kStoreScores) {
             if (scoring == ScoringFunc::kSigmoid) {
                 return 1.0f / (1.0f + __expf(-logit));
             }
@@ -210,19 +206,21 @@ struct RouterProjectionBase {
         return logit;
     }
 
-    __device__ static void store_logits(Workspace* __restrict__ workspace,
+    __device__ static void store_logits(Workspace const* __restrict__ workspace,
                                         std::uint32_t col,
                                         const float* __restrict__ v,
-                                        ScoringFunc scoring) {
+                                        ScoringFunc scoring,
+                                        MoEProblemSize const& problem_size) {
         const std::uint32_t t0 = token_begin();
         const std::uint32_t gate = router_gate();
 #pragma unroll
         for (std::uint32_t t = 0; t < RouterGemm::kTileShapeN; ++t) {
+            if (t0 + t >= problem_size.num_tokens) break;
             const float stored = to_stored(v[t], scoring);
-            if constexpr (kStoreScores) {
-                workspace->router_logits.row(gate, t0 + t)[col] = stored;
+            if constexpr (RouterGemm::kStoreScores) {
+                workspace->router_logits(gate, t0 + t, col) = stored;
             } else {
-                workspace->router_logits.row(gate, t0 + t)[col] =
+                workspace->router_logits(gate, t0 + t, col) =
                     __float2bfloat16_rn(stored);
             }
         }
@@ -255,7 +253,7 @@ struct RouterProjection<KernelTraits, true>
     // Every thread of the block: the loader streams, the issuer consumes.
     __device__ static void run(CUtensorMap const& tma_router_weights_desc,
                                CUtensorMap const& tma_input_desc,
-                               Workspace* __restrict__ workspace,
+                               Workspace const* __restrict__ workspace,
                                SharedStorage* __restrict__ smem,
                                ScoringFunc scoring,
                                MoEProblemSize const& problem_size) {
@@ -280,7 +278,7 @@ struct RouterProjection<KernelTraits, true>
         // The calc warps read their accumulators back and publish the logits.
         if (WarpRole::is_calc_warp(warp_idx)) {
             store_and_publish_logits(workspace, smem, Base::router_tile(),
-                                     scoring);
+                                     scoring, problem_size);
         }
     }
 
@@ -330,8 +328,9 @@ struct RouterProjection<KernelTraits, true>
 
     // Reads this block's M tile back, stores its logits and publishes them.
     __device__ static void store_and_publish_logits(
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t tile, ScoringFunc scoring) {
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem, std::uint32_t tile,
+        ScoringFunc scoring, MoEProblemSize const& problem_size) {
         static_assert(RouterGemm::kTileShapeN % 8u == 0u,
                       "the token columns are whole 8-wide TMEM reads");
         static_assert(kTileShapeM <= 128u,
@@ -351,7 +350,7 @@ struct RouterProjection<KernelTraits, true>
             if (lane_idx < kRowsPerRead && row_base + lane_idx < kTileShapeM) {
                 store_logits(workspace,
                              tile * kTileShapeM + row_base + lane_idx, v,
-                             scoring);
+                             scoring, problem_size);
             }
         }
         // The up phase's UMMAs reuse the columns once every warp is done.
@@ -359,7 +358,7 @@ struct RouterProjection<KernelTraits, true>
         WarpRole::sync_calc_threads();
         tcgen05_fence_after_thread_sync();
         if (warp_idx == 0u && lane_idx == 0u) {
-            workspace->cta_comm.publish_router_tasks(smem->launch_parity, 1u);
+            workspace->cta_comm->publish_router_tasks(smem->launch_parity, 1u);
         }
     }
 
@@ -394,7 +393,7 @@ struct RouterProjection<KernelTraits, false>
     // Every thread of the block: the loader streams, the calc warps consume.
     __device__ static void run(CUtensorMap const& tma_router_weights_desc,
                                CUtensorMap const& tma_input_desc,
-                               Workspace* __restrict__ workspace,
+                               Workspace const* __restrict__ workspace,
                                SharedStorage* __restrict__ smem,
                                ScoringFunc scoring,
                                MoEProblemSize const& problem_size) {
@@ -417,7 +416,7 @@ struct RouterProjection<KernelTraits, false>
 
             // The calc warps read their partials back and publish the logits.
             store_and_publish_logits(workspace, smem, Base::router_tile(),
-                                     scoring);
+                                     scoring, problem_size);
         }
     }
 
@@ -473,8 +472,9 @@ struct RouterProjection<KernelTraits, false>
 
     // Reads this block's M tile back, stores its logits and publishes them.
     __device__ static void store_and_publish_logits(
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t tile, ScoringFunc scoring) {
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem, std::uint32_t tile,
+        ScoringFunc scoring, MoEProblemSize const& problem_size) {
         // One thread per (token, 4 experts), summing the warps in order.
         WarpRole::sync_calc_threads();
         constexpr std::uint32_t kTokens = RouterGemm::kTileShapeN;
@@ -485,7 +485,8 @@ struct RouterProjection<KernelTraits, false>
                       "cell");
         const std::uint32_t tok = threadIdx.x / kQuads % kTokens;
         const std::uint32_t q = threadIdx.x % kQuads;
-        if (threadIdx.x < kTokens * kQuads) {
+        if (threadIdx.x < kTokens * kQuads &&
+            Base::token_begin() + tok < problem_size.num_tokens) {
             float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
             for (std::uint32_t w = 0; w < WarpRole::kCalcWarpCount; ++w) {
@@ -496,11 +497,10 @@ struct RouterProjection<KernelTraits, false>
                 sum.z += p.z;
                 sum.w += p.w;
             }
-            if constexpr (Base::kStoreScores) {
-                *reinterpret_cast<float4*>(
-                    workspace->router_logits.row(Base::router_gate(),
-                                                 Base::token_begin() + tok) +
-                    tile * kTileShapeM + 4u * q) =
+            if constexpr (RouterGemm::kStoreScores) {
+                *reinterpret_cast<float4*>(&workspace->router_logits(
+                    Base::router_gate(), Base::token_begin() + tok,
+                    tile * kTileShapeM + 4u * q)) =
                     make_float4(Base::to_stored(sum.x, scoring),
                                 Base::to_stored(sum.y, scoring),
                                 Base::to_stored(sum.z, scoring),
@@ -508,10 +508,9 @@ struct RouterProjection<KernelTraits, false>
             } else {
                 const __nv_bfloat162 lo = __floats2bfloat162_rn(sum.x, sum.y);
                 const __nv_bfloat162 hi = __floats2bfloat162_rn(sum.z, sum.w);
-                *reinterpret_cast<uint2*>(
-                    workspace->router_logits.row(Base::router_gate(),
-                                                 Base::token_begin() + tok) +
-                    tile * kTileShapeM + 4u * q) =
+                *reinterpret_cast<uint2*>(&workspace->router_logits(
+                    Base::router_gate(), Base::token_begin() + tok,
+                    tile * kTileShapeM + 4u * q)) =
                     make_uint2(*reinterpret_cast<const std::uint32_t*>(&lo),
                                *reinterpret_cast<const std::uint32_t*>(&hi));
             }
@@ -519,7 +518,7 @@ struct RouterProjection<KernelTraits, false>
         // Join the writers, then count the block's tiles in.
         WarpRole::sync_calc_threads();
         if (threadIdx.x == 0u) {
-            workspace->cta_comm.publish_router_tasks(smem->launch_parity, 1u);
+            workspace->cta_comm->publish_router_tasks(smem->launch_parity, 1u);
         }
     }
 

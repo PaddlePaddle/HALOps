@@ -68,7 +68,7 @@ class TaskScheduler {
     // `down_grid_task` entry that ends a block's down task sequence.
     static constexpr std::uint32_t kNoTask = SharedStorage::kNoDownTask;
 
-    __device__ TaskScheduler(SharedStorage* smem, Workspace* workspace,
+    __device__ TaskScheduler(SharedStorage* smem, Workspace const* workspace,
                              MoERuntime const& runtime)
         : cta_group_(runtime),
           num_ctas_per_expert_(runtime.num_ctas_per_expert),
@@ -97,7 +97,7 @@ class TaskScheduler {
             grid_task = static_down_task();
         } else if (num_tasks > num_static_tasks) {
             const std::uint32_t claimed =
-                workspace_->cta_comm.claim_down_task(smem_->launch_parity);
+                workspace_->cta_comm->claim_down_task(smem_->launch_parity);
             if (claimed < num_tasks - num_static_tasks)
                 grid_task = num_static_tasks + claimed;
         }
@@ -180,7 +180,7 @@ class TaskScheduler {
     std::uint32_t num_ctas_per_expert_ = 1u;
     cutlass::FastDivmod ctas_per_expert_divmod_{};
     SharedStorage* smem_ = nullptr;
-    Workspace* workspace_ = nullptr;
+    Workspace const* workspace_ = nullptr;
     BlockPhase phase_ = BlockPhase::kNone;
     std::uint32_t next_ = 0u;
     std::uint32_t expert_count_ = 0u;

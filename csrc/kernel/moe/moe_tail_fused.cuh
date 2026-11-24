@@ -336,13 +336,12 @@ struct TailGroup {
         int parityC;
     };
 
-    __device__ static __forceinline__ Ctx make_ctx(const P& p, uint32_t cta,
-                                                   uint32_t tid,
-                                                   uint8_t* scratch,
-                                                   Sync sync) {
+    __device__ static __forceinline__ Ctx
+    make_ctx(const P& p, const DataType::ElementOut* shared, uint32_t cta,
+             uint32_t tid, uint8_t* scratch, Sync sync) {
         return Ctx{p,
                    sync,
-                   p.shared_out,
+                   shared,
                    p.tail_uc_base[p.tail_rank] + TC::kSlotRegionBytes,
                    scratch + TC::kSmemWStage,
                    reinterpret_cast<uint64_t*>(scratch + TC::kSmemWBar),
@@ -559,7 +558,9 @@ struct TailGroup {
         if constexpr (kPrefetchC) {
             const int tt = int(c.tid) / kPer, j = int(c.tid) % kPer;
             if (int(c.tid) < TPG * kPer && c.t0 + tt < c.m) {
-                ld_global_16B(vpre, c.shared + int64_t(c.t0 + tt) * H,
+                ld_global_16B(vpre,
+                              c.shared + int64_t(c.t0 + tt) *
+                                             c.p.problem_size.hidden_size,
                               round_c_vec(c, j));
             }
         }
@@ -645,7 +646,8 @@ struct TailGroup {
             if constexpr (kPrefetchC) {
                 v = vpre;
             } else {
-                ld_global_16B(v, c.shared + int64_t(t) * H, hv);
+                ld_global_16B(
+                    v, c.shared + int64_t(t) * p.problem_size.hidden_size, hv);
             }
             if (owned) {
 #pragma unroll
@@ -662,11 +664,10 @@ struct TailGroup {
         }
     }
 
-    __device__ static __forceinline__ void run(const P& p, uint32_t cta,
-                                               uint32_t tid, uint8_t* scratch,
-                                               Sync sync,
-                                               uint32_t launch_parity) {
-        Ctx c = make_ctx(p, cta, tid, scratch, sync);
+    __device__ static __forceinline__ void run(
+        const P& p, const DataType::ElementOut* shared, uint32_t cta,
+        uint32_t tid, uint8_t* scratch, Sync sync, uint32_t launch_parity) {
+        Ctx c = make_ctx(p, shared, cta, tid, scratch, sync);
         const bool active = group_active(c);
         if (active) stage_weights(c);
         c.parityA = c.parityC = int(launch_parity & 1u);
@@ -686,12 +687,11 @@ struct TailGroup {
 };
 
 template <int WORLD, int L, int H, int MAXM, class TC, class P, class Sync>
-__device__ __forceinline__ void eb5_tail_group_body(const P& p, uint32_t cta,
-                                                    uint32_t tid,
-                                                    uint8_t* scratch, Sync sync,
-                                                    uint32_t launch_parity) {
-    TailGroup<WORLD, L, H, MAXM, TC, P, Sync>::run(p, cta, tid, scratch, sync,
-                                                   launch_parity);
+__device__ __forceinline__ void eb5_tail_group_body(
+    const P& p, const DataType::ElementOut* shared, uint32_t cta, uint32_t tid,
+    uint8_t* scratch, Sync sync, uint32_t launch_parity) {
+    TailGroup<WORLD, L, H, MAXM, TC, P, Sync>::run(p, shared, cta, tid, scratch,
+                                                   sync, launch_parity);
 }
 
 }  // namespace tail

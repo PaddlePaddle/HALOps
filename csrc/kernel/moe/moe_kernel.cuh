@@ -70,8 +70,7 @@ __global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel(
     const std::uint32_t warp_idx = WarpRole::get_warp_idx();
 
     using Workspace = MoEWorkspace<Dims>;
-    Workspace* __restrict__ workspace =
-        reinterpret_cast<Workspace*>(mainloop_params.scratchpad);
+    Workspace const* __restrict__ workspace = &mainloop_params.workspace;
 
     // Initialize the launcher-thread states and publish to all warps.
     collective_mainloop.initialize(mainloop_params, smem);

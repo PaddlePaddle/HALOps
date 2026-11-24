@@ -94,7 +94,7 @@ struct TailPhase {
     // AllReduce + RMSNorm + fc2 + shared-combine
     template <class P>
     __device__ static void run(P const& params,
-                               Workspace* __restrict__ workspace,
+                               Workspace const* __restrict__ workspace,
                                SharedStorage* __restrict__ smem,
                                Group const& cta_group) {
         const std::uint32_t shared_ctas = params.tail_shared_ctas;
@@ -105,8 +105,8 @@ struct TailPhase {
                       "the tail scratch must fit the weight-ring union");
         if (shared_ctas != 0u) {
             if (threadIdx.x == 0) {
-                workspace->cta_comm.wait_shared_down_done(smem->launch_parity,
-                                                          shared_ctas);
+                workspace->cta_comm->wait_shared_down_tasks(smem->launch_parity,
+                                                            shared_ctas);
             }
             WarpRole::sync_calc_threads();
             __threadfence();
@@ -115,7 +115,7 @@ struct TailPhase {
         ::halops::moe::tail::eb5_tail_group_body<
             Geometry::kWorld, Dims::kLatentSize, Dims::kHiddenSize,
             Geometry::kMaxM, Geometry>(
-            params, blockIdx.x, threadIdx.x,
+            params, workspace->shared_down_out.data, blockIdx.x, threadIdx.x,
             reinterpret_cast<std::uint8_t*>(&smem->routed_experts),
             CalcWarpSync{}, smem->tail_parity);
         WarpRole::sync_calc_threads();

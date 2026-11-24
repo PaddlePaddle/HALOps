@@ -240,7 +240,10 @@ void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,
 
 int64_t MoETailRegionBytes(bool wide, int64_t tp_size);
 
-int64_t GetWorkspaceSize(int64_t max_tokens);
+int64_t GetWorkspaceSize(std::uint32_t max_tokens, std::uint32_t hidden_size,
+                         std::uint32_t intermediate_size,
+                         std::uint32_t latent_size, std::uint32_t num_experts,
+                         std::uint32_t num_router_gates);
 
 void PrintMoEKernelInfo(const std::string& quant_mode);
 
@@ -323,7 +326,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_tail_region_bytes", &halops::MoETailRegionBytes, py::arg("wide"),
           py::arg("tp_size") = 1);
     m.def("moe_get_workspace_size", &halops::GetWorkspaceSize,
-          py::arg("max_tokens") = 0);
+          py::arg("max_tokens") = 0, py::arg("hidden_size") = 4096,
+          py::arg("intermediate_size") = 512, py::arg("latent_size") = 2048,
+          py::arg("num_experts") = 512, py::arg("num_router_gates") = 2);
     m.def("print_moe_kernel_info", &halops::PrintMoEKernelInfo,
           py::arg("quant_mode") = "");
 }

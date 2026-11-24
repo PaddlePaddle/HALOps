@@ -57,12 +57,27 @@ class MoEWorkspace:
     _keepalive: tuple
 
 
-def _workspace_layout(max_tokens: Optional[int], tp_size: int = 1):
+def _workspace_layout(
+    max_tokens: Optional[int],
+    tp_size: int,
+    hidden_size: int,
+    intermediate_size: int,
+    latent_size: int,
+    num_experts: int,
+    num_router_gates: int,
+):
     """Return (scratchpad bytes, tail offset, total bytes) of the workspace."""
     if tp_size not in (1, 4):
         raise ValueError(f"tp_size must be 1 or 4, got {tp_size}")
     scratch = int(
-        halops_kernel.moe_get_workspace_size(0 if max_tokens is None else max_tokens)
+        halops_kernel.moe_get_workspace_size(
+            0 if max_tokens is None else max_tokens,
+            hidden_size,
+            intermediate_size,
+            latent_size,
+            num_experts,
+            num_router_gates,
+        )
     )
     offset = -(-scratch // _TAIL_ALIGN) * _TAIL_ALIGN
     if max_tokens is None:
@@ -81,6 +96,12 @@ def get_workspace_for_moe(
     group_name: str,
     tp_rank: int,
     tp_size: int,
+    *,
+    hidden_size: int = 4096,
+    intermediate_size: int = 512,
+    latent_size: int = 2048,
+    num_experts: int = 512,
+    num_router_gates: int = 2,
 ) -> MoEWorkspace:
     """Allocate the workspace of ``mega_ll_moe`` for up to ``max_tokens`` tokens.
 
@@ -95,6 +116,11 @@ def get_workspace_for_moe(
             ranks. It is unused for a single-rank launch.
         tp_rank: Rank in that group.
         tp_size: Size of that group. Supported values are 1 and 4.
+        hidden_size: Input feature width.
+        intermediate_size: Per-expert intermediate width on this rank.
+        latent_size: Latent projection width, or zero for sizing without it.
+        num_experts: Number of routed experts.
+        num_router_gates: Number of router gates.
 
     Returns:
         The workspace to pass to ``mega_ll_moe``.
@@ -103,7 +129,15 @@ def get_workspace_for_moe(
     device = torch.device("cuda", torch.cuda.current_device())
     if tp_size not in (1, 4):
         raise ValueError(f"tp_size must be 1 or 4, got {tp_size}")
-    scratch, offset, nbytes = _workspace_layout(max_tokens, tp_size)
+    scratch, offset, nbytes = _workspace_layout(
+        max_tokens,
+        tp_size,
+        hidden_size,
+        intermediate_size,
+        latent_size,
+        num_experts,
+        num_router_gates,
+    )
 
     if tp_size == 1:
         region = torch.zeros(nbytes, dtype=torch.uint8, device=device)
@@ -365,7 +399,7 @@ def mega_ll_moe(
             tensor-parallel size and rank of the launch.
         top_k (int): Experts selected per token, in [1, 10].
         num_router_gates (int, optional): Gates stacked in
-            ``router_weight``'s rows; this build requires 2. Default: 2.
+            ``router_weight``'s rows. Supports 1 or 2. Default: 2.
         scoring_func (str, optional): Router scoring, either "sigmoid" or
             "softmax". Default: "sigmoid".
         renormalize (bool, optional): Renormalize the top-k weights to sum to
@@ -445,7 +479,13 @@ def mega_ll_moe(
 
 
 def get_workspace_size_for_moe(
-    max_tokens: Optional[int] = None, tp_size: int = 1
+    max_tokens: Optional[int] = None,
+    tp_size: int = 1,
+    hidden_size: int = 4096,
+    intermediate_size: int = 512,
+    latent_size: int = 2048,
+    num_experts: int = 512,
+    num_router_gates: int = 2,
 ) -> int:
     """Return the workspace region size in bytes for a token bound.
 
@@ -454,9 +494,22 @@ def get_workspace_size_for_moe(
             Without it, the larger of the supported schedules is returned.
             Default: None.
         tp_size (int, optional): Tensor-parallel size, either 1 or 4.
-            Default: 1.
+        hidden_size: Input feature width.
+        intermediate_size: Per-expert intermediate width on this rank.
+        latent_size: Latent projection width, or zero for sizing without it.
+        num_experts: Number of routed experts.
+        num_router_gates: Number of router gates.
+            Default: 2.
 
     Returns:
         Size in bytes of the scratchpad plus the tail mailbox.
     """
-    return _workspace_layout(max_tokens, tp_size)[2]
+    return _workspace_layout(
+        max_tokens,
+        tp_size,
+        hidden_size,
+        intermediate_size,
+        latent_size,
+        num_experts,
+        num_router_gates,
+    )[2]

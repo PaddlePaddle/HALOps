@@ -17,6 +17,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "cute/container/array.hpp"
+#include "cute/pointer.hpp"
 #include "kernel/moe/mma_core.cuh"
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_cta_comm.cuh"
@@ -25,264 +27,227 @@
 
 namespace halops::moe {
 
-// The router's per-(gate, token) row: bf16 logits or fp32 scores.
-template <typename Dims>
-struct RouterLogits {
-    using RouterGemm = RouterGemmTraits<Dims>;
-
-    static constexpr std::uint32_t kNumGates = MoERuntime::kMaxRouterGates;
-    static constexpr bool kStoreScores = kNumGates > 1u;
-
-    using ResultType = std::conditional_t<kStoreScores, float, __nv_bfloat16>;
-    static constexpr std::uint32_t kNumRows = RouterGemm::kGemmN;
-    static constexpr std::uint32_t kNumCols = RouterGemm::kGemmM;
-
-    alignas(16) ResultType data[kNumGates * kNumRows * kNumCols];
-
-    __device__ __forceinline__ ResultType* row(std::uint32_t gate,
-                                               std::uint32_t row_idx) {
-        return data + (gate * kNumRows + row_idx) * kNumCols;
+template <typename Element>
+__host__ __device__ constexpr std::size_t storage_bytes(std::size_t count) {
+    if constexpr (cute::is_subbyte_v<Element>) {
+        constexpr auto bits = cute::sizeof_bits_v<Element>;
+        return (count / 8u) * bits +
+               cute::bits_to_bytes<std::size_t>((count % 8u) * bits);
+    } else {
+        return count * sizeof(Element);
     }
-    __device__ __forceinline__ const ResultType* row(
-        std::uint32_t gate, std::uint32_t row_idx) const {
-        return data + (gate * kNumRows + row_idx) * kNumCols;
+}
+
+// Contiguous view into workspace memory, with the last dimension at unit
+// stride.
+template <typename Element, std::size_t Rank>
+struct WorkspaceTensor {
+    Element* data;
+    cute::array<std::uint32_t, Rank> shape;
+
+    __host__ __device__ constexpr void init(
+        Element* ptr, cute::array<std::uint32_t, Rank> extents) {
+        data = ptr;
+        shape = extents;
+    }
+
+    __host__ __device__ static constexpr std::size_t bytes(
+        cute::array<std::uint32_t, Rank> extents) {
+        std::size_t count = 1;
+        for (std::size_t dim = 0; dim < Rank; ++dim) {
+            count *= extents[dim];
+        }
+        return storage_bytes<Element>(count);
+    }
+
+    __host__ __device__ constexpr std::size_t bytes() const {
+        return bytes(shape);
+    }
+
+    template <typename... Indices>
+    __host__ __device__ decltype(auto) operator()(Indices... indices) const {
+        static_assert(sizeof...(Indices) == Rank,
+                      "expected one index per dimension");
+        const std::size_t coord[] = {static_cast<std::size_t>(indices)...};
+        std::size_t offset = coord[0];
+#pragma unroll
+        for (std::size_t dim = 1; dim < Rank; ++dim) {
+            offset = offset * shape[dim] + coord[dim];
+        }
+        return cute::recast_ptr<Element>(data)[offset];
     }
 };
 
-// Latent output data and scales in routed-up staging layout.
-template <typename Dims>
-struct LatentDownOutput {
-    using LatentDownGemm = LatentDownGemmTraits<Dims>;
-    using OutputQuant = typename LatentDownGemm::OutputQuant;
-    using Element = DataType::ElementQA;
+// Row-major activation with one scale per group along the last axis.
+template <typename Quant, std::size_t Rank = 2>
+struct QuantActivation {
+    using Element = typename Quant::ElementType;
+    using Scale = typename Quant::ScaleType;
 
-    static constexpr std::uint32_t kNumRows = Dims::kNumTokens;
-    static constexpr std::uint32_t kNumCols = Dims::kLatentSize;
+    WorkspaceTensor<Element, Rank> values;
+    WorkspaceTensor<Scale, Rank> scales;
+
+    __host__ __device__ static constexpr auto value_shape(
+        cute::array<std::uint32_t, Rank> shape) {
+        return shape;
+    }
+
+    __host__ __device__ static constexpr auto scale_shape(
+        cute::array<std::uint32_t, Rank> shape) {
+        const auto width = shape[Rank - 1];
+        shape[Rank - 1] =
+            width / Quant::kBlockSize + (width % Quant::kBlockSize != 0);
+        return shape;
+    }
+
+    __host__ __device__ constexpr void init(
+        Element* data, Scale* scale_data,
+        cute::array<std::uint32_t, Rank> shape) {
+        values.init(data, value_shape(shape));
+        scales.init(scale_data, scale_shape(shape));
+    }
+
+    __host__ __device__ constexpr std::size_t bytes() const {
+        return values.bytes() + scales.bytes();
+    }
+};
+
+// Latent and shared producers both stage [K chunk][schedule row + pad][16 B].
+template <typename Quant>
+struct ChunkedQuantActivation {
+    using Element = typename Quant::ElementType;
+    using Scale = typename Quant::ScaleType;
 
     static constexpr std::uint32_t kLboChunk = LboChunkK<Element>::value;
-    static constexpr std::uint32_t kNumChunks = kNumCols / kLboChunk;
-
-    // UE8M0 bytes: one 128-token SfAtom per four K groups.
     static constexpr std::uint32_t kSfAtomBytes = 512u;
-    static constexpr std::uint32_t kNumSfAtoms =
-        kNumCols / (4u * OutputQuant::kBlockSize);
-    static_assert(kNumCols % (4u * OutputQuant::kBlockSize) == 0u,
-                  "the latent width must close whole SfAtoms");
 
-    alignas(16) Element data[kNumChunks][kNumRows + 1u][kLboChunk];
-    union alignas(16) {
-        typename OutputQuant::ScaleType
-            blockwise[kNumCols / OutputQuant::kBlockSize][kNumRows];
-        std::uint8_t mxfp8[kNumSfAtoms][kSfAtomBytes];
-    } scale;
+    WorkspaceTensor<Element, 3> values;
+    WorkspaceTensor<Scale, 2> scales;
 
-    static constexpr std::uint32_t kDataBytes = sizeof(data);
-    static constexpr std::uint32_t kScaleBytes = sizeof(scale);
-
-    __device__ __forceinline__ Element* cell(std::uint32_t chunk,
-                                             std::uint32_t row) {
-        return &data[chunk][row][0];
+    __host__ __device__ static constexpr cute::array<std::uint32_t, 3>
+    value_shape(cute::array<std::uint32_t, 2> shape) {
+        const std::size_t width = shape[1];
+        const std::uint32_t chunks = (width + kLboChunk - 1u) / kLboChunk;
+        return {chunks, shape[0] + 1u, kLboChunk};
     }
 
-    __device__ __forceinline__ void clear_pad_row(std::uint32_t chunk) {
-        *reinterpret_cast<uint4*>(&data[chunk][kNumRows][0]) =
+    __host__ __device__ static constexpr cute::array<std::uint32_t, 2>
+    scale_shape(cute::array<std::uint32_t, 2> shape) {
+        const std::size_t width = shape[1];
+        if constexpr (Quant::kMethod == QuantMethod::kBlockwiseFP8) {
+            const std::uint32_t blocks =
+                (width + Quant::kBlockSize - 1u) / Quant::kBlockSize;
+            return {blocks, shape[0]};
+        } else {
+            const std::uint32_t atoms =
+                cute::ceil_div(width, 4u * Quant::kBlockSize);
+            return {atoms, kSfAtomBytes};
+        }
+    }
+
+    __host__ __device__ constexpr void init(
+        Element* data, Scale* scale_data, cute::array<std::uint32_t, 2> shape) {
+        values.init(data, value_shape(shape));
+        scales.init(scale_data, scale_shape(shape));
+    }
+
+    __host__ __device__ constexpr std::size_t bytes() const {
+        return values.bytes() + scales.bytes();
+    }
+
+    __host__ __device__ decltype(auto) value(std::uint32_t token,
+                                             std::uint32_t feature) const {
+        return values(feature / kLboChunk, token, feature % kLboChunk);
+    }
+
+    __host__ __device__ Scale& scale(std::uint32_t token,
+                                     std::uint32_t group) const {
+        if constexpr (Quant::kMethod == QuantMethod::kBlockwiseFP8) {
+            return scales(group, token);
+        } else {
+            return scales(group / 4u, sf_atom_offset(token, group % 4u));
+        }
+    }
+
+    __device__ void clear_pad_row(std::uint32_t chunk) const {
+        *reinterpret_cast<uint4*>(&values(chunk, values.shape[1] - 1u, 0u)) =
             make_uint4(0u, 0u, 0u, 0u);
-    }
-
-    __device__ __forceinline__ typename OutputQuant::ScaleType* scale_row(
-        std::uint32_t block) {
-        return scale.blockwise[block];
-    }
-
-    // The SfAtom holding K group `group`.
-    __device__ __forceinline__ std::uint8_t* sf_atom(std::uint32_t group) {
-        return scale.mxfp8[group / 4u];
-    }
-
-    __host__ __device__ __forceinline__ Element* data_ptr() {
-        return &data[0][0][0];
-    }
-    __host__ __device__ __forceinline__ void* scale_ptr() { return &scale; }
-};
-
-// The shared expert's up output, in the down's staging layout.
-template <typename Dims>
-struct SharedUpOutput {
-    using ElementType = DataType::ElementQA;
-    using ScaleType = float;
-    using SharedUpGemm = SharedUpGemmTraits<Dims>;
-    using SharedDownGemm = SharedDownGemmTraits<Dims>;
-
-    static constexpr std::uint32_t kQuantBlock = SharedUpGemm::kTileShapeM / 2u;
-
-    static constexpr std::uint32_t kNumRows = Dims::kNumTokens;
-    static constexpr std::uint32_t kNumCols = Dims::kIntermediateSize;
-
-    static constexpr std::uint32_t kLboChunk = LboChunkK<ElementType>::value;
-    static constexpr std::uint32_t kNumChunks = kNumCols / kLboChunk;
-    static constexpr std::uint32_t kNumScaleCols = kNumCols / kQuantBlock;
-
-    // The union keeps workspace sizing identical across quantization recipes.
-    static constexpr std::uint32_t kDownTilesK =
-        Dims::kIntermediateSize / SharedDownGemm::kTileShapeK;
-    static constexpr std::uint32_t kSfAtomBytes =
-        128u * (SharedDownGemm::kTileShapeK / 32u);
-
-    alignas(16) ElementType data[kNumChunks][kNumRows + 1u][kLboChunk];
-    union alignas(16) {
-        ScaleType blockwise[kNumScaleCols][kNumRows];
-        std::uint8_t mxfp8[kDownTilesK][kSfAtomBytes];
-    } scale;
-
-    __device__ __forceinline__ ElementType* cell(std::uint32_t chunk,
-                                                 std::uint32_t row) {
-        return &data[chunk][row][0];
-    }
-
-    __device__ __forceinline__ void clear_pad_row(std::uint32_t chunk) {
-        *reinterpret_cast<uint4*>(&data[chunk][Dims::kNumTokens][0]) =
-            make_uint4(0u, 0u, 0u, 0u);
-    }
-
-    __device__ __forceinline__ ScaleType* scale_row(std::uint32_t block) {
-        return scale.blockwise[block];
-    }
-
-    // UE8M0 scale slab for one down-input K tile.
-    __device__ __forceinline__ std::uint8_t* sf_slab(std::uint32_t tile) {
-        return scale.mxfp8[tile];
-    }
-
-    __host__ __device__ __forceinline__ ElementType* data_ptr() {
-        return &data[0][0][0];
-    }
-    __host__ __device__ __forceinline__ ScaleType* scale_ptr() {
-        return &scale.blockwise[0][0];
-    }
-    __host__ __device__ __forceinline__ std::uint8_t* scale_bytes() {
-        return &scale.mxfp8[0][0];
-    }
-};
-
-template <typename Dims>
-struct SharedDownOutput {
-    using ElementType = DataType::ElementOut;
-
-    alignas(16) ElementType data[Dims::kNumTokens * Dims::kHiddenSize];
-};
-
-// The up projection's output: the gated activation in expert-sorted rows.
-template <typename Dims>
-struct RoutedUpOutput {
-    using ElementType = DataType::ElementQA;
-    using ScaleType = float;
-    using UpGemm = RoutedUpGemmTraits<Dims>;
-
-    static constexpr std::uint32_t kNumRows = UpGemm::kGemmN * Dims::kMaxTopk;
-    static constexpr std::uint32_t kNumCols = Dims::kIntermediateSize;
-
-    static constexpr std::uint32_t kQuantBlock = UpGemm::kTileShapeM / 2u;
-    static constexpr std::uint32_t kNumScaleCols = kNumCols / kQuantBlock;
-    // MX uses one UE8M0 byte per row and 32 features, repacked into SfAtoms
-    // during down loading.
-    static constexpr std::uint32_t kNumMxScaleCols = kNumCols / 32u;
-
-    alignas(16) ElementType data[(kNumRows + 8u) * kNumCols];
-    // The union keeps workspace sizing identical across quantization recipes.
-    union alignas(16) {
-        ScaleType blockwise[kNumRows * kNumScaleCols];
-        std::uint8_t mxfp8[kNumRows * kNumMxScaleCols];
-    } scale;
-
-    __device__ __forceinline__ ElementType* row(std::uint32_t row_idx) {
-        return data + row_idx * kNumCols;
-    }
-
-    __device__ __forceinline__ const ElementType* row(
-        std::uint32_t row_idx) const {
-        return data + row_idx * kNumCols;
-    }
-
-    __device__ __forceinline__ ScaleType* scale_row(std::uint32_t row_idx) {
-        return scale.blockwise + row_idx * kNumScaleCols;
-    }
-
-    __device__ __forceinline__ const ScaleType* scale_row(
-        std::uint32_t row_idx) const {
-        return scale.blockwise + row_idx * kNumScaleCols;
-    }
-
-    __device__ __forceinline__ std::uint8_t* mx_scale_row(
-        std::uint32_t row_idx) {
-        return scale.mxfp8 + row_idx * kNumMxScaleCols;
-    }
-};
-
-// The down projection's output: one bf16 slot per routed (token, expert) pair.
-template <typename Dims>
-struct RoutedDownOutput {
-    using ElementType = DataType::ElementOut;
-    using DownGemm = RoutedDownGemmTraits<Dims>;
-
-    static constexpr std::uint32_t kNumRows = DownGemm::kGemmN * Dims::kMaxTopk;
-    // The latent stage narrows the experts' reduction; size for the wider
-    // input so one workspace serves either recipe.
-    static constexpr std::uint32_t kNumCols =
-        Dims::kLatentSize > Dims::kHiddenSize ? Dims::kLatentSize
-                                              : Dims::kHiddenSize;
-
-    alignas(16) ElementType data[kNumRows * kNumCols];
-
-    __device__ __forceinline__ ElementType* row(std::uint32_t row_idx) {
-        return data + row_idx * kNumCols;
-    }
-
-    __device__ __forceinline__ const ElementType* row(
-        std::uint32_t row_idx) const {
-        return data + row_idx * kNumCols;
     }
 };
 
 template <typename Dims>
 struct MoEWorkspace {
-    using DownGemm = RoutedDownGemmTraits<Dims>;
-    using LatentDownGemm = LatentDownGemmTraits<Dims>;
-    using RoutedUpOut = RoutedUpOutput<Dims>;
-    using RoutedDownOut = RoutedDownOutput<Dims>;
-    using SharedUpOut = SharedUpOutput<Dims>;
+    static constexpr std::uint32_t kMaxRoutedRows =
+        Dims::kNumTokens * Dims::kMaxTopk;
+    using LatentDownQuant = typename LatentDownGemmTraits<Dims>::OutputQuant;
+    using RoutedUpQuant = typename RoutedUpGemmTraits<Dims>::OutputQuant;
+    using SharedUpQuant = typename SharedUpGemmTraits<Dims>::OutputQuant;
 
-    static constexpr uint32_t kMaxTopk = Dims::kMaxTopk;
+    using CtaComm = MoECtaComm<Dims::KernelConfig::kSpecMaxGrid, kMaxRoutedRows,
+                               MoERuntime::kMaxCtasPerExpert>;
 
-    static constexpr uint32_t kMaxRoutedRows = RoutedDownOut::kNumRows;
+    CtaComm* cta_comm;
+    MoERoutingTables<Dims>* router_tables;
+    WorkspaceTensor<typename RouterGemmTraits<Dims>::LogitType, 3>
+        router_logits;
+    ChunkedQuantActivation<LatentDownQuant> latent_down_out;
+    ChunkedQuantActivation<SharedUpQuant> shared_up_out;
+    WorkspaceTensor<DataType::ElementOut, 2> shared_down_out;
+    QuantActivation<RoutedUpQuant> routed_up_out;
+    WorkspaceTensor<DataType::ElementOut, 2> routed_down_out;
 
-    static constexpr uint32_t kSpecMaxGrid = Dims::KernelConfig::kSpecMaxGrid;
+    std::size_t bind(void* buffer, MoEProblemSize const& problem) {
+        constexpr auto tokens = Dims::kNumTokens;
+        const auto intermediate = problem.intermediate_size;
+        auto* base = static_cast<std::uint8_t*>(buffer);
+        std::size_t offset = 0;
+        auto reserve = [&](std::size_t bytes) {
+            auto* ptr = base ? base + offset : nullptr;
+            offset += cute::round_up(bytes, std::size_t{16});
+            return ptr;
+        };
+        auto bind_tensor = [&](auto& tensor, decltype(tensor.shape) shape) {
+            auto* ptr = reserve(tensor.bytes(shape));
+            if (ptr) {
+                tensor.init(reinterpret_cast<decltype(tensor.data)>(ptr),
+                            shape);
+            }
+        };
+        auto bind_activation = [&]<typename Activation>(
+                                   Activation& activation,
+                                   cute::array<std::uint32_t, 2> shape,
+                                   std::uint32_t extra_value_rows = 0) {
+            auto value_shape = Activation::value_shape(shape);
+            value_shape[0] += extra_value_rows;
+            auto* values = reserve(activation.values.bytes(value_shape));
+            auto* scales = reserve(
+                activation.scales.bytes(Activation::scale_shape(shape)));
+            if (values) {
+                activation.init(
+                    reinterpret_cast<typename Activation::Element*>(values),
+                    reinterpret_cast<typename Activation::Scale*>(scales),
+                    shape);
+            }
+        };
 
-    SharedUpOut shared_up_out;
-    SharedDownOutput<Dims> shared_down_out;
+        cta_comm = reinterpret_cast<CtaComm*>(reserve(sizeof(*cta_comm)));
+        router_tables = reinterpret_cast<MoERoutingTables<Dims>*>(
+            reserve(sizeof(*router_tables)));
+        bind_tensor(router_logits,
+                    {problem.num_router_gates, tokens, problem.num_experts});
+        bind_activation(latent_down_out, {tokens, problem.latent_size});
+        bind_activation(shared_up_out, {tokens, intermediate});
+        bind_tensor(shared_down_out, {tokens, problem.hidden_size});
+        // Keep the eight padded rows outside the routed-up value view.
+        bind_activation(routed_up_out, {kMaxRoutedRows, intermediate}, 8u);
+        bind_tensor(routed_down_out, {kMaxRoutedRows, problem.input_size()});
+        return offset;
+    }
 
-    using LatentOut = LatentDownOutput<Dims>;
-    LatentOut latent_down_out;
-
-    RouterLogits<Dims> router_logits;
-    static constexpr bool kRouterStoreScores = RouterLogits<Dims>::kStoreScores;
-
-    RoutedUpOut routed_up_out;
-
-    // Byte offset of the fp8 values, for the host TMA wrapper.
-    static constexpr size_t kUpOutFp8Offset =
-        offsetof(MoEWorkspace<Dims>, routed_up_out.data);
-
-    RoutedDownOut routed_down_out;
-
-    MoERoutingTables<Dims> router_tables;
-
-    static constexpr uint32_t kMaxCtasPerExpert = MoERuntime::kMaxCtasPerExpert;
-
-    using CtaComm = MoECtaComm<kSpecMaxGrid, kMaxRoutedRows,
-                               RoutedUpOut::kNumScaleCols, kMaxCtasPerExpert>;
-    static constexpr uint32_t kUpOutReadyFull = CtaComm::kUpOutReadyFull;
-
-    CtaComm cta_comm;
+    static std::size_t bytes(MoEProblemSize const& problem) {
+        MoEWorkspace view;
+        return view.bind(nullptr, problem);
+    }
 };
 
 }  // namespace halops::moe

@@ -72,10 +72,10 @@ struct RoutedUpProjectionBase
 
     // One K tile of the quantized input with its scale rows: a blockscaled
     // recipe stages one SfAtom slab, blockwise one row per K block.
-    __device__ static void load_input_tile(Workspace* __restrict__ workspace,
-                                           SharedStorage* __restrict__ smem,
-                                           std::uint32_t slot,
-                                           std::uint32_t k_iter) {
+    __device__ static void load_input_tile(
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem, std::uint32_t slot,
+        std::uint32_t k_iter) {
         using Quantized = decltype(smem->routed_experts.quantized_input);
         constexpr std::uint32_t kTileBytes =
             static_cast<std::uint32_t>(sizeof(Quantized::data[0]));
@@ -83,7 +83,7 @@ struct RoutedUpProjectionBase
         constexpr std::uint32_t kScaleBytes =
             static_cast<std::uint32_t>(sizeof(Quantized::scale[0]));
         const auto* const src = reinterpret_cast<const char*>(
-                                    workspace->latent_down_out.data_ptr()) +
+                                    workspace->latent_down_out.values.data) +
                                 k_iter * kTileBytes;
         auto* const dst = reinterpret_cast<char*>(
             &smem->routed_experts.quantized_input.data[slot][0][0][0]);
@@ -91,7 +91,7 @@ struct RoutedUpProjectionBase
         ready.arrive(slot, kTileBytes + kScaleBytes);
         tma_load_1d(src, kTileBytes, dst, ready.raw(slot));
         tma_load_1d(reinterpret_cast<const char*>(
-                        workspace->latent_down_out.scale_ptr()) +
+                        workspace->latent_down_out.scales.data) +
                         k_iter * kScaleBytes,
                     kScaleBytes,
                     reinterpret_cast<char*>(
@@ -102,10 +102,10 @@ struct RoutedUpProjectionBase
 
     // Apply the gated activation, then quantize and publish each token.
     __device__ static void epilogue(
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t e, std::uint32_t gemm_n, std::uint32_t m_block_idx,
-        Activation activation, float situ_beta, float situ_linear_beta,
-        Accumulator& acc_gate, Accumulator& acc_up) {
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem, std::uint32_t e, std::uint32_t gemm_n,
+        std::uint32_t m_block_idx, Activation activation, float situ_beta,
+        float situ_linear_beta, Accumulator& acc_gate, Accumulator& acc_up) {
         [[maybe_unused]] const std::uint32_t expert_id =
             smem->routing.active_experts[e];
 
@@ -145,9 +145,10 @@ struct RoutedUpProjectionBase
 
     // Quantize and publish one routed output row.
     __device__ static void quantize_publish_rows(
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t e, std::uint32_t gemm_n, std::uint32_t base_feature,
-        std::uint32_t m_block_idx, std::uint32_t tok) {
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem, std::uint32_t e, std::uint32_t gemm_n,
+        std::uint32_t base_feature, std::uint32_t m_block_idx,
+        std::uint32_t tok) {
         using Quant = typename Base::OutputQuantizer::Quant;
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         std::uint32_t dest_row = 0u;
@@ -164,14 +165,10 @@ struct RoutedUpProjectionBase
                 smem->routed_experts.act_up_out[lane_idx + i * 32u][tok];
         }
         Base::OutputQuantizer::quantize(values, quantized, scales);
-        auto* const out = workspace->routed_up_out.row(dest_row) + base_feature;
-        typename Base::OutputQuantizer::ScaleType* scale;
-        if constexpr (Quant::kMethod == QuantMethod::kMXFP8) {
-            scale = workspace->routed_up_out.mx_scale_row(dest_row) +
-                    base_feature / Quant::kBlockSize;
-        } else {
-            scale = workspace->routed_up_out.scale_row(dest_row) + m_block_idx;
-        }
+        auto* const out =
+            &workspace->routed_up_out.values(dest_row, base_feature);
+        auto* const scale = &workspace->routed_up_out.scales(
+            dest_row, base_feature / Quant::kBlockSize);
 #pragma unroll
         for (std::uint32_t i = 0; i < kQuantGroups; ++i) {
             out[i * 32u + lane_idx] = quantized[i];
@@ -184,8 +181,8 @@ struct RoutedUpProjectionBase
             }
         }
         // Store quantized data and scales before publishing readiness.
-        workspace->cta_comm.publish_up_out(smem->launch_parity, dest_row,
-                                           m_block_idx, lane_idx);
+        workspace->cta_comm->publish_up_out(smem->launch_parity, dest_row,
+                                            m_block_idx, lane_idx);
     }
 };
 
@@ -215,7 +212,8 @@ struct RoutedUpProjection<KernelTraits, true>
     __device__ static void run(
         const typename UpGemm::ElementScale* __restrict__ expert_scales_up,
         Activation activation, float situ_beta, float situ_linear_beta,
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem,
         CUtensorMap const& tma_up_weights_desc, TaskScheduler<Traits>& sched,
         MoEProblemSize const& problem_size, std::uint64_t weight_cache_hint) {
         const unsigned warp_idx = WarpRole::get_warp_idx();
@@ -324,8 +322,9 @@ struct RoutedUpProjection<KernelTraits, true>
     }
 
     __device__ static void run_load_input_k_loop(
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t task_id, std::uint32_t num_k_tiles) {
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem, std::uint32_t task_id,
+        std::uint32_t num_k_tiles) {
 #pragma unroll 1
         for (std::uint32_t k_iter_id = 0; k_iter_id < num_k_tiles;
              ++k_iter_id) {
@@ -421,7 +420,8 @@ struct RoutedUpProjection<KernelTraits, false>
     __device__ static void run(
         const typename UpGemm::ElementScale* __restrict__ expert_scales_up,
         Activation activation, float situ_beta, float situ_linear_beta,
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem,
         CUtensorMap const& tma_up_weights_desc, TaskScheduler<Traits>& sched,
         MoEProblemSize const& problem_size, std::uint64_t weight_cache_hint) {
         const unsigned warp_idx = WarpRole::get_warp_idx();
@@ -470,8 +470,9 @@ struct RoutedUpProjection<KernelTraits, false>
     // Stream the quantized latent output through the input ring, one K tile per
     // weight slot; the dequant that read a tile's scale rows frees its slot.
     __device__ static void run_load_input_k_loop(
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t task_id, std::uint32_t num_k_tiles) {
+        Workspace const* __restrict__ workspace,
+        SharedStorage* __restrict__ smem, std::uint32_t task_id,
+        std::uint32_t num_k_tiles) {
 #pragma unroll 1
         for (std::uint32_t k_iter = 0; k_iter < num_k_tiles; ++k_iter) {
             const std::uint32_t ring_iter = task_id * num_k_tiles + k_iter;

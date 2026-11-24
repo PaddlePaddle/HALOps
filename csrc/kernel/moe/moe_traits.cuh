@@ -91,11 +91,14 @@ struct LatentDownGemmTraits {
         WeightQuant::template ScaleShape<kTileShapeM, kTileShapeK>();
 };
 
-// Router Linear (logits = input x weight, bf16 in, fp32 accumulate, bf16 out).
+// Router projection with BF16 inputs and FP32 accumulation.
 template <typename Dims>
 struct RouterGemmTraits {
     static constexpr std::uint32_t kGemmM = Dims::kNumExperts;
     static constexpr std::uint32_t kGemmN = Dims::kNumTokens;
+
+    static constexpr bool kStoreScores = MoERuntime::kMaxRouterGates > 1u;
+    using LogitType = std::conditional_t<kStoreScores, float, __nv_bfloat16>;
 
     static constexpr bool kUseUmma =
         Dims::KernelConfig::kRouterMma == MmaKind::kUmma;

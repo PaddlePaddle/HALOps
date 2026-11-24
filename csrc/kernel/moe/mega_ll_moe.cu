@@ -35,9 +35,10 @@ moe::MoEProblemSize BuildProblem(const torch::Tensor& input,
                                  const torch::Tensor& router_weight,
                                  const torch::Tensor& shared_down_weight,
                                  const torch::Tensor& latent_down_weight,
-                                 std::uint32_t num_router_gates) {
-    TORCH_CHECK(num_router_gates == 2, "Only support 2 router gates, got ",
-                num_router_gates, ".");
+                                 std::int64_t num_router_gates) {
+    TORCH_CHECK(num_router_gates >= 1 &&
+                    num_router_gates <= MoERuntime::kMaxRouterGates,
+                "num_router_gates must be 1 or 2, got ", num_router_gates, ".");
     TORCH_CHECK(input.dim() == 2,
                 "The input's shape must be [tokens, hidden].");
 
@@ -170,11 +171,6 @@ moe::MoERuntime BuildRuntimeConfig(const MoEProblemSize& problem) {
     const std::uint32_t num_shared_ctas =
         MoEDims::KernelConfig::kNumCtasForShared;
 
-    TORCH_CHECK(
-        problem.num_router_gates >= 1u &&
-            problem.num_router_gates <= moe::MoERuntime::kMaxRouterGates,
-        "the router runs 1..", moe::MoERuntime::kMaxRouterGates, " gates, got ",
-        problem.num_router_gates, ".");
     // Every phase's CTA budget must cover whole tiles.
     const std::uint32_t num_latent_tiles =
         problem.latent_size / LatentDownGemm::kTileShapeM;
@@ -192,9 +188,10 @@ moe::MoERuntime BuildRuntimeConfig(const MoEProblemSize& problem) {
                 num_shared_ctas,
                 ") must cover whole up-projection slabs of 2*intermediate=",
                 2u * problem.intermediate_size, ".");
-    TORCH_CHECK(num_shared_ctas == num_down_tiles,
-                "the shared up and down passes need the same CTA count (",
-                num_shared_ctas, " vs ", num_down_tiles, ").");
+    TORCH_CHECK(
+        problem.hidden_size == num_shared_ctas * SharedDownGemm::kTileShapeM,
+        "the shared up and down passes need the same CTA count (",
+        num_shared_ctas, " vs ", num_down_tiles, ").");
     const std::uint32_t num_ctas_per_expert =
         MoEDims::KernelConfig::kCtasPerExpert;
     TORCH_CHECK(num_ctas_per_expert <= moe::MoERuntime::kMaxCtasPerExpert,
@@ -387,7 +384,10 @@ void MoEImpl(
                                  latent_down_weight_scale.const_data_ptr())
                            : nullptr;
 
-    args.workspace = static_cast<char*>(workspace.data_ptr());
+    const auto scratch_bytes = MoEWorkspace<MoEDims>::bytes(problem);
+    TORCH_CHECK(workspace.nbytes() >= scratch_bytes, "MoE scratchpad needs ",
+                scratch_bytes, " bytes, got ", workspace.nbytes(), ".");
+    args.workspace.bind(workspace.data_ptr(), problem);
 
     const int device = input.get_device();
     int l2_cached_bytes = 0;
@@ -424,11 +424,6 @@ void MoEImpl(
         args, grid_size, args.runtime.cluster_size, stream, use_pdl);
     TORCH_CHECK(launch_status == cudaSuccess,
                 "kernel launch failed: ", cudaGetErrorString(launch_status));
-}
-
-template <class Dims>
-constexpr int64_t WorkspaceBytesFor() {
-    return static_cast<int64_t>(sizeof(moe::MoEWorkspace<Dims>));
 }
 
 template <class Dims, class GemmTraits>
@@ -521,26 +516,19 @@ struct MoEKernelDispatcher {
         }
     }
 
-    // Largest workspace of a token class, over both TP worlds and recipes.
-    template <bool kWide, typename... Dims>
-    static constexpr int64_t max_workspace_bytes(TypeList<Dims...>) {
-        int64_t best = 0;
-        ((best =
-              (is_wide<Dims>() == kWide && static_cast<int64_t>(sizeof(
-                                               moe::MoEWorkspace<Dims>)) > best
-                   ? static_cast<int64_t>(sizeof(moe::MoEWorkspace<Dims>))
-                   : best)),
-         ...);
-        return best;
-    }
-
-    static int64_t workspace_size(int64_t max_tokens) {
-        constexpr int64_t kBs8Bytes = max_workspace_bytes<false>(DimsAll{});
-        constexpr int64_t kBs16Bytes = max_workspace_bytes<true>(DimsAll{});
-        if (max_tokens <= 0) {
-            return kBs8Bytes > kBs16Bytes ? kBs8Bytes : kBs16Bytes;
-        }
-        return max_tokens <= 8 ? kBs8Bytes : kBs16Bytes;
+    template <typename... Dims>
+    static int64_t workspace_size(TypeList<Dims...>,
+                                  const moe::MoEProblemSize& problem) {
+        std::size_t bytes = 0;
+        auto include = [&](auto dims) {
+            using D = decltype(dims);
+            if (problem.num_tokens == 0u ||
+                is_wide<D>() == (problem.num_tokens > 8u)) {
+                bytes = std::max(bytes, moe::MoEWorkspace<D>::bytes(problem));
+            }
+        };
+        (include(Dims{}), ...);
+        return static_cast<int64_t>(bytes);
     }
 
     template <typename... Dims>
@@ -603,8 +591,15 @@ struct MoEKernelDispatcher {
     }
 };
 
-int64_t GetWorkspaceSize(int64_t max_tokens) {
-    return MoEKernelDispatcher::workspace_size(max_tokens);
+int64_t GetWorkspaceSize(std::uint32_t max_tokens, std::uint32_t hidden_size,
+                         std::uint32_t intermediate_size,
+                         std::uint32_t latent_size, std::uint32_t num_experts,
+                         std::uint32_t num_router_gates) {
+    TORCH_CHECK(max_tokens <= 16u, "MoE workspace supports at most 16 tokens.");
+    return MoEKernelDispatcher::workspace_size(
+        MoEKernelDispatcher::DimsAll{},
+        {max_tokens, hidden_size, intermediate_size, latent_size, num_experts,
+         num_router_gates});
 }
 
 void PrintMoEKernelInfo(const std::string& quant_mode) {
@@ -644,9 +639,9 @@ void MegaLLMoE(const torch::Tensor& input, const torch::Tensor& router_weight,
         "quant_mode must be w8a8-blockwise, w8a8-mxfp8 or w4a8-mxfp4, got ",
         quant_mode, ".");
 
-    const moe::MoEProblemSize problem = moe::BuildProblem(
-        input, router_weight, shared_down_weight, latent_down_weight,
-        static_cast<std::uint32_t>(num_router_gates));
+    const moe::MoEProblemSize problem =
+        moe::BuildProblem(input, router_weight, shared_down_weight,
+                          latent_down_weight, num_router_gates);
 
     TORCH_CHECK(scoring_func == "sigmoid" || scoring_func == "softmax",
                 "scoring_func must be sigmoid or softmax.");

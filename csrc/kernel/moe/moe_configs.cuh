@@ -142,7 +142,6 @@ struct QuantConfig {
 template <QuantConfig Config, std::uint32_t NumTokens, int TailWorld = 4>
 struct MoEDims_E512_N512_K2048 {
     static constexpr uint32_t kHiddenSize = 4096;
-    static constexpr uint32_t kIntermediateSize = 512;
     static constexpr std::uint32_t kLatentSize = 2048;
     static constexpr uint32_t kNumTokens = NumTokens;
     static constexpr uint32_t kNumExperts = 512;

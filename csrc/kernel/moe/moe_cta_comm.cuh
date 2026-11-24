@@ -47,15 +47,13 @@ struct PackedTokenCounts {
 };
 
 template <std::uint32_t kSpecMaxGrid, std::uint32_t kMaxRoutedRows,
-          std::uint32_t kUpOutScaleCols, std::uint32_t kMaxCtasPerExpert>
+          std::uint32_t kMaxCtasPerExpert>
 struct MoECtaComm {
     // Per-block launch counter; its parity selects the double-buffer half.
     std::uint32_t launch_flip[kSpecMaxGrid];
 
     // Per-row readiness bits, double-buffered by launch parity. Each up block
     // release-sets its bit after storing data and scales.
-    static constexpr std::uint32_t kUpOutReadyFull =
-        (kUpOutScaleCols >= 32u) ? 0xFFFFFFFFu : ((1u << kUpOutScaleCols) - 1u);
     std::uint32_t up_out_ready[2][kMaxRoutedRows];
 
     // Parity-buffered down-task cursor and packed per-token completion counts.
@@ -63,13 +61,13 @@ struct MoECtaComm {
     std::uint32_t down_task_next[2];
     std::uint64_t down_tasks_done[2][kMaxCtasPerExpert];
 
-    // Published router-task count, double-buffered by launch parity.
+    // Published task counts, double-buffered by launch parity.
     std::uint32_t router_tasks_done[2];
-    // Published latent-task count, double-buffered by launch parity.
     std::uint32_t latent_tasks_done[2];
-    // Shared expert blocks that have published their activation slice.
-    std::uint32_t shared_up_out_done[2];
-    std::uint32_t shared_down_done[2];
+    // Shared expert blocks that have published their activation slices.
+    std::uint32_t shared_up_tasks_done[2];
+    // Shared expert blocks that have finished their down projection.
+    std::uint32_t shared_down_tasks_done[2];
 
     // Routing tables are published in 32 lane-strided word slices.
     static constexpr std::uint32_t kRouterTableSlices = 32u;
@@ -100,8 +98,8 @@ struct MoECtaComm {
             down_task_next[inactive] = 0u;
             router_tasks_done[inactive] = 0u;
             latent_tasks_done[inactive] = 0u;
-            shared_up_out_done[inactive] = 0u;
-            shared_down_done[inactive] = 0u;
+            shared_up_tasks_done[inactive] = 0u;
+            shared_down_tasks_done[inactive] = 0u;
         }
     }
 
@@ -155,26 +153,27 @@ struct MoECtaComm {
     }
 
     // One shared expert block published its activation slice.
-    __device__ __forceinline__ void publish_shared_up_out(
+    __device__ __forceinline__ void publish_shared_up_tasks(
         std::uint32_t parity, std::uint32_t num_tasks) {
-        global_red_add_release_u32(&shared_up_out_done[parity], num_tasks);
+        global_red_add_release_u32(&shared_up_tasks_done[parity], num_tasks);
     }
 
-    __device__ __forceinline__ void wait_shared_up_out(
+    __device__ __forceinline__ void wait_shared_up_tasks(
         std::uint32_t parity, std::uint32_t num_tasks) const {
-        while (global_load_acquire_u32(&shared_up_out_done[parity]) <
+        while (global_load_acquire_u32(&shared_up_tasks_done[parity]) <
                num_tasks) {
         }
     }
 
-    __device__ __forceinline__ void publish_shared_down_done(
+    __device__ __forceinline__ void publish_shared_down_tasks(
         std::uint32_t parity, std::uint32_t num_tasks) {
-        global_red_add_release_u32(&shared_down_done[parity], num_tasks);
+        global_red_add_release_u32(&shared_down_tasks_done[parity], num_tasks);
     }
 
-    __device__ __forceinline__ void wait_shared_down_done(
+    __device__ __forceinline__ void wait_shared_down_tasks(
         std::uint32_t parity, std::uint32_t num_tasks) const {
-        while (global_load_acquire_u32(&shared_down_done[parity]) < num_tasks) {
+        while (global_load_acquire_u32(&shared_down_tasks_done[parity]) <
+               num_tasks) {
         }
     }
 
