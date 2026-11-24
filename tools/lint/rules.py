@@ -14,7 +14,9 @@
 """Rule table and per-file checks for halops_lint.py."""
 
 import ast
+import io
 import re
+import tokenize
 
 CPP = (".cu", ".cuh", ".h", ".cc", ".hpp")
 COMMON = "csrc/common/"
@@ -25,7 +27,9 @@ RULES = {
     "new-namespace": ("error", "namespace"),
     "ns-static": ("error", "namespace"),
     "ns-collision": ("error", "namespace"),
-    "ns-constexpr-in-cu": ("warn", "magic"),
+    "model-constexpr": ("error", "magic"),
+    "ns-constexpr": ("error", "magic"),
+    "local-constexpr": ("error", "magic"),
     "reuse-cuda-check": ("error", "reuse"),
     "reuse-launch": ("error", "reuse"),
     "reuse-pdl": ("error", "reuse"),
@@ -40,6 +44,7 @@ RULES = {
     "type-alias": ("warn", "alias"),
     "check-budget": ("warn", "defensive"),
     "debug-comment": ("error", "comment"),
+    "comment": ("error", "comment"),
     "comment-density": ("error", "comment"),
     "file-too-long": ("error", "layout"),
     "hpp": ("error", "layout"),
@@ -131,6 +136,46 @@ GLOBAL_SEED = re.compile(
 SPAWN = re.compile(
     r"\bsubprocess\.(run|Popen|check_call|check_output)\b|\bmp\.spawn\b|\bmultiprocessing\b"
 )
+MODEL_CAMEL = re.compile(
+    r"^k?(\w*?)(Heads?|HeadDim|Dims?|Hidden|Nope|Rope|Latent|Lora|Vocab|Experts?|TopK|Topk|"
+    r"Intermediate|PageSize|ScaleGroup|QuantGroup|RowBytes|Sf)(?=[A-Z0-9_]|$)(\w*)"
+)
+NOT_MODEL = re.compile(
+    r"(Tile|Block|Box|Warp|Cta|Mma|Atom|Chunk|Stage|Depth|Smem|Tmem|Thread|Lane|Vec|Pack|"
+    r"Per|No|Invalid|Swizzle)$"
+)
+MODEL_SUFFIX = re.compile(
+    r"^(_?(Size|Dims?|Bytes|Rank|Ratio|Groups?|Num|Count|Len|Elems?|Cols|Rows|Total|K|Q|V|"
+    r"Kv|Qk|Vo|O|Nope|Rope|Ckv|Kpe|\d+))*$"
+)
+DESCRIPTOR = re.compile(r"Model|Dims|Shape|Desc")
+MODEL_UPPER = re.compile(
+    r"(^|_)(HEAD_?DIM|HEAD_SIZE|HEADS|HIDDEN|NOPE|ROPE|LATENT|LORA|VOCAB|TOP_?K|EXPERTS|"
+    r"INTERMEDIATE|PAGE_SIZE|SCALE_GROUP|QUANT_GROUP)(_|$)",
+    re.I,
+)
+CONSTEXPR = re.compile(r"^\s*((static|inline)\s+)*(constexpr|const)\b")
+DEFINE = re.compile(r"^\s*#\s*define\s+(\w+)\s+(\S.*)$")
+IDENT = re.compile(r"\b[A-Za-z_]\w*\b")
+LITERAL_OK = re.compile(
+    r"^(true|false|nullptr|static_cast|int|unsigned|signed|long|short|char|bool|float|"
+    r"double|size_t|u?int\d+_t)$"
+)
+CONST_NAME = re.compile(r"^([A-Z][A-Z0-9_]*|k[A-Z]\w*)$")
+DIRECTIVE = re.compile(
+    r"halops-lint:|clang-format\s+(on|off)|NOLINT|IWYU\s+pragma|\bnoqa\b|type:\s*ignore|"
+    r"fmt:\s*(on|off|skip)|^pragma\b|pylint:|isort:|pyright:|mypy:|^!/|coding[:=]"
+)
+LICENSE = re.compile(r"Copyright|Licensed|SPDX-License")
+DOC_TYPE = re.compile(
+    r"^(template\b|(struct|class|union|enum)\b(?!.*;\s*$)|typedef\b|using\s+\w+\s*=)"
+)
+NOT_FN = re.compile(
+    r"^(#|[{}()]|static_assert\b|return\b|using\s+namespace\b|(public|private|"
+    r"protected)\s*:)"
+)
+BANNER = re.compile(r"[=\-#*~/]{6,}")
+ARG_CMT = re.compile(r"^\s*\w+\s*=\s*$")
 CHECK_BUDGET = 6
 NEW_FILE_MAX_LINES = 600
 CMT_DENSITY_MAX = 0.10  # p90 on main is 0.091
@@ -141,11 +186,12 @@ def strip_strings(line):
     return re.sub(r'"(\\.|[^"\\])*"', '""', line)
 
 
-def scope_map(text, defs=None):
+def scope_map(text, defs=None, decl=None):
     """Per line: (all enclosing scopes are namespaces, enclosing function start line,
     enclosing namespace path such as "halops::moe"; an anonymous namespace is "").
     When defs is a list, append (line, kind, head, namespace path) for every function or
-    type body opened at namespace scope."""
+    type body opened at namespace scope. When decl is a list, append per line whether
+    every enclosing scope is a namespace or a type body, where declarations live."""
     stack, out, pending, func = [], [], "", None
     for no, raw in enumerate(text.splitlines(), 1):
         line = strip_strings(raw.split("//")[0])
@@ -156,6 +202,8 @@ def scope_map(text, defs=None):
                 "::".join(n for k, n in stack if k == "ns"),
             )
         )
+        if decl is not None:
+            decl.append(all(k in ("ns", "type") for k, _ in stack))
         for ch in line:
             if ch == "{":
                 head = pending.strip()
@@ -245,6 +293,307 @@ def definitions(text):
 TU = (".cu", ".cc")
 
 
+def model_name(name):
+    """Whether a constant is named after a model or data-format dimension: head count,
+    head and latent dims, rope, hidden, experts, top-k, page size, quantization groups,
+    row layout. A tile, block, atom ... of such a dim (kTileDim, kSfAtomM, kRopeDepth) is
+    tuning or hardware layout, and kNoExpert-style sentinels are not shapes."""
+    m = MODEL_CAMEL.match(name)
+    if m:
+        return not NOT_MODEL.search(m.group(1)) and bool(MODEL_SUFFIX.match(m.group(3)))
+    return bool(MODEL_UPPER.search(name))
+
+
+def parse_decls(body):
+    """[(name, initializer)] of a constant variable declaration after its qualifiers;
+    [] for a function."""
+    parts, depth, cur = [], 0, ""
+    for ch in body:
+        depth += ch in "([{"
+        depth -= ch in ")]}"
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    cuts = [parts[0].find(c) for c in "=({" if c in parts[0]]
+    if not cuts or parts[0][min(cuts)] == "(":
+        return []
+    out = []
+    for p in parts:
+        m = re.search(r"(\w+)\s*(?:\[[^\]]*\])?\s*(?:=|\{)", p)
+        if m:
+            out.append((m.group(1), p[m.end() :]))
+    return out
+
+
+def literal(value, known=frozenset()):
+    """The initializer is a number or bool written out, possibly combined with sizeof,
+    casts to built-in types and the known names."""
+    value = re.sub(r"\bsizeof\s*\((?:[^()]|\([^()]*\))*\)", " sizeof ", value)
+    names = IDENT.findall(re.sub(r"\b\d[\w.']*", " ", value))
+    if not re.search(r"\b\d|\b(true|false)\b", value):
+        return False
+    return all(n in known or n == "sizeof" or LITERAL_OK.match(n) for n in names)
+
+
+def constant_decls(text, scopes):
+    """[(first line, last line, scope, qualifiers, [(name, initializer)])] for constant
+    variables and object-like #define values; scope is "ns", "fn" or "type". A line that
+    continues an open parenthesis (parameters, arguments) is not a declaration."""
+    lines, decls, depth, opened = text.splitlines(), [], 0, []
+    for raw in lines:
+        opened.append(depth)
+        code = strip_strings(raw.split("//")[0])
+        depth = max(0, depth + code.count("(") - code.count(")"))
+    i = 0
+    while i < len(lines):
+        stmt = strip_strings(lines[i].split("//")[0])
+        m = DEFINE.match(stmt)
+        if m and not m.group(2).rstrip().endswith("\\"):
+            decls.append((i + 1, i + 1, "ns", "#define", [(m.group(1), m.group(2))]))
+        q = CONSTEXPR.match(stmt)
+        if not q or opened[i]:
+            i += 1
+            continue
+        j = i
+        while ";" not in stmt and j + 1 < len(lines) and j - i < 20:
+            j += 1
+            stmt += " " + strip_strings(lines[j].split("//")[0])
+        ds = parse_decls(stmt[q.end() :].split(";")[0])
+        if not ds:
+            i += 1
+            continue
+        at_ns, fn, _ = scopes[i]
+        scope = "ns" if at_ns else ("fn" if fn else "type")
+        decls.append((i + 1, j + 1, scope, q.group(0).split(), ds))
+        i = j + 1
+    return decls
+
+
+def model_set(text, scopes, decls, types):
+    """Namespace-scope constants that carry the model shape: named after a model dim,
+    derived from one, or sizeof of a non-template type whose body uses one."""
+    lines, bodies = text.splitlines(), []
+    for no, h in types:
+        m = re.search(r"\b(?:struct|class|union)\b(?:\s+alignas\([^)]*\))?\s+(\w+)", h)
+        if m and not re.search(r"\btemplate\s*<", h):
+            end = no
+            while end < len(lines) and not scopes[end][0]:
+                end += 1
+            body = " ".join(
+                strip_strings(s.split("//")[0]) for s in lines[no - 1 : end]
+            )
+            bodies.append((m.group(1), set(IDENT.findall(body))))
+    model, grew = set(), True
+    while grew:
+        grew = False
+        for _, _, scope, _, ds in decls:
+            for n, v in ds:
+                if scope == "ns" and n not in model:
+                    if model_name(n) or set(IDENT.findall(v)) & model:
+                        model.add(n)
+                        grew = True
+        for n, used in bodies:
+            if n not in model and used & model:
+                model.add(n)
+                grew = True
+    return model
+
+
+MSG_NS = (
+    "constant at file scope; put tuning values in the kernel's Config/Traits as static "
+    "constexpr, arch constants in csrc/common and schedule constants in the host planner"
+)
+MSG_MODEL_NS = (
+    "model-shape constant at namespace scope; make the model values template parameters "
+    "of the kernel config and derive the rest there"
+)
+MSG_LOCAL = (
+    "literal constant inside a function; make it a static constexpr member of the "
+    "kernel's Config/Traits"
+)
+
+
+def constant_findings(path, text):
+    """{first line: (last line, rule, message)} for constant definitions.
+
+    model-constexpr: a namespace-scope constant in the model set, a literal model value
+    inside a function or a primary class template, and a literal model value in a
+    non-template type read as Type::kName. A non-template type or explicit specialization
+    that is only passed as a template argument describes the model and is allowed.
+    ns-constexpr: any other namespace-scope constant or numeric #define.
+    local-constexpr: a constexpr or static const local with a literal initializer.
+    The last two apply to .cu/.cuh/.h outside csrc/common, which holds arch constants.
+    """
+    defs = []
+    scopes = scope_map(text, defs)
+    decls = constant_decls(text, scopes)
+    types = [
+        (no, re.sub(r"\s+", " ", head)) for no, kind, head, _ in defs if kind == "type"
+    ]
+    model = model_set(text, scopes, decls, types)
+    kernel = path.endswith((".cu", ".cuh", ".h")) and not path.startswith(COMMON)
+    out = {}
+    for first, last, scope, qual, ds in decls:
+        rule = "model-constexpr"
+        if scope == "ns":
+            hit, msg = [n for n, _ in ds if n in model], MSG_MODEL_NS
+            if not hit and kernel:
+                rule, msg = "ns-constexpr", MSG_NS
+                if qual != "#define":
+                    hit = [n for n, _ in ds]
+                elif re.search(r"\d", ds[0][1]) and re.fullmatch(
+                    r"[\w\s()+\-*/%<>&|^~.]+", ds[0][1]
+                ):
+                    names = IDENT.findall(ds[0][1])
+                    if all(LITERAL_OK.match(n) or CONST_NAME.match(n) for n in names):
+                        hit = [ds[0][0]]
+        elif scope == "fn":
+            msg = "model value fixed in a function; take it from the template config"
+            hit = [n for n, v in ds if model_name(n) and literal(v, model)]
+            if not hit and kernel:
+                rule, msg = "local-constexpr", MSG_LOCAL
+                named = "constexpr" in qual or "static" in qual
+                hit = [
+                    n for n, v in ds if literal(v) and (named or CONST_NAME.match(n))
+                ]
+        else:
+            owner = [h for no, h in types if no <= first]
+            m = owner and re.search(
+                r"\b(?:struct|class)\b(?:\s+alignas\([^)]*\))?\s+(\w+)", owner[-1]
+            )
+            if not m or re.search(r"\btemplate\s*<\s*>", owner[-1]):
+                continue
+            name = m.group(1)
+            hit = [n for n, v in ds if model_name(n) and literal(v, model)]
+            read = [
+                n
+                for n in hit
+                if re.search(rf"\b{name}\s*(<[^;{{}}]*?>)?\s*::\s*{n}\b", text)
+            ]
+            if read:
+                hit, msg = read, (
+                    f"model value read as {name}::; pass {name} to the kernel as a "
+                    "template argument instead of naming it"
+                )
+            elif re.search(r"\btemplate\s*<", owner[-1]) and not DESCRIPTOR.search(
+                name
+            ):
+                msg = f"model value fixed in template {name}; make it a template parameter"
+            else:
+                continue
+        if hit:
+            out[first] = (last, rule, f"{', '.join(hit)}: {msg}")
+    return out
+
+
+def cpp_comment_rows(text):
+    """Per line: (code outside comments, comment text or None), with string literals and
+    block comments tracked across lines."""
+    rows, block = [], False
+    for raw in text.splitlines():
+        code, cmt, i, n = "", [] if block else None, 0, len(raw)
+        while i < n:
+            if block:
+                j = raw.find("*/", i)
+                cmt.append(raw[i:] if j < 0 else raw[i:j])
+                i, block = (n, True) if j < 0 else (j + 2, False)
+                continue
+            ch = raw[i]
+            if ch == '"' or (ch == "'" and not (i and raw[i - 1].isalnum())):
+                j = i + 1
+                while j < n and raw[j] != ch:
+                    j += 2 if raw[j] == "\\" else 1
+                code += raw[i : j + 1]
+                i = j + 1
+            elif raw.startswith("//", i):
+                cmt = (cmt or []) + [raw[i + 2 :]]
+                break
+            elif raw.startswith("/*", i):
+                j = raw.find("*/", i + 2)
+                if j > 0 and ARG_CMT.match(raw[i + 2 : j]):
+                    code += " "
+                    i = j + 2
+                    continue
+                cmt, block, i = cmt or [], True, i + 2
+            else:
+                code += ch
+                i += 1
+        text_ = None if cmt is None else " ".join(cmt).strip(" */")
+        rows.append((code.strip(), text_))
+    return rows
+
+
+def py_comment_rows(text):
+    """Per line: (code outside the comment, comment text or None) from tokenize."""
+    lines = text.splitlines()
+    rows = [(s.strip(), None) for s in lines]
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.COMMENT and tok.start[0] <= len(lines):
+                r, c = tok.start
+                rows[r - 1] = (lines[r - 1][:c].strip(), tok.string[1:].strip())
+    except (tokenize.TokenError, SyntaxError):
+        return [(s.strip(), None) for s in lines]
+    return rows
+
+
+MSG_COMMENT = (
+    "only docstrings are kept (a comment block directly above a function, type or alias "
+    "declaration, or a Python docstring); delete this comment"
+)
+MSG_TRAILING = "trailing comment; delete it or move the reason into a name"
+
+
+def doc_head(code):
+    """Whether a line at namespace or class scope starts a function, type or alias
+    declaration, the declarations a docstring may document."""
+    code = re.sub(r"\b(alignas|__align__)\s*\([^()]*\)", "", code).strip()
+    if DOC_TYPE.match(code):
+        return True
+    if NOT_FN.match(code):
+        return False
+    m = re.search(r"[=(]", code)
+    return bool(m and m.group(0) == "(" and re.search(r"\w\s*\($", code[: m.end()]))
+
+
+def comment_findings(rows, doc_target):
+    """[(first line, last line, message)] for comments that are not docstrings.
+
+    rows holds (code, comment text or None) per line, and doc_target(index) tells whether
+    the code on that line may carry a docstring. A run of comment-only lines is a
+    docstring when the next line is such a declaration. Tool directives, the license
+    header and the labels on a namespace's closing brace or an #endif are kept."""
+    n, i, out = len(rows), 0, []
+    while i < n and not rows[i][0]:
+        i += 1
+    if not any(c and LICENSE.search(c) for _, c in rows[:i]):
+        i = 0
+    while i < n:
+        code, cmt = rows[i]
+        if cmt is None or (code and DIRECTIVE.search(cmt)):
+            i += 1
+            continue
+        if code:
+            label = re.match(r"^\};?$", code) and re.search(r"\bnamespace\b", cmt)
+            if not label and not re.match(r"^#\s*(endif|else|elif)\b", code):
+                out.append((i + 1, i + 1, MSG_TRAILING))
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and not rows[j + 1][0] and rows[j + 1][1] is not None:
+            j += 1
+        prose = [c for _, c in rows[i : j + 1] if not DIRECTIVE.search(c)]
+        nxt = j + 1
+        doc = nxt < n and rows[nxt][0] and doc_target(nxt)
+        if prose and (not doc or any(BANNER.search(c) for c in prose)):
+            out.append((i + 1, j + 1, MSG_COMMENT))
+        i = j + 1
+    return out
+
+
 def common_index(read):
     """Device helper names and inline PTX strings defined in csrc/common."""
     names, asms = {}, {}
@@ -263,6 +612,19 @@ def check_cpp(path, text, added, is_new, index):
     checks_in_fn = {}
     in_common = path.startswith(COMMON)
     defs = definitions(text) if path.endswith(TU) and index else {}
+    for first, (last, rid, msg) in sorted(constant_findings(path, text).items()):
+        if any(no in added for no in range(first, last + 1)):
+            f.append((first, rid, msg))
+    decl = []
+    scope_map(text, decl=decl)
+    rows = cpp_comment_rows(text)
+
+    def doc_target(i):
+        return decl[i] and doc_head(rows[i][0])
+
+    for first, last, msg in comment_findings(rows, doc_target):
+        if any(no in added for no in range(first, last + 1)):
+            f.append((first, "comment", msg))
     for no in sorted(added):
         line = lines[no - 1] if no <= len(lines) else ""
         code = strip_strings(line.split("//")[0])
@@ -290,12 +652,6 @@ def check_cpp(path, text, added, is_new, index):
             f.append((no, "new-namespace", f"do not add namespace {full}"))
         if at_ns and re.match(r"^\s*(template\s*<.*>\s*)?([A-Z_]+\s+)*static\b", code):
             f.append((no, "ns-static", "no static at namespace scope"))
-        if (
-            at_ns
-            and path.endswith(".cu")
-            and re.match(r"^\s*(inline\s+)?constexpr\b", code)
-        ):
-            f.append((no, "ns-constexpr-in-cu", "file-scope constexpr in .cu"))
         for rid, pat, allow, msg in BANNED:
             if re.search(pat, code) and not (allow and path.startswith(allow)):
                 f.append((no, rid, msg))
@@ -435,6 +791,9 @@ def check_py(path, text, added, is_new):
                     "comment records debugging, experiments or history",
                 )
             )
+    for first, last, msg in comment_findings(py_comment_rows(text), lambda i: False):
+        if any(no in added for no in range(first, last + 1)):
+            f.append((first, "comment", msg))
     if api:
         try:
             tree = ast.parse(text)
