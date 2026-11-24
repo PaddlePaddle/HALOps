@@ -30,6 +30,7 @@
 #include <unordered_map>
 
 #include "common/pdl.cuh"
+#include "common/ptx.cuh"
 #include "kernel/gemm/gemm_utils.h"
 #include "kernel/mla/mla_intrinsics.cuh"
 
@@ -37,7 +38,7 @@ namespace halops {
 
 using namespace mla;
 
-namespace {
+namespace detail {
 
 // A 2-CTA cluster attends pairs of tokens (2j, 2j+1) of a request over the
 // union of their KV lists, so each KV tile is read and dequantized once for
@@ -276,7 +277,7 @@ static_assert(kDsaSmemBytes <= 227 * 1024);
 // C::kTile &c. uniformly; HcaCfg resolves them to HCA's 64-key values.
 // kFuse compiles in the fused merge (see fused_merge); the launches that
 // cannot use it run a build without it, whose main loop the merge code would
-// otherwise slow (2-6% at P > 76, measured).
+// otherwise slow down.
 template <bool kDsaV, bool kFuseV = !kDsaV>
 struct Cfg {
     static constexpr bool kDsa = kDsaV;
@@ -593,7 +594,7 @@ CUTE_DEVICE int effective_cap(const HcaParams& p, int total_unc, int clusters) {
 // pole-length sweep showed regresses short-KV batches).  Clusters past the
 // scheduled count see an empty range and exit, like the tiny-batch path.
 // ceil(x / d) for 0 <= x < 2^20, d > 0: a float estimate and an integer
-// correction.  Integer division is a ~0.1 us dependent chain in find_range.
+// correction, as integer division is a long dependent chain in find_range.
 CUTE_DEVICE int ceil_div_f(int x, int d) {
     int q = __float2int_rz(__fdividef(float(x), float(d)));
     q += (q + 1) * d <= x;
@@ -723,35 +724,31 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
     if (p.eff == 2) {
         bool spread = false;  // sched_clusters' count, legacy merge
         // Auto gate: the host cannot see the KV lengths (only the index
-        // width), so pick per launch.  The legacy path (2 clusters per pair,
-        // capped at smax, inline merge) costs ~14.5 + 1.18 us per tile of its
-        // busiest cluster, h0 = max(U / 2P, n_max / smax), plus ~2.1 + 0.09
-        // min(P, kCombJobs) us here for the wide launch and the idle combine;
-        // eff 1 (wide split, combine kernel) ~14.3 + 0.55 us per pair + 1.31
-        // us per tile of h1 = U / sched.  Fitted on the 8K-512K x T2-76
-        // sweep, in quarter tiles: eff 1 iff 4 (h0 - h1) > 3P - 8 (3.2 us
-        // total loss over 88 shapes vs the per-shape best).  With the merge
-        // fused (no combine launch, helpers, see fused_merge) the fit on the
-        // same sweep is ~14.1 + 1.16 h0 + 0.11 P vs ~15.4 + 1.24 h1 + 0.15 P,
-        // and the aligned schedule (no merge) ~10.05 + 1.14 n_max + 0.03 P:
-        // the cheapest wins (0.5 us total loss over 40 shapes; 8K always
-        // aligned, ~5 us faster than the 2-cluster split at T32-76).
+        // width), so pick per launch.  Each schedule's cost is a linear model
+        // in its busiest cluster's tiles and the pair count P, fitted over KV
+        // lengths 8K-512K and T2-76.  The legacy path (2 clusters per pair,
+        // capped at smax, inline merge) has h0 = max(U / 2P, n_max / smax)
+        // tiles; eff 1 (wide split, combine kernel) has h1 = U / sched.
+        // Without the fused merge, eff 1 wins iff 4 (h0 - h1) > 3P - 8 (in
+        // quarter tiles).  With the merge fused (no combine launch, see
+        // fused_merge) the costs c0 (legacy), c1 (wide split) and cu (the
+        // aligned schedule, no merge) below are compared and the cheapest
+        // wins; 8K is always aligned.
         const int pp = max(pairs, 1);
         const int h0 = max(ceil_div_f(total_unc, 2 * pp),
                            (n_max + kDefaultSmax - 1) / kDefaultSmax);
         const int h1 = ceil_div_f(total_unc, sched);
         if (p.fuse) {
-            const int cu = 1005 + 114 * n_max + 3 * pp;  // 10 ns units
+            const int cu = 1005 + 114 * n_max + 3 * pp;  // in 1/100 of a usec
             const int c0 = 1410 + 116 * h0 + 11 * pp;
             const int c1 = 1540 + 124 * h1 + 15 * pp;
             comb = p.combine && c1 < min(c0, cu);
             aligned = !comb && cu <= c0;
             if (float(p.clusters) * p.ks_rp < 3.f) {
-                // P > clusters / 3 (no k-split): refit on the 8K-1M x T16-72
-                // tpr8 sweep, plus the spread schedule (eff 3's: every cluster,
-                // inline merge, capped) ~14.2 + 1.19 h1 + 1.65 sched / P +
-                // 0.08 P us (0.5 us margin), which beats the fused merge's
-                // fan-in at long KV (512K-1M T56-64 1-3 us).
+                // P > clusters / 3 (no k-split): a second fit over KV lengths
+                // 8K-1M, T16-72 and 8 tokens per request adds d3, the spread
+                // schedule (eff 3's: every cluster, inline merge, capped),
+                // which beats the fused merge's fan-in at long KV.
                 const int d0 = 1362 + 115 * h0 + 14 * pp;
                 const int d1 = 1813 + 116 * h1 + 14 * pp;
                 const int d3 = 1417 + 119 * h1 + 8 * pp +
@@ -763,11 +760,11 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
             }
             // Equal pairs: k parts per pair, sched = k P, puts every range on
             // pair boundaries (range_lo(j k) = j n); c1's ranges straddle
-            // pairs unless sched is a multiple of P, ~1-3.5 us more.  Fit on
-            // the 8K-512K x T8-64 k sweep: ~12.8 + 1.17 h + b k + 0.03 P us,
-            // b = 0.08 + 0.06 P, h = ceil(n / k), best k near sqrt(1.17 n / b).
-            // k = 2 stays on c0 (faster at T48-64); k <= n keeps every part
-            // non-empty.  Float math: integer divisions are ~0.1 us each here.
+            // pairs unless sched is a multiple of P.  The k-split cost is
+            // 1.17 h + b k (in tiles), b = 0.08 + 0.06 P, h = ceil(n / k),
+            // so the best k is near sqrt(1.17 n / b).  k = 2 stays on c0;
+            // k <= n keeps every part non-empty.  Float math avoids the
+            // integer divisions' dependent chains.
             const int kmax = min(n_max, p.ks_kmax);
             if (C::kFuse && !aligned && kmax >= 3 && n_max * pp == total_unc) {
                 const float n = float(n_max), b = p.ks_b, fs = sched * p.ks_rp;
@@ -803,9 +800,8 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
     } else if (p.eff == 3) {
         // Legacy above the eff 1 region (P <= clusters < 2P): one cluster per
         // pair leaves the rest idle, which a long pair cannot afford.  Spread
-        // over every cluster when that shortens the busiest one by >= 6 tiles
-        // (~1.2 us each), enough to repay the split's merge (~5 us); measured
-        // on 8K-512K x P40-76 (512K P40 85 -> 59 us, short KV stays put).
+        // over every cluster when that shortens the busiest one by >= 6 tiles,
+        // enough to repay the split's merge; short KV keeps one per pair.
         const int wide = (total_unc + p.clusters - 1) / p.clusters;
         if (n_max - wide < 6) {
             sched = min(max(pairs, 1), p.clusters);
@@ -1003,12 +999,9 @@ CUTE_DEVICE void index_warp(const HcaParams& p, const HcaMaps& maps,
         // dims-half 0 against CTA0's rope_kv, so CTA1's rope_kv must be zero
         // for its dims-half to add nothing.  Zero it once here (it is never
         // rewritten), fenced for the ss-MMA's async-proxy read.  This halves
-        // the rope DRAM/L2 traffic vs both CTAs staging the full rope.
-        // (A BALANCED variant -- both CTAs stage full rope, q_rope pre-halved
-        // -- was built + measured 2026-11-08: relerr identical but perf
-        // regressed 1.46/1.18/1.04/0.94x vs 1.48/1.21/1.06/0.95x.  CTA0 was
-        // already the critical path, so balancing only adds 2x rope L2 traffic
-        // without shortening it; CTA1's barrier idle-wait was free.  Reverted.)
+        // the rope DRAM/L2 traffic vs both CTAs staging the full rope.  CTA0
+        // is the critical path, so staging the rope on both CTAs would only
+        // add L2 traffic without shortening it.
         if (cta == 1) {
             CUTLASS_PRAGMA_UNROLL
             for (int s = 0; s < C::kStages; ++s) {
@@ -1536,13 +1529,9 @@ CUTE_DEVICE void bulk_commit() {
     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
 }
 
-// This thread's bulk stores have read their shared memory source / are done.
+// This thread's bulk stores have read their shared memory source.
 CUTE_DEVICE void bulk_wait_read() {
     asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
-}
-
-CUTE_DEVICE void bulk_wait() {
-    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
 }
 
 // A lane's row of a 128-byte swizzled box: its address with the row's
@@ -1783,7 +1772,7 @@ CUTE_DEVICE void read_o_bf16(typename C::Smem& sm, uint32_t lane_base, int t,
 // a lone token's CTA 1: it still drains O (releasing it to the next unit's PV)
 // but stores nothing, as the row it would write belongs to the next request.
 // The cluster's last unit stages all of O at once in the idle KV stages, so
-// no round waits for the previous one's box to be read (~1 us at 8K).
+// no round waits for the previous one's box to be read.
 template <class C>
 CUTE_DEVICE void store_out_rows(const HcaMaps& maps, typename C::Smem& sm,
                                 int token, uint32_t lane_base, int t,
@@ -2249,7 +2238,7 @@ CUTE_DEVICE void qo_wg(const HcaParams& p, const HcaMaps& maps,
                    sink_log2, true);
     }
     // The output is written before the CTA exits.
-    if (t == 0) bulk_wait();
+    if (t == 0) bulk_store_wait_all();
 }
 
 template <class C>
@@ -2545,8 +2534,8 @@ CUTE_DEVICE void run_decode(const HcaParams& p, const HcaMaps& maps) {
     pdl_wait();
     find_range<C>(p, sm, cluster);
     const int n = sm.start[2];
-    // The fused build merges at one call site shared by both groups: two
-    // inlined copies cost the no-merge launches ~0.3 us (code placement).
+    // The fused build merges at one call site shared by both groups, as two
+    // inlined copies slow the no-merge launches through code placement.
     if (C::kFuse && wg < 2) {
         if (wg == 0) {
             cutlass::arch::warpgroup_reg_alloc<kSoftmaxRegs>();
@@ -2815,40 +2804,31 @@ void launch_decode(HcaParams& p, const HcaMaps& maps, const torch::Tensor& q,
                               : pairs <= max_clusters   ? pairs
                                                         : max_clusters);
     // DSA: the wide-split + separate combine (eff=1) path only pays at very
-    // low batch (measured crossover pairs<=~9), where idle SMs >> tokens and a
-    // single token's 2048-KV latency dominates.  Above that the inline 2-way
-    // split-pair merge (eff=0) is 14-30% faster (measured T=16..38), since it
-    // avoids the throughput-bound low-conc combine kernel.
+    // low batch, where idle SMs far outnumber tokens and a single token's
+    // 2048-KV latency dominates.  Above that the inline 2-way split-pair merge
+    // (eff=0) wins, since it avoids the throughput-bound low-conc combine
+    // kernel.
     // HCA's 2*pairs<=max_clusters region launches wide in auto mode (eff 2):
-    // eff 1 only wins for long KV at small batch (512K up to ~T40, 110K at
-    // T2), the legacy path everywhere else, and only the device knows the
-    // lengths, so find_range picks per launch.
+    // eff 1 only wins for long KV at small batch, the legacy path everywhere
+    // else, and only the device knows the lengths, so find_range picks per
+    // launch.
     const bool is_dsa = (kernel == dsa_decode_attention_kernel);
     const int eff_mul = is_dsa ? 8 : 2;
     p.eff = eff_mul * pairs <= max_clusters ? (is_dsa ? 1 : 2) : 0;
     // Between that and P <= max_clusters HCA launches wide and find_range
     // decides per launch whether to use the spare clusters (eff 3).
     if (!is_dsa && p.eff == 0 && pairs <= max_clusters) p.eff = 3;
-    if (const char* e = getenv("HCA_EFF")) p.eff = atoi(e);
     p.tpc = kDefaultTpc;
-    if (const char* e = getenv("HCA_TPC")) p.tpc = atoi(e);
     p.clusters = p.eff ? max_clusters : heuristic;
-    if (const char* e = getenv("HCA_CLUSTERS"))
-        p.clusters = std::min(atoi(e), max_clusters);
     // eff leaves the split uncapped (work-aware sizing + cheap wide combine);
     // the legacy inline-merge path keeps the adaptive per-pair cap.
     p.smax = p.eff == 1 ? 0 : kDefaultSmax;
-    if (const char* e = getenv("HCA_SMAX")) p.smax = atoi(e);
     p.cap = kNoCap;
     p.nomerge = 0;
-    if (const char* e = getenv("HCA_NOMERGE")) p.nomerge = atoi(e);
     p.pipe = 1;
-    if (const char* e = getenv("HCA_PIPE")) p.pipe = atoi(e);
     p.combine = p.eff == 1 || p.eff == 2 ? 1 : 0;
-    if (const char* e = getenv("HCA_COMBINE")) p.combine = atoi(e);
     if (pairs > max_clusters) p.combine = 0;  // jobs has a slot per pair
     p.fuse = is_dsa ? 0 : 1;                  // DSA keeps the combine kernel
-    if (const char* e = getenv("HCA_FUSE")) p.fuse = atoi(e);
     p.ks_kmax = p.eff == 2 && p.combine && p.fuse && pairs > 0
                     ? p.clusters / int(pairs)
                     : 0;
@@ -2864,40 +2844,24 @@ void launch_decode(HcaParams& p, const HcaMaps& maps, const torch::Tensor& q,
     p.jobs = reinterpret_cast<MergeJob*>(ws.jobs.data_ptr<int>());
     p.total_g = ws.total_g.data_ptr<int>();
     p.eff_g = ws.eff_g.data_ptr<int>();
-    // __DSA_LAUNCH_TAIL__
     const cudaStream_t stream = GetCurrentCUDAStream(q);
     HALOPS_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
-    cudaLaunchAttribute attrs[2];
-    attrs[0].id = cudaLaunchAttributeClusterDimension;
-    attrs[0].val.clusterDim = {2, 1, 1};
-    attrs[1] = PdlLaunchAttribute();
-    cudaLaunchConfig_t cfg{};
-    cfg.gridDim = dim3(2 * p.clusters);
-    cfg.blockDim = dim3(kThreads);
-    cfg.dynamicSmemBytes = smem_bytes;
-    cfg.stream = stream;
-    cfg.attrs = attrs;
-    cfg.numAttrs = use_pdl ? 2 : 1;
-    HALOPS_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, p, maps));
+    HALOPS_CUDA_CHECK(LaunchKernelWithPdl(
+        kernel, dim3(2 * p.clusters), dim3(kThreads), dim3(2, 1, 1), smem_bytes,
+        stream, use_pdl, p, maps));
     if (p.combine && !p.fuse) {
         // Same stream: the main kernel's partials are visible before combine.
         // PDL: launch combine as a programmatic dependent so its grid-launch
         // latency overlaps the main kernel's drain (griddepcontrol.wait inside
         // combine gates the actual reads).
-        cudaLaunchAttribute cattr = PdlLaunchAttribute();
-        cudaLaunchConfig_t ccfg{};
         // One job slot per pair (pairs <= clusters here), the job axis capped
         // at kCombJobs: surplus blocks would only exit, yet still cost
         // block-launch waves, also when the device merged inline (eff 2).
-        ccfg.gridDim =
-            dim3(kPlanes, 2, int(std::min<int64_t>(pairs, kCombJobs)));
-        ccfg.blockDim = dim3(kCombSplit * kWarpGroup);
-        ccfg.dynamicSmemBytes = 0;
-        ccfg.stream = stream;
-        ccfg.attrs = &cattr;
-        ccfg.numAttrs = use_pdl ? 1 : 0;
-        HALOPS_CUDA_CHECK(cudaLaunchKernelEx(&ccfg, hca_combine_kernel, p));
+        HALOPS_CUDA_CHECK(LaunchKernelWithPdl(
+            hca_combine_kernel,
+            dim3(kPlanes, 2, int(std::min<int64_t>(pairs, kCombJobs))),
+            dim3(kCombSplit * kWarpGroup), kNoCluster, 0, stream, use_pdl, p));
     }
 }
 
@@ -2961,7 +2925,9 @@ void set_pool_dsa(HcaParams& p, HcaMaps& maps, const torch::Tensor& pool,
     maps.raw[1][1] = maps.raw[1][0];
 }
 
-}  // namespace
+}  // namespace detail
+
+using namespace detail;
 
 torch::Tensor HcaDecodeAttention(
     const torch::Tensor& q, const torch::Tensor& swa_k_cache,
