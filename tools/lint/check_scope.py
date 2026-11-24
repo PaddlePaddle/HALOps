@@ -21,7 +21,9 @@ Without head_ref the working tree, untracked files included, is compared. Fails 
   - edits assertions, tolerances or parametrization in tests/,
   - edits a hunk that is not near a finding reported on base_ref, is not structural
     (include, namespace open/close, blank), is not an addition under csrc/common/,
-    and does not mention a symbol named by a finding.
+    is not a templating edit (only adds or removes template heads, template arguments
+    that are names, `typename` or `X::` qualifiers), and does not mention a symbol
+    named by a finding.
 """
 
 import collections
@@ -54,6 +56,10 @@ TEST_LOGIC = re.compile(
 )
 STRUCTURAL = re.compile(
     r"^\s*(#include\b.*|namespace\s*[\w:]*\s*\{|\}\s*(//.*)?|using namespace\s+[\w:]+;)?\s*$"
+)
+TEMPLATING = re.compile(
+    r"\btemplate\s*<[^<>]*>|<\s*(?:class\s+|typename\s+)?[A-Za-z_][\w:]*\s*>"
+    r"|\btypename\s+|\b[A-Za-z_]\w*::(?=[A-Za-z_])"
 )
 WINDOW = 8
 KEYWORDS = {
@@ -99,6 +105,16 @@ KEYWORDS = {
     "import",
     "from",
 }
+
+
+def templating(removed, added):
+    """True when the hunk only adds or removes template syntax and scope qualifiers."""
+
+    def strip(lines):
+        out = (re.sub(r"\s+", "", TEMPLATING.sub("", x)) for x in lines)
+        return [x for x in out if x]
+
+    return strip(removed) == strip(added)
 
 
 def git(root, *args, check=True):
@@ -242,6 +258,8 @@ def main():
         if all(STRUCTURAL.match(x) for x in changed):
             continue
         if path.startswith(rules.COMMON) and not removed:
+            continue
+        if templating(removed, added):
             continue
         words = {w for x in changed for w in re.findall(r"[A-Za-z_]\w{3,}", x)}
         if words & names:
