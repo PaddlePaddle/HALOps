@@ -353,9 +353,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("swa_shift") = 1, py::arg("q_positions") = py::none(),
           py::arg("q_freqs") = py::none(), py::arg("q_norm_eps") = 1e-6);
     m.def("hca_decode_attention", &halops::HcaDecodeAttention, py::arg("q"),
-          py::arg("swa_k_cache"), py::arg("swa_indices"), py::arg("swa_lengths"),
-          py::arg("c128_k_cache"), py::arg("c128_indices"),
-          py::arg("c128_lengths"), py::arg("attn_sink"), py::arg("softmax_scale"),
+          py::arg("swa_k_cache"), py::arg("swa_indices"),
+          py::arg("swa_lengths"), py::arg("c128_k_cache"),
+          py::arg("c128_indices"), py::arg("c128_lengths"),
+          py::arg("attn_sink"), py::arg("softmax_scale"),
           py::arg("tokens_per_req"), py::arg("out") = py::none(),
           py::arg("use_pdl") = true);
     m.def("dsa_decode_attention", &halops::DsaDecodeAttention, py::arg("q"),

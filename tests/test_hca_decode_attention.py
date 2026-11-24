@@ -109,7 +109,10 @@ def make_batch(tokens, tpr, n_c128, seed):
     c_pages = c_rows // 2 + 1
     c128 = make_cache(reqs * c_pages, 2, gen)
     lists = torch.stack(
-        [torch.randperm(c_pages * 2, generator=gen)[:c_rows] + q * c_pages * 2 for q in range(reqs)]
+        [
+            torch.randperm(c_pages * 2, generator=gen)[:c_rows] + q * c_pages * 2
+            for q in range(reqs)
+        ]
     )
     c_idx = torch.full((tokens, (c_rows + 63) // 64 * 64), -1, dtype=torch.int32)
     c_idx[:, :c_rows] = lists[r].int()
@@ -141,8 +144,23 @@ def assert_close(out, ref, rows=None):
 
 @pytest.mark.parametrize(
     "tokens, tpr",
-    [(8, 2), (8, 4), (8, 8), (64, 4), (64, 8), (128, 4), (128, 8), (256, 8), (768, 4), (1536, 8),
-     (6, 3), (24, 3), (30, 5), (768, 3), (765, 5)],
+    [
+        (8, 2),
+        (8, 4),
+        (8, 8),
+        (64, 4),
+        (64, 8),
+        (128, 4),
+        (128, 8),
+        (256, 8),
+        (768, 4),
+        (1536, 8),
+        (6, 3),
+        (24, 3),
+        (30, 5),
+        (768, 3),
+        (765, 5),
+    ],
 )
 def test_hca_decode_attention_matches_reference(tokens, tpr):
     """Small batches give a pair one or two clusters, larger ones split the
@@ -156,12 +174,11 @@ def test_hca_decode_attention_nan_query_isolated_lone():
     """A NaN in a lone (odd-request) token's query stays local, and a NaN in
     another token does not reach the lone one."""
     args = make_batch(24, 3, 860, seed=4)
-    args[0][2, 1, 9] = float("nan")   # the first request's lone token
-    args[0][7, 0, 0] = float("nan")   # a paired token of the third request
+    args[0][2, 1, 9] = float("nan")  # the first request's lone token
+    args[0][7, 0, 0] = float("nan")  # a paired token of the third request
     rows = torch.ones(24, dtype=torch.bool)
     rows[2] = rows[7] = False
     assert_close(run(args, 3), reference(*args), rows)
-
 
 
 def test_hca_decode_attention_long_and_short_lists():
@@ -217,8 +234,18 @@ def test_hca_decode_attention_deterministic_and_inplace():
     q, swa, swa_idx, swa_len, c128, c_idx, c_len, sink = args
     out = torch.full((tokens, 1, HEADS, DIM), float("nan"), dtype=torch.bfloat16)
     got = hca_decode_attention(
-        q[:, None], swa, swa_idx[:, None], swa_len, c128, c_idx[:, None], c_len,
-        sink, SCALE, tpr, out=out, use_pdl=False,
+        q[:, None],
+        swa,
+        swa_idx[:, None],
+        swa_len,
+        c128,
+        c_idx[:, None],
+        c_len,
+        sink,
+        SCALE,
+        tpr,
+        out=out,
+        use_pdl=False,
     )
     assert got.data_ptr() == out.data_ptr()
     assert torch.equal(got.view_as(ref), ref)
@@ -231,11 +258,20 @@ def test_hca_decode_attention_matches_flash_mla():
     args = make_batch(tokens, tpr, 860, seed=5)
     q, swa, swa_idx, swa_len, c128, c_idx, c_len, sink = args
     ref = fm.flash_mla_with_kvcache(
-        q=q[:, None], k_cache=swa, head_dim_v=DIM, block_table=None,
-        cache_seqlens=None, tile_scheduler_metadata=fm.get_mla_metadata()[0],
-        softmax_scale=SCALE, is_fp8_kvcache=True, indices=swa_idx[:, None],
-        topk_length=swa_len, attn_sink=sink, extra_k_cache=c128,
-        extra_indices_in_kvcache=c_idx[:, None], extra_topk_length=c_len,
+        q=q[:, None],
+        k_cache=swa,
+        head_dim_v=DIM,
+        block_table=None,
+        cache_seqlens=None,
+        tile_scheduler_metadata=fm.get_mla_metadata()[0],
+        softmax_scale=SCALE,
+        is_fp8_kvcache=True,
+        indices=swa_idx[:, None],
+        topk_length=swa_len,
+        attn_sink=sink,
+        extra_k_cache=c128,
+        extra_indices_in_kvcache=c_idx[:, None],
+        extra_topk_length=c_len,
     )[0][:, 0]
     assert_close(run(args, tpr), ref)
 
@@ -249,8 +285,12 @@ def test_hca_decode_attention_matches_flash_mla():
     "tpr, expected",
     [
         pytest.param(1, "tokens_per_req must be >= 2", id="tpr1"),
-        pytest.param(16, "tokens_per_req must be >= 2 and divide T", id="tpr_not_dividing"),
-        pytest.param(3, "tokens_per_req must be >= 2 and divide T", id="tpr_not_dividing_odd"),
+        pytest.param(
+            16, "tokens_per_req must be >= 2 and divide T", id="tpr_not_dividing"
+        ),
+        pytest.param(
+            3, "tokens_per_req must be >= 2 and divide T", id="tpr_not_dividing_odd"
+        ),
     ],
 )
 def test_hca_decode_attention_errors(tpr, expected):

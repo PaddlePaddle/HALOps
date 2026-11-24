@@ -145,16 +145,16 @@ constexpr int kQoRounds = kHalfDims / kQBoxDims;
 // QK is structurally identical to HCA's 512 contraction) and the 64 rope
 // splits 32/CTA.  Scales are an inline f32 multiplier per 128-dim group (vs
 // HCA's separate UE8M0 sf block); a disabled key passes scale 0 -> zero row.
-constexpr int kDsaNope = 512;                       // fp8 latent dims / row
-constexpr int kDsaRope = 64;                        // bf16 rope dims / row
-constexpr int kDsaQk = kDsaNope + kDsaRope;         // 576 contraction
-constexpr int kDsaScaleGroup = 128;                 // latent dims per f32 scale
-constexpr int kDsaScales = kDsaNope / kDsaScaleGroup;          // 4
-constexpr int kDsaScaleBytes = kDsaScales * sizeof(float);     // 16
-constexpr int kDsaRopeBytes = kDsaRope * sizeof(__nv_bfloat16);// 128
-constexpr int kDsaRowBytes = kDsaNope + kDsaScaleBytes + kDsaRopeBytes; // 656
-constexpr int kDsaNopeHalf = kDsaNope / 2;          // 256 fp8 nope dims / CTA
-constexpr int kDsaScaleOff = kDsaNope;              // 512: first f32 scale byte
+constexpr int kDsaNope = 512;                // fp8 latent dims / row
+constexpr int kDsaRope = 64;                 // bf16 rope dims / row
+constexpr int kDsaQk = kDsaNope + kDsaRope;  // 576 contraction
+constexpr int kDsaScaleGroup = 128;          // latent dims per f32 scale
+constexpr int kDsaScales = kDsaNope / kDsaScaleGroup;                    // 4
+constexpr int kDsaScaleBytes = kDsaScales * sizeof(float);               // 16
+constexpr int kDsaRopeBytes = kDsaRope * sizeof(__nv_bfloat16);          // 128
+constexpr int kDsaRowBytes = kDsaNope + kDsaScaleBytes + kDsaRopeBytes;  // 656
+constexpr int kDsaNopeHalf = kDsaNope / 2;  // 256 fp8 nope dims / CTA
+constexpr int kDsaScaleOff = kDsaNope;      // 512: first f32 scale byte
 constexpr int kDsaRopeOff = kDsaNope + kDsaScaleBytes;  // 528: first rope byte
 // Per-CTA raw gather: each CTA takes its 256 fp8 nope dims and its two f32
 // scales.  The nope lands at the stage head (then dequantizes in place like
@@ -165,7 +165,8 @@ constexpr int kDsaRopeOff = kDsaNope + kDsaScaleBytes;  // 528: first rope byte
 // (Q and K), CTA1's rope_kv is zeroed once, so half0 = full rope, half1 = 0,
 // and softmax's pair sum (half0 + half1) counts the 64-dim rope exactly once.
 // rope-Q staged in SMEM for the ss-MMA: kHeads rows x 64 rope dims, bf16.
-constexpr int kDsaQRopeBytes = kHeads * kDsaRope * sizeof(__nv_bfloat16);  // 8 KB
+constexpr int kDsaQRopeBytes =
+    kHeads * kDsaRope * sizeof(__nv_bfloat16);    // 8 KB
 constexpr int kDsaRopeSteps = kDsaRope / kUmmaK;  // 64/16 = 4 K-steps
 // SMEM budget: DSA stages a 256-dim nope KV tile, the full 64 rope dims/key
 // and 64 rope-Q dims (8 KB total), and drops HCA's sf block (scales inline).
@@ -183,12 +184,13 @@ constexpr int kDsaRopeSteps = kDsaRope / kUmmaK;  // 64/16 = 4 K-steps
 // outweighs the latency win on this latency-bound path.  Kept at 64/4, the
 // proven-best config; the trait plumbing stays so the tile remains tunable.
 constexpr int kDsaTile = 64;
-constexpr int kDsaHalf = kDsaTile / 2;                        // 32
-constexpr int kDsaIndexWarps = kDsaTile / kWarp;              // 2
-constexpr int kDsaBlockBytes = kDsaTile * kRowPitch;          // 8 KB
-constexpr int kDsaStageBytes = kLocalBlocks * kDsaBlockBytes; // 32 KB
+constexpr int kDsaHalf = kDsaTile / 2;                         // 32
+constexpr int kDsaIndexWarps = kDsaTile / kWarp;               // 2
+constexpr int kDsaBlockBytes = kDsaTile * kRowPitch;           // 8 KB
+constexpr int kDsaStageBytes = kLocalBlocks * kDsaBlockBytes;  // 32 KB
 constexpr int kDsaKvStages = 4;
-constexpr int kDsaRopeStageBytes = kDsaTile * kDsaRope * sizeof(__nv_bfloat16);  // 8 KB
+constexpr int kDsaRopeStageBytes =
+    kDsaTile * kDsaRope * sizeof(__nv_bfloat16);  // 8 KB
 
 struct HcaSmem {
     alignas(kAtomBytes) uint8_t kv[kKvStages][kStageBytes];
@@ -201,16 +203,17 @@ struct HcaSmem {
     uint32_t any[kIdxStages][kIndexWarps];
     int idx_raw[kIndexWarps][kIndexDepth][kWarp][2];
     float red[kWarpGroup];
-    float2 ml[2][kWarpGroup];  // per unit parity: row max, partial row sum
-    int start[3];              // first pair, its first tile, tile count
+    float2 ml[2][kWarpGroup];     // per unit parity: row max, partial row sum
+    int start[3];                 // first pair, its first tile, tile count
     int4 unit_lens[kTableUnits];  // lengths of the range's pairs from start[0]
-    int total;      // sum of schedule weights (== total tiles when uncapped)
-    int wstart;     // schedule-weight start of the range's first pair
-    int cap;        // effective per-pair weight cap this launch (kNoCap = none)
-    int sched;      // clusters actually scheduled this launch (<= p.clusters)
-    int comb;       // split pairs merged by the combine kernel this launch
-    int n_mj;       // fused merge: the split pairs this cluster holds a part of
-    int4 mj[2];     // (first part cluster, last part cluster, token a, pair * 2 + has_b)
+    int total;   // sum of schedule weights (== total tiles when uncapped)
+    int wstart;  // schedule-weight start of the range's first pair
+    int cap;     // effective per-pair weight cap this launch (kNoCap = none)
+    int sched;   // clusters actually scheduled this launch (<= p.clusters)
+    int comb;    // split pairs merged by the combine kernel this launch
+    int n_mj;    // fused merge: the split pairs this cluster holds a part of
+    int4 mj[2];  // (first part cluster, last part cluster, token a, pair * 2 +
+                 // has_b)
     uint64_t q_full, q_empty, o_full, o_empty[2], merge_full[kMergeBuf];
     uint64_t qs_full;  // every unit's Q boxes land in qo_stage
     uint64_t ml_full[2], ml_empty[2];
@@ -232,7 +235,8 @@ struct DsaSmem {
     alignas(kAtomBytes) uint8_t rope_kv[kDsaKvStages][kDsaRopeStageBytes];
     alignas(kAtomBytes) uint8_t p[2][kHeads * kRowPitch];
     alignas(kAtomBytes) uint8_t qo_stage[2][kQBoxBytes];
-    alignas(kAtomBytes) uint8_t q_rope[kDsaQRopeBytes];  // rope-Q for the ss-MMA
+    alignas(
+        kAtomBytes) uint8_t q_rope[kDsaQRopeBytes];  // rope-Q for the ss-MMA
     alignas(kChunk) float xchg[kWarpGroup][kDsaHalf];
     // This CTA's two inline f32 group scales per key (vs HCA's sf block).
     alignas(kChunk) float dsa_sc[kDsaKvStages][kDsaTile][kDsaScales / 2];
@@ -254,7 +258,8 @@ struct DsaSmem {
     uint64_t qs_full;
     uint64_t ml_full[2], ml_empty[2];
     uint64_t idx_full[kIdxStages], idx_empty[kIdxStages];
-    uint64_t raw_full[kDsaKvStages], kv_full[kDsaKvStages], kv_empty[kDsaKvStages];
+    uint64_t raw_full[kDsaKvStages], kv_full[kDsaKvStages],
+        kv_empty[kDsaKvStages];
     uint64_t s_full[2], s_empty[2], p_full[2], pv_done[2];
     uint32_t tmem_base;
 };
@@ -292,8 +297,8 @@ using DsaCfg = Cfg<true>;
 
 struct HcaMaps {
     CUtensorMap raw[2][2];  // [cta][seg] 16-bit view of the rows, raw_pitch box
-    CUtensorMap q;          // q rows (token x head), 64-dim swizzled boxes of 64 rows
-    CUtensorMap out;        // out rows, boxes as for q
+    CUtensorMap q;    // q rows (token x head), 64-dim swizzled boxes of 64 rows
+    CUtensorMap out;  // out rows, boxes as for q
 };
 
 // One split pair the separate combine kernel must finish: its first token,
@@ -335,16 +340,16 @@ struct HcaParams {
     MergeJob* jobs;  // [pairs] slot per pair when combine: the merger's job,
                      // wn == 0 for an unsplit pair (rewritten every launch)
     int* total_g;    // the capped tile total, for cluster_of in combine
-    int eff;   // 1 = size the scheduled cluster count to the batch's tile work;
+    int eff;  // 1 = size the scheduled cluster count to the batch's tile work;
               // 2 = pick eff 1 or legacy per launch from the device lengths;
               // 3 = legacy, launched wide, one cluster per pair or all of them
-    int tpc;   // work-aware target tiles per scheduled cluster (eff only)
+    int tpc;  // work-aware target tiles per scheduled cluster (eff only)
     // eff 2 k-split (find_range): max parts per pair (0: off), its cost
     // slope b per part, 1.17 / b and 1 / P, precomputed from P on the host.
     int ks_kmax;
     float ks_b, ks_a, ks_rp;
-    int* eff_g;      // clusters scheduled (sched), for the combine kernel;
-                     // 0 = this launch merged inline, combine has no work
+    int* eff_g;  // clusters scheduled (sched), for the combine kernel;
+                 // 0 = this launch merged inline, combine has no work
     float scale_log2;
 };
 
@@ -448,21 +453,24 @@ CUTE_DEVICE void tmem_ld(uint32_t addr, float (&v)[N]) {
 }
 
 CUTE_DEVICE void cp_async4(int* dst, const int* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(smem_u32(dst)),
-                 "l"(src)
-                 : "memory");
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(smem_u32(dst)),
+        "l"(src)
+        : "memory");
 }
 
 CUTE_DEVICE void cp_async8(void* dst, const void* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(smem_u32(dst)),
-                 "l"(src)
-                 : "memory");
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(smem_u32(dst)),
+        "l"(src)
+        : "memory");
 }
 
 CUTE_DEVICE void cp_async16(void* dst, const void* src) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_u32(dst)),
-                 "l"(src)
-                 : "memory");
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_u32(dst)),
+        "l"(src)
+        : "memory");
 }
 
 // Arrives on bar once this thread's earlier cp.async copies have landed; the
@@ -481,7 +489,7 @@ CUTE_DEVICE void cp_async_arrive_noinc(uint64_t* bar) {
 // read out of bounds.
 struct PairGeom {
     int a, len[2][2], n_c4, n_s, n_tiles;  // len[seg][token of pair]
-    bool has_b;                            // false for a lone (odd-request) token
+    bool has_b;  // false for a lone (odd-request) token
 };
 
 // The lengths of a pair's tokens, [seg][token].
@@ -554,9 +562,10 @@ CUTE_DEVICE int cluster_of(int clusters, int total, int pos) {
 }
 
 constexpr int kNoCap = 0x7fffffff;
-constexpr int kDefaultSmax = 6;  // adaptive cap target: clusters a pair may span
-constexpr int kCapFloor = 8;     // never cap below this many tiles
-constexpr int kDefaultTpc = 3;   // work-aware target tiles per scheduled cluster
+constexpr int kDefaultSmax =
+    6;                          // adaptive cap target: clusters a pair may span
+constexpr int kCapFloor = 8;    // never cap below this many tiles
+constexpr int kDefaultTpc = 3;  // work-aware target tiles per scheduled cluster
 // A pair's schedule weight is w = min(n_tiles, cap).  A part owning weight
 // offset [a, b) of the pair owns real tiles [w_to_tile(a), w_to_tile(b)); so a
 // long pair is spread over fewer clusters (bounded merge fan-in) while each of
@@ -601,8 +610,8 @@ CUTE_DEVICE int sched_clusters(const HcaParams& p, int total_unc) {
 
 struct Unit {
     PairGeom g;
-    int off, n;   // real tiles [off, off + n) of the pair
-    int w0, wn;   // pair's schedule-weight start and weight (min(n_tiles, cap))
+    int off, n;  // real tiles [off, off + n) of the pair
+    int w0, wn;  // pair's schedule-weight start and weight (min(n_tiles, cap))
     int pair;
     bool split;
 };
@@ -641,9 +650,11 @@ struct UnitCursor {
 // All threads count the tiles of every pair and scan them; the result is
 // the first pair and tile of this cluster's range.
 template <class C>
-CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm, int cluster) {
+CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
+                            int cluster) {
     __shared__ int part[kThreads / kWarp], part_max[kThreads / kWarp];
-    __shared__ int part2[kThreads / kWarp];  // pass 2's, so pass 1's need no barrier
+    __shared__ int
+        part2[kThreads / kWarp];  // pass 2's, so pass 1's need no barrier
     const int pairs =
         (p.tokens / p.tokens_per_req) * ((p.tokens_per_req + 1) / 2);
     const int per = (pairs + kThreads - 1) / kThreads;
@@ -675,7 +686,8 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm, int cluste
         const PairLens l = load_lens(p, q);
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < kKeep; ++k) {
-            if (j == k) keep[k] = make_int4(l.v[0][0], l.v[0][1], l.v[1][0], l.v[1][1]);
+            if (j == k)
+                keep[k] = make_int4(l.v[0][0], l.v[0][1], l.v[1][0], l.v[1][1]);
         }
         const int n = pair_geom(p, q, l, C::kTile).n_tiles;
         sum_unc += n;
@@ -735,14 +747,15 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm, int cluste
             comb = p.combine && c1 < min(c0, cu);
             aligned = !comb && cu <= c0;
             if (float(p.clusters) * p.ks_rp < 3.f) {
-                // P > clusters / 3 (no k-split): refit on the 8K-1M x T16-72 tpr8
-                // sweep, plus the spread schedule (eff 3's: every cluster,
+                // P > clusters / 3 (no k-split): refit on the 8K-1M x T16-72
+                // tpr8 sweep, plus the spread schedule (eff 3's: every cluster,
                 // inline merge, capped) ~14.2 + 1.19 h1 + 1.65 sched / P +
                 // 0.08 P us (0.5 us margin), which beats the fused merge's
                 // fan-in at long KV (512K-1M T56-64 1-3 us).
                 const int d0 = 1362 + 115 * h0 + 14 * pp;
                 const int d1 = 1813 + 116 * h1 + 14 * pp;
-                const int d3 = 1417 + 119 * h1 + 8 * pp + __float2int_rn(164.5f * sched * p.ks_rp);
+                const int d3 = 1417 + 119 * h1 + 8 * pp +
+                               __float2int_rn(164.5f * sched * p.ks_rp);
                 const int dm = min(min(d0, d1), d3);
                 aligned = cu <= dm;
                 spread = !aligned && d3 == dm;
@@ -761,15 +774,17 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm, int cluste
                 // h near sqrt(n / a) = n / k, no smaller than ceil(n / kmax)
                 const float hmin = ceilf(__fdividef(n, kmax) - 0.01f);
                 const float hs = fmaxf(floorf(n * rsqrtf(n * p.ks_a)), hmin);
-                float bc = comb ? 1.17f * h1 + b * fs +
-                                      (fabsf(fs - rintf(fs)) > 1e-3f ? 1.8f : 0.f)
-                                : 1.17f * ((n_max + 1) / 2) + 2.f * b;
+                float bc =
+                    comb ? 1.17f * h1 + b * fs +
+                               (fabsf(fs - rintf(fs)) > 1e-3f ? 1.8f : 0.f)
+                         : 1.17f * ((n_max + 1) / 2) + 2.f * b;
                 bc -= 0.3f;  // margin
                 int best = 0;
                 CUTLASS_PRAGMA_UNROLL
                 for (int j = 0; j < 2; ++j) {
                     const float h = hs + j;
-                    const float k = ceilf(__fdividef(n, h) - 0.01f);  // fewest parts
+                    const float k =
+                        ceilf(__fdividef(n, h) - 0.01f);  // fewest parts
                     const float c = 1.17f * h + b * k;
                     if (k >= 3.f && c < bc) {
                         bc = c;
@@ -798,8 +813,9 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm, int cluste
         }
     }
     // eff 1 leaves the split uncapped; the legacy path keeps the adaptive cap.
-    const int cap = (p.eff == 2 && comb) || aligned ? kNoCap
-                                                    : effective_cap(p, total_unc, sched);
+    const int cap = (p.eff == 2 && comb) || aligned
+                        ? kNoCap
+                        : effective_cap(p, total_unc, sched);
     if (threadIdx.x == 0) {
         sm.cap = cap;
         sm.sched = sched;
@@ -841,7 +857,8 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm, int cluste
             sm.start[0] = cluster;
             sm.wstart = pre;
             sm.start[1] = 0;
-            sm.start[2] = pair_geom(p, cluster, lens_of(cluster), C::kTile).n_tiles;
+            sm.start[2] =
+                pair_geom(p, cluster, lens_of(cluster), C::kTile).n_tiles;
         } else if (threadIdx.x == 0 && cluster >= pairs) {
             sm.start[0] = 0;
             sm.start[2] = 0;
@@ -864,7 +881,8 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm, int cluste
                         w_to_tile(min(hi - pre, w), g.n_tiles, w) - sm.start[1];
                     int wpos = pre + w;
                     for (int qq = q + 1; wpos < hi; ++qq) {
-                        const PairGeom g2 = pair_geom(p, qq, lens_of(qq), C::kTile);
+                        const PairGeom g2 =
+                            pair_geom(p, qq, lens_of(qq), C::kTile);
                         const int w2 = min(g2.n_tiles, cap);
                         tiles += w_to_tile(min(hi - wpos, w2), g2.n_tiles, w2);
                         wpos += w2;
@@ -896,10 +914,12 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm, int cluste
             if (q >= first && q < min(first + per, pairs)) {
                 int wq = base + incl - sum;
                 for (int qq = first; qq < q; ++qq)
-                    wq += min(pair_geom(p, qq, lens_of(qq), C::kTile).n_tiles, cap);
+                    wq += min(pair_geom(p, qq, lens_of(qq), C::kTile).n_tiles,
+                              cap);
                 const PairGeom g = pair_geom(p, q, lens_of(q), C::kTile);
                 const int f = cluster_of(sched, total, wq);
-                const int l = cluster_of(sched, total, wq + min(g.n_tiles, cap) - 1);
+                const int l =
+                    cluster_of(sched, total, wq + min(g.n_tiles, cap) - 1);
                 if (l > f && (cute::block_rank_in_cluster() == 0 || g.has_b)) {
                     sm.mj[0] = make_int4(f, l, g.a, q * 2 + g.has_b);
                     sm.n_mj = 1;
@@ -920,7 +940,8 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm, int cluste
                     sm.unit_lens[rel] = keep[k];
                 }
             }
-        } else if (threadIdx.x < kTableUnits && sm.start[0] + int(threadIdx.x) < pairs) {
+        } else if (threadIdx.x < kTableUnits &&
+                   sm.start[0] + int(threadIdx.x) < pairs) {
             const int q = sm.start[0] + threadIdx.x;
             const PairLens l = load_lens(p, q);
             sm.unit_lens[threadIdx.x] =
@@ -931,10 +952,10 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm, int cluste
 }
 
 template <class C>
-CUTE_DEVICE UnitCursor start_cursor(const HcaParams& p, const typename C::Smem& sm,
-                                    int cluster) {
-    return {sm.start[0], sm.start[1], sm.start[2],
-            sm.wstart, cluster, sm.start[0], sm.cap, C::kTile};
+CUTE_DEVICE UnitCursor start_cursor(const HcaParams& p,
+                                    const typename C::Smem& sm, int cluster) {
+    return {sm.start[0], sm.start[1], sm.start[2], sm.wstart,
+            cluster,     sm.start[0], sm.cap,      C::kTile};
 }
 
 // Index warp w resolves keys [32w, 32w + 32) of every tile, one per lane:
@@ -983,19 +1004,18 @@ CUTE_DEVICE void index_warp(const HcaParams& p, const HcaMaps& maps,
         // for its dims-half to add nothing.  Zero it once here (it is never
         // rewritten), fenced for the ss-MMA's async-proxy read.  This halves
         // the rope DRAM/L2 traffic vs both CTAs staging the full rope.
-        // (A BALANCED variant -- both CTAs stage full rope, q_rope pre-halved --
-        // was built + measured 2026-11-08: relerr identical but perf regressed
-        // 1.46/1.18/1.04/0.94x vs 1.48/1.21/1.06/0.95x.  CTA0 was already the
-        // critical path, so balancing only adds 2x rope L2 traffic without
-        // shortening it; CTA1's barrier idle-wait was free.  Reverted.)
+        // (A BALANCED variant -- both CTAs stage full rope, q_rope pre-halved
+        // -- was built + measured 2026-11-08: relerr identical but perf
+        // regressed 1.46/1.18/1.04/0.94x vs 1.48/1.21/1.06/0.95x.  CTA0 was
+        // already the critical path, so balancing only adds 2x rope L2 traffic
+        // without shortening it; CTA1's barrier idle-wait was free.  Reverted.)
         if (cta == 1) {
             CUTLASS_PRAGMA_UNROLL
             for (int s = 0; s < C::kStages; ++s) {
                 CUTLASS_PRAGMA_UNROLL
                 for (int c = 0; c < kDsaRopeBytes / kChunk; ++c) {
-                    *reinterpret_cast<uint4*>(sm.rope_kv[s] +
-                                              sw128_offset(j, c)) =
-                        uint4{0, 0, 0, 0};
+                    *reinterpret_cast<uint4*>(
+                        sm.rope_kv[s] + sw128_offset(j, c)) = uint4{0, 0, 0, 0};
                 }
             }
             cutlass::arch::fence_view_async_shared();
@@ -1035,12 +1055,12 @@ CUTE_DEVICE void index_warp(const HcaParams& p, const HcaMaps& maps,
             // raw_full beside the TMA nope.  CTA1's rope_kv stays zero (zeroed
             // once at entry), so the full rope dot lands in dims-half 0.
             if (any) {
-                const uint8_t* const base =
-                    p.pool[seg] + int64_t(page) * p.pool_stride[seg] +
-                    int64_t(row) * kDsaRowBytes;
-                cp_async8(sm.dsa_sc[s][j], base + kDsaScaleOff +
-                                               cta * (kDsaScales / 2) *
-                                                   int(sizeof(float)));
+                const uint8_t* const base = p.pool[seg] +
+                                            int64_t(page) * p.pool_stride[seg] +
+                                            int64_t(row) * kDsaRowBytes;
+                cp_async8(sm.dsa_sc[s][j],
+                          base + kDsaScaleOff +
+                              cta * (kDsaScales / 2) * int(sizeof(float)));
                 if (cta == 0) {
                     CUTLASS_PRAGMA_UNROLL
                     for (int c = 0; c < kDsaRopeBytes / kChunk; ++c) {
@@ -1067,10 +1087,9 @@ CUTE_DEVICE void index_warp(const HcaParams& p, const HcaMaps& maps,
             }
             __syncwarp();
         } else {
-            const uint8_t* const sf = p.pool[seg] +
-                                      int64_t(page) * p.pool_stride[seg] +
-                                      (int64_t(1) << p.page_shift[seg]) * kRowBytes +
-                                      row * kSfBytes;
+            const uint8_t* const sf =
+                p.pool[seg] + int64_t(page) * p.pool_stride[seg] +
+                (int64_t(1) << p.page_shift[seg]) * kRowBytes + row * kSfBytes;
             if (any) cp_async8(sm.sf[s][j], sf);
             cp_async_arrive_noinc(&sm.raw_full[s]);
             const int src = lane % kGroupsPerWarp * kGather;
@@ -1114,122 +1133,135 @@ struct DequantPlan {
     static constexpr int kFp8Chunks =
         (kCta == 0 ? kHalfDims : kNopeBytes1) / kChunk;
     static constexpr int kFp8Loads = kTile * kFp8Chunks / kWarpGroup;
-    static constexpr int kRopeChunks = kCta == 0 ? 0 : (kRowBytes - kNope) / kChunk;
+    static constexpr int kRopeChunks =
+        kCta == 0 ? 0 : (kRowBytes - kNope) / kChunk;
     static constexpr int kRopeLoads = kTile * kRopeChunks / kWarpGroup;
 };
 
 template <int kCta, class C>
 CUTE_DEVICE void dequant_wg(typename C::Smem& sm, int n, int t) {
-  if constexpr (C::kDsa) {
-    // DSA: both CTAs hold 256 fp8 latent dims (== kHalfDims, HCA's CTA-0
-    // layout), no rope in the nope stage, and an inline f32 scale per 128-dim
-    // group.  A disabled key dequantizes with scale 0 -> zero row.
-    constexpr int kChunks = kHalfDims / kChunk;             // 16 nope chunks/CTA
-    constexpr int kLoads = C::kTile * kChunks / kWarpGroup; // 4 at kTile 32
-    constexpr int kPitch = kDsaNopeHalf;                    // 256 B nope row
-    constexpr int kGroupChunks = kDsaScaleGroup / kChunk;   // 8 chunks / f32
-    for (int i = 0; i < n; ++i) {
-        const int s = i % C::kStages, is = i % kIdxStages;
-        Bar::wait(&sm.idx_full[is], (i / kIdxStages) & 1);
-        // any[w] holds the 32 keys of index warp w; a tile narrower than 64
-        // keys runs a single index warp, so any[is][1] does not exist and
-        // row/kWarp is always 0 there.
-        uint32_t any[2];
-        any[0] = sm.any[is][0];
-        if constexpr (C::kIndexWarps > 1) any[1] = sm.any[is][1];
-        else any[1] = 0u;
-        Bar::wait(&sm.raw_full[s], (i / C::kStages) & 1);
-        uint8_t* const stage = sm.kv[s];
-        uint4 raw[kLoads];
-        float sc[kLoads];
-        CUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < kLoads; ++k) {
-            const int e = t + k * kWarpGroup;
-            const int row = e / kChunks, c = e % kChunks;
-            raw[k] = *reinterpret_cast<const uint4*>(stage + row * kPitch +
-                                                     c * kChunk);
-            const float s0 = sm.dsa_sc[s][row][c / kGroupChunks];
-            sc[k] = (any[row / kWarp] >> (row % kWarp)) & 1 ? s0 : 0.0f;
+    if constexpr (C::kDsa) {
+        // DSA: both CTAs hold 256 fp8 latent dims (== kHalfDims, HCA's CTA-0
+        // layout), no rope in the nope stage, and an inline f32 scale per
+        // 128-dim group.  A disabled key dequantizes with scale 0 -> zero row.
+        constexpr int kChunks = kHalfDims / kChunk;  // 16 nope chunks/CTA
+        constexpr int kLoads =
+            C::kTile * kChunks / kWarpGroup;                   // 4 at kTile 32
+        constexpr int kPitch = kDsaNopeHalf;                   // 256 B nope row
+        constexpr int kGroupChunks = kDsaScaleGroup / kChunk;  // 8 chunks / f32
+        for (int i = 0; i < n; ++i) {
+            const int s = i % C::kStages, is = i % kIdxStages;
+            Bar::wait(&sm.idx_full[is], (i / kIdxStages) & 1);
+            // any[w] holds the 32 keys of index warp w; a tile narrower than 64
+            // keys runs a single index warp, so any[is][1] does not exist and
+            // row/kWarp is always 0 there.
+            uint32_t any[2];
+            any[0] = sm.any[is][0];
+            if constexpr (C::kIndexWarps > 1)
+                any[1] = sm.any[is][1];
+            else
+                any[1] = 0u;
+            Bar::wait(&sm.raw_full[s], (i / C::kStages) & 1);
+            uint8_t* const stage = sm.kv[s];
+            uint4 raw[kLoads];
+            float sc[kLoads];
+            CUTLASS_PRAGMA_UNROLL
+            for (int k = 0; k < kLoads; ++k) {
+                const int e = t + k * kWarpGroup;
+                const int row = e / kChunks, c = e % kChunks;
+                raw[k] = *reinterpret_cast<const uint4*>(stage + row * kPitch +
+                                                         c * kChunk);
+                const float s0 = sm.dsa_sc[s][row][c / kGroupChunks];
+                sc[k] = (any[row / kWarp] >> (row % kWarp)) & 1 ? s0 : 0.0f;
+            }
+            __syncwarp();
+            if (t % kWarp == 0) Bar::arrive(&sm.idx_empty[is]);
+            NamedBar::sync(kWarpGroup, kDequantBar);
+            CUTLASS_PRAGMA_UNROLL
+            for (int k = 0; k < kLoads; ++k) {
+                const int e = t + k * kWarpGroup;
+                const int row = e / kChunks, c = e % kChunks;
+                const bool odd = (c / 4) & 1;
+                const int q0 = c % 4 * 2;
+                uint8_t* const block = stage + c / 4 * C::kBlockBytes;
+                const uint4 first =
+                    dequant8_f32(odd ? raw[k].z : raw[k].x,
+                                 odd ? raw[k].w : raw[k].y, sc[k]);
+                const uint4 second =
+                    dequant8_f32(odd ? raw[k].x : raw[k].z,
+                                 odd ? raw[k].y : raw[k].w, sc[k]);
+                *reinterpret_cast<uint4*>(block + sw128_offset(row, q0 + odd)) =
+                    first;
+                *reinterpret_cast<uint4*>(
+                    block + sw128_offset(row, q0 + !odd)) = second;
+            }
+            cutlass::arch::fence_view_async_shared();
+            __syncwarp();
+            if (t % kWarp == 0) Bar::arrive(&sm.kv_full[s], 0, 1);
         }
-        __syncwarp();
-        if (t % kWarp == 0) Bar::arrive(&sm.idx_empty[is]);
-        NamedBar::sync(kWarpGroup, kDequantBar);
-        CUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < kLoads; ++k) {
-            const int e = t + k * kWarpGroup;
-            const int row = e / kChunks, c = e % kChunks;
-            const bool odd = (c / 4) & 1;
-            const int q0 = c % 4 * 2;
-            uint8_t* const block = stage + c / 4 * C::kBlockBytes;
-            const uint4 first = dequant8_f32(odd ? raw[k].z : raw[k].x,
-                                             odd ? raw[k].w : raw[k].y, sc[k]);
-            const uint4 second = dequant8_f32(odd ? raw[k].x : raw[k].z,
-                                              odd ? raw[k].y : raw[k].w, sc[k]);
-            *reinterpret_cast<uint4*>(block + sw128_offset(row, q0 + odd)) = first;
-            *reinterpret_cast<uint4*>(block + sw128_offset(row, q0 + !odd)) = second;
+    } else {
+        using Plan = DequantPlan<kCta>;
+        constexpr int kPitch = raw_pitch(kCta);
+        for (int i = 0; i < n; ++i) {
+            const int s = i % C::kStages, is = i % kIdxStages;
+            Bar::wait(&sm.idx_full[is], (i / kIdxStages) & 1);
+            const uint32_t any[2] = {sm.any[is][0], sm.any[is][1]};
+            Bar::wait(&sm.raw_full[s], (i / C::kStages) & 1);
+            uint8_t* const stage = sm.kv[s];
+            uint4 raw[Plan::kFp8Loads];
+            uint8_t e8[Plan::kFp8Loads];
+            CUTLASS_PRAGMA_UNROLL
+            for (int k = 0; k < Plan::kFp8Loads; ++k) {
+                const int e = t + k * kWarpGroup;
+                const int row = e / Plan::kFp8Chunks, c = e % Plan::kFp8Chunks;
+                raw[k] = *reinterpret_cast<const uint4*>(stage + row * kPitch +
+                                                         c * kChunk);
+                const uint8_t sf = sm.sf[s][row][kCta * kLocalBlocks + c / 4];
+                e8[k] = (any[row / kWarp] >> (row % kWarp)) & 1 ? sf : 0;
+            }
+            // Only CTA 1 holds rope dims; the max() keeps CTA 0's dead code
+            // legal.
+            constexpr int kRopeChunks = cute::max(Plan::kRopeChunks, 1);
+            uint4 rope[cute::max(Plan::kRopeLoads, 1)];
+            CUTLASS_PRAGMA_UNROLL
+            for (int k = 0; k < Plan::kRopeLoads; ++k) {
+                const int e = t + k * kWarpGroup;
+                const int row = e / kRopeChunks, c = e % kRopeChunks;
+                rope[k] = *reinterpret_cast<const uint4*>(
+                    stage + row * kPitch + kNopeBytes1 + c * kChunk);
+            }
+            __syncwarp();
+            if (t % kWarp == 0) Bar::arrive(&sm.idx_empty[is]);
+            NamedBar::sync(kWarpGroup, kDequantBar);
+            CUTLASS_PRAGMA_UNROLL
+            for (int k = 0; k < Plan::kFp8Loads; ++k) {
+                const int e = t + k * kWarpGroup;
+                const int row = e / Plan::kFp8Chunks, c = e % Plan::kFp8Chunks;
+                const bool odd = (c / 4) & 1;
+                const int q0 = c % 4 * 2;
+                uint8_t* const block = stage + c / 4 * kBlockBytes;
+                const uint4 first = dequant8(odd ? raw[k].z : raw[k].x,
+                                             odd ? raw[k].w : raw[k].y, e8[k]);
+                const uint4 second = dequant8(odd ? raw[k].x : raw[k].z,
+                                              odd ? raw[k].y : raw[k].w, e8[k]);
+                *reinterpret_cast<uint4*>(block + sw128_offset(row, q0 + odd)) =
+                    first;
+                *reinterpret_cast<uint4*>(
+                    block + sw128_offset(row, q0 + !odd)) = second;
+            }
+            CUTLASS_PRAGMA_UNROLL
+            for (int k = 0; k < Plan::kRopeLoads; ++k) {
+                const int e = t + k * kWarpGroup;
+                const int row = e / kRopeChunks, c = e % kRopeChunks;
+                *reinterpret_cast<uint4*>(stage +
+                                          (kLocalBlocks - 1) * kBlockBytes +
+                                          sw128_offset(row, c)) = rope[k];
+            }
+            cutlass::arch::fence_view_async_shared();
+            __syncwarp();
+            if (t % kWarp == 0) Bar::arrive(&sm.kv_full[s], 0, 1);
         }
-        cutlass::arch::fence_view_async_shared();
-        __syncwarp();
-        if (t % kWarp == 0) Bar::arrive(&sm.kv_full[s], 0, 1);
     }
-  } else {
-    using Plan = DequantPlan<kCta>;
-    constexpr int kPitch = raw_pitch(kCta);
-    for (int i = 0; i < n; ++i) {
-        const int s = i % C::kStages, is = i % kIdxStages;
-        Bar::wait(&sm.idx_full[is], (i / kIdxStages) & 1);
-        const uint32_t any[2] = {sm.any[is][0], sm.any[is][1]};
-        Bar::wait(&sm.raw_full[s], (i / C::kStages) & 1);
-        uint8_t* const stage = sm.kv[s];
-        uint4 raw[Plan::kFp8Loads];
-        uint8_t e8[Plan::kFp8Loads];
-        CUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < Plan::kFp8Loads; ++k) {
-            const int e = t + k * kWarpGroup;
-            const int row = e / Plan::kFp8Chunks, c = e % Plan::kFp8Chunks;
-            raw[k] = *reinterpret_cast<const uint4*>(stage + row * kPitch + c * kChunk);
-            const uint8_t sf = sm.sf[s][row][kCta * kLocalBlocks + c / 4];
-            e8[k] = (any[row / kWarp] >> (row % kWarp)) & 1 ? sf : 0;
-        }
-        // Only CTA 1 holds rope dims; the max() keeps CTA 0's dead code legal.
-        constexpr int kRopeChunks = cute::max(Plan::kRopeChunks, 1);
-        uint4 rope[cute::max(Plan::kRopeLoads, 1)];
-        CUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < Plan::kRopeLoads; ++k) {
-            const int e = t + k * kWarpGroup;
-            const int row = e / kRopeChunks, c = e % kRopeChunks;
-            rope[k] = *reinterpret_cast<const uint4*>(stage + row * kPitch +
-                                                      kNopeBytes1 + c * kChunk);
-        }
-        __syncwarp();
-        if (t % kWarp == 0) Bar::arrive(&sm.idx_empty[is]);
-        NamedBar::sync(kWarpGroup, kDequantBar);
-        CUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < Plan::kFp8Loads; ++k) {
-            const int e = t + k * kWarpGroup;
-            const int row = e / Plan::kFp8Chunks, c = e % Plan::kFp8Chunks;
-            const bool odd = (c / 4) & 1;
-            const int q0 = c % 4 * 2;
-            uint8_t* const block = stage + c / 4 * kBlockBytes;
-            const uint4 first = dequant8(odd ? raw[k].z : raw[k].x,
-                                         odd ? raw[k].w : raw[k].y, e8[k]);
-            const uint4 second = dequant8(odd ? raw[k].x : raw[k].z,
-                                          odd ? raw[k].y : raw[k].w, e8[k]);
-            *reinterpret_cast<uint4*>(block + sw128_offset(row, q0 + odd)) = first;
-            *reinterpret_cast<uint4*>(block + sw128_offset(row, q0 + !odd)) = second;
-        }
-        CUTLASS_PRAGMA_UNROLL
-        for (int k = 0; k < Plan::kRopeLoads; ++k) {
-            const int e = t + k * kWarpGroup;
-            const int row = e / kRopeChunks, c = e % kRopeChunks;
-            *reinterpret_cast<uint4*>(stage + (kLocalBlocks - 1) * kBlockBytes +
-                                      sw128_offset(row, c)) = rope[k];
-        }
-        cutlass::arch::fence_view_async_shared();
-        __syncwarp();
-        if (t % kWarp == 0) Bar::arrive(&sm.kv_full[s], 0, 1);
-    }
-  }
 }
 
 // The QK^T and PV warps of CTA 0 issue independently, so a late KV stage
@@ -1237,8 +1269,8 @@ CUTE_DEVICE void dequant_wg(typename C::Smem& sm, int n, int t) {
 // QK^T.  QK^T(i) goes to S buffer i % 2 once its stage is dequantized and the
 // softmax has read S(i - 2); a unit's first QK^T also waits for its Q.
 template <class C>
-CUTE_DEVICE void qk_warp(const HcaParams& p, typename C::Smem& sm, uint32_t tmem,
-                         int cluster) {
+CUTE_DEVICE void qk_warp(const HcaParams& p, typename C::Smem& sm,
+                         uint32_t tmem, int cluster) {
     const uint32_t idesc = instr_desc<2 * C::kTile, cute::UMMA::Major::K>();
     UnitCursor cur = start_cursor<C>(p, sm, cluster);
     Unit u;
@@ -1252,13 +1284,14 @@ CUTE_DEVICE void qk_warp(const HcaParams& p, typename C::Smem& sm, uint32_t tmem
             if (cute::elect_one_sync()) {
                 CUTLASS_PRAGMA_UNROLL
                 for (int ks = 0; ks < kQkSteps; ++ks) {
-                    umma_ts(tmem + kTmemS + sb * C::kTmemSCols,
-                            tmem + kTmemQ + ks * kUmmaK / 2,
-                            sw128_desc(sm.kv[s] +
-                                           ks / kKStepsPerBlock * C::kBlockBytes +
-                                           ks % kKStepsPerBlock * kKStepBytes,
-                                       kChunk),
-                            idesc, ks > 0);
+                    umma_ts(
+                        tmem + kTmemS + sb * C::kTmemSCols,
+                        tmem + kTmemQ + ks * kUmmaK / 2,
+                        sw128_desc(sm.kv[s] +
+                                       ks / kKStepsPerBlock * C::kBlockBytes +
+                                       ks % kKStepsPerBlock * kKStepBytes,
+                                   kChunk),
+                        idesc, ks > 0);
                 }
                 // DSA rope ride: the 64 rope dims didn't fit the TMEM Q tile,
                 // so they contract from SMEM (q_rope x rope_kv) into the SAME
@@ -1270,17 +1303,20 @@ CUTE_DEVICE void qk_warp(const HcaParams& p, typename C::Smem& sm, uint32_t tmem
                 if constexpr (C::kDsa) {
                     CUTLASS_PRAGMA_UNROLL
                     for (int ks = 0; ks < kDsaRopeSteps; ++ks) {
-                        umma_ss(tmem + kTmemS + sb * C::kTmemSCols,
-                                sw128_desc(sm.q_rope + ks * kKStepBytes, kChunk),
-                                sw128_desc(sm.rope_kv[s] + ks * kKStepBytes,
-                                           kChunk),
-                                idesc, true);
+                        umma_ss(
+                            tmem + kTmemS + sb * C::kTmemSCols,
+                            sw128_desc(sm.q_rope + ks * kKStepBytes, kChunk),
+                            sw128_desc(sm.rope_kv[s] + ks * kKStepBytes,
+                                       kChunk),
+                            idesc, true);
                     }
                 }
             }
-            cutlass::arch::umma_arrive_multicast_2x1SM(&sm.s_full[sb], kBothCtas);
+            cutlass::arch::umma_arrive_multicast_2x1SM(&sm.s_full[sb],
+                                                       kBothCtas);
             if (k == u.n - 1) {
-                cutlass::arch::umma_arrive_multicast_2x1SM(&sm.q_empty, kBothCtas);
+                cutlass::arch::umma_arrive_multicast_2x1SM(&sm.q_empty,
+                                                           kBothCtas);
             }
         }
     }
@@ -1290,8 +1326,8 @@ CUTE_DEVICE void qk_warp(const HcaParams& p, typename C::Smem& sm, uint32_t tmem
 // first PV of a unit overwrites O, each half (128 columns) once the previous
 // unit's epilogue has read it.
 template <class C>
-CUTE_DEVICE void pv_warp(const HcaParams& p, typename C::Smem& sm, uint32_t tmem,
-                         int cluster) {
+CUTE_DEVICE void pv_warp(const HcaParams& p, typename C::Smem& sm,
+                         uint32_t tmem, int cluster) {
     const uint32_t idesc = instr_desc<kPvN, cute::UMMA::Major::MN>();
     UnitCursor cur = start_cursor<C>(p, sm, cluster);
     Unit u;
@@ -1301,26 +1337,31 @@ CUTE_DEVICE void pv_warp(const HcaParams& p, typename C::Smem& sm, uint32_t tmem
             Bar::wait(&sm.p_full[pb], (i / 2) & 1);
             CUTLASS_PRAGMA_UNROLL
             for (int m = 0; m < kPvMmas; ++m) {
-                if (k == 0 && unit > 0) Bar::wait(&sm.o_empty[m], (unit - 1) & 1);
+                if (k == 0 && unit > 0)
+                    Bar::wait(&sm.o_empty[m], (unit - 1) & 1);
                 tcgen05_after_thread_sync();
                 if (cute::elect_one_sync()) {
                     CUTLASS_PRAGMA_UNROLL
                     for (int ks = 0; ks < C::kPvSteps; ++ks) {
                         umma_ss(tmem + kTmemO + m * kPvN / 2,
                                 sw128_desc(sm.p[pb] + ks * kKStepBytes, kChunk),
-                                sw128_desc(sm.kv[s] +
-                                               m * kPvBlocksPerMma * C::kBlockBytes +
-                                               ks * kUmmaK * kRowPitch,
-                                           C::kBlockBytes),
+                                sw128_desc(
+                                    sm.kv[s] +
+                                        m * kPvBlocksPerMma * C::kBlockBytes +
+                                        ks * kUmmaK * kRowPitch,
+                                    C::kBlockBytes),
                                 idesc, k > 0 || ks > 0);
                     }
                 }
                 __syncwarp();
             }
-            cutlass::arch::umma_arrive_multicast_2x1SM(&sm.pv_done[pb], kBothCtas);
-            cutlass::arch::umma_arrive_multicast_2x1SM(&sm.kv_empty[s], kBothCtas);
+            cutlass::arch::umma_arrive_multicast_2x1SM(&sm.pv_done[pb],
+                                                       kBothCtas);
+            cutlass::arch::umma_arrive_multicast_2x1SM(&sm.kv_empty[s],
+                                                       kBothCtas);
             if (k == u.n - 1) {
-                cutlass::arch::umma_arrive_multicast_2x1SM(&sm.o_full, kBothCtas);
+                cutlass::arch::umma_arrive_multicast_2x1SM(&sm.o_full,
+                                                           kBothCtas);
             }
         }
     }
@@ -1344,8 +1385,9 @@ CUTE_DEVICE void wait_pv(typename C::Smem& sm, int j) {
 // the masked sums give the row max (with the partner's), P and the row sum.
 // O is rescaled when the row max grows by more than 2^6.
 template <class C>
-CUTE_DEVICE void softmax_tile(const HcaParams& p, typename C::Smem& sm, int i, int k,
-                              uint32_t lane_base, int t, float& m, float& l) {
+CUTE_DEVICE void softmax_tile(const HcaParams& p, typename C::Smem& sm, int i,
+                              int k, uint32_t lane_base, int t, float& m,
+                              float& l) {
     const int head = t % kHeads, half = t / kHeads;
     const int is = i % kIdxStages, sb = i % 2;
     // DSA narrows the KV tile (32 vs 64 keys), so the per-thread key span and
@@ -1370,8 +1412,8 @@ CUTE_DEVICE void softmax_tile(const HcaParams& p, typename C::Smem& sm, int i, i
     tmem_ld(lane_base + kTmemS + sb * kTmemSCols + (half ^ 1) * kHalf, own);
     CUTLASS_PRAGMA_UNROLL
     for (int q = 0; q < kQuads; ++q) {
-        peer[q ^ (t % kQuads)] =
-            make_float4(own[4 * q], own[4 * q + 1], own[4 * q + 2], own[4 * q + 3]);
+        peer[q ^ (t % kQuads)] = make_float4(own[4 * q], own[4 * q + 1],
+                                             own[4 * q + 2], own[4 * q + 3]);
     }
     tmem_ld(lane_base + kTmemS + sb * kTmemSCols + half * kHalf, own);
     tcgen05_before_thread_sync();
@@ -1390,7 +1432,8 @@ CUTE_DEVICE void softmax_tile(const HcaParams& p, typename C::Smem& sm, int i, i
         CUTLASS_PRAGMA_UNROLL
         for (int e = 0; e < 4; ++e) {
             const int c = 4 * q + e;
-            own[c] = (valid >> (vbit + c)) & 1 ? own[c] + add[e] : -CUDART_INF_F;
+            own[c] =
+                (valid >> (vbit + c)) & 1 ? own[c] + add[e] : -CUDART_INF_F;
             local = fmaxf(local, own[c]);
         }
     }
@@ -1447,8 +1490,8 @@ CUTE_DEVICE void softmax_tile(const HcaParams& p, typename C::Smem& sm, int i, i
 // Per unit: the online softmax over its tiles, then the row max and partial
 // sum go to the Q/O warp group.
 template <class C>
-CUTE_DEVICE void softmax_wg(const HcaParams& p, typename C::Smem& sm, uint32_t tmem,
-                            int t, int cluster) {
+CUTE_DEVICE void softmax_wg(const HcaParams& p, typename C::Smem& sm,
+                            uint32_t tmem, int t, int cluster) {
     const uint32_t lane_base = tmem + ((t / kWarp * kWarp) << 16);
     UnitCursor cur = start_cursor<C>(p, sm, cluster);
     Unit u;
@@ -1543,7 +1586,8 @@ CUTE_DEVICE uint32_t xor_words(const uint4* v, int n) {
 
 CUTE_DEVICE void qo_sync_after(uint32_t x) {
     constexpr uint32_t kId =
-        kQoBar + uint32_t(cutlass::arch::ReservedNamedBarriers::FirstUserBarrier);
+        kQoBar +
+        uint32_t(cutlass::arch::ReservedNamedBarriers::FirstUserBarrier);
     asm volatile(
         "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %0, 0;\n\t"
         "bar.red.or.pred p, %1, %2, p;\n\t}" ::"r"(x),
@@ -1555,8 +1599,8 @@ CUTE_DEVICE void qo_sync_after(uint32_t x) {
 // head row is strided, and direct loads of it occupy the L1 a row per lane,
 // stalling the softmax's shared memory accesses meanwhile.
 template <class C>
-CUTE_DEVICE void fetch_q(const HcaMaps& maps, typename C::Smem& sm, int token, int t,
-                         uint4 (&v)[kQVecs]) {
+CUTE_DEVICE void fetch_q(const HcaMaps& maps, typename C::Smem& sm, int token,
+                         int t, uint4 (&v)[kQVecs]) {
     CUTLASS_PRAGMA_UNROLL
     for (int r = 0; r < kQoRounds; ++r) {
         if (t == 0) {
@@ -1598,8 +1642,8 @@ CUTE_DEVICE void store_q(const HcaParams& p, typename C::Smem& sm,
         // Each head row carries all 64 rope dims (sw128, 128 B/row).
         const int head = t % kHeads, g = t / kHeads;
         if (g == 0) {
-            const __nv_bfloat16* src = p.q +
-                (int64_t(token) * kHeads + head) * kDsaQk + kDsaNope;
+            const __nv_bfloat16* src =
+                p.q + (int64_t(token) * kHeads + head) * kDsaQk + kDsaNope;
             CUTLASS_PRAGMA_UNROLL
             for (int c = 0; c < kDsaRope / kElemsPerChunk; ++c) {
                 *reinterpret_cast<uint4*>(sm.q_rope + sw128_offset(head, c)) =
@@ -1643,8 +1687,8 @@ constexpr int kMergeCols = 32;  // TMEM columns per step of the merge
 // Reads O columns [m * 128, m * 128 + 128) of this lane, then frees them
 // for the next unit's first PV.
 template <class C>
-CUTE_DEVICE void read_o_half(typename C::Smem& sm, uint32_t lane_base, int t, int m,
-                             float (&o)[kOHalf]) {
+CUTE_DEVICE void read_o_half(typename C::Smem& sm, uint32_t lane_base, int t,
+                             int m, float (&o)[kOHalf]) {
     CUTLASS_PRAGMA_UNROLL
     for (int c = 0; c < kOHalf; c += kTmemLd) {
         tmem_ld_32dp32bNx<kTmemLd>(lane_base + kTmemO + m * kOHalf + c, o + c);
@@ -1662,8 +1706,8 @@ CUTE_DEVICE void store_out(__nv_bfloat16* dst, const float* v, float scale) {
         uint32_t w[8];
         CUTLASS_PRAGMA_UNROLL
         for (int e = 0; e < 8; ++e) {
-            const nv_bfloat162 b2 = __floats2bfloat162_rn(v[q + 2 * e] * scale,
-                                                          v[q + 2 * e + 1] * scale);
+            const nv_bfloat162 b2 = __floats2bfloat162_rn(
+                v[q + 2 * e] * scale, v[q + 2 * e + 1] * scale);
             w[e] = reinterpret_cast<const uint32_t&>(b2);
         }
         st_global_v8_na(dst + q, w);
@@ -1671,12 +1715,16 @@ CUTE_DEVICE void store_out(__nv_bfloat16* dst, const float* v, float scale) {
 }
 
 CUTE_DEVICE void red_release_add(int* ptr, int v) {
-    asm volatile("red.release.gpu.global.add.s32 [%0], %1;" ::"l"(ptr), "r"(v) : "memory");
+    asm volatile("red.release.gpu.global.add.s32 [%0], %1;" ::"l"(ptr), "r"(v)
+                 : "memory");
 }
 
 CUTE_DEVICE int ld_acquire(const int* ptr) {
     int v;
-    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(ptr) : "memory");
+    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];"
+                 : "=r"(v)
+                 : "l"(ptr)
+                 : "memory");
     return v;
 }
 
@@ -1687,8 +1735,8 @@ CUTE_DEVICE int ld_acquire(const int* ptr) {
 constexpr int kRoundWords = kQBoxDims / 2;
 
 template <class C>
-CUTE_DEVICE void store_round(const HcaMaps& maps, typename C::Smem& sm, int token, int t,
-                             int r, const uint32_t* w) {
+CUTE_DEVICE void store_round(const HcaMaps& maps, typename C::Smem& sm,
+                             int token, int t, int r, const uint32_t* w) {
     if (r > 0) {
         if (t == 0) bulk_wait_read();
         NamedBar::sync(kWarpGroup, kQoBar);
@@ -1703,8 +1751,8 @@ CUTE_DEVICE void store_round(const HcaMaps& maps, typename C::Smem& sm, int toke
     if (t == 0) {
         CUTLASS_PRAGMA_UNROLL
         for (int h = 0; h < 2; ++h) {
-            tma_store_2d(&maps.out, sm.qo_stage[h], (h * kQoRounds + r) * kQBoxDims,
-                         token * kHeads);
+            tma_store_2d(&maps.out, sm.qo_stage[h],
+                         (h * kQoRounds + r) * kQBoxDims, token * kHeads);
         }
         bulk_commit();
     }
@@ -1713,8 +1761,8 @@ CUTE_DEVICE void store_round(const HcaMaps& maps, typename C::Smem& sm, int toke
 // Reads half mh (128 columns) of this lane's O, scaled, as bf16 pairs, and
 // releases it to the next unit's first PV.
 template <class C>
-CUTE_DEVICE void read_o_bf16(typename C::Smem& sm, uint32_t lane_base, int t, int mh,
-                             float scale, uint32_t (&w)[kOHalf / 2]) {
+CUTE_DEVICE void read_o_bf16(typename C::Smem& sm, uint32_t lane_base, int t,
+                             int mh, float scale, uint32_t (&w)[kOHalf / 2]) {
     CUTLASS_PRAGMA_UNROLL
     for (int c = 0; c < kOHalf; c += kTmemLd) {
         float o[kTmemLd];
@@ -1737,9 +1785,9 @@ CUTE_DEVICE void read_o_bf16(typename C::Smem& sm, uint32_t lane_base, int t, in
 // The cluster's last unit stages all of O at once in the idle KV stages, so
 // no round waits for the previous one's box to be read (~1 us at 8K).
 template <class C>
-CUTE_DEVICE void store_out_rows(const HcaMaps& maps, typename C::Smem& sm, int token,
-                                uint32_t lane_base, int t, float scale,
-                                bool write, bool last) {
+CUTE_DEVICE void store_out_rows(const HcaMaps& maps, typename C::Smem& sm,
+                                int token, uint32_t lane_base, int t,
+                                float scale, bool write, bool last) {
     static_assert(2 * kQoRounds * kQBoxBytes <= sizeof(sm.kv));
     if (!C::kDsa && last && write) {
         const auto box = [&](int h, int r) {
@@ -1751,12 +1799,15 @@ CUTE_DEVICE void store_out_rows(const HcaMaps& maps, typename C::Smem& sm, int t
             read_o_bf16<C>(sm, lane_base, t, mh, scale, w);
             CUTLASS_PRAGMA_UNROLL
             for (int k = 0; k < 2; ++k) {
-                const uint32_t row = swizzled_row(box(t / kHeads, 2 * mh + k), t % kHeads);
+                const uint32_t row =
+                    swizzled_row(box(t / kHeads, 2 * mh + k), t % kHeads);
                 const uint32_t* wr = w + k * kRoundWords;
-                cute::for_each(cute::make_int_sequence<kChunksPerBox>{}, [&](auto q) {
-                    constexpr int Q = decltype(q)::value;
-                    sts_chunk<Q>(row, wr[4 * Q], wr[4 * Q + 1], wr[4 * Q + 2], wr[4 * Q + 3]);
-                });
+                cute::for_each(cute::make_int_sequence<kChunksPerBox>{},
+                               [&](auto q) {
+                                   constexpr int Q = decltype(q)::value;
+                                   sts_chunk<Q>(row, wr[4 * Q], wr[4 * Q + 1],
+                                                wr[4 * Q + 2], wr[4 * Q + 3]);
+                               });
             }
             cutlass::arch::fence_view_async_shared();
             NamedBar::sync(kWarpGroup, kQoBar);
@@ -1766,7 +1817,8 @@ CUTE_DEVICE void store_out_rows(const HcaMaps& maps, typename C::Smem& sm, int t
                     CUTLASS_PRAGMA_UNROLL
                     for (int h = 0; h < 2; ++h) {
                         const int r = 2 * mh + k;
-                        tma_store_2d(&maps.out, box(h, r), (h * kQoRounds + r) * kQBoxDims,
+                        tma_store_2d(&maps.out, box(h, r),
+                                     (h * kQoRounds + r) * kQBoxDims,
                                      token * kHeads);
                     }
                 }
@@ -1794,8 +1846,8 @@ CUTE_DEVICE void store_out_rows(const HcaMaps& maps, typename C::Smem& sm, int t
 // first.. up to the one holding the pair's last tile, skipping clusters with
 // an empty range.
 template <class F>
-CUTE_DEVICE void for_parts(int clusters, const Unit& u, int first,
-                           int total, F&& f) {
+CUTE_DEVICE void for_parts(int clusters, const Unit& u, int first, int total,
+                           F&& f) {
     const int end = u.w0 + u.wn;
     for (int c = first; c < clusters && range_lo(c, total, clusters) < end;
          ++c) {
@@ -1807,12 +1859,13 @@ CUTE_DEVICE void for_parts(int clusters, const Unit& u, int first,
 
 // A part's planes are contiguous: plain bulk copies move them.
 CUTE_DEVICE void bulk_prefetch(const void* src, uint32_t bytes) {
-    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"(bytes)
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src),
+                 "r"(bytes)
                  : "memory");
 }
 
-
-CUTE_DEVICE void bulk_load(void* dst, const void* src, uint32_t bytes, uint64_t* bar) {
+CUTE_DEVICE void bulk_load(void* dst, const void* src, uint32_t bytes,
+                           uint64_t* bar) {
     asm volatile(
         "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
         "[%0], [%1], %2, [%3];" ::"r"(smem_u32(dst)),
@@ -1820,9 +1873,11 @@ CUTE_DEVICE void bulk_load(void* dst, const void* src, uint32_t bytes, uint64_t*
         : "memory");
 }
 
-CUTE_DEVICE const float* part_box(const HcaParams& p, int slot, int cta, int bx) {
-    return p.o_part + (int64_t(slot * 2 + cta) * kPlanes + bx * kPartBoxPlanes) *
-                          (kPlaneBytes / sizeof(float));
+CUTE_DEVICE const float* part_box(const HcaParams& p, int slot, int cta,
+                                  int bx) {
+    return p.o_part +
+           (int64_t(slot * 2 + cta) * kPlanes + bx * kPartBoxPlanes) *
+               (kPlaneBytes / sizeof(float));
 }
 
 // O of a finished unit: bf16 output with the sink in the denominator.  A
@@ -1833,9 +1888,10 @@ CUTE_DEVICE const float* part_box(const HcaParams& p, int slot, int cta, int bx)
 // in cluster order, in fp32 in TMEM, so it does not depend on timing.  Each
 // half of O is released to the next unit's first PV once it is read.
 template <class C>
-CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps, typename C::Smem& sm,
-                         const Unit& u, int unit, int cta, int cluster,
-                         uint32_t lane_base, int t, float sink_log2, bool final_unit) {
+CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
+                         typename C::Smem& sm, const Unit& u, int unit, int cta,
+                         int cluster, uint32_t lane_base, int t,
+                         float sink_log2, bool final_unit) {
     const int head = t % kHeads, half = t / kHeads;
     const int b = unit % 2;
     const int total = sm.total;
@@ -1865,7 +1921,8 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps, typename C::Sm
     // long before.
     if (u.split && first == cluster && t < kPartBoxes && !sm.comb) {
         for (int k = 1; k <= others; ++k) {
-            bulk_prefetch(part_box(p, part_cluster(k), cta, t), kPartBoxPlanes * kPlaneBytes);
+            bulk_prefetch(part_box(p, part_cluster(k), cta, t),
+                          kPartBoxPlanes * kPlaneBytes);
         }
     }
     qo_wait(&sm.ml_full[b], (unit / 2) & 1, t);
@@ -1885,12 +1942,14 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps, typename C::Sm
             sum > 0.0f ? 1.0f / (sum + exp2f(sink_log2 - m)) : 0.0f;
         qo_wait(&sm.o_full, unit & 1, t);
         tcgen05_after_thread_sync();
-        store_out_rows<C>(maps, sm, u.g.a + cta, lane_base, t, scale, !lone, final_unit);
+        store_out_rows<C>(maps, sm, u.g.a + cta, lane_base, t, scale, !lone,
+                          final_unit);
         return;
     }
     int* const ctr = p.counter + first * 2 + cta;  // parts published
-    __nv_bfloat16* const out =
-        p.out + (int64_t(u.g.a + cta) * kHeads + head) * kDim + half * kHalfDims;
+    __nv_bfloat16* const out = p.out +
+                               (int64_t(u.g.a + cta) * kHeads + head) * kDim +
+                               half * kHalfDims;
     const float own_scale = sum > 0.0f ? 1.0f / sum : 0.0f;
     const float own_lse = sum > 0.0f ? m + log2f(sum) : -CUDART_INF_F;
     qo_wait(&sm.o_full, unit & 1, t);
@@ -1919,7 +1978,8 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps, typename C::Sm
         const int sid = sm.comb ? cluster * 2 + (first == cluster) : cluster;
         if (half == 0) p.lse_part[part_row(sid, cta, head)] = own_lse;
         float* const dst =
-            p.o_part + (int64_t(sid * 2 + cta) * kPlanes * kWarpGroup + t) * kPlaneCols;
+            p.o_part +
+            (int64_t(sid * 2 + cta) * kPlanes * kWarpGroup + t) * kPlaneCols;
         CUTLASS_PRAGMA_UNROLL
         for (int mh = 0; mh < 2; ++mh) {
             float o[kOHalf];
@@ -1929,7 +1989,8 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps, typename C::Sm
                 const int pl = mh * kOHalf / kPlaneCols + q;
                 *reinterpret_cast<float4*>(dst + pl * kWarpGroup * kPlaneCols) =
                     make_float4(o[4 * q] * own_scale, o[4 * q + 1] * own_scale,
-                                o[4 * q + 2] * own_scale, o[4 * q + 3] * own_scale);
+                                o[4 * q + 2] * own_scale,
+                                o[4 * q + 3] * own_scale);
             }
         }
         // Thread 0's release covers the group's stores, ordered by the barrier.
@@ -1946,7 +2007,8 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps, typename C::Sm
                 // pair, so no cluster merges twice in a row.
                 const bool shared = first == cluster && sm.n_mj > 0;
                 red_release_add(ctr, 1 + (shared ? kMergeShared : 0));
-                sm.mj[sm.n_mj++] = make_int4(first, last, u.g.a, u.pair * 2 + u.g.has_b);
+                sm.mj[sm.n_mj++] =
+                    make_int4(first, last, u.g.a, u.pair * 2 + u.g.has_b);
             }
         } else if (sm.comb) {
             if (first == cluster && cta == 0 && t == 0) {
@@ -1986,12 +2048,15 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps, typename C::Sm
     float lse_r[kLseRegs];
     CUTLASS_PRAGMA_UNROLL
     for (int j = 0; j < kLseRegs; ++j) {
-        lse_r[j] = j >= n_parts ? -CUDART_INF_F
-                   : j == 0     ? own_lse
-                                : __ldcg(p.lse_part + part_row(part_cluster(j), cta, head));
+        lse_r[j] =
+            j >= n_parts ? -CUDART_INF_F
+            : j == 0
+                ? own_lse
+                : __ldcg(p.lse_part + part_row(part_cluster(j), cta, head));
     }
     const auto lse_at = [&](int j) {
-        if (j >= kLseRegs) return __ldcg(p.lse_part + part_row(part_cluster(j), cta, head));
+        if (j >= kLseRegs)
+            return __ldcg(p.lse_part + part_row(part_cluster(j), cta, head));
         float v = 0.0f;
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < kLseRegs; ++k) {
@@ -2013,7 +2078,8 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps, typename C::Sm
         if (lse > -CUDART_INF_F) den += exp2f(lse - mx);
     }
     const float inv = den > 0.0f ? 1.0f / den : 0.0f;
-    const float w_own = own_lse > -CUDART_INF_F ? exp2f(own_lse - mx) * inv : 0.0f;
+    const float w_own =
+        own_lse > -CUDART_INF_F ? exp2f(own_lse - mx) * inv : 0.0f;
     // Each other part in turn is staged in the KV stages; the running sum
     // stays in TMEM, the last part's pass writes the output.
     static_assert(kPlanes * kPlaneBytes <= C::kStages * C::kStageBytes);
@@ -2033,14 +2099,17 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps, typename C::Sm
         cutlass::arch::fence_view_async_tmem_store();
         NamedBar::sync(kWarpGroup, kQoBar);
         // One box = kPartBoxPlanes planes = kSubPerBox dim blocks; load it into
-        // ring buffer buf.  A box is kMergeBoxBytes; the KV stages are reused as
-        // the scratch, so address the buffers as flat box-sized slabs of the kv
-        // array (with a narrow tile a stage can be smaller than a box, so one
-        // box may span >1 stage).
+        // ring buffer buf.  A box is kMergeBoxBytes; the KV stages are reused
+        // as the scratch, so address the buffers as flat box-sized slabs of the
+        // kv array (with a narrow tile a stage can be smaller than a box, so
+        // one box may span >1 stage).
         constexpr int kSubPerBox = kPartBoxPlanes / (kMergeCols / kPlaneCols);
         constexpr int kMergeBoxBytes = kPartBoxPlanes * kPlaneBytes;
-        static_assert(kMergeBuf * kMergeBoxBytes <= C::kStages * C::kStageBytes);
-        const auto merge_buf = [&](int buf) { return sm.kv[0] + buf * kMergeBoxBytes; };
+        static_assert(kMergeBuf * kMergeBoxBytes <=
+                      C::kStages * C::kStageBytes);
+        const auto merge_buf = [&](int buf) {
+            return sm.kv[0] + buf * kMergeBoxBytes;
+        };
         const auto load_box = [&](int k, int bx, int buf) {
             if (t == 0) {
                 cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(
@@ -2068,12 +2137,13 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps, typename C::Sm
                 tmem_ld_32dp32bNx<kMergeCols>(cols + db * kMergeCols, x);
                 cutlass::arch::fence_view_async_tmem_load();
                 const uint8_t* const planes =
-                    merge_buf(buf) + sub * (kMergeCols / kPlaneCols) * kPlaneBytes +
+                    merge_buf(buf) +
+                    sub * (kMergeCols / kPlaneCols) * kPlaneBytes +
                     t * kPlaneCols * sizeof(float);
                 CUTLASS_PRAGMA_UNROLL
                 for (int q = 0; q < kMergeCols / kPlaneCols; ++q) {
-                    const float4 v =
-                        *reinterpret_cast<const float4*>(planes + q * kPlaneBytes);
+                    const float4 v = *reinterpret_cast<const float4*>(
+                        planes + q * kPlaneBytes);
                     x[4 * q] += v.x * w;
                     x[4 * q + 1] += v.y * w;
                     x[4 * q + 2] += v.z * w;
@@ -2092,56 +2162,61 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps, typename C::Sm
                 load_box(1 + g2 / kPartBoxes, g2 % kPartBoxes, g2 % kMergeBuf);
         }
     } else {
-    stage_part(0);
-    for (int k = 0; k < others; ++k) {
-        const float lse = lse_at(k + 1);
-        const float w = lse > -CUDART_INF_F ? exp2f(lse - mx) * inv : 0.0f;
-        if (k > 0) stage_part(k);
-        Bar::wait(&sm.merge_full[0], k & 1);
-        // Two steps per TMEM round trip.
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < kHalfDims / kMergeCols; j += 2) {
-            float x[2][kMergeCols];
-            tmem_ld_32dp32bNx<kMergeCols>(cols + j * kMergeCols, x[0]);
-            tmem_ld_32dp32bNx<kMergeCols>(cols + (j + 1) * kMergeCols, x[1]);
-            cutlass::arch::fence_view_async_tmem_load();
+        stage_part(0);
+        for (int k = 0; k < others; ++k) {
+            const float lse = lse_at(k + 1);
+            const float w = lse > -CUDART_INF_F ? exp2f(lse - mx) * inv : 0.0f;
+            if (k > 0) stage_part(k);
+            Bar::wait(&sm.merge_full[0], k & 1);
+            // Two steps per TMEM round trip.
             CUTLASS_PRAGMA_UNROLL
-            for (int jj = 0; jj < 2; ++jj) {
-                if (k == 0) {
-                    CUTLASS_PRAGMA_UNROLL
-                    for (int q = 0; q < kMergeCols; ++q) x[jj][q] = x[jj][q] * own_scale * w_own;
-                }
-                const uint8_t* const planes =
-                    sm.kv[0] + (j + jj) * kMergeCols / kPlaneCols * kPlaneBytes +
-                    t * kPlaneCols * sizeof(float);
+            for (int j = 0; j < kHalfDims / kMergeCols; j += 2) {
+                float x[2][kMergeCols];
+                tmem_ld_32dp32bNx<kMergeCols>(cols + j * kMergeCols, x[0]);
+                tmem_ld_32dp32bNx<kMergeCols>(cols + (j + 1) * kMergeCols,
+                                              x[1]);
+                cutlass::arch::fence_view_async_tmem_load();
                 CUTLASS_PRAGMA_UNROLL
-                for (int q = 0; q < kMergeCols / kPlaneCols; ++q) {
-                    const float4 v =
-                        *reinterpret_cast<const float4*>(planes + q * kPlaneBytes);
-                    x[jj][4 * q] += v.x * w;
-                    x[jj][4 * q + 1] += v.y * w;
-                    x[jj][4 * q + 2] += v.z * w;
-                    x[jj][4 * q + 3] += v.w * w;
-                }
-                if (k == others - 1) {
-                    store_out<kMergeCols>(out + (j + jj) * kMergeCols, x[jj], 1.0f);
-                } else {
-                    tmem_st_32dp32bNx<kMergeCols>(cols + (j + jj) * kMergeCols, x[jj]);
+                for (int jj = 0; jj < 2; ++jj) {
+                    if (k == 0) {
+                        CUTLASS_PRAGMA_UNROLL
+                        for (int q = 0; q < kMergeCols; ++q)
+                            x[jj][q] = x[jj][q] * own_scale * w_own;
+                    }
+                    const uint8_t* const planes =
+                        sm.kv[0] +
+                        (j + jj) * kMergeCols / kPlaneCols * kPlaneBytes +
+                        t * kPlaneCols * sizeof(float);
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int q = 0; q < kMergeCols / kPlaneCols; ++q) {
+                        const float4 v = *reinterpret_cast<const float4*>(
+                            planes + q * kPlaneBytes);
+                        x[jj][4 * q] += v.x * w;
+                        x[jj][4 * q + 1] += v.y * w;
+                        x[jj][4 * q + 2] += v.z * w;
+                        x[jj][4 * q + 3] += v.w * w;
+                    }
+                    if (k == others - 1) {
+                        store_out<kMergeCols>(out + (j + jj) * kMergeCols,
+                                              x[jj], 1.0f);
+                    } else {
+                        tmem_st_32dp32bNx<kMergeCols>(
+                            cols + (j + jj) * kMergeCols, x[jj]);
+                    }
                 }
             }
+            cutlass::arch::fence_view_async_tmem_store();
+            // The staged part is read by every thread before the next one lands
+            // in the same place.
+            NamedBar::sync(kWarpGroup, kQoBar);
         }
-        cutlass::arch::fence_view_async_tmem_store();
-        // The staged part is read by every thread before the next one lands
-        // in the same place.
-        NamedBar::sync(kWarpGroup, kQoBar);
-    }
     }
 }
 
 template <class C>
-CUTE_DEVICE void qo_wg(const HcaParams& p, const HcaMaps& maps, typename C::Smem& sm,
-                       uint32_t tmem, float sink_log2, int cta, int t,
-                       int cluster) {
+CUTE_DEVICE void qo_wg(const HcaParams& p, const HcaMaps& maps,
+                       typename C::Smem& sm, uint32_t tmem, float sink_log2,
+                       int cta, int t, int cluster) {
     const uint32_t lane_base = tmem + ((t / kWarp * kWarp) << 16);
     UnitCursor cur = start_cursor<C>(p, sm, cluster);
     Unit u, prev;
@@ -2164,14 +2239,14 @@ CUTE_DEVICE void qo_wg(const HcaParams& p, const HcaMaps& maps, typename C::Smem
         store_q<C>(p, sm, lane_base, q_token, cta, t, qv);
         if (unit > 0) {
             store_o<C>(p, maps, sm, prev, unit - 1, cta, cluster, lane_base, t,
-                    sink_log2, false);
+                       sink_log2, false);
         }
         prev = u;
         more = cur.next(p, sm.unit_lens, u);
     }
     if (unit > 0) {
         store_o<C>(p, maps, sm, prev, unit - 1, cta, cluster, lane_base, t,
-                sink_log2, true);
+                   sink_log2, true);
     }
     // The output is written before the CTA exits.
     if (t == 0) bulk_wait();
@@ -2238,12 +2313,15 @@ CUTE_DEVICE void merge_block(const HcaParams& p, const float* w, int first,
             wk[b] = k < k1 ? w[k * kHeads + head] : 0.0f;
             const int sid = (first + k) * 2 + (k == 0);
             const float4* const src = reinterpret_cast<const float4*>(
-                p.o_part + (int64_t(sid * 2 + cta) * kPlanes * kWarpGroup + tsi) * kPlaneCols);
+                p.o_part +
+                (int64_t(sid * 2 + cta) * kPlanes * kWarpGroup + tsi) *
+                    kPlaneCols);
             CUTLASS_PRAGMA_UNROLL
             for (int u = 0; u < UP; ++u) {
                 const int pl = pl0 + u * pstep;
-                v[b][u] = k < k1 && pl < phi ? __ldcg(src + pl * kWarpGroup)
-                                             : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                v[b][u] = k < k1 && pl < phi
+                              ? __ldcg(src + pl * kWarpGroup)
+                              : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
         }
         CUTLASS_PRAGMA_UNROLL
@@ -2281,8 +2359,10 @@ CUTE_DEVICE void merge_slice(const HcaParams& p, const float* w, float4* red,
     for (int pb = plo + (ksplit ? 0 : wg); pb < phi; pb += UP * pstep) {
         float4 acc[UP];
         CUTLASS_PRAGMA_UNROLL
-        for (int u = 0; u < UP; ++u) acc[u] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        merge_block<UP, UK>(p, w, first, cta, tsi, head, pb, pstep, phi, k0, k1, acc);
+        for (int u = 0; u < UP; ++u)
+            acc[u] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        merge_block<UP, UK>(p, w, first, cta, tsi, head, pb, pstep, phi, k0, k1,
+                            acc);
         if (ksplit) {
             if (wg == 1) red[tsi] = acc[0];
             merge_sync();
@@ -2296,8 +2376,9 @@ CUTE_DEVICE void merge_slice(const HcaParams& p, const float* w, float4* red,
             if (pl >= phi) break;
             const nv_bfloat162 lo = __floats2bfloat162_rn(acc[u].x, acc[u].y);
             const nv_bfloat162 hi = __floats2bfloat162_rn(acc[u].z, acc[u].w);
-            stage[tsi * pitch + pl - plo] = make_uint2(
-                *reinterpret_cast<const uint32_t*>(&lo), *reinterpret_cast<const uint32_t*>(&hi));
+            stage[tsi * pitch + pl - plo] =
+                make_uint2(*reinterpret_cast<const uint32_t*>(&lo),
+                           *reinterpret_cast<const uint32_t*>(&hi));
         }
     }
     merge_sync();
@@ -2307,8 +2388,8 @@ CUTE_DEVICE void merge_slice(const HcaParams& p, const float* w, float4* red,
         const int row = e / ns, c = e - row * ns;
         const int dim = (row / kHeads) * kHalfDims + (plo + c) * kPlaneCols;
         *reinterpret_cast<uint2*>(
-            p.out + (int64_t(token + cta) * kHeads + row % kHeads) * kDim + dim) =
-            stage[row * pitch + c];
+            p.out + (int64_t(token + cta) * kHeads + row % kHeads) * kDim +
+            dim) = stage[row * pitch + c];
     }
 }
 
@@ -2318,7 +2399,8 @@ CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
     // The KV stages are idle once the last unit's PV is done (every merging
     // thread has seen o_full): weights in stage 0, the part-split sum in 1.
     constexpr int kMaxParts = sizeof(sm.kv[0]) / (kHeads * sizeof(float));
-    static_assert(kMaxParts >= 128 && sizeof(sm.kv[1]) >= kWarpGroup * sizeof(float4));
+    static_assert(kMaxParts >= 128 &&
+                  sizeof(sm.kv[1]) >= kWarpGroup * sizeof(float4));
     float* const w = reinterpret_cast<float*>(sm.kv[0]);
     float4* const red = reinterpret_cast<float4*>(sm.kv[1]);
     uint2* const stage = reinterpret_cast<uint2*>(sm.kv[2]);
@@ -2327,7 +2409,8 @@ CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
     merge_sync();  // sm.mj from the Q/O group
     // Helpers: the clusters past sched, helper h on pair h % P (find_range),
     // at most enough that every merger keeps a plane.
-    const int pairs = (p.tokens / p.tokens_per_req) * ((p.tokens_per_req + 1) / 2);
+    const int pairs =
+        (p.tokens / p.tokens_per_req) * ((p.tokens_per_req + 1) / 2);
     const int n_help = p.clusters - sm.sched;
     for (int i = 0; i < sm.n_mj; ++i) {
         const int4 j = sm.mj[i];
@@ -2335,7 +2418,8 @@ CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
         int* const ctr = p.counter + first * 2 + cta;
         const int r = cluster - first;
         const bool helper = cluster >= sm.sched;
-        const int hq = min(q < n_help ? (n_help - 1 - q) / pairs + 1 : 0, max(kPlanes - n, 0));
+        const int hq = min(q < n_help ? (n_help - 1 - q) / pairs + 1 : 0,
+                           max(kPlanes - n, 0));
         const int hi = (cluster - sm.sched) / max(pairs, 1);
         if (helper && hi >= hq) continue;
         // A shared first part (see store_o) sits this pair out: it neither
@@ -2364,8 +2448,8 @@ CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
             const int h = threadIdx.x % kHeads, s = threadIdx.x / kHeads;
             float m = -CUDART_INF_F, den = 0.0f;
             for (int k = s; k < n; k += kS) {
-                const float l =
-                    __ldcg(p.lse_part + part_row((first + k) * 2 + (k == 0), cta, h));
+                const float l = __ldcg(
+                    p.lse_part + part_row((first + k) * 2 + (k == 0), cta, h));
                 w[k * kHeads + h] = l;
                 if (l > -CUDART_INF_F) {
                     const float nm = fmaxf(m, l);
@@ -2375,7 +2459,8 @@ CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
             }
             md[s * kHeads + h] = make_float2(m, den);
             merge_sync();
-            const float sink = p.sink ? __ldg(p.sink + h) * CUDART_L2E_F : -CUDART_INF_F;
+            const float sink =
+                p.sink ? __ldg(p.sink + h) * CUDART_L2E_F : -CUDART_INF_F;
             float mx = sink;
             CUTLASS_PRAGMA_UNROLL
             for (int g = 0; g < kS; ++g) mx = fmaxf(mx, md[g * kHeads + h].x);
@@ -2388,17 +2473,22 @@ CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
             const float inv = d > 0.0f ? 1.0f / d : 0.0f;
             for (int k = s; k < n; k += kS) {
                 const float l = w[k * kHeads + h];
-                w[k * kHeads + h] = l > -CUDART_INF_F ? exp2f(l - mx) * inv : 0.0f;
+                w[k * kHeads + h] =
+                    l > -CUDART_INF_F ? exp2f(l - mx) * inv : 0.0f;
             }
             merge_sync();
             if (n <= 2) {
-                merge_slice<8, 2>(p, w, red, stage, first, n, cta, plo, phi, j.z);
+                merge_slice<8, 2>(p, w, red, stage, first, n, cta, plo, phi,
+                                  j.z);
             } else if (n <= 4) {
-                merge_slice<4, 4>(p, w, red, stage, first, n, cta, plo, phi, j.z);
+                merge_slice<4, 4>(p, w, red, stage, first, n, cta, plo, phi,
+                                  j.z);
             } else if (n <= 8) {
-                merge_slice<2, 8>(p, w, red, stage, first, n, cta, plo, phi, j.z);
+                merge_slice<2, 8>(p, w, red, stage, first, n, cta, plo, phi,
+                                  j.z);
             } else {
-                merge_slice<1, 16>(p, w, red, stage, first, n, cta, plo, phi, j.z);
+                merge_slice<1, 16>(p, w, red, stage, first, n, cta, plo, phi,
+                                   j.z);
             }
             merge_sync();  // w and red are rewritten by the next pair
         }
@@ -2500,18 +2590,21 @@ CUTE_DEVICE void run_decode(const HcaParams& p, const HcaMaps& maps) {
     }
 }
 
-__global__ void __launch_bounds__(kThreads, 1) hca_decode_attention_kernel(
-    const __grid_constant__ HcaParams p, const __grid_constant__ HcaMaps maps) {
+__global__ void __launch_bounds__(kThreads, 1)
+    hca_decode_attention_kernel(const __grid_constant__ HcaParams p,
+                                const __grid_constant__ HcaMaps maps) {
     run_decode<HcaCfg>(p, maps);
 }
 
-__global__ void __launch_bounds__(kThreads, 1) hca_plain_attention_kernel(
-    const __grid_constant__ HcaParams p, const __grid_constant__ HcaMaps maps) {
+__global__ void __launch_bounds__(kThreads, 1)
+    hca_plain_attention_kernel(const __grid_constant__ HcaParams p,
+                               const __grid_constant__ HcaMaps maps) {
     run_decode<HcaPlainCfg>(p, maps);
 }
 
-__global__ void __launch_bounds__(kThreads, 1) dsa_decode_attention_kernel(
-    const __grid_constant__ HcaParams p, const __grid_constant__ HcaMaps maps) {
+__global__ void __launch_bounds__(kThreads, 1)
+    dsa_decode_attention_kernel(const __grid_constant__ HcaParams p,
+                                const __grid_constant__ HcaMaps maps) {
     run_decode<DsaCfg>(p, maps);
 }
 
@@ -2541,9 +2634,9 @@ __global__ void hca_combine_kernel(const __grid_constant__ HcaParams p) {
     const int sched = *p.eff_g;
     if (sched == 0) return;
     const int cta = blockIdx.y;
-    const int pl = blockIdx.x;                  // plane [0, kPlanes)
-    const int grp = threadIdx.x / kWarpGroup;   // part-group [0, kCombSplit)
-    const int tsi = threadIdx.x % kWarpGroup;   // storage thread index
+    const int pl = blockIdx.x;                 // plane [0, kPlanes)
+    const int grp = threadIdx.x / kWarpGroup;  // part-group [0, kCombSplit)
+    const int tsi = threadIdx.x % kWarpGroup;  // storage thread index
     const int head = tsi % kHeads, half = tsi / kHeads;
     const int total = *p.total_g;
     const float sink_log2 =
@@ -2580,7 +2673,9 @@ __global__ void hca_combine_kernel(const __grid_constant__ HcaParams p) {
             den = den * sc + e;
             const float4 v = *reinterpret_cast<const float4*>(
                 p.o_part +
-                (int64_t((sid(c) * 2 + cta) * kPlanes + pl) * kWarpGroup + tsi) * kPlaneCols);
+                (int64_t((sid(c) * 2 + cta) * kPlanes + pl) * kWarpGroup +
+                 tsi) *
+                    kPlaneCols);
             acc[0] = acc[0] * sc + e * v.x;
             acc[1] = acc[1] * sc + e * v.y;
             acc[2] = acc[2] * sc + e * v.z;
@@ -2597,8 +2692,10 @@ __global__ void hca_combine_kernel(const __grid_constant__ HcaParams p) {
             // (denom only), then normalize.  Identical to the two-pass merge.
             float mx = sink_log2;
             CUTLASS_PRAGMA_UNROLL
-            for (int g = 0; g < kCombSplit; ++g) mx = fmaxf(mx, redmd[g][tsi][0]);
-            float dtot = sink_log2 > -CUDART_INF_F ? exp2f(sink_log2 - mx) : 0.0f;
+            for (int g = 0; g < kCombSplit; ++g)
+                mx = fmaxf(mx, redmd[g][tsi][0]);
+            float dtot =
+                sink_log2 > -CUDART_INF_F ? exp2f(sink_log2 - mx) : 0.0f;
             CUTLASS_PRAGMA_UNROLL
             for (int e = 0; e < kPlaneCols; ++e) acc[e] = 0.0f;
             CUTLASS_PRAGMA_UNROLL
@@ -2606,7 +2703,8 @@ __global__ void hca_combine_kernel(const __grid_constant__ HcaParams p) {
                 const float sc = exp2f(redmd[g][tsi][0] - mx);
                 dtot += redmd[g][tsi][1] * sc;
                 CUTLASS_PRAGMA_UNROLL
-                for (int e = 0; e < kPlaneCols; ++e) acc[e] += red[g][tsi][e] * sc;
+                for (int e = 0; e < kPlaneCols; ++e)
+                    acc[e] += red[g][tsi][e] * sc;
             }
             const float inv = dtot > 0.0f ? 1.0f / dtot : 0.0f;
             CUTLASS_PRAGMA_UNROLL
@@ -2616,8 +2714,10 @@ __global__ void hca_combine_kernel(const __grid_constant__ HcaParams p) {
             const int dim = half * kHalfDims + mh * kOHalf + q * kPlaneCols;
             __nv_bfloat16* const out =
                 p.out + (int64_t(j.a + cta) * kHeads + head) * kDim + dim;
-            reinterpret_cast<nv_bfloat162*>(out)[0] = __floats2bfloat162_rn(acc[0], acc[1]);
-            reinterpret_cast<nv_bfloat162*>(out)[1] = __floats2bfloat162_rn(acc[2], acc[3]);
+            reinterpret_cast<nv_bfloat162*>(out)[0] =
+                __floats2bfloat162_rn(acc[0], acc[1]);
+            reinterpret_cast<nv_bfloat162*>(out)[1] =
+                __floats2bfloat162_rn(acc[2], acc[3]);
         }
         __syncthreads();  // red / redmd are rewritten by the next job
     }
@@ -2635,7 +2735,8 @@ CUtensorMap make_map(const void* ptr, CUtensorMapDataType dtype,
 }
 
 void set_pool(HcaParams& p, HcaMaps& maps, int seg, const torch::Tensor& pool,
-              const torch::Tensor& idx, const torch::Tensor& len, int64_t tokens) {
+              const torch::Tensor& idx, const torch::Tensor& len,
+              int64_t tokens) {
     TORCH_CHECK(pool.dim() == 4 && pool.scalar_type() == torch::kByte &&
                     pool.size(2) == 1 && pool.size(3) == kRowBytes + kSfBytes &&
                     pool.stride(0) % kRowBytes == 0,
@@ -2680,13 +2781,15 @@ Workspace& workspace(const torch::Tensor& q, int clusters) {
     if (!ws.counter.defined() || ws.counter.size(0) != clusters) {
         const auto f32 = q.options().dtype(torch::kFloat);
         const auto i32 = q.options().dtype(torch::kInt);
-        // Two partial slots per cluster (index cluster*2 + which): a cluster can
-        // be the leading continuation (which=0) of one split pair and the
+        // Two partial slots per cluster (index cluster*2 + which): a cluster
+        // can be the leading continuation (which=0) of one split pair and the
         // trailing owner (which=1) of another, so one slot each avoids a clash.
-        ws.o_part = torch::empty({2 * clusters, 2, kPlanes, kWarpGroup, kPlaneCols}, f32);
+        ws.o_part = torch::empty(
+            {2 * clusters, 2, kPlanes, kWarpGroup, kPlaneCols}, f32);
         ws.lse_part = torch::empty({2 * clusters, 2, kHeads}, f32);
         ws.counter = torch::zeros({clusters, 2}, i32);
-        ws.jobs = torch::empty({clusters, 4}, i32);  // MergeJob[pairs <= clusters]
+        ws.jobs =
+            torch::empty({clusters, 4}, i32);  // MergeJob[pairs <= clusters]
         ws.total_g = torch::zeros({1}, i32);
         ws.eff_g = torch::zeros({1}, i32);
     }
@@ -2706,11 +2809,11 @@ void launch_decode(HcaParams& p, const HcaMaps& maps, const torch::Tensor& q,
     // separate combine kernel merges the wide split.  When many pairs the
     // legacy path already fills the machine and inline-merges cheaply.
     const int max_clusters = GetSmCount() / 2;
-    const int64_t pairs = int64_t(p.tokens) / p.tokens_per_req *
-                          ((p.tokens_per_req + 1) / 2);
+    const int64_t pairs =
+        int64_t(p.tokens) / p.tokens_per_req * ((p.tokens_per_req + 1) / 2);
     const int heuristic = int(2 * pairs <= max_clusters ? 2 * pairs
-                              : pairs <= max_clusters    ? pairs
-                                                         : max_clusters);
+                              : pairs <= max_clusters   ? pairs
+                                                        : max_clusters);
     // DSA: the wide-split + separate combine (eff=1) path only pays at very
     // low batch (measured crossover pairs<=~9), where idle SMs >> tokens and a
     // single token's 2048-KV latency dominates.  Above that the inline 2-way
@@ -2730,7 +2833,8 @@ void launch_decode(HcaParams& p, const HcaMaps& maps, const torch::Tensor& q,
     p.tpc = kDefaultTpc;
     if (const char* e = getenv("HCA_TPC")) p.tpc = atoi(e);
     p.clusters = p.eff ? max_clusters : heuristic;
-    if (const char* e = getenv("HCA_CLUSTERS")) p.clusters = std::min(atoi(e), max_clusters);
+    if (const char* e = getenv("HCA_CLUSTERS"))
+        p.clusters = std::min(atoi(e), max_clusters);
     // eff leaves the split uncapped (work-aware sizing + cheap wide combine);
     // the legacy inline-merge path keeps the adaptive per-pair cap.
     p.smax = p.eff == 1 ? 0 : kDefaultSmax;
@@ -2743,9 +2847,11 @@ void launch_decode(HcaParams& p, const HcaMaps& maps, const torch::Tensor& q,
     p.combine = p.eff == 1 || p.eff == 2 ? 1 : 0;
     if (const char* e = getenv("HCA_COMBINE")) p.combine = atoi(e);
     if (pairs > max_clusters) p.combine = 0;  // jobs has a slot per pair
-    p.fuse = is_dsa ? 0 : 1;  // DSA keeps the combine kernel
+    p.fuse = is_dsa ? 0 : 1;                  // DSA keeps the combine kernel
     if (const char* e = getenv("HCA_FUSE")) p.fuse = atoi(e);
-    p.ks_kmax = p.eff == 2 && p.combine && p.fuse && pairs > 0 ? p.clusters / int(pairs) : 0;
+    p.ks_kmax = p.eff == 2 && p.combine && p.fuse && pairs > 0
+                    ? p.clusters / int(pairs)
+                    : 0;
     p.ks_b = 0.077f + 0.062f * float(pairs);
     p.ks_a = 1.17f / p.ks_b;
     p.ks_rp = pairs > 0 ? 1.f / float(pairs) : 0.f;
@@ -2784,7 +2890,8 @@ void launch_decode(HcaParams& p, const HcaMaps& maps, const torch::Tensor& q,
         // One job slot per pair (pairs <= clusters here), the job axis capped
         // at kCombJobs: surplus blocks would only exit, yet still cost
         // block-launch waves, also when the device merged inline (eff 2).
-        ccfg.gridDim = dim3(kPlanes, 2, int(std::min<int64_t>(pairs, kCombJobs)));
+        ccfg.gridDim =
+            dim3(kPlanes, 2, int(std::min<int64_t>(pairs, kCombJobs)));
         ccfg.blockDim = dim3(kCombSplit * kWarpGroup);
         ccfg.dynamicSmemBytes = 0;
         ccfg.stream = stream;
@@ -2866,8 +2973,8 @@ torch::Tensor HcaDecodeAttention(
     const bool use_pdl) {
     const CudaDeviceGuard device_guard(q.device());
     const int64_t tokens = q.size(0);
-    TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kBFloat16 && q.is_contiguous() &&
-                    q.numel() == tokens * kHeads * kDim,
+    TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kBFloat16 &&
+                    q.is_contiguous() && q.numel() == tokens * kHeads * kDim,
                 "q must be a contiguous bfloat16 [T, 64, 512] tensor");
     TORCH_CHECK(tokens_per_req >= 2 && tokens % tokens_per_req == 0,
                 "tokens_per_req must be >= 2 and divide T");
@@ -2876,15 +2983,17 @@ torch::Tensor HcaDecodeAttention(
                     out.numel() == q.numel(),
                 "out must be a contiguous bfloat16 [T, 64, 512] tensor");
     for (const torch::Tensor* x : std::initializer_list<const torch::Tensor*>{
-             &swa_k_cache, &swa_indices, &swa_lengths, &c128_k_cache, &c128_indices,
-             &c128_lengths, &out}) {
-        TORCH_CHECK(x->device() == q.device(), "all tensors must be on q's device");
+             &swa_k_cache, &swa_indices, &swa_lengths, &c128_k_cache,
+             &c128_indices, &c128_lengths, &out}) {
+        TORCH_CHECK(x->device() == q.device(),
+                    "all tensors must be on q's device");
     }
-    TORCH_CHECK(!attn_sink.has_value() ||
-                    (attn_sink->device() == q.device() &&
-                     attn_sink->scalar_type() == torch::kFloat &&
-                     attn_sink->is_contiguous() && attn_sink->numel() == kHeads),
-                "attn_sink must be a contiguous float32 [64] tensor");
+    TORCH_CHECK(
+        !attn_sink.has_value() ||
+            (attn_sink->device() == q.device() &&
+             attn_sink->scalar_type() == torch::kFloat &&
+             attn_sink->is_contiguous() && attn_sink->numel() == kHeads),
+        "attn_sink must be a contiguous float32 [64] tensor");
     if (tokens == 0) return out;
 
     HcaParams p{};
@@ -2936,13 +3045,15 @@ torch::Tensor DsaDecodeAttention(
                 "out must be a contiguous bfloat16 [T, 64, 512] tensor");
     for (const torch::Tensor* x : std::initializer_list<const torch::Tensor*>{
              &k_cache, &indices, &lengths, &out}) {
-        TORCH_CHECK(x->device() == q.device(), "all tensors must be on q's device");
+        TORCH_CHECK(x->device() == q.device(),
+                    "all tensors must be on q's device");
     }
-    TORCH_CHECK(!attn_sink.has_value() ||
-                    (attn_sink->device() == q.device() &&
-                     attn_sink->scalar_type() == torch::kFloat &&
-                     attn_sink->is_contiguous() && attn_sink->numel() == kHeads),
-                "attn_sink must be a contiguous float32 [64] tensor");
+    TORCH_CHECK(
+        !attn_sink.has_value() ||
+            (attn_sink->device() == q.device() &&
+             attn_sink->scalar_type() == torch::kFloat &&
+             attn_sink->is_contiguous() && attn_sink->numel() == kHeads),
+        "attn_sink must be a contiguous float32 [64] tensor");
     if (tokens == 0) return out;
 
     HcaParams p{};
