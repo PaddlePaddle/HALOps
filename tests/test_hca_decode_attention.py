@@ -20,20 +20,11 @@ import torch
 from halops import hca_decode_attention
 
 HEADS, DIM, NOPE, ROPE = 64, 512, 448, 64
-ROW = NOPE + 2 * ROPE  # data bytes of a cache row: fp8 nope, bf16 rope
-SF = 8  # scale bytes of a cache row: 7 UE8M0 scales of 64 dims, 1 pad
+ROW = NOPE + 2 * ROPE
+SF = 8
 WINDOW = 128
 SCALE = DIM**-0.5
-# Relative to the largest |output| of a token.  P is rounded to bf16 for the
-# PV MMA, as in FlashMLA: an error of 2^-9 |v| per key, about 2^-7 of the
-# output's scale here (FlashMLA's own error against this reference is the
-# same, 7.8e-3), plus the bf16 output rounding.
 RTOL = 2e-2
-
-
-# =====================================================================
-# Inputs and reference
-# =====================================================================
 
 
 def make_cache(pages, page_size, gen):
@@ -137,11 +128,6 @@ def assert_close(out, ref, rows=None):
     assert (d <= bound).all(), f"max rel err {(d / bound).max().item() * RTOL:.3g}"
 
 
-# =====================================================================
-# Correctness tests
-# =====================================================================
-
-
 @pytest.mark.parametrize(
     "tokens, tpr",
     [
@@ -174,8 +160,8 @@ def test_hca_decode_attention_nan_query_isolated_lone():
     """A NaN in a lone (odd-request) token's query stays local, and a NaN in
     another token does not reach the lone one."""
     args = make_batch(24, 3, 860, seed=4)
-    args[0][2, 1, 9] = float("nan")  # the first request's lone token
-    args[0][7, 0, 0] = float("nan")  # a paired token of the third request
+    args[0][2, 1, 9] = float("nan")
+    args[0][7, 0, 0] = float("nan")
     rows = torch.ones(24, dtype=torch.bool)
     rows[2] = rows[7] = False
     assert_close(run(args, 3), reference(*args), rows)
@@ -274,11 +260,6 @@ def test_hca_decode_attention_matches_flash_mla():
         extra_topk_length=c_len,
     )[0][:, 0]
     assert_close(run(args, tpr), ref)
-
-
-# =====================================================================
-# Error input tests
-# =====================================================================
 
 
 @pytest.mark.parametrize(
