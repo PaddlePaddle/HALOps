@@ -891,6 +891,75 @@ class CollectiveEpilogue {
             }
 
             int buf_i = 0;
+            // Quantized D: one UE8M0 scale per kGroup columns, e4m3 data via
+            // the SMEM stage and TMA (direct stores for rows above the box),
+            // then the row's scale word.
+            const auto store_quant = [&](const __nv_bfloat162* vals,
+                                         const TileRows& rows, int64_t row,
+                                         bool row_ok, int64_t bcol0, int col0,
+                                         uint32_t expert) {
+                const int32_t box_row =
+                    (int32_t)((int64_t)rows.row0 - (int64_t)rows.lo);
+                SfWord sf_word = 0;
+                CUTLASS_PRAGMA_UNROLL
+                for (int g = 0; g < kGroups; ++g) {
+                    const __nv_bfloat162* v = &vals[g * kGroup / 2];
+                    const uint32_t m = exp8_pair(abs_max<kGroup / 2>(v));
+                    const uint32_t e =
+                        scale_of_exp8(::max(m & 0xffffu, m >> 16));
+                    sf_word |= (SfWord)(e << (8 * g));
+                    const uint32_t sc_bits = multiplier_bits(e) * 0x10001u;
+                    const __nv_bfloat162 sc =
+                        reinterpret_cast<const __nv_bfloat162&>(sc_bits);
+                    uint32_t q[kGroup / 4];
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int i = 0; i < kGroup / 4; ++i) {
+                        q[i] = e4m3x4(v[2 * i], v[2 * i + 1], sc);
+                    }
+                    const uint4 lo = make_uint4(q[0], q[1], q[2], q[3]);
+                    const uint4 hi = make_uint4(q[4], q[5], q[6], q[7]);
+                    if (box_row < 0) {
+                        if (row_ok) {
+                            uint4* dst = reinterpret_cast<uint4*>(
+                                reinterpret_cast<uint8_t*>(
+                                    epilogue_params.ptr_d) +
+                                d_row(epilogue_params, rows, row) + bcol0 +
+                                col0 + g * kGroup);
+                            dst[0] = lo;
+                            dst[1] = hi;
+                        }
+                        continue;
+                    }
+                    uint8_t* buf =
+                        stage + buf_i * KernelTraits::KEpiBufBytes;
+                    *reinterpret_cast<uint4*>(buf + st_off + st_x) = lo;
+                    *reinterpret_cast<uint4*>(buf + st_off +
+                                              (st_x ^ KVec)) = hi;
+                    cutlass::arch::fence_view_async_shared();
+                    if (issuer) {
+                        cute::tma_store_wait<0>();
+                    }
+                    cutlass::arch::NamedBarrier::sync(
+                        cutlass::NumThreadsPerWarpGroup, KEpiBarrier + wg);
+                    if (issuer) {
+                        cute::SM90_TMA_STORE_3D::copy(
+                            &epilogue_params.d_desc, buf, col0 + g * kGroup,
+                            box_row,
+                            KernelTraits::KernelType == KernelMode::Batch
+                                ? (int32_t)expert
+                                : 0);
+                        cute::tma_store_arrive();
+                    }
+                    buf_i ^= 1;
+                }
+                if (row_ok) {
+                    *reinterpret_cast<SfWord*>(
+                        epilogue_params.ptr_sfd +
+                        sf_offset(epilogue_params, rows, row,
+                                  bcol0 + col0)) = sf_word;
+                }
+            };
+
             AccumulatorPipelineState acc_pipe_consumer_state;
             BiasPipelineState bias_pipe_consumer_state;
             while (scheduler.is_valid()) {
@@ -1118,66 +1187,8 @@ class CollectiveEpilogue {
                 }
 
                 if constexpr (KQuantD) {
-                    const int32_t box_row =
-                        (int32_t)((int64_t)rows.row0 - (int64_t)rows.lo);
-                    SfWord sf_word = 0;
-                    CUTLASS_PRAGMA_UNROLL
-                    for (int g = 0; g < kGroups; ++g) {
-                        const __nv_bfloat162* v = &vals[g * kGroup / 2];
-                        const uint32_t m = exp8_pair(abs_max<kGroup / 2>(v));
-                        const uint32_t e =
-                            scale_of_exp8(::max(m & 0xffffu, m >> 16));
-                        sf_word |= (SfWord)(e << (8 * g));
-                        const uint32_t sc_bits = multiplier_bits(e) * 0x10001u;
-                        const __nv_bfloat162 sc =
-                            reinterpret_cast<const __nv_bfloat162&>(sc_bits);
-                        uint32_t q[kGroup / 4];
-                        CUTLASS_PRAGMA_UNROLL
-                        for (int i = 0; i < kGroup / 4; ++i) {
-                            q[i] = e4m3x4(v[2 * i], v[2 * i + 1], sc);
-                        }
-                        const uint4 lo = make_uint4(q[0], q[1], q[2], q[3]);
-                        const uint4 hi = make_uint4(q[4], q[5], q[6], q[7]);
-                        if (box_row < 0) {
-                            if (row_ok) {
-                                uint4* dst = reinterpret_cast<uint4*>(
-                                    reinterpret_cast<uint8_t*>(
-                                        epilogue_params.ptr_d) +
-                                    d_row(epilogue_params, rows, row) + bcol0 +
-                                    col0 + g * kGroup);
-                                dst[0] = lo;
-                                dst[1] = hi;
-                            }
-                            continue;
-                        }
-                        uint8_t* buf =
-                            stage + buf_i * KernelTraits::KEpiBufBytes;
-                        *reinterpret_cast<uint4*>(buf + st_off + st_x) = lo;
-                        *reinterpret_cast<uint4*>(buf + st_off +
-                                                  (st_x ^ KVec)) = hi;
-                        cutlass::arch::fence_view_async_shared();
-                        if (issuer) {
-                            cute::tma_store_wait<0>();
-                        }
-                        cutlass::arch::NamedBarrier::sync(
-                            cutlass::NumThreadsPerWarpGroup, KEpiBarrier + wg);
-                        if (issuer) {
-                            cute::SM90_TMA_STORE_3D::copy(
-                                &epilogue_params.d_desc, buf, col0 + g * kGroup,
-                                box_row,
-                                KernelTraits::KernelType == KernelMode::Batch
-                                    ? (int32_t)scheduler.expert_idx()
-                                    : 0);
-                            cute::tma_store_arrive();
-                        }
-                        buf_i ^= 1;
-                    }
-                    if (row_ok) {
-                        *reinterpret_cast<SfWord*>(
-                            epilogue_params.ptr_sfd +
-                            sf_offset(epilogue_params, rows, row,
-                                      bcol0 + col0)) = sf_word;
-                    }
+                    store_quant(vals, rows, row, row_ok, bcol0, col0,
+                                scheduler.expert_idx());
                 }
                 scheduler.advance();
             }
