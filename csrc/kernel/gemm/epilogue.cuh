@@ -52,9 +52,6 @@ class CollectiveEpilogue {
     using CopyOpT2R = typename KernelTraits::CopyOpT2R;
     using CopyOpT2R_Sub = typename KernelTraits::CopyOpT2R_Sub;
     using OverlapComputeTile = typename KernelTraits::OverlapComputeTile;
-    // Used by the BF16 epilogue path.
-    using CopyOpT2R_Overlap = typename KernelTraits::CopyOpT2R_Overlap;
-    using OverlapLoadTile = typename KernelTraits::OverlapLoadTile;
     // One epilogue compute tile spans the whole per-CTA M.
     static_assert(cute::size<0>(EpilogueTile{}) ==
                   cute::size<0>(EpiComputeTile{}));
@@ -285,9 +282,13 @@ class CollectiveEpilogue {
         Params const& p, TileScheduler<KernelTraits> const& scheduler,
         TileRows const& rows) {
         if constexpr (KernelTraits::KernelType == KernelMode::Batch) {
-            return p.batch_out_bmn ? 0
-                                   : batch_col0(p, scheduler) -
-                                         (int64_t)rows.lo * p.d_ld;
+            const int64_t shift =
+                batch_col0(p, scheduler) - (int64_t)rows.lo * p.d_ld;
+            if constexpr (KernelTraits::KIsBF16) {
+                return p.batch_out_bmn ? 0 : shift;  // only BF16 takes it
+            } else {
+                return shift;
+            }
         } else {
             return 0;
         }
@@ -742,440 +743,6 @@ class CollectiveEpilogue {
         }
     }
 
-    template <bool KStreamK, class TmemStorage>
-    CUTLASS_DEVICE void epilogue_bf16(Params const& epilogue_params,
-                                      AccumulatorPipeline& acc_pipeline,
-                                      SharedStorage& shared_storage,
-                                      TmemStorage& tmem_storage, int warp_idx,
-                                      TileScheduler<KernelTraits>& scheduler) {
-        int warp_group_idx = warp_idx / 4;
-        int block_rank_in_cluster = cute::block_rank_in_cluster();
-
-        cute::Layout cluster_layout_vmnk =
-            cute::tiled_divide(cute::make_layout(ClusterShape_MNK{}),
-                               cute::make_tile(typename TiledMma::AtomThrID{}));
-        auto cta_coord_vmnk =
-            cluster_layout_vmnk.get_flat_coord(block_rank_in_cluster);
-        int cta_v = cute::get<0>(cta_coord_vmnk);
-
-        cute::Tensor tmem_accumulators = tmem_storage.tmem_accumulators;
-        cute::Tensor acc = tmem_accumulators(cute::make_coord(cute::_, cute::_),
-                                             cute::_0{}, cute::_0{}, cute::_);
-
-        // TMEM is read in 16-column sub-tiles; KOverlapSubCount of them at the
-        // stage boundary form the overlap region.
-        static constexpr int SubTilesPerWG = KernelTraits::KSubTilesPerWG;
-        static constexpr int OverlapSubCount = KernelTraits::KOverlapSubCount;
-
-        cute::Tensor acc_sub_tile =
-            cute::flat_divide(acc, OverlapComputeTile{});
-
-        cute::TiledCopy tiled_t2r_sub = cute::make_tmem_copy(
-            CopyOpT2R_Sub{},
-            acc_sub_tile(cute::_, cute::_, cute::_0{}, cute::_0{}, cute::_0{}));
-        auto tx = threadIdx.x % cute::size(tiled_t2r_sub);
-        cute::ThrCopy thread_t2r_sub = tiled_t2r_sub.get_slice(tx);
-
-        cute::Tensor thr_tacc_src_sub =
-            thread_t2r_sub.partition_S(acc_sub_tile);
-        cute::Tensor thr_demo_sub = thread_t2r_sub.partition_D(
-            acc_sub_tile(cute::_, cute::_, cute::_0{}, cute::_0{}, cute::_0{}));
-        cute::Tensor thr_racc_dst_sub =
-            cute::make_tensor<TypeAccumulate>(cute::shape(thr_demo_sub));
-        cute::Tensor thr_rd_sub =
-            cute::make_tensor<TypeD>(cute::shape(thr_demo_sub));
-
-        // Unswapped output dims. D rows are d_ld apart: N, or B * N for Batch,
-        // whose D is [M, B * N] with batch b in columns [b * N, (b + 1) * N).
-        const size_t out_m = epilogue_params.m;  // activation M
-        const size_t out_n = epilogue_params.n;  // weight N
-        const int64_t d_ld = epilogue_params.d_ld;
-
-        cute::Tensor mD = [&]() {
-            if constexpr (SwapAB) {
-                auto stride_d =
-                    cute::make_stride(cute::Int<1>{}, d_ld, out_m * out_n);
-                auto layout_d =
-                    cute::make_layout(cute::make_shape(out_n, out_m, 1),
-                                      cute::append<3>(stride_d, cute::_0{}));
-                return cute::make_tensor(
-                    cute::make_gmem_ptr(epilogue_params.ptr_d), layout_d);
-            } else {
-                auto stride_d =
-                    cute::make_stride(d_ld, cute::_1{}, out_m * out_n);
-                auto layout_d =
-                    cute::make_layout(cute::make_shape(out_m, out_n, 1),
-                                      cute::append<3>(stride_d, cute::_0{}));
-                return cute::make_tensor(
-                    cute::make_gmem_ptr(epilogue_params.ptr_d), layout_d);
-            }
-        }();
-
-        cute::Tensor gD = cute::local_tile(
-            mD, cute::take<0, 2>(CtaShape_MNK{}),
-            cute::make_coord(cute::_, cute::_, cute::Int<0>{}));
-
-        cute::Tensor gD_sub_tile = cute::flat_divide(gD, OverlapComputeTile{});
-        auto tiled_r2g_sub = [&]() {
-            if constexpr (SwapAB) {
-                return cute::make_tiled_copy_D(
-                    cute::Copy_Atom<cute::UniversalCopy<TypeD>, TypeD>{},
-                    tiled_t2r_sub);
-            } else {
-                return cute::make_tiled_copy_D(
-                    cute::Copy_Atom<cute::SM100_STORE_256bit_CACHE_NOALLOCATION,
-                                    TypeD>{},
-                    tiled_t2r_sub);
-            }
-        }();
-        auto thr_r2g_sub = tiled_r2g_sub.get_slice(tx);
-        cute::Tensor src_sub = thr_r2g_sub.retile_S(thr_rd_sub);
-        cute::Tensor dst_sub = thr_r2g_sub.partition_D(gD_sub_tile);
-
-        // Coordinates partitioned like dst: the stores below are not clipped,
-        // so the M bound is checked per element.
-        auto dst_coords_sub = [&]() {
-            auto mD_coords = cute::make_identity_tensor(
-                SwapAB ? cute::make_shape(out_n, out_m, 1)
-                       : cute::make_shape(out_m, out_n, 1));
-            auto gD_coords = cute::local_tile(
-                mD_coords, cute::take<0, 2>(CtaShape_MNK{}),
-                cute::make_coord(cute::_, cute::_, cute::Int<0>{}));
-            auto gD_sub_tile_coords =
-                cute::flat_divide(gD_coords, OverlapComputeTile{});
-            return thr_r2g_sub.partition_D(gD_sub_tile_coords);
-        }();
-
-        // Stream-K: partials address a compact per-CTA [CtaShape_M][KBlockN]
-        // slot instead of the global D grid.
-        static constexpr int KPartialM =
-            cute::size<0>(cute::take<0, 2>(CtaShape_MNK{}));
-        static constexpr int KPartialN =
-            cute::size<1>(cute::take<0, 2>(CtaShape_MNK{}));
-
-        // Built once against the workspace base (doing it in r2g_sub causes
-        // spills); same thread layout as the D store. Empty when !KStreamK.
-        auto partial_store = [&]() {
-            if constexpr (KStreamK) {
-                auto tiled_p = cute::make_tiled_copy_D(
-                    cute::Copy_Atom<
-                        cute::AutoVectorizingCopyWithAssumedAlignment<128>,
-                        TypeAccumulate>{},
-                    tiled_t2r_sub);
-                auto thr_p = tiled_p.get_slice(tx);
-                return cute::make_tuple(
-                    tiled_p, thr_p.retile_S(thr_racc_dst_sub),
-                    thr_p.partition_D(cute::flat_divide(
-                        cute::make_tensor(
-                            cute::make_gmem_ptr(epilogue_params.ptr_partial),
-                            cute::make_layout(
-                                cute::make_shape(cute::Int<KPartialM>{},
-                                                 cute::Int<KPartialN>{}),
-                                cute::make_stride(cute::Int<KPartialN>{},
-                                                  cute::_1{}))),
-                        OverlapComputeTile{})));
-            } else {
-                return cute::make_tuple();
-            }
-        }();
-
-        // BF16 tiles never straddle a batch (the host requires whole tiles),
-        // so stores clip against the stacked D only; a per-batch bound would
-        // keep the batch range live across the store loop.
-        const TileRows store_bound{0, out_m, 0, out_m % KTileRows == 0};
-
-        AccumulatorPipelineState acc_pipe_consumer_state;
-
-        uint32_t epilogue_stage_idx = 0;
-
-        while (scheduler.is_valid()) {
-            uint32_t m_idx = scheduler.m_idx();
-            uint32_t n_idx = scheduler.n_idx();
-            // Resolved per work item: < 0 stores the final bf16 result.
-            int partial_slot = -1;
-            int64_t partial_off = 0;
-            if constexpr (KStreamK) {
-                partial_slot = scheduler.partial_slot();
-                partial_off =
-                    (static_cast<int64_t>(partial_slot) * KNumCTA + cta_v) *
-                    KPartialM * KPartialN;
-            }
-            const uint32_t block_m_idx = m_idx * KNumCTA + cta_v;
-            const TileRows rows =
-                tile_rows(scheduler, out_m, block_m_idx, n_idx);
-            const int64_t row_shift = d_shift(epilogue_params, scheduler, rows);
-            float alpha_val = 1.0f;
-            if constexpr (HasAlpha) {
-                alpha_val = shared_storage.alpha[scheduler.expert_idx()];
-            }
-            acc_pipeline.consumer_wait(acc_pipe_consumer_state);
-            epilogue_stage_idx = acc_pipe_consumer_state.index();
-
-            auto t2r_sub = [&](uint32_t sub_n_idx) {
-                cute::copy(
-                    tiled_t2r_sub,
-                    thr_tacc_src_sub(cute::_, cute::_, cute::_, cute::_0{},
-                                     sub_n_idx, epilogue_stage_idx),
-                    thr_racc_dst_sub);
-                if constexpr (!KernelTraits::SkipTmemFence) {
-                    cutlass::arch::fence_view_async_tmem_load();
-                }
-            };
-
-            auto r2g_sub = [&](uint32_t sub_n_idx) {
-                // N-overhang predicate: a KBlockN that does not divide n
-                // overhangs on the last tile, and D is stored register -> GMEM
-                // (not TMA), so nothing clips OOB writes. The host enforces
-                // n % KSubTileN == 0, so one compare covers a whole sub-tile.
-                if constexpr (KernelTraits::KEpiNeedsNPredicate) {
-                    const uint32_t sub_n_begin =
-                        n_idx * static_cast<uint32_t>(KernelTraits::KBlockN) +
-                        sub_n_idx *
-                            static_cast<uint32_t>(KernelTraits::KSubTileN);
-                    if (sub_n_begin >= static_cast<uint32_t>(out_n)) {
-                        return;
-                    }
-                }
-                // Stream-K tail chunk: store the raw fp32 accumulator; the
-                // reduce kernel sums and casts. Stream-K is no-alpha only.
-                if constexpr (KStreamK) {
-                    if (partial_slot >= 0) {
-                        auto dst_p = cute::get<2>(partial_store);
-                        dst_p.data() = dst_p.data() + partial_off;
-                        copy(cute::get<0>(partial_store),
-                             cute::get<1>(partial_store),
-                             dst_p((cute::_, cute::_), cute::_, cute::_,
-                                   cute::Int<0>{}, sub_n_idx));
-                        return;
-                    }
-                }
-
-                auto dst_cur = cute::make_tensor(dst_sub.data() + row_shift,
-                                                 dst_sub.layout())(
-                    (cute::_, cute::_), cute::_, cute::_, cute::Int<0>{},
-                    sub_n_idx, block_m_idx, n_idx);
-                auto coord_cur = dst_coords_sub((cute::_, cute::_), cute::_,
-                                                cute::_, cute::Int<0>{},
-                                                sub_n_idx, block_m_idx, n_idx);
-
-                {
-                    constexpr int kN = decltype(cute::size(thr_rd_sub))::value;
-                    using Converter =
-                        cutlass::NumericArrayConverter<TypeD, TypeAccumulate,
-                                                       kN>;
-                    auto& src_arr =
-                        reinterpret_cast<cutlass::Array<TypeAccumulate, kN>&>(
-                            *thr_racc_dst_sub.data());
-                    auto& dst_arr =
-                        reinterpret_cast<cutlass::Array<TypeD, kN>&>(
-                            *thr_rd_sub.data());
-                    if constexpr (HasAlpha) {
-                        CUTLASS_PRAGMA_UNROLL
-                        for (int i = 0; i < kN; ++i) {
-                            src_arr[i] *= alpha_val;
-                        }
-                    }
-                    dst_arr = Converter::convert(src_arr);
-                }
-
-                store_rows(tiled_r2g_sub, src_sub, dst_cur, coord_cur,
-                           store_bound);
-            };
-
-            auto process_sub = [&](uint32_t sub_n_idx) {
-                if constexpr (KernelTraits::IsSfbUnaligned) {
-                    // The last N tile overhangs N; a sub-tile is all in or all
-                    // out because N is a multiple of the sub-tile width.
-                    if (n_idx * cute::size<1>(TileShape{}) +
-                            sub_n_idx * KernelTraits::KSubTileN >=
-                        out_n) {
-                        return;
-                    }
-                }
-                t2r_sub(sub_n_idx);
-                r2g_sub(sub_n_idx);
-            };
-
-            if constexpr (KernelTraits::KTmemOverlapCols > 0) {
-                // Overlap WG alternates: wg1 on even stages, wg0 on odd.
-                uint32_t overlap_wg = 1 - (epilogue_stage_idx % 2);
-
-                uint32_t ovlp_sub_base =
-                    (epilogue_stage_idx % 2 == 0)
-                        ? (2 * SubTilesPerWG - OverlapSubCount)
-                        : 0;
-
-                uint32_t wg_sub_base = warp_group_idx * SubTilesPerWG;
-
-                // Remaining (non-overlap) sub-tiles of the overlap WG.
-                auto process_non_overlap_subs = [&]() {
-                    CUTLASS_PRAGMA_UNROLL
-                    for (uint32_t s = 0; s < SubTilesPerWG; s++) {
-                        uint32_t sub_idx = wg_sub_base + s;
-                        if (sub_idx < ovlp_sub_base ||
-                            sub_idx >= ovlp_sub_base + OverlapSubCount) {
-                            process_sub(sub_idx);
-                        }
-                    }
-                };
-
-                if constexpr (KernelTraits::KOverlapSingleLoad) {
-                    // Overlap region fits one TMEM load: T2R, arrive, then
-                    // R2G, so MMA resumes without waiting for the stores.
-                    cute::Tensor acc_ovlp_tile =
-                        cute::flat_divide(acc, OverlapLoadTile{});
-                    cute::TiledCopy tiled_t2r_ovlp = cute::make_tmem_copy(
-                        CopyOpT2R_Overlap{},
-                        acc_ovlp_tile(cute::_, cute::_, cute::_0{}, cute::_0{},
-                                      cute::_0{}));
-                    auto tx_ovlp = threadIdx.x % cute::size(tiled_t2r_ovlp);
-                    cute::ThrCopy thread_t2r_ovlp =
-                        tiled_t2r_ovlp.get_slice(tx_ovlp);
-
-                    cute::Tensor thr_tacc_src_ovlp =
-                        thread_t2r_ovlp.partition_S(acc_ovlp_tile);
-                    cute::Tensor thr_demo_ovlp = thread_t2r_ovlp.partition_D(
-                        acc_ovlp_tile(cute::_, cute::_, cute::_0{}, cute::_0{},
-                                      cute::_0{}));
-                    cute::Tensor thr_racc_dst_ovlp =
-                        cute::make_tensor<TypeAccumulate>(
-                            cute::shape(thr_demo_ovlp));
-                    cute::Tensor thr_rd_ovlp =
-                        cute::make_tensor<TypeD>(cute::shape(thr_demo_ovlp));
-
-                    cute::Tensor gD_ovlp_tile =
-                        cute::flat_divide(gD, OverlapLoadTile{});
-                    auto tiled_r2g_ovlp = [&]() {
-                        if constexpr (SwapAB) {
-                            return cute::make_tiled_copy_D(
-                                cute::Copy_Atom<cute::UniversalCopy<TypeD>,
-                                                TypeD>{},
-                                tiled_t2r_ovlp);
-                        } else {
-                            return cute::make_tiled_copy_D(
-                                cute::Copy_Atom<
-                                    cute::SM100_STORE_256bit_CACHE_NOALLOCATION,
-                                    TypeD>{},
-                                tiled_t2r_ovlp);
-                        }
-                    }();
-                    auto thr_r2g_ovlp = tiled_r2g_ovlp.get_slice(tx_ovlp);
-                    cute::Tensor src_ovlp = thr_r2g_ovlp.retile_S(thr_rd_ovlp);
-                    cute::Tensor dst_ovlp =
-                        thr_r2g_ovlp.partition_D(gD_ovlp_tile);
-
-                    static constexpr int WideTilesTotal =
-                        KernelTraits::KWideTilesTotal;
-                    uint32_t ovlp_wide_idx = (epilogue_stage_idx % 2 == 0)
-                                                 ? (WideTilesTotal - 1)
-                                                 : 0;
-
-                    if (warp_group_idx == overlap_wg) {
-                        cute::copy(tiled_t2r_ovlp,
-                                   thr_tacc_src_ovlp(
-                                       cute::_, cute::_, cute::_, cute::_0{},
-                                       ovlp_wide_idx, epilogue_stage_idx),
-                                   thr_racc_dst_ovlp);
-                        cutlass::arch::fence_view_async_tmem_load();
-                    }
-
-                    // Overlap columns read; MMA may proceed.
-                    if (warp_group_idx == overlap_wg) {
-                        overlap_arrive(shared_storage, cta_v, warp_group_idx);
-                    }
-
-                    if (warp_group_idx == overlap_wg) {
-                        {
-                            constexpr int kN =
-                                decltype(cute::size(thr_rd_ovlp))::value;
-                            using Converter =
-                                cutlass::NumericArrayConverter<
-                                    TypeD, TypeAccumulate, kN>;
-                            auto& src_arr = reinterpret_cast<
-                                cutlass::Array<TypeAccumulate, kN> const&>(
-                                *thr_racc_dst_ovlp.data());
-                            auto& dst_arr = reinterpret_cast<
-                                cutlass::Array<TypeD, kN>&>(
-                                *thr_rd_ovlp.data());
-                            if constexpr (HasAlpha) {
-                                CUTLASS_PRAGMA_UNROLL
-                                for (int i = 0; i < kN; ++i) {
-                                    src_arr[i] *= alpha_val;
-                                }
-                            }
-                            dst_arr = Converter::convert(src_arr);
-                        }
-
-                        auto dst_cur = cute::make_tensor(
-                            dst_ovlp.data() + row_shift,
-                            dst_ovlp.layout())((cute::_, cute::_), cute::_,
-                                               cute::_, cute::Int<0>{},
-                                               ovlp_wide_idx, block_m_idx,
-                                               n_idx);
-
-                        if constexpr (SwapAB) {
-                            CUTLASS_PRAGMA_UNROLL
-                            for (uint32_t v_id = 0; v_id < src_ovlp.size();
-                                 ++v_id) {
-                                auto* addr = (TypeD*)&dst_cur(v_id);
-                                auto val = src_ovlp[v_id];
-                                asm volatile(
-                                    "st.global.L1::no_allocate.b16 "
-                                    "[%0], %1;"
-                                    :
-                                    : "l"(addr), "h"(*(uint16_t*)&val));
-                            }
-                        } else {
-                            cute::copy(tiled_r2g_ovlp, src_ovlp, dst_cur);
-                        }
-
-                        process_non_overlap_subs();
-                    }
-                } else {
-                    // No single TMEM load covers the overlap region: do
-                    // T2R + R2G per sub-tile, then arrive after the last read.
-                    if (warp_group_idx == overlap_wg) {
-                        CUTLASS_PRAGMA_UNROLL
-                        for (uint32_t o = 0; o < OverlapSubCount; o++) {
-                            process_sub(ovlp_sub_base + o);
-                        }
-                    }
-
-                    if (warp_group_idx == overlap_wg) {
-                        overlap_arrive(shared_storage, cta_v, warp_group_idx);
-                    }
-
-                    if (warp_group_idx == overlap_wg) {
-                        process_non_overlap_subs();
-                    }
-                }
-
-                if (warp_group_idx != overlap_wg) {
-                    CUTLASS_PRAGMA_UNROLL
-                    for (uint32_t s = 0; s < SubTilesPerWG; s++) {
-                        process_sub(wg_sub_base + s);
-                    }
-                }
-            } else {
-                uint32_t wg_sub_base = warp_group_idx * SubTilesPerWG;
-                CUTLASS_PRAGMA_UNROLL
-                for (uint32_t s = 0; s < SubTilesPerWG; s++) {
-                    process_sub(wg_sub_base + s);
-                }
-            }
-
-            if constexpr (KernelTraits::SkipTmemFence) {
-                // One fence after the last TMEM load, before releasing the
-                // stage (instead of one per load).
-                cutlass::arch::fence_view_async_tmem_load();
-            }
-            acc_pipeline.consumer_release(acc_pipe_consumer_state);
-            ++acc_pipe_consumer_state;
-
-            scheduler.advance();
-        }
-    }
-
     // KStreamK: tail-only stream-K instantiation (BF16 only).
     template <bool KStreamK = false, class TmemStorage>
     CUTLASS_DEVICE void epilogue(Params const& epilogue_params,
@@ -1184,11 +751,7 @@ class CollectiveEpilogue {
                                  SharedStorage& shared_storage,
                                  TmemStorage& tmem_storage, int warp_idx,
                                  TileScheduler<KernelTraits>& scheduler) {
-        if constexpr (KernelTraits::KIsBF16) {
-            epilogue_bf16<KStreamK>(epilogue_params, acc_pipeline,
-                                    shared_storage, tmem_storage, warp_idx,
-                                    scheduler);
-        } else if constexpr (KernelTraits::KSwapStaged) {
+        if constexpr (KernelTraits::KSwapStaged) {
             epilogue_swap(epilogue_params, acc_pipeline, shared_storage,
                           tmem_storage, warp_idx, scheduler);
         } else {
@@ -1228,6 +791,20 @@ class CollectiveEpilogue {
                 tiled_t2r_sub.get_slice(tx).partition_D(acc_sub_tile(
                     cute::_, cute::_, cute::_0{}, cute::_0{}, cute::_0{}))));
             constexpr int kN = decltype(cute::size(thr_rd_sub))::value;
+            static_assert(decltype(cute::size(tiled_t2r_sub))::value ==
+                          cutlass::NumThreadsPerWarpGroup);
+            // The raw unit load assumes N in TMEM columns (32dp, 4x1); BF16
+            // tiles also use the 16dp (64-row CTA) and 2SM "2x2" layouts, so
+            // they load through the partitioned tiled copy instead.
+            constexpr bool kPartitionedLoad = KernelTraits::KIsBF16;
+            // BF16 tiles never straddle a batch (the host requires whole
+            // tiles), so they clip against the stacked D; a per-batch bound
+            // keeps the batch range live across the store loop and spills.
+            constexpr bool kClipWholeD = KernelTraits::KIsBF16;
+            cute::Tensor thr_tacc_src_sub =
+                tiled_t2r_sub.get_slice(tx).partition_S(acc_sub_tile);
+            cute::Tensor thr_racc_sub =
+                cute::make_tensor<TypeAccumulate>(cute::shape(thr_rd_sub));
             const auto shape_d = SwapAB ? cute::make_shape(out_n, out_m, 1)
                                         : cute::make_shape(out_m, out_n, 1);
             cute::Tensor mD = cute::make_tensor(
@@ -1261,6 +838,47 @@ class CollectiveEpilogue {
                     shared_storage.tensor_sC(), OverlapComputeTile{}));
             cute::Tensor thr_rC_sub =
                 cute::make_tensor<TypeC>(cute::shape(thr_rd_sub));
+            const TileRows whole_d{
+                0, out_m, 0,
+                out_m % (SwapAB ? KernelTraits::KBlockN
+                                : KernelTraits::KBlockM) ==
+                    0};
+            const auto clip_rows = [&](const TileRows& rows) -> const TileRows& {
+                if constexpr (kClipWholeD) {
+                    return whole_d;
+                } else {
+                    return rows;
+                }
+            };
+
+            // Stream-K partials go to a compact per-CTA [CtaShape_M][KBlockN]
+            // slot, through the D store's thread layout. Built once: building
+            // it per sub-tile spills. Empty when !KStreamK.
+            constexpr int kPartialM = cute::size<0>(CtaShape_MNK{});
+            constexpr int kPartialN = cute::size<1>(CtaShape_MNK{});
+            auto partial_store = [&]() {
+                if constexpr (KStreamK) {
+                    auto tiled_p = cute::make_tiled_copy_D(
+                        cute::Copy_Atom<
+                            cute::AutoVectorizingCopyWithAssumedAlignment<128>,
+                            TypeAccumulate>{},
+                        tiled_t2r_sub);
+                    auto thr_p = tiled_p.get_slice(tx);
+                    return cute::make_tuple(
+                        tiled_p, thr_p.retile_S(thr_racc_sub),
+                        thr_p.partition_D(cute::flat_divide(
+                            cute::make_tensor(
+                                cute::make_gmem_ptr(epilogue_params.ptr_partial),
+                                cute::make_layout(
+                                    cute::make_shape(cute::Int<kPartialM>{},
+                                                     cute::Int<kPartialN>{}),
+                                    cute::make_stride(cute::Int<kPartialN>{},
+                                                      cute::_1{}))),
+                            OverlapComputeTile{})));
+                } else {
+                    return cute::make_tuple();
+                }
+            }();
 
             uint8_t* const stage = reinterpret_cast<uint8_t*>(&shared_storage) +
                                    KStagedSmem +
@@ -1286,7 +904,17 @@ class CollectiveEpilogue {
                     alpha = shared_storage.alpha[scheduler.expert_idx()];
                 }
                 const int64_t bcol0 = batch_col0(epilogue_params, scheduler);
-                const int64_t row_shift = bcol0 - (int64_t)rows.lo * d_ld;
+                const int64_t row_shift =
+                    d_shift(epilogue_params, scheduler, rows);
+                // < 0: this tile stores its final result.
+                [[maybe_unused]] int partial_slot = -1;
+                [[maybe_unused]] int64_t partial_off = 0;
+                if constexpr (KStreamK) {
+                    partial_slot = scheduler.partial_slot();
+                    partial_off =
+                        (static_cast<int64_t>(partial_slot) * KNumCTA + cta_v) *
+                        kPartialM * kPartialN;
+                }
                 const int64_t row = (int64_t)rows.row0 + tx;
                 const bool row_ok =
                     row >= (int64_t)rows.lo && row < (int64_t)rows.hi;
@@ -1333,7 +961,15 @@ class CollectiveEpilogue {
                      << 16) +
                     wg * kCols;
                 const auto load_unit = [&](int u, uint32_t(&r)[kU]) {
-                    copy_to_regs<UnitLoad>(acc + u * kU, r);
+                    if constexpr (kPartitionedLoad) {
+                        cute::copy(tiled_t2r_sub,
+                                   thr_tacc_src_sub(cute::_, cute::_, cute::_,
+                                                    cute::_0{}, wg * kUnits + u,
+                                                    stage_idx),
+                                   thr_racc_sub);
+                    } else {
+                        copy_to_regs<UnitLoad>(acc + u * kU, r);
+                    }
                 };
                 const auto consume = [&](int u, const uint32_t(&r)[kU]) {
                     if constexpr (KGlu) {
@@ -1376,10 +1012,29 @@ class CollectiveEpilogue {
                         }
                     } else {
                         const int sub_idx = wg * kUnits + u;
-                        if constexpr (KernelTraits::IsSfbUnaligned && !SwapAB) {
+                        // The last N tile overhangs N (unaligned-SFB pair
+                        // tiles, BF16 N-tails); a sub-tile is all in or all
+                        // out because N is a multiple of the sub-tile width.
+                        if constexpr ((KernelTraits::IsSfbUnaligned &&
+                                       !SwapAB) ||
+                                      KernelTraits::KEpiNeedsNPredicate) {
                             if (n_idx * cute::size<1>(TileShape{}) +
                                     sub_idx * kSubN >=
                                 out_n) {
+                                return;
+                            }
+                        }
+                        // Stream-K tail chunk: store the raw fp32
+                        // accumulator; the reduce kernel sums and casts.
+                        if constexpr (KStreamK) {
+                            if (partial_slot >= 0) {
+                                auto dst_p = cute::get<2>(partial_store);
+                                dst_p.data() = dst_p.data() + partial_off;
+                                cute::copy(cute::get<0>(partial_store),
+                                           cute::get<1>(partial_store),
+                                           dst_p((cute::_, cute::_), cute::_,
+                                                 cute::_, cute::Int<0>{},
+                                                 sub_idx));
                                 return;
                             }
                         }
@@ -1393,7 +1048,11 @@ class CollectiveEpilogue {
                         cutlass::Array<TypeAccumulate, kN> f;
                         CUTLASS_PRAGMA_UNROLL
                         for (int i = 0; i < kN; ++i) {
-                            f[i] = __uint_as_float(r[i]) * alpha;
+                            if constexpr (kPartitionedLoad) {
+                                f[i] = thr_racc_sub(i) * alpha;
+                            } else {
+                                f[i] = __uint_as_float(r[i]) * alpha;
+                            }
                             if constexpr (AddBias && KAct) {
                                 f[i] += static_cast<float>(thr_rC_sub[i]);
                             }
@@ -1418,7 +1077,7 @@ class CollectiveEpilogue {
                                    dst_coords_sub((cute::_, cute::_), cute::_,
                                                   cute::_, cute::Int<0>{},
                                                   sub_idx, block_m_idx, n_idx),
-                                   rows);
+                                   clip_rows(rows));
                     }
                 };
                 const bool ovlp_wg =

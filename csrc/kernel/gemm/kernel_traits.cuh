@@ -204,9 +204,6 @@ struct GemmKernelTraits {
     using OverlapComputeTile = cute::conditional_t<
         KSubTileN == KEpiComputeN, EpiComputeTile,
         cute::Shape<cute::Int<KBlockM / KNumCTA>, cute::Int<KSubTileN>>>;
-    static constexpr int KSubTilesPerWG = KEpiComputeN / KSubTileN;
-    // Overlap sub-tiles sit at the boundary between adjacent stages.
-    static constexpr int KOverlapSubCount = KTmemOverlapCols / KSubTileN;
     // Overlap region fits one TMEM load (widths with a hardware op), so MMA can
     // resume right after T2R; other widths (e.g. 48) interleave per sub-tile.
     static constexpr bool KOverlapSingleLoad =
@@ -261,34 +258,6 @@ struct GemmKernelTraits {
                   "tile must cover the full KBlockN (set "
                   "KEpilogueWarpGroupsOverride = 1) or warps 2/3 address "
                   "outside the tile and the output is silently wrong.");
-
-    // CopyOp for the whole overlap region when KOverlapSingleLoad; width
-    // matched to KTmemOverlapCols, else 16x.
-    using CopyOpT2R_Overlap = cute::conditional_t<
-        KEpiTmemDp == 16,
-        // 16dp: N repeat halved relative to the 32dp column below.
-        cute::conditional_t<
-            KTmemOverlapCols == 16, cute::SM100_TMEM_LOAD_16dp32b8x,
-            cute::conditional_t<
-                KTmemOverlapCols == 32, cute::SM100_TMEM_LOAD_16dp32b16x,
-                cute::conditional_t<KTmemOverlapCols == 64,
-                                    cute::SM100_TMEM_LOAD_16dp32b32x,
-                                    cute::SM100_TMEM_LOAD_16dp32b64x>>>,
-        cute::conditional_t<
-            KTmemOverlapCols == 16, cute::SM100_TMEM_LOAD_32dp32b16x,
-            cute::conditional_t<
-                KTmemOverlapCols == 32, cute::SM100_TMEM_LOAD_32dp32b32x,
-                cute::conditional_t<KTmemOverlapCols == 64,
-                                    cute::SM100_TMEM_LOAD_32dp32b64x,
-                                    cute::SM100_TMEM_LOAD_32dp32b128x>>>>;
-
-    static constexpr int KOverlapLoadN =
-        KOverlapSingleLoad ? KTmemOverlapCols
-                           : (KTmemOverlapCols == 0 ? 16 : KSubTileN);
-    using OverlapLoadTile =
-        cute::Shape<cute::Int<KBlockM / KNumCTA>, cute::Int<KOverlapLoadN>>;
-
-    static constexpr int KWideTilesTotal = KBlockN / KOverlapLoadN;
 
     // T2R op for EpiComputeTile N (and CtaM). `Nx` is the column count; a
     // mismatched width moves the wrong columns, so every reachable width needs
