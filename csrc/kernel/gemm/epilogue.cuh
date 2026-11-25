@@ -293,6 +293,16 @@ class CollectiveEpilogue {
             return 0;
         }
     }
+    // Per-expert alpha of the current tile; 1 when the traits carry none.
+    CUTLASS_DEVICE static float tile_alpha(
+        SharedStorage const& shared_storage,
+        TileScheduler<KernelTraits> const& scheduler) {
+        if constexpr (HasAlpha) {
+            return shared_storage.alpha[scheduler.expert_idx()];
+        } else {
+            return 1.0f;
+        }
+    }
     CUTLASS_DEVICE static int64_t d_row(Params const& p, TileRows const& rows,
                                         int64_t row) {
         return (row - (int64_t)rows.lo) * p.d_ld;
@@ -480,10 +490,7 @@ class CollectiveEpilogue {
             const auto chunk_row = [&](int i) {
                 return (int64_t)rows.row0 + (wg + i * KEpilogueWgs) * kChunk;
             };
-            float alpha = 1.0f;
-            if constexpr (HasAlpha) {
-                alpha = shared_storage.alpha[scheduler.expert_idx()];
-            }
+            const float alpha = tile_alpha(shared_storage, scheduler);
             uint32_t g[KGateMul ? kMyChunks : 1][kLoads][kQuad];
             if constexpr (KGateMul) {
                 const TypeC* base = epilogue_params.ptr_gate + col0 +
@@ -968,10 +975,7 @@ class CollectiveEpilogue {
                     scheduler.m_idx() * KNumCTA + cta_v;
                 const TileRows rows =
                     tile_rows(scheduler, out_m, block_m_idx, n_idx);
-                float alpha = 1.0f;
-                if constexpr (HasAlpha) {
-                    alpha = shared_storage.alpha[scheduler.expert_idx()];
-                }
+                const float alpha = tile_alpha(shared_storage, scheduler);
                 const int64_t bcol0 = batch_col0(epilogue_params, scheduler);
                 const int64_t row_shift =
                     d_shift(epilogue_params, scheduler, rows);
