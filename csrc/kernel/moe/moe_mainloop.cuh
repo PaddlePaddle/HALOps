@@ -219,9 +219,11 @@ struct CollectiveMainloopMoE {
              static_cast<std::uint64_t>(args.intermediate_size) * expert_width *
                  Traits::RoutedDownGemm::MmaCore::kElementABits) /
             8u;
+        // Latent, shared and tail weights also use L2 during this launch.
+        const auto expert_cache_bytes = args.l2_cached_bytes / 2u;
         params.l2_expert_capacity =
             args.l2_cached_bytes > 0u && expert_weight_bytes > 0u
-                ? static_cast<std::uint32_t>(args.l2_cached_bytes /
+                ? static_cast<std::uint32_t>(expert_cache_bytes /
                                              expert_weight_bytes)
                 : 0xFFFFFFFFu;
 
@@ -273,9 +275,12 @@ struct CollectiveMainloopMoE {
                                              kSwizzleBoxK * kUpBits / 8u};
             std::uint32_t up_w_box[3] = {kSwizzleBoxK, UpGemm::kTileShapeM,
                                          UpGemm::MmaCore::kNumSwizzleBoxKs};
-            params.tma_up_weights_desc =
-                CreateTmaDesc<3>("routed_up weights", args.expert_up_weights,
-                                 up_w_shape, up_w_strides, up_w_box);
+            constexpr auto promotion = kUpBits == 4u
+                                           ? CU_TENSOR_MAP_L2_PROMOTION_L2_256B
+                                           : CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
+            params.tma_up_weights_desc = CreateTmaDesc<3>(
+                "routed_up weights", args.expert_up_weights, up_w_shape,
+                up_w_strides, up_w_box, /*use_swizzle=*/true, promotion);
         }
 
         constexpr std::uint64_t kDownBytes =
