@@ -55,8 +55,9 @@ class CollectiveEpilogue {
     // Used by the BF16 epilogue path.
     using CopyOpT2R_Overlap = typename KernelTraits::CopyOpT2R_Overlap;
     using OverlapLoadTile = typename KernelTraits::OverlapLoadTile;
-    static constexpr uint32_t EpiMIter =
-        cute::size<0>(EpilogueTile{}) / cute::size<0>(EpiComputeTile{});
+    // One epilogue compute tile spans the whole per-CTA M.
+    static_assert(cute::size<0>(EpilogueTile{}) ==
+                  cute::size<0>(EpiComputeTile{}));
     // Bias uses plain TMA (no 2SM multicast); each CTA loads its own copy.
     using CopyOpG2S_Bias = cute::SM90_TMA_LOAD;
     using CopyOpS2R =
@@ -273,6 +274,20 @@ class CollectiveEpilogue {
         Params const& p, TileScheduler<KernelTraits> const& scheduler) {
         if constexpr (KernelTraits::KernelType == KernelMode::Batch) {
             return (int64_t)scheduler.expert_idx() * (p.n / KAccColsPerOut);
+        } else {
+            return 0;
+        }
+    }
+    // Shift from the stacked-row D pointer to the tile's D. The default Batch
+    // layout moves batch b's rows to row 0, columns b * N; [B, M, N] keeps
+    // the stacked row.
+    CUTLASS_DEVICE static int64_t d_shift(
+        Params const& p, TileScheduler<KernelTraits> const& scheduler,
+        TileRows const& rows) {
+        if constexpr (KernelTraits::KernelType == KernelMode::Batch) {
+            return p.batch_out_bmn ? 0
+                                   : batch_col0(p, scheduler) -
+                                         (int64_t)rows.lo * p.d_ld;
         } else {
             return 0;
         }
@@ -864,6 +879,11 @@ class CollectiveEpilogue {
             }
         }();
 
+        // BF16 tiles never straddle a batch (the host requires whole tiles),
+        // so stores clip against the stacked D only; a per-batch bound would
+        // keep the batch range live across the store loop.
+        const TileRows store_bound{0, out_m, 0, out_m % KTileRows == 0};
+
         AccumulatorPipelineState acc_pipe_consumer_state;
 
         uint32_t epilogue_stage_idx = 0;
@@ -880,15 +900,10 @@ class CollectiveEpilogue {
                     (static_cast<int64_t>(partial_slot) * KNumCTA + cta_v) *
                     KPartialM * KPartialN;
             }
-            // Batch: move the stacked row b * M + r to row r, columns b * N
-            // (already contiguous in the [B, M, N] layout).
-            int64_t row_shift = 0;
-            if constexpr (KernelTraits::KernelType == KernelMode::Batch) {
-                const int64_t b =
-                    epilogue_params.batch_out_bmn ? 0 : scheduler.expert_idx();
-                row_shift = b * static_cast<int64_t>(out_n) -
-                            b * scheduler.max_m_per_expert() * d_ld;
-            }
+            const uint32_t block_m_idx = m_idx * KNumCTA + cta_v;
+            const TileRows rows =
+                tile_rows(scheduler, out_m, block_m_idx, n_idx);
+            const int64_t row_shift = d_shift(epilogue_params, scheduler, rows);
             float alpha_val = 1.0f;
             if constexpr (HasAlpha) {
                 alpha_val = shared_storage.alpha[scheduler.expert_idx()];
@@ -896,10 +911,10 @@ class CollectiveEpilogue {
             acc_pipeline.consumer_wait(acc_pipe_consumer_state);
             epilogue_stage_idx = acc_pipe_consumer_state.index();
 
-            auto t2r_sub = [&](uint32_t epi_m_idx, uint32_t sub_n_idx) {
+            auto t2r_sub = [&](uint32_t sub_n_idx) {
                 cute::copy(
                     tiled_t2r_sub,
-                    thr_tacc_src_sub(cute::_, cute::_, cute::_, epi_m_idx,
+                    thr_tacc_src_sub(cute::_, cute::_, cute::_, cute::_0{},
                                      sub_n_idx, epilogue_stage_idx),
                     thr_racc_dst_sub);
                 if constexpr (!KernelTraits::SkipTmemFence) {
@@ -907,7 +922,7 @@ class CollectiveEpilogue {
                 }
             };
 
-            auto r2g_sub = [&](uint32_t epi_m_idx, uint32_t sub_n_idx) {
+            auto r2g_sub = [&](uint32_t sub_n_idx) {
                 // N-overhang predicate: a KBlockN that does not divide n
                 // overhangs on the last tile, and D is stored register -> GMEM
                 // (not TMA), so nothing clips OOB writes. The host enforces
@@ -935,7 +950,6 @@ class CollectiveEpilogue {
                     }
                 }
 
-                const uint32_t block_m_idx = m_idx * KNumCTA + cta_v;
                 auto dst_cur = cute::make_tensor(dst_sub.data() + row_shift,
                                                  dst_sub.layout())(
                     (cute::_, cute::_), cute::_, cute::_, cute::Int<0>{},
@@ -964,52 +978,11 @@ class CollectiveEpilogue {
                     dst_arr = Converter::convert(src_arr);
                 }
 
-                if constexpr (SwapAB) {
-                    auto store_one = [&](uint32_t v_id) {
-                        auto* addr = (TypeD*)&dst_cur(v_id);
-                        auto val = src_sub[v_id];
-                        asm volatile("st.global.L1::no_allocate.b16 [%0], %1;"
-                                     :
-                                     : "l"(addr), "h"(*(uint16_t*)&val));
-                    };
-                    if (out_m % KernelTraits::KBlockN == 0) {
-                        // Full M tiles: no bounds check needed.
-                        CUTLASS_PRAGMA_UNROLL
-                        for (uint32_t v_id = 0; v_id < src_sub.size(); ++v_id) {
-                            store_one(v_id);
-                        }
-                    } else {
-                        // Partial last M tile: skip rows past M.
-                        CUTLASS_PRAGMA_UNROLL
-                        for (uint32_t v_id = 0; v_id < src_sub.size(); ++v_id) {
-                            if ((size_t)cute::get<1>(coord_cur(v_id)) >=
-                                out_m) {
-                                continue;
-                            }
-                            store_one(v_id);
-                        }
-                    }
-                } else {
-                    if (out_m % KernelTraits::KBlockM == 0) {
-                        // Full M tiles: no bounds check needed.
-                        cute::copy(tiled_r2g_sub, src_sub, dst_cur);
-                    } else {
-                        // Predicate per store vector (one vector spans one M
-                        // row), which keeps the 256-bit store.
-                        auto pred_cur =
-                            cute::make_tensor<bool>(cute::shape(src_sub));
-                        CUTLASS_PRAGMA_UNROLL
-                        for (uint32_t v_id = 0; v_id < src_sub.size(); ++v_id) {
-                            pred_cur(v_id) =
-                                (size_t)cute::get<0>(coord_cur(v_id)) < out_m;
-                        }
-                        cute::copy_if(tiled_r2g_sub, pred_cur, src_sub,
-                                      dst_cur);
-                    }
-                }
+                store_rows(tiled_r2g_sub, src_sub, dst_cur, coord_cur,
+                           store_bound);
             };
 
-            auto process_sub = [&](uint32_t epi_m_idx, uint32_t sub_n_idx) {
+            auto process_sub = [&](uint32_t sub_n_idx) {
                 if constexpr (KernelTraits::IsSfbUnaligned) {
                     // The last N tile overhangs N; a sub-tile is all in or all
                     // out because N is a multiple of the sub-tile width.
@@ -1019,8 +992,8 @@ class CollectiveEpilogue {
                         return;
                     }
                 }
-                t2r_sub(epi_m_idx, sub_n_idx);
-                r2g_sub(epi_m_idx, sub_n_idx);
+                t2r_sub(sub_n_idx);
+                r2g_sub(sub_n_idx);
             };
 
             if constexpr (KernelTraits::KTmemOverlapCols > 0) {
@@ -1034,44 +1007,14 @@ class CollectiveEpilogue {
 
                 uint32_t wg_sub_base = warp_group_idx * SubTilesPerWG;
 
-                auto overlap_barrier_arrive = [&]() {
-                    constexpr int overlap_bar_threads = 4 * 32 + 32;
-                    if constexpr (KNumCTA == 1) {
-                        cutlass::arch::NamedBarrier::arrive(overlap_bar_threads,
-                                                            0);
-                    } else {
-                        if (cta_v == 0) {
-                            cutlass::arch::NamedBarrier::arrive(
-                                overlap_bar_threads, 0);
-                        } else {
-                            constexpr int wg_threads = 4 * 32;
-                            cutlass::arch::NamedBarrier wg_barrier(
-                                wg_threads, 1 /*barrier id*/);
-                            wg_barrier.arrive_and_wait();
-                            if (threadIdx.x == warp_group_idx * 128) {
-                                // The pair's MMA leader: V is the low bits of
-                                // the cluster rank.
-                                cutlass::arch::ClusterBarrier::arrive(
-                                    &shared_storage.overlap_cluster_bar,
-                                    cute::block_rank_in_cluster() - cta_v,
-                                    true /*pred*/);
-                            }
-                        }
-                    }
-                };
-
                 // Remaining (non-overlap) sub-tiles of the overlap WG.
                 auto process_non_overlap_subs = [&]() {
                     CUTLASS_PRAGMA_UNROLL
-                    for (uint32_t epi_m_idx = 0; epi_m_idx < EpiMIter;
-                         epi_m_idx++) {
-                        CUTLASS_PRAGMA_UNROLL
-                        for (uint32_t s = 0; s < SubTilesPerWG; s++) {
-                            uint32_t sub_idx = wg_sub_base + s;
-                            if (sub_idx < ovlp_sub_base ||
-                                sub_idx >= ovlp_sub_base + OverlapSubCount) {
-                                process_sub(epi_m_idx, sub_idx);
-                            }
+                    for (uint32_t s = 0; s < SubTilesPerWG; s++) {
+                        uint32_t sub_idx = wg_sub_base + s;
+                        if (sub_idx < ovlp_sub_base ||
+                            sub_idx >= ovlp_sub_base + OverlapSubCount) {
+                            process_sub(sub_idx);
                         }
                     }
                 };
@@ -1128,72 +1071,62 @@ class CollectiveEpilogue {
                                                  : 0;
 
                     if (warp_group_idx == overlap_wg) {
-                        CUTLASS_PRAGMA_UNROLL
-                        for (uint32_t epi_m_idx = 0; epi_m_idx < EpiMIter;
-                             epi_m_idx++) {
-                            cute::copy(tiled_t2r_ovlp,
-                                       thr_tacc_src_ovlp(
-                                           cute::_, cute::_, cute::_, epi_m_idx,
-                                           ovlp_wide_idx, epilogue_stage_idx),
-                                       thr_racc_dst_ovlp);
-                            cutlass::arch::fence_view_async_tmem_load();
-                        }
+                        cute::copy(tiled_t2r_ovlp,
+                                   thr_tacc_src_ovlp(
+                                       cute::_, cute::_, cute::_, cute::_0{},
+                                       ovlp_wide_idx, epilogue_stage_idx),
+                                   thr_racc_dst_ovlp);
+                        cutlass::arch::fence_view_async_tmem_load();
                     }
 
                     // Overlap columns read; MMA may proceed.
                     if (warp_group_idx == overlap_wg) {
-                        overlap_barrier_arrive();
+                        overlap_arrive(shared_storage, cta_v, warp_group_idx);
                     }
 
                     if (warp_group_idx == overlap_wg) {
-                        CUTLASS_PRAGMA_UNROLL
-                        for (uint32_t epi_m_idx = 0; epi_m_idx < EpiMIter;
-                             epi_m_idx++) {
-                            {
-                                constexpr int kN =
-                                    decltype(cute::size(thr_rd_ovlp))::value;
-                                using Converter =
-                                    cutlass::NumericArrayConverter<
-                                        TypeD, TypeAccumulate, kN>;
-                                auto& src_arr = reinterpret_cast<
-                                    cutlass::Array<TypeAccumulate, kN> const&>(
-                                    *thr_racc_dst_ovlp.data());
-                                auto& dst_arr = reinterpret_cast<
-                                    cutlass::Array<TypeD, kN>&>(
-                                    *thr_rd_ovlp.data());
-                                if constexpr (HasAlpha) {
-                                    CUTLASS_PRAGMA_UNROLL
-                                    for (int i = 0; i < kN; ++i) {
-                                        src_arr[i] *= alpha_val;
-                                    }
-                                }
-                                dst_arr = Converter::convert(src_arr);
-                            }
-
-                            const uint32_t block_m_idx =
-                                m_idx * KNumCTA + cta_v;
-                            auto dst_cur = cute::make_tensor(
-                                dst_ovlp.data() + row_shift,
-                                dst_ovlp.layout())((cute::_, cute::_), cute::_,
-                                                   cute::_, cute::Int<0>{},
-                                                   ovlp_wide_idx, block_m_idx,
-                                                   n_idx);
-
-                            if constexpr (SwapAB) {
+                        {
+                            constexpr int kN =
+                                decltype(cute::size(thr_rd_ovlp))::value;
+                            using Converter =
+                                cutlass::NumericArrayConverter<
+                                    TypeD, TypeAccumulate, kN>;
+                            auto& src_arr = reinterpret_cast<
+                                cutlass::Array<TypeAccumulate, kN> const&>(
+                                *thr_racc_dst_ovlp.data());
+                            auto& dst_arr = reinterpret_cast<
+                                cutlass::Array<TypeD, kN>&>(
+                                *thr_rd_ovlp.data());
+                            if constexpr (HasAlpha) {
                                 CUTLASS_PRAGMA_UNROLL
-                                for (uint32_t v_id = 0; v_id < src_ovlp.size();
-                                     ++v_id) {
-                                    auto* addr = (TypeD*)&dst_cur(v_id);
-                                    auto val = src_ovlp[v_id];
-                                    asm volatile(
-                                        "st.global.L1::no_allocate.b16 "
-                                        "[%0], %1;"
-                                        :
-                                        : "l"(addr), "h"(*(uint16_t*)&val));
+                                for (int i = 0; i < kN; ++i) {
+                                    src_arr[i] *= alpha_val;
                                 }
-                            } else {
-                                cute::copy(tiled_r2g_ovlp, src_ovlp, dst_cur);
                             }
+                            dst_arr = Converter::convert(src_arr);
+                        }
+
+                        auto dst_cur = cute::make_tensor(
+                            dst_ovlp.data() + row_shift,
+                            dst_ovlp.layout())((cute::_, cute::_), cute::_,
+                                               cute::_, cute::Int<0>{},
+                                               ovlp_wide_idx, block_m_idx,
+                                               n_idx);
+
+                        if constexpr (SwapAB) {
+                            CUTLASS_PRAGMA_UNROLL
+                            for (uint32_t v_id = 0; v_id < src_ovlp.size();
+                                 ++v_id) {
+                                auto* addr = (TypeD*)&dst_cur(v_id);
+                                auto val = src_ovlp[v_id];
+                                asm volatile(
+                                    "st.global.L1::no_allocate.b16 "
+                                    "[%0], %1;"
+                                    :
+                                    : "l"(addr), "h"(*(uint16_t*)&val));
+                            }
+                        } else {
+                            cute::copy(tiled_r2g_ovlp, src_ovlp, dst_cur);
                         }
 
                         process_non_overlap_subs();
@@ -1203,17 +1136,13 @@ class CollectiveEpilogue {
                     // T2R + R2G per sub-tile, then arrive after the last read.
                     if (warp_group_idx == overlap_wg) {
                         CUTLASS_PRAGMA_UNROLL
-                        for (uint32_t epi_m_idx = 0; epi_m_idx < EpiMIter;
-                             epi_m_idx++) {
-                            CUTLASS_PRAGMA_UNROLL
-                            for (uint32_t o = 0; o < OverlapSubCount; o++) {
-                                process_sub(epi_m_idx, ovlp_sub_base + o);
-                            }
+                        for (uint32_t o = 0; o < OverlapSubCount; o++) {
+                            process_sub(ovlp_sub_base + o);
                         }
                     }
 
                     if (warp_group_idx == overlap_wg) {
-                        overlap_barrier_arrive();
+                        overlap_arrive(shared_storage, cta_v, warp_group_idx);
                     }
 
                     if (warp_group_idx == overlap_wg) {
@@ -1223,23 +1152,15 @@ class CollectiveEpilogue {
 
                 if (warp_group_idx != overlap_wg) {
                     CUTLASS_PRAGMA_UNROLL
-                    for (uint32_t epi_m_idx = 0; epi_m_idx < EpiMIter;
-                         epi_m_idx++) {
-                        CUTLASS_PRAGMA_UNROLL
-                        for (uint32_t s = 0; s < SubTilesPerWG; s++) {
-                            process_sub(epi_m_idx, wg_sub_base + s);
-                        }
+                    for (uint32_t s = 0; s < SubTilesPerWG; s++) {
+                        process_sub(wg_sub_base + s);
                     }
                 }
             } else {
+                uint32_t wg_sub_base = warp_group_idx * SubTilesPerWG;
                 CUTLASS_PRAGMA_UNROLL
-                for (uint32_t epi_m_idx = 0; epi_m_idx < EpiMIter;
-                     epi_m_idx++) {
-                    uint32_t wg_sub_base = warp_group_idx * SubTilesPerWG;
-                    CUTLASS_PRAGMA_UNROLL
-                    for (uint32_t s = 0; s < SubTilesPerWG; s++) {
-                        process_sub(epi_m_idx, wg_sub_base + s);
-                    }
+                for (uint32_t s = 0; s < SubTilesPerWG; s++) {
+                    process_sub(wg_sub_base + s);
                 }
             }
 
