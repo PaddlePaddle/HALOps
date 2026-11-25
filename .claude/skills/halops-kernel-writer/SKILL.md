@@ -10,7 +10,7 @@ description: 在 HALOps 里新增或修改 CUDA kernel、launcher 和 Python 接
 ## 流程
 
 1. **先找能复用的代码。** 开工前列出 `csrc/common/` 的头文件，PTX 封装、kernel launch、PDL、stream、`HALOPS_CUDA_CHECK`、量化和激活 helper 都先在这里找。lint 的 reuse-* 规则按函数名和 PTX 字符串比对，重复定义会被拦下。
-2. **按现有结构放代码。** kernel 和 launcher 放在 `csrc/kernel/<模块>/`，namespace 用文件所在模块已有的 namespace，绑定只加在 `csrc/common/cpp_extensions.cc`，Python 接口放在 `halops/<模块>/`。参数检查放在 C++ 入口，Python 接口不再检查、不分配输出以外的张量。
+2. **按现有结构放代码。** kernel 和 launcher 放在 `csrc/kernel/<模块>/`，namespace 用文件所在模块已有的 namespace，绑定只加在 `csrc/common/cpp_extensions.cc`，Python 接口放在 `halops/<模块>/`。参数检查放在 C++ 入口，Python 接口不再检查、不分配输出以外的张量。kernel 的常量按 `.claude/skills/halops-format-brush/SKILL.md` 的"kernel 配置分层"放进 Format / Config / Params / Plan，从第一版就这样写。
 3. **边写边看 hook。** 每次 Edit/Write 之后，PostToolUse hook 回报这个文件新增行上的 finding。error 级的当场改；改不了的记下原因，写进最后的评论。
 4. **测试。** 用例放在 `tests/test_<算子>.py`。随机种子由 `tests/conftest.py` 统一设置，需要独立随机流时用局部 `torch.Generator`；容差用具名常量。
 5. **性能。** 用 `benchmark/` 下的脚本测 before/after，记录 GPU、shape 和时间。

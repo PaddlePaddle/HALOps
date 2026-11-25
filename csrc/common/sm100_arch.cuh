@@ -28,6 +28,8 @@ inline constexpr int kUmmaKBytes = kUmmaK * sizeof(__nv_bfloat16);
 inline constexpr int kTmemCols = 512;
 inline constexpr int kTmemLd = 32;
 
+inline constexpr int kSmemCapacity = 232448;
+
 inline constexpr int kChunk = 16;
 inline constexpr int kElemsPerChunk = kChunk / sizeof(__nv_bfloat16);
 

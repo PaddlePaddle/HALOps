@@ -3802,6 +3802,31 @@
    "code": "ws.eff_g = torch::zeros({1}, i32);"
   },
   {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "format-tuning",
+   "code": "static constexpr int kPvN = 256;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "format-tuning",
+   "code": "static constexpr int kPlaneCols = 4;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "format-tuning",
+   "code": "static constexpr int kPartBoxPlanes = 16;"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "smem-cap",
+   "code": "static_assert(kSmemBytes <= 232448,"
+  },
+  {
+   "path": "csrc/kernel/mla/hca_decode_attention.cu",
+   "rule": "unused-alias",
+   "code": "using HcaPlainCfg = Cfg<HcaModelFormat, false>;"
+  },
+  {
    "path": "csrc/kernel/mla/mla_attention.cu",
    "rule": "anon-namespace",
    "code": "namespace {"
@@ -3965,6 +3990,11 @@
    "path": "csrc/kernel/mla/mla_traits.cuh",
    "rule": "type-alias",
    "code": "using PartialT = float;"
+  },
+  {
+   "path": "csrc/kernel/mla/mla_traits.cuh",
+   "rule": "smem-cap",
+   "code": "static constexpr int SmemPerCtaMax = 227 * 1024;"
   },
   {
    "path": "csrc/kernel/mla/mla_utils.cuh",
@@ -4485,6 +4515,11 @@
    "path": "csrc/kernel/moe/moe_kernel.cuh",
    "rule": "comment",
    "code": "// Phase 5: the latent moe tail."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_kernel.cuh",
+   "rule": "smem-cap",
+   "code": "static_assert(sizeof(MoESharedStorage<Dims>) <= 228 * 1024,"
   },
   {
    "path": "csrc/kernel/moe/moe_mainloop.cuh",

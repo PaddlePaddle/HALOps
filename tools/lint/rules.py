@@ -14,6 +14,7 @@
 """Rule table and per-file checks for halops_lint.py."""
 
 import ast
+import collections
 import io
 import re
 import tokenize
@@ -30,6 +31,10 @@ RULES = {
     "model-constexpr": ("error", "magic"),
     "ns-constexpr": ("error", "magic"),
     "local-constexpr": ("error", "magic"),
+    "format-tuning": ("error", "magic"),
+    "shape-template": ("error", "magic"),
+    "smem-cap": ("error", "magic"),
+    "unused-alias": ("error", "dead"),
     "reuse-cuda-check": ("error", "reuse"),
     "reuse-launch": ("error", "reuse"),
     "reuse-pdl": ("error", "reuse"),
@@ -119,6 +124,13 @@ BANNED = [
         None,
         "do not alias built-in types",
     ),
+    (
+        "smem-cap",
+        r"\b(232448|233472|22[78]\s*\*\s*1024|1024\s*\*\s*22[78])\b",
+        COMMON,
+        "literal shared-memory capacity; compare against kSmemCapacity "
+        "(common/sm100_arch.cuh)",
+    ),
 ]
 DEBUG_CMT = re.compile(
     r"\b\d+(\.\d+)?\s*(us|ms|ns|GB/s|TB/s|TFLOPS)\b|\bmeasured\b|\bfaster than\b|"
@@ -162,6 +174,12 @@ LITERAL_OK = re.compile(
     r"double|size_t|u?int\d+_t)$"
 )
 CONST_NAME = re.compile(r"^([A-Z][A-Z0-9_]*|k[A-Z]\w*)$")
+SHAPE_PARAM = re.compile(
+    r"^(k?(Num)?(Batch|BatchSize|Bsz|Seqs)|k?SeqLen(Q|K|Kv)?|k?Num(Tokens|Reqs|Requests)|"
+    r"(NUM_)?(BATCH(_SIZE)?|BSZ|SEQS)|SEQ_?LEN(_[QK]V?)?|NUM_(TOKENS|REQS))_?$",
+    re.I,
+)
+USING = re.compile(r"^\s*using\s+(\w+)\s*=")
 DIRECTIVE = re.compile(
     r"halops-lint:|clang-format\s+(on|off)|NOLINT|IWYU\s+pragma|\bnoqa\b|type:\s*ignore|"
     r"fmt:\s*(on|off|skip)|^pragma\b|pylint:|isort:|pyright:|mypy:|^!/|coding[:=]"
@@ -291,6 +309,45 @@ def definitions(text):
 
 
 TU = (".cu", ".cc")
+
+
+def template_params(text):
+    """[(line, name, is_type)] for the parameters of every template<...> in text; a
+    type or template-template parameter has is_type True. Default arguments are
+    skipped."""
+    code = "\n".join(strip_strings(s.split("//")[0]) for s in text.splitlines())
+    out = []
+    for m in re.finditer(r"\btemplate\s*<", code):
+        i, depth, start, params = m.end(), 1, m.end(), []
+        while i < len(code) and depth:
+            ch = code[i]
+            depth += ch in "<(["
+            depth -= ch in ">)]"
+            if depth == 0 or (ch == "," and depth == 1):
+                params.append((start, code[start:i]))
+                start = i + 1
+            i += 1
+        for off, p in params:
+            decl = p.split("=")[0]
+            names = list(re.finditer(r"\b[A-Za-z_]\w*\b", decl))
+            if len(names) < 2:
+                continue
+            kind = decl[: names[-1].start()]
+            is_type = bool(re.search(r"\b(class|typename)\s*(\.\.\.)?\s*$", kind))
+            line = code.count("\n", 0, off + names[-1].start()) + 1
+            out.append((line, names[-1].group(0), is_type))
+    return out
+
+
+def format_template(head):
+    """A primary class template whose parameters are all model or data-format values,
+    such as template <int kHeads_, int kDim_> struct HeadLayout."""
+    if not re.search(r"\btemplate\s*<\s*[^>\s]", head):
+        return False
+    params = template_params(head)
+    return bool(params) and all(
+        not t and model_name(n.rstrip("_")) for _, n, t in params
+    )
 
 
 def model_name(name):
@@ -425,7 +482,11 @@ def constant_findings(path, text):
     that is only passed as a template argument describes the model and is allowed.
     ns-constexpr: any other namespace-scope constant or numeric #define.
     local-constexpr: a constexpr or static const local with a literal initializer.
-    The last two apply to .cu/.cuh/.h outside csrc/common, which holds arch constants.
+    format-tuning: a numeric literal member of a model format template (all template
+    parameters are model values) that is not itself a model value: tile, MMA N, box and
+    buffer sizes belong to the kernel Config built on the format.
+    The ns and local rules apply to .cu/.cuh/.h outside csrc/common, which holds arch
+    constants.
     """
     defs = []
     scopes = scope_map(text, defs)
@@ -467,6 +528,20 @@ def constant_findings(path, text):
             if not m or re.search(r"\btemplate\s*<\s*>", owner[-1]):
                 continue
             name = m.group(1)
+            if format_template(owner[-1]):
+                tune = [
+                    n
+                    for n, v in ds
+                    if not model_name(n) and literal(v) and re.search(r"\d", v)
+                ]
+                if tune:
+                    out[first] = (
+                        last,
+                        "format-tuning",
+                        f"{', '.join(tune)}: tuning value in model format {name}; "
+                        f"move it to the kernel Config that takes {name} as a parameter",
+                    )
+                    continue
             hit = [n for n, v in ds if model_name(n) and literal(v, model)]
             read = [
                 n
@@ -625,6 +700,20 @@ def check_cpp(path, text, added, is_new, index):
     for first, last, msg in comment_findings(rows, doc_target):
         if any(no in added for no in range(first, last + 1)):
             f.append((first, "comment", msg))
+    for no, name, is_type in template_params(text):
+        if no in added and not is_type and SHAPE_PARAM.match(name):
+            f.append(
+                (
+                    no,
+                    "shape-template",
+                    f"{name}: runtime shape as a template parameter; keep batch, "
+                    "sequence and token counts in Params and check them in the "
+                    "launcher (a capacity bound is named kMaxXxx)",
+                )
+            )
+    used = collections.Counter(
+        IDENT.findall(" ".join(strip_strings(r[0]) for r in rows))
+    )
     for no in sorted(added):
         line = lines[no - 1] if no <= len(lines) else ""
         code = strip_strings(line.split("//")[0])
@@ -652,6 +741,15 @@ def check_cpp(path, text, added, is_new, index):
             f.append((no, "new-namespace", f"do not add namespace {full}"))
         if at_ns and re.match(r"^\s*(template\s*<.*>\s*)?([A-Z_]+\s+)*static\b", code):
             f.append((no, "ns-static", "no static at namespace scope"))
+        m = USING.match(code)
+        if m and at_ns and path.endswith(".cu") and used[m.group(1)] == 1:
+            f.append(
+                (
+                    no,
+                    "unused-alias",
+                    f"{m.group(1)} is never used in this file; delete it",
+                )
+            )
         for rid, pat, allow, msg in BANNED:
             if re.search(pat, code) and not (allow and path.startswith(allow)):
                 f.append((no, rid, msg))
