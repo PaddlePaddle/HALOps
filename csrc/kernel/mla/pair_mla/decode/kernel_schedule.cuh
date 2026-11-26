@@ -21,7 +21,7 @@
 #include "kernel/mla/pair_mla/decode/hca_schedule.cuh"
 #include "kernel/mla/pair_mla/decode/params.cuh"
 
-namespace halops::detail {
+namespace halops::mla {
 
 // Persistent schedule: cluster c takes tiles [c * total / C, (c + 1) * total
 // / C) of the stream.  A unit is the part of one pair inside a cluster's
@@ -347,4 +347,4 @@ CUTE_DEVICE UnitCursor<C> start_cursor(const HcaParams& p,
             cluster,     sm.start[0], sm.cap,      C::kTile};
 }
 
-}  // namespace halops::detail
+}  // namespace halops::mla

@@ -23,7 +23,7 @@
 #include "kernel/mla/pair_mla/decode/config.cuh"
 #include "kernel/mla/pair_mla/decode/params.cuh"
 
-namespace halops::detail {
+namespace halops::mla {
 
 template <class C>
 void set_pool(HcaParams& p, HcaMaps& maps, int seg, const torch::Tensor& pool,
@@ -149,4 +149,4 @@ Workspace& workspace(const torch::Tensor& q, int clusters) {
     return ws;
 }
 
-}  // namespace halops::detail
+}  // namespace halops::mla

@@ -17,7 +17,7 @@
 #include "common/sm100_arch.cuh"
 #include "kernel/mla/pair_mla/decode/params.cuh"
 
-namespace halops::detail {
+namespace halops::mla {
 
 CUTE_DEVICE PairMap pair_map(const HcaParams& p, int pair) {
     const int ppr = (p.tokens_per_req + 1) / 2;
@@ -82,4 +82,4 @@ struct KeyRaw {
     int seg;
 };
 
-}  // namespace halops::detail
+}  // namespace halops::mla

@@ -20,7 +20,7 @@
 
 #include "kernel/mla/pair_mla/decode/kernel_schedule.cuh"
 
-namespace halops::detail {
+namespace halops::mla {
 
 // Index warp w resolves keys [32w, 32w + 32) of every tile, one per lane:
 // the union key, this CTA's token validity, the TMA row coordinate; then it
@@ -126,9 +126,9 @@ CUTE_DEVICE void index_warp(const HcaParams& p, const HcaMaps& maps,
             }
             __syncwarp();
             if (lane < C::kGroupsPerWarp) {
-                tma_gather4(&maps.raw[cta][0], &sm.raw_full[s],
-                            sm.kv[s] + (w * kWarp + src) * C::kDsaNopeHalf,
-                            cta * C::kHalfDims / 2, r0, r1, r2, r3);
+                hca_tma_gather4(&maps.raw[cta][0], &sm.raw_full[s],
+                                sm.kv[s] + (w * kWarp + src) * C::kDsaNopeHalf,
+                                cta * C::kHalfDims / 2, r0, r1, r2, r3);
             }
             __syncwarp();
         } else {
@@ -153,9 +153,10 @@ CUTE_DEVICE void index_warp(const HcaParams& p, const HcaMaps& maps,
                 const CUtensorMap* const map =
                     cta == 0 ? (gseg == 0 ? &maps.raw[0][0] : &maps.raw[0][1])
                              : (gseg == 0 ? &maps.raw[1][0] : &maps.raw[1][1]);
-                tma_gather4(map, &sm.raw_full[s],
-                            sm.kv[s] + (w * kWarp + src) * raw_pitch<C>(cta),
-                            cta * C::kHalfDims / 2, r0, r1, r2, r3);
+                hca_tma_gather4(
+                    map, &sm.raw_full[s],
+                    sm.kv[s] + (w * kWarp + src) * raw_pitch<C>(cta),
+                    cta * C::kHalfDims / 2, r0, r1, r2, r3);
             }
             __syncwarp();
         }
@@ -316,19 +317,20 @@ CUTE_DEVICE void qk_warp(const HcaParams& p, typename C::Smem& sm,
             if (cute::elect_one_sync()) {
                 CUTLASS_PRAGMA_UNROLL
                 for (int ks = 0; ks < C::kQkSteps; ++ks) {
-                    umma_ts(tmem + C::kTmemS + sb * C::kTmemSCols,
-                            tmem + C::kTmemQ + ks * kUmmaK / 2,
-                            sw128_desc(
-                                sm.kv[s] +
-                                    ks / C::kKStepsPerBlock * C::kBlockBytes +
-                                    ks % C::kKStepsPerBlock * kUmmaKBytes,
-                                kChunk),
-                            idesc, ks > 0);
+                    hca_umma_ts(
+                        tmem + C::kTmemS + sb * C::kTmemSCols,
+                        tmem + C::kTmemQ + ks * kUmmaK / 2,
+                        sw128_desc(
+                            sm.kv[s] +
+                                ks / C::kKStepsPerBlock * C::kBlockBytes +
+                                ks % C::kKStepsPerBlock * kUmmaKBytes,
+                            kChunk),
+                        idesc, ks > 0);
                 }
                 if constexpr (C::kDsa) {
                     CUTLASS_PRAGMA_UNROLL
                     for (int ks = 0; ks < C::kDsaRopeSteps; ++ks) {
-                        umma_ss(
+                        hca_umma_ss(
                             tmem + C::kTmemS + sb * C::kTmemSCols,
                             sw128_desc(sm.q_rope + ks * kUmmaKBytes, kChunk),
                             sw128_desc(sm.rope_kv[s] + ks * kUmmaKBytes,
@@ -368,14 +370,15 @@ CUTE_DEVICE void pv_warp(const HcaParams& p, typename C::Smem& sm,
                 if (cute::elect_one_sync()) {
                     CUTLASS_PRAGMA_UNROLL
                     for (int ks = 0; ks < C::kPvSteps; ++ks) {
-                        umma_ss(tmem + C::kTmemO + m * C::kPvN / 2,
-                                sw128_desc(sm.p[pb] + ks * kUmmaKBytes, kChunk),
-                                sw128_desc(sm.kv[s] +
-                                               m * C::kPvBlocksPerMma *
-                                                   C::kBlockBytes +
-                                               ks * kUmmaK * kSw128AtomRowBytes,
-                                           C::kBlockBytes),
-                                idesc, k > 0 || ks > 0);
+                        hca_umma_ss(
+                            tmem + C::kTmemO + m * C::kPvN / 2,
+                            sw128_desc(sm.p[pb] + ks * kUmmaKBytes, kChunk),
+                            sw128_desc(
+                                sm.kv[s] +
+                                    m * C::kPvBlocksPerMma * C::kBlockBytes +
+                                    ks * kUmmaK * kSw128AtomRowBytes,
+                                C::kBlockBytes),
+                            idesc, k > 0 || ks > 0);
                     }
                 }
                 __syncwarp();
@@ -511,4 +514,4 @@ CUTE_DEVICE void softmax_wg(const HcaParams& p, typename C::Smem& sm,
     }
 }
 
-}  // namespace halops::detail
+}  // namespace halops::mla

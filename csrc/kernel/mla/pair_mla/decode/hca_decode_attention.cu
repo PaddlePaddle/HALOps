@@ -25,9 +25,7 @@
 #include "kernel/mla/pair_mla/decode/kernel.cuh"
 #include "kernel/mla/pair_mla/decode/params.cuh"
 
-namespace halops {
-
-namespace detail {
+namespace halops::mla {
 
 // Scheduling, workspace sizing and the two kernel launches, shared by the HCA
 // and DSA entry points.  The callers differ only in the K-cache pool layout
@@ -97,12 +95,8 @@ void launch_decode(HcaParams& p, const HcaMaps& maps, const torch::Tensor& q,
     }
 }
 
-}  // namespace detail
-
-using namespace detail;
-
 template <class C>
-torch::Tensor HcaDecodeAttention(
+torch::Tensor hca_decode_attention(
     const torch::Tensor& q, const torch::Tensor& swa_k_cache,
     const torch::Tensor& swa_indices, const torch::Tensor& swa_lengths,
     const torch::Tensor& c128_k_cache, const torch::Tensor& c128_indices,
@@ -167,7 +161,7 @@ torch::Tensor HcaDecodeAttention(
 // There is no SWA segment.  Everything past the pool layout and the 576-wide Q
 // tensor map is the shared launch / scheduling / combine path.
 template <class C>
-torch::Tensor DsaDecodeAttention(
+torch::Tensor dsa_decode_attention(
     const torch::Tensor& q, const torch::Tensor& k_cache,
     const torch::Tensor& indices, const torch::Tensor& lengths,
     const std::optional<torch::Tensor>& attn_sink, const double softmax_scale,
@@ -226,6 +220,10 @@ torch::Tensor DsaDecodeAttention(
     return out;
 }
 
+}  // namespace halops::mla
+
+namespace halops {
+
 torch::Tensor HcaDecodeAttention(
     const torch::Tensor& q, const torch::Tensor& swa_k_cache,
     const torch::Tensor& swa_indices, const torch::Tensor& swa_lengths,
@@ -237,16 +235,17 @@ torch::Tensor HcaDecodeAttention(
     const int64_t heads = q.dim() >= 3 ? q.size(-2) : 0;
     const int64_t dim = q.dim() >= 3 ? q.size(-1) : 0;
     const int64_t row = c128_k_cache.dim() == 4 ? c128_k_cache.size(3) : 0;
-    TORCH_CHECK(heads == HcaCfg::kHeads && dim == HcaCfg::kDim &&
-                    row == HcaCfg::kRowBytes + HcaCfg::kSfBytes,
-                "hca_decode_attention has no kernel for heads=", heads,
-                ", dim=", dim, ", k cache row bytes=", row,
-                "; supported: heads=", HcaCfg::kHeads, ", dim=", HcaCfg::kDim,
-                ", k cache row bytes=", HcaCfg::kRowBytes + HcaCfg::kSfBytes);
-    return HcaDecodeAttention<HcaCfg>(q, swa_k_cache, swa_indices, swa_lengths,
-                                      c128_k_cache, c128_indices, c128_lengths,
-                                      attn_sink, softmax_scale, tokens_per_req,
-                                      out_opt, use_pdl);
+    TORCH_CHECK(
+        heads == mla::HcaCfg::kHeads && dim == mla::HcaCfg::kDim &&
+            row == mla::HcaCfg::kRowBytes + mla::HcaCfg::kSfBytes,
+        "hca_decode_attention has no kernel for heads=", heads, ", dim=", dim,
+        ", k cache row bytes=", row, "; supported: heads=", mla::HcaCfg::kHeads,
+        ", dim=", mla::HcaCfg::kDim,
+        ", k cache row bytes=", mla::HcaCfg::kRowBytes + mla::HcaCfg::kSfBytes);
+    return mla::hca_decode_attention<mla::HcaCfg>(
+        q, swa_k_cache, swa_indices, swa_lengths, c128_k_cache, c128_indices,
+        c128_lengths, attn_sink, softmax_scale, tokens_per_req, out_opt,
+        use_pdl);
 }
 
 torch::Tensor DsaDecodeAttention(
@@ -258,16 +257,16 @@ torch::Tensor DsaDecodeAttention(
     const int64_t heads = q.dim() >= 3 ? q.size(-2) : 0;
     const int64_t dim = q.dim() >= 3 ? q.size(-1) : 0;
     const int64_t row = k_cache.dim() == 4 ? k_cache.size(3) : 0;
-    TORCH_CHECK(heads == DsaCfg::kHeads && dim == DsaCfg::kDsaQk &&
-                    row == DsaCfg::kDsaRowBytes,
+    TORCH_CHECK(heads == mla::DsaCfg::kHeads && dim == mla::DsaCfg::kDsaQk &&
+                    row == mla::DsaCfg::kDsaRowBytes,
                 "dsa_decode_attention has no kernel for heads=", heads,
                 ", qk dim=", dim, ", k cache row bytes=", row,
-                "; supported: heads=", DsaCfg::kHeads,
-                ", qk dim=", DsaCfg::kDsaQk,
-                ", k cache row bytes=", DsaCfg::kDsaRowBytes);
-    return DsaDecodeAttention<DsaCfg>(q, k_cache, indices, lengths, attn_sink,
-                                      softmax_scale, tokens_per_req, out_opt,
-                                      use_pdl);
+                "; supported: heads=", mla::DsaCfg::kHeads,
+                ", qk dim=", mla::DsaCfg::kDsaQk,
+                ", k cache row bytes=", mla::DsaCfg::kDsaRowBytes);
+    return mla::dsa_decode_attention<mla::DsaCfg>(
+        q, k_cache, indices, lengths, attn_sink, softmax_scale, tokens_per_req,
+        out_opt, use_pdl);
 }
 
 }  // namespace halops

@@ -22,7 +22,7 @@
 
 #include "kernel/mla/pair_mla/common/schedule.cuh"
 
-namespace halops::detail {
+namespace halops::mla {
 
 // Host schedule defaults and the combine-kernel launch shape.  kNoCap marks
 // an uncapped split.
@@ -107,4 +107,4 @@ struct HcaParams {
 using Bar = cutlass::arch::ClusterBarrier;
 using NamedBar = cutlass::arch::NamedBarrier;
 
-}  // namespace halops::detail
+}  // namespace halops::mla

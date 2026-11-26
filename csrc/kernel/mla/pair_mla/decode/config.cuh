@@ -25,11 +25,7 @@
 #include "kernel/mla/pair_mla/common/config.cuh"
 #include "kernel/mla/pair_mla/decode/smem.cuh"
 
-namespace halops {
-using namespace mla;
-}  // namespace halops
-
-namespace halops::detail {
+namespace halops::mla {
 
 // Head geometry shared by the HCA and DSA formats and the combine kernel;
 // kBlockDims (one bf16 SW128 row) is also the HCA UE8M0 scale block.
@@ -224,4 +220,4 @@ struct HcaIsa {
     static constexpr int kStoreElems = 16;
 };
 
-}  // namespace halops::detail
+}  // namespace halops::mla

@@ -18,7 +18,7 @@
 
 #include "kernel/mla/pair_mla/decode/kernel_schedule.cuh"
 
-namespace halops::detail {
+namespace halops::mla {
 
 // A later unit's Q comes by TMA, one box per dims half at a time: a lane's
 // head row is strided, and direct loads of it occupy the L1 a row per lane,
@@ -33,9 +33,9 @@ CUTE_DEVICE void fetch_q(const HcaMaps& maps, typename C::Smem& sm, int token,
                 &sm.qs_full, 2 * C::kQBoxBytes);
             CUTLASS_PRAGMA_UNROLL
             for (int h = 0; h < 2; ++h) {
-                tma_load_2d(&maps.q, &sm.qs_full, sm.qo_stage[h],
-                            (h * C::kQoRounds + r) * C::kQBoxDims,
-                            token * C::kHeads);
+                hca_tma_load_2d(&maps.q, &sm.qs_full, sm.qo_stage[h],
+                                (h * C::kQoRounds + r) * C::kQBoxDims,
+                                token * C::kHeads);
             }
         }
         Bar::wait(&sm.qs_full, r & 1);
@@ -512,4 +512,4 @@ CUTE_DEVICE void qo_wg(const HcaParams& p, const HcaMaps& maps,
     if (t == 0) bulk_store_wait_all();
 }
 
-}  // namespace halops::detail
+}  // namespace halops::mla

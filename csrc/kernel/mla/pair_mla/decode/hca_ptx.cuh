@@ -27,7 +27,7 @@
 #include "kernel/mla/pair_mla/common/sw128.cuh"
 #include "kernel/mla/pair_mla/decode/config.cuh"
 
-namespace halops::detail {
+namespace halops::mla {
 
 CUTE_DEVICE uint32_t smem_u32(const void* p) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -53,16 +53,16 @@ CUTE_DEVICE uint32_t instr_desc() {
         HcaIsa::kInstrDescShift);
 }
 
-CUTE_DEVICE void umma_ss(uint32_t d, uint64_t a, uint64_t b, uint32_t idesc,
-                         bool accumulate) {
+CUTE_DEVICE void hca_umma_ss(uint32_t d, uint64_t a, uint64_t b, uint32_t idesc,
+                             bool accumulate) {
     asm volatile(
         "{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\n"
         "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;\n}\n" ::"r"(d),
         "l"(a), "l"(b), "r"(idesc), "r"(uint32_t(accumulate)));
 }
 
-CUTE_DEVICE void umma_ts(uint32_t d, uint32_t a, uint64_t b, uint32_t idesc,
-                         bool accumulate) {
+CUTE_DEVICE void hca_umma_ts(uint32_t d, uint32_t a, uint64_t b, uint32_t idesc,
+                             bool accumulate) {
     asm volatile(
         "{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\n"
         "tcgen05.mma.cta_group::2.kind::f16 [%0], [%1], %2, %3, p;\n}\n" ::"r"(
@@ -70,8 +70,9 @@ CUTE_DEVICE void umma_ts(uint32_t d, uint32_t a, uint64_t b, uint32_t idesc,
         "r"(a), "l"(b), "r"(idesc), "r"(uint32_t(accumulate)));
 }
 
-CUTE_DEVICE void tma_gather4(const CUtensorMap* map, uint64_t* bar, void* dst,
-                             int col, int r0, int r1, int r2, int r3) {
+CUTE_DEVICE void hca_tma_gather4(const CUtensorMap* map, uint64_t* bar,
+                                 void* dst, int col, int r0, int r1, int r2,
+                                 int r3) {
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4.mbarrier:"
         ":complete_tx::bytes [%0], [%1, {%2, %3, %4, %5, %6}], [%7];" ::"r"(
@@ -133,8 +134,8 @@ CUTE_DEVICE void cp_async_arrive_noinc(uint64_t* bar) {
                  : "memory");
 }
 
-CUTE_DEVICE void tma_load_2d(const CUtensorMap* map, uint64_t* bar, void* dst,
-                             int col, int row) {
+CUTE_DEVICE void hca_tma_load_2d(const CUtensorMap* map, uint64_t* bar,
+                                 void* dst, int col, int row) {
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::"
         "complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" ::"r"(smem_u32(dst)),
@@ -232,4 +233,4 @@ CUTE_DEVICE void bulk_load(void* dst, const void* src, uint32_t bytes,
         : "memory");
 }
 
-}  // namespace halops::detail
+}  // namespace halops::mla

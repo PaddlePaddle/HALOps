@@ -18,7 +18,7 @@
 
 #include "kernel/mla/pair_mla/decode/kernel_schedule.cuh"
 
-namespace halops::detail {
+namespace halops::mla {
 
 template <class C>
 CUTE_DEVICE void merge_sync() {
@@ -312,4 +312,4 @@ __global__ void hca_combine_kernel(const __grid_constant__ HcaParams p) {
     }
 }
 
-}  // namespace halops::detail
+}  // namespace halops::mla

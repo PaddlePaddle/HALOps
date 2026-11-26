@@ -23,7 +23,7 @@
 #include "kernel/mla/pair_mla/decode/kernel_mainloop.cuh"
 #include "kernel/mla/pair_mla/decode/kernel_schedule.cuh"
 
-namespace halops::detail {
+namespace halops::mla {
 
 template <class C>
 CUTE_DEVICE void init_barriers(typename C::Smem& sm) {
@@ -149,4 +149,4 @@ __global__ void __launch_bounds__(C::kThreads, 1)
     run_decode<C>(p, maps);
 }
 
-}  // namespace halops::detail
+}  // namespace halops::mla

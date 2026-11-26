@@ -20,7 +20,7 @@
 
 #include "common/sm100_arch.cuh"
 
-namespace halops::detail {
+namespace halops::mla {
 
 // Shared memory of an HCA build: KV stages, the per-key UE8M0 scales, P, the
 // Q/O staging boxes, the index ring and the barriers.
@@ -91,4 +91,4 @@ struct DsaSmem {
     uint32_t tmem_base;
 };
 
-}  // namespace halops::detail
+}  // namespace halops::mla
