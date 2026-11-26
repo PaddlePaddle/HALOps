@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+#include <cutlass/cluster_launch.hpp>
 #include <cutlass/cuda_host_adapter.hpp>
 #include <map>
 #include <mutex>
@@ -109,27 +110,19 @@ inline int setup_kernel_once(const void* kernel, const LaunchDims& dims,
 
 template <class Kernel, class... Args>
 void launch_pdl(Kernel* kernel, const LaunchDims& dims, Args... args) {
-    cudaLaunchConfig_t cfg = {};
-    cfg.gridDim = dim3(dims.grid, 1, 1);
-    cfg.blockDim = dim3(dims.block, 1, 1);
-    cfg.dynamicSmemBytes = dims.smem;
-    cfg.stream = GetCurrentCUDAStream();
-    cudaLaunchAttribute attr[2] = {};
-    attr[0] = PdlLaunchAttribute();
-    attr[1].id = cudaLaunchAttributeClusterDimension;
-    attr[1].val.clusterDim.x = dims.cluster;
-    attr[1].val.clusterDim.y = 1;
-    attr[1].val.clusterDim.z = 1;
-    cfg.attrs = attr;
-    cfg.numAttrs = dims.cluster > 1 ? 2 : 1;
-    cudaLaunchConfig_t query = cfg;
-    query.attrs = attr + 1;
-    query.numAttrs = 1;
+    const dim3 grid(dims.grid, 1, 1);
+    const dim3 block(dims.block, 1, 1);
+    const dim3 cluster(dims.cluster, 1, 1);
+    const cudaStream_t stream = GetCurrentCUDAStream();
+    auto query = cutlass::ClusterLauncher::make_cluster_launch_config(
+        grid, cluster, block, dims.smem, stream, false);
+    query.launch_config.attrs = query.launch_attribute;
     const int max_clusters =
-        setup_kernel_once((const void*)kernel, dims, query);
+        setup_kernel_once((const void*)kernel, dims, query.launch_config);
     TORCH_CHECK(dims.cluster == 1 || max_clusters >= dims.grid / dims.cluster,
                 "mla: only ", max_clusters, " of ", dims.grid / dims.cluster,
                 " clusters co-resident");
-    HALOPS_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, args...));
+    HALOPS_CUDA_CHECK(LaunchKernelWithPdl(kernel, grid, block, cluster,
+                                          dims.smem, stream, true, args...));
 }
 }  // namespace halops::mla
