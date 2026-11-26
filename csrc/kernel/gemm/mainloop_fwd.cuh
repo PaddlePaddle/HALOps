@@ -27,6 +27,9 @@ struct CollectiveMainloop {
 
     using TiledMma = typename KernelTraits::TiledMma;
     using TiledMma_SF = typename KernelTraits::TiledMma_SF;
+    using TiledMmaForSF = typename KernelTraits::TiledMmaForSF;
+    // BF16 (kind::f16) has no block-scale factors; SF paths compile out.
+    static constexpr bool KIsBF16 = KernelTraits::KIsBF16;
     using AtomThrID = typename TiledMma::AtomThrID;
     using UtccpOp = cute::conditional_t<KernelTraits::KNumCTA == 1,
                                         cute::SM100_UTCCP_4x32dp128bit_1cta,
@@ -34,6 +37,8 @@ struct CollectiveMainloop {
 
     using TileShape = typename KernelTraits::TileShape;
     using TileShape_SF = typename KernelTraits::TileShape_SF;
+    // Stand-in tile shape for the dummy BF16 SF atom; == TileShape for FP8/FP4.
+    using SFTileShape = typename KernelTraits::SFTileShape;
     using ClusterShape_MNK = typename KernelTraits::ClusterShape_MNK;
     using EpilogueTile = typename KernelTraits::EpilogueTile;
     using AtomThrShapeMNK =
@@ -106,8 +111,8 @@ struct CollectiveMainloop {
     using TMALoad_SFA = decltype(cute::make_tma_atom_A_sm100<uint16_t>(
         GmemTiledLoad{},
         cute::make_tensor(static_cast<TypeSF const*>(nullptr), LayoutSFA{}),
-        SmemLayoutSFA{}(cute::_, cute::_, cute::_, cute::Int<0>{}), TileShape{},
-        TiledMma{}, ClusterLayout_VMNK{}));
+        SmemLayoutSFA{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
+        SFTileShape{}, TiledMmaForSF{}, ClusterLayout_VMNK{}));
 
     // Unaligned-N SFB loads through `sfb_run_desc`.
     struct NoSfbTma {};
@@ -191,9 +196,11 @@ struct CollectiveMainloop {
     // with 16 transaction bytes, so the barrier's arrival count is unchanged.
     static constexpr uint32_t KSfbReadyTx = 16;
     static constexpr uint32_t TmaTransactionBytesAB =
-        TmaTransactionBytesA + TmaTransactionBytesB + TmaTransactionBytesSFA +
-        (IsSfbRowShift ? KSfbReadyTx * KernelTraits::KNumCTA
-                       : TmaTransactionBytesSFB);
+        KIsBF16 ? (TmaTransactionBytesA + TmaTransactionBytesB)
+                : (TmaTransactionBytesA + TmaTransactionBytesB +
+                   TmaTransactionBytesSFA +
+                   (IsSfbRowShift ? KSfbReadyTx * KernelTraits::KNumCTA
+                                  : TmaTransactionBytesSFB));
 
     struct Arguments {
         TypeA const* ptr_a;
@@ -254,10 +261,10 @@ struct CollectiveMainloop {
                 tiled_mma, acc_shape, OverlapTile{});
 
         cute::Tensor tmem_SFA =
-            cute::make_tensor<typename TiledMma::FrgTypeSFA>(
+            cute::make_tensor<typename KernelTraits::FrgTypeSFA>(
                 cute::shape(SmemLayoutAtomSFA{}));
         cute::Tensor tmem_SFB =
-            cute::make_tensor<typename TiledMma::FrgTypeSFB>(
+            cute::make_tensor<typename KernelTraits::FrgTypeSFB>(
                 cute::shape(SmemLayoutAtomSFB{}));
 
         TmemStorage<decltype(tmem_accumulators), decltype(tmem_SFA),
@@ -303,11 +310,6 @@ struct CollectiveMainloop {
                     args.ptr_b)),
             args.layout_B);
 
-        cute::Tensor tensor_sfa =
-            cute::make_tensor(args.ptr_sfa, args.layout_SFA);
-        cute::Tensor tensor_sfb =
-            cute::make_tensor(args.ptr_sfb, args.layout_SFB);
-
         TMALoad_A tma_load_A = cute::make_tma_atom_A_sm100(
             GmemTiledLoad{}, tensor_a,
             SmemLayoutA{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
@@ -318,77 +320,100 @@ struct CollectiveMainloop {
             SmemLayoutB{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
             TileShape{}, TiledMma{}, cluster_layout_vmnk);
 
-        TMALoad_SFA tma_load_sfa = cute::make_tma_atom_A_sm100<uint16_t>(
-            GmemTiledLoad{}, tensor_sfa,
-            SmemLayoutSFA{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
-            TileShape{}, TiledMma{}, cluster_layout_vmnk);
+        // BF16: SF pointers are null, so return default-constructed atoms.
+        if constexpr (KIsBF16) {
+            return {args.layout_A,
+                    args.layout_B,
+                    args.layout_SFA,
+                    args.layout_SFB,
+                    tma_load_A,
+                    tma_load_B,
+                    TMALoad_SFA{},
+                    TMALoad_SFB{},
+                    cute::TmaDescriptor{},
+                    cute::TmaDescriptor{},
+                    cute::TmaDescriptor{},
+                    args.m,
+                    k,
+                    args.num_experts};
+        } else {
+            cute::Tensor tensor_sfa =
+                cute::make_tensor(args.ptr_sfa, args.layout_SFA);
+            cute::Tensor tensor_sfb =
+                cute::make_tensor(args.ptr_sfb, args.layout_SFB);
 
-        TMALoad_SFB tma_load_sfb{};
-        if constexpr (!IsSfbUnaligned) {
-            tma_load_sfb = cute::make_tma_atom_B_sm100<uint16_t>(
-                GmemTiledLoadSfb{}, tensor_sfb,
-                SmemLayoutSFB{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
-                TileShape_SF{}, TiledMma_SF{}, cluster_layout_sfb_vmnk);
-        }
+            TMALoad_SFA tma_load_sfa = cute::make_tma_atom_A_sm100<uint16_t>(
+                GmemTiledLoad{}, tensor_sfa,
+                SmemLayoutSFA{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
+                TileShape{}, TiledMmaForSF{}, cluster_layout_vmnk);
 
-        const auto row_box_desc = [&](cute::TmaDescriptor& desc,
-                                      const void* ptr, auto layout,
-                                      int box_rows, const char* what) {
-            EncodeTmaDesc<2>(&desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, ptr,
-                             {static_cast<cuuint64_t>(k),
-                              static_cast<cuuint64_t>(cute::size<0>(layout))},
-                             {static_cast<cuuint64_t>(cute::stride<0>(layout))},
-                             {static_cast<cuuint32_t>(KernelTraits::KBlockK),
-                              static_cast<cuuint32_t>(box_rows)},
-                             CU_TENSOR_MAP_SWIZZLE_128B, what);
-        };
-        cute::TmaDescriptor a_run_desc{};
-        if constexpr (KernelTraits::KNarrowA) {
-            const int rows = NarrowARows(args.m, args.num_experts);
-            row_box_desc(a_run_desc, args.ptr_a, args.layout_A,
-                         rows > 0 ? rows
-                                  : std::min<int>(cute::size<0>(args.layout_A),
-                                                  KernelTraits::KBlockM),
-                         "narrow A");
-        }
-        cute::TmaDescriptor act_row_desc{};
-        if constexpr (KernelTraits::KActRowTma) {
-            row_box_desc(act_row_desc, args.ptr_b, args.layout_B,
-                         KernelTraits::KBlockN / KernelTraits::KNumCTA,
-                         "activation rows");
-        }
-        cute::TmaDescriptor sfb_run_desc{};
-        if constexpr (IsSfbUnaligned) {
-            // tile_atom_to_shape_SFB orders atoms K-block first, then N.
-            const uint64_t k_blks = cute::size<1, 1>(args.layout_SFB);
-            // Grouped modes lay the experts out after the N atoms, so they fold
-            // into the same run dimension (one stride per atom).
-            const uint64_t n_atoms = static_cast<uint64_t>(
-                cute::ceil_div(cute::size<0>(args.layout_B), 128));
-            EncodeTmaDesc<3>(
-                &sfb_run_desc, CU_TENSOR_MAP_DATA_TYPE_UINT16, args.ptr_sfb,
-                {kSfbAtomBytes / 2, k_blks,
-                 n_atoms *
-                     static_cast<uint64_t>(SwapAB ? 1 : args.num_experts)},
-                {kSfbAtomBytes, k_blks * kSfbAtomBytes},
-                {kSfbAtomBytes / 2, 1, KSfbAtoms}, CU_TENSOR_MAP_SWIZZLE_NONE,
-                "SFB atom run");
-        }
+            TMALoad_SFB tma_load_sfb{};
+            if constexpr (!IsSfbUnaligned) {
+                tma_load_sfb = cute::make_tma_atom_B_sm100<uint16_t>(
+                    GmemTiledLoadSfb{}, tensor_sfb,
+                    SmemLayoutSFB{}(cute::_, cute::_, cute::_, cute::Int<0>{}),
+                    TileShape_SF{}, TiledMma_SF{}, cluster_layout_sfb_vmnk);
+            }
 
-        return {args.layout_A,
-                args.layout_B,
-                args.layout_SFA,
-                args.layout_SFB,
-                tma_load_A,
-                tma_load_B,
-                tma_load_sfa,
-                tma_load_sfb,
-                sfb_run_desc,
-                a_run_desc,
-                act_row_desc,
-                args.m,
-                k,
-                args.num_experts};
+            const auto row_box_desc = [&](cute::TmaDescriptor& desc,
+                                          const void* ptr, auto layout,
+                                          int box_rows, const char* what) {
+                EncodeTmaDesc<2>(&desc, CU_TENSOR_MAP_DATA_TYPE_UINT8, ptr,
+                                 {static_cast<cuuint64_t>(k),
+                                  static_cast<cuuint64_t>(cute::size<0>(layout))},
+                                 {static_cast<cuuint64_t>(cute::stride<0>(layout))},
+                                 {static_cast<cuuint32_t>(KernelTraits::KBlockK),
+                                  static_cast<cuuint32_t>(box_rows)},
+                                 CU_TENSOR_MAP_SWIZZLE_128B, what);
+            };
+            cute::TmaDescriptor a_run_desc{};
+            if constexpr (KernelTraits::KNarrowA) {
+                const int rows = NarrowARows(args.m, args.num_experts);
+                row_box_desc(a_run_desc, args.ptr_a, args.layout_A,
+                             rows > 0 ? rows
+                                      : std::min<int>(cute::size<0>(args.layout_A),
+                                                      KernelTraits::KBlockM),
+                             "narrow A");
+            }
+            cute::TmaDescriptor act_row_desc{};
+            if constexpr (KernelTraits::KActRowTma) {
+                row_box_desc(act_row_desc, args.ptr_b, args.layout_B,
+                             KernelTraits::KBlockN / KernelTraits::KNumCTA,
+                             "activation rows");
+            }
+            cute::TmaDescriptor sfb_run_desc{};
+            if constexpr (IsSfbUnaligned) {
+                // tile_atom_to_shape_SFB orders atoms K-block first, then N.
+                const uint64_t k_blks = cute::size<1, 1>(args.layout_SFB);
+                // Grouped modes lay the experts out after the N atoms, so they fold
+                // into the same run dimension (one stride per atom).
+                const uint64_t n_atoms = static_cast<uint64_t>(
+                    cute::ceil_div(cute::size<0>(args.layout_B), 128));
+                EncodeTmaDesc<3>(
+                    &sfb_run_desc, CU_TENSOR_MAP_DATA_TYPE_UINT16, args.ptr_sfb,
+                    {kSfbAtomBytes / 2, k_blks,
+                     n_atoms *
+                         static_cast<uint64_t>(SwapAB ? 1 : args.num_experts)},
+                    {kSfbAtomBytes, k_blks * kSfbAtomBytes},
+                    {kSfbAtomBytes / 2, 1, KSfbAtoms}, CU_TENSOR_MAP_SWIZZLE_NONE,
+                    "SFB atom run");
+            }
+
+            return {args.layout_A,
+                    args.layout_B,
+                    args.layout_SFA,
+                    args.layout_SFB,
+                    tma_load_A,
+                    tma_load_B,
+                    tma_load_sfa,
+                    tma_load_sfb,
+                    sfb_run_desc,
+                    a_run_desc,
+                    act_row_desc,
+                    args.m,
+                    k,
+                    args.num_experts};
+        }
     }
 
     CUTLASS_DEVICE void tma_loadAB(Params const& mainloop_params,
@@ -408,7 +433,8 @@ struct CollectiveMainloop {
         TileScheduler<KernelTraits>& scheduler) {
         bool select_thr = cute::elect_one_sync();
 
-        uint32_t tile_num_k =
+        // Unused: the per-work-item K range comes from the scheduler.
+        [[maybe_unused]] uint32_t tile_num_k =
             cute::ceil_div(mainloop_params.k, cute::size<2>(TileShape{}));
 
         int block_rank_in_cluster = cute::block_rank_in_cluster();
@@ -461,7 +487,10 @@ struct CollectiveMainloop {
         }();
         cute::Tensor cta_sA = shared_storage.tensor_sA();
         cute::Tensor cta_sB = shared_storage.tensor_sB();
-        cute::ThrMMA cta_mma = tiled_mma.get_slice(block_rank_in_cluster);
+        // Slice by the atom's thread coord, not the flat cluster rank: extra
+        // CTAs of a multi-CTA cluster would index past the atom layout.
+        cute::ThrMMA cta_mma = tiled_mma.get_slice(
+            block_rank_in_cluster % cute::size(typename TiledMma::AtomThrID{}));
 
         cute::Tensor gA = cute::local_tile(
             A, TileShape{}, cute::make_coord(cute::_, cute::_, cute::_),
@@ -555,10 +584,16 @@ struct CollectiveMainloop {
             block_rank_in_cluster %
             cute::size(typename TiledMma_SF::AtomThrID{}));
 
+        // SFTileShape and TiledMmaForSF must be used together: for BF16 they
+        // are dummy stand-ins, and mixing them with the real ones breaks
+        // tma_partition's mode-0 sizes.
+        cute::ThrMMA cta_mma_sfa = TiledMmaForSF{}.get_slice(
+            block_rank_in_cluster %
+            cute::size(typename TiledMmaForSF::AtomThrID{}));
         cute::Tensor gSFA = cute::local_tile(
-            SFA, TileShape{}, cute::make_coord(cute::_, cute::_, cute::_),
+            SFA, SFTileShape{}, cute::make_coord(cute::_, cute::_, cute::_),
             cute::Step<cute::_1, cute::X, cute::_1>{});
-        cute::Tensor cta_gSFA = cta_mma.partition_A(gSFA);
+        cute::Tensor cta_gSFA = cta_mma_sfa.partition_A(gSFA);
 
         auto [tma_gSFA, tma_sSFA] = cute::tma_partition(
             mainloop_params.tma_load_SFA, cute::get<2>(cta_coord_vmnk),
@@ -668,12 +703,17 @@ struct CollectiveMainloop {
                     lo + KernelTraits::KBlockM - narrow_rows);
                 narrow_smem_row = narrow_row - lo;
             }
-            for (uint32_t k_tile_id = 0; k_tile_id < tile_num_k; ++k_tile_id) {
+            // Stream-K: a work item may cover only a K-slice; producer and
+            // consumer take the range from the scheduler, so stages match.
+            const uint32_t k_lo = scheduler.k_begin();
+            const uint32_t k_hi = scheduler.k_end();
+            for (uint32_t k_tile_id = k_lo; k_tile_id < k_hi; ++k_tile_id) {
                 ab_pipeline.producer_acquire(mainloop_pipe_producer_state);
                 BarrierType* tma_barrier = ab_pipeline.producer_get_barrier(
                     mainloop_pipe_producer_state);
                 prologue_stage_idx = mainloop_pipe_producer_state.index();
 
+                // A, B (+ SFA, SFB unless BF16) TMA copies share one barrier.
                 if (select_thr) {
                     if constexpr (IsSfbRowShift) {
                         cutlass::arch::ClusterTransactionBarrier::
@@ -718,12 +758,16 @@ struct CollectiveMainloop {
                                    tma_sB(cute::_, (cute::Int<0>{},
                                                     prologue_stage_idx)));
                     }
-                    cute::copy(mainloop_params.tma_load_SFA.with(
-                                   *tma_barrier, mcast_mask_sfa),
-                               a_tile(tma_gSFA, m_idx, k_tile_id, expert_idx),
-                               tma_sSFA(cute::_,
-                                        (cute::Int<0>{}, prologue_stage_idx)));
-                    if constexpr (!IsSfbUnaligned) {
+                    if constexpr (!KIsBF16) {
+                        cute::copy(mainloop_params.tma_load_SFA.with(
+                                       *tma_barrier, mcast_mask_sfa),
+                                   a_tile(tma_gSFA, m_idx, k_tile_id, expert_idx),
+                                   tma_sSFA(cute::_,
+                                            (cute::Int<0>{}, prologue_stage_idx)));
+                    }
+                    if constexpr (KIsBF16) {
+                        // No scale factors.
+                    } else if constexpr (!IsSfbUnaligned) {
                         cute::copy(
                             mainloop_params.tma_load_SFB.with(*tma_barrier,
                                                               mcast_mask_sfb),
@@ -820,7 +864,7 @@ struct CollectiveMainloop {
         }
     }
 
-    template <class TmemStorage>
+    template <class TmemStorage, bool KStreamK = false>
     CUTLASS_DEVICE void mma(Params const& mainloop_params,
                             MainloopPipeline& mainloop_pipeline,
                             AccumulatorPipeline& accumulator_pipeline,
@@ -829,13 +873,17 @@ struct CollectiveMainloop {
                             TileScheduler<KernelTraits>& scheduler) {
         bool select_thr = cute::elect_one_sync();
 
-        uint32_t tile_num_k =
+        // Unused: the per-work-item K range comes from the scheduler.
+        [[maybe_unused]] uint32_t tile_num_k =
             cute::ceil_div(mainloop_params.k, cute::size<2>(TileShape{}));
         uint32_t iter_k = KernelTraits::kItersK;
 
         int block_rank_in_cluster = cute::block_rank_in_cluster();
+        // Same atom-rank rule as tma_loadAB_impl (see there).
+        int cta_atom_rank =
+            block_rank_in_cluster % cute::size(typename TiledMma::AtomThrID{});
 
-        cute::ThrMMA cta_mma = tiled_mma.get_slice(block_rank_in_cluster);
+        cute::ThrMMA cta_mma = tiled_mma.get_slice(cta_atom_rank);
 
         uint32_t prologue_stage_idx = 0;
         uint32_t epilogue_stage_idx = 0;
@@ -885,15 +933,20 @@ struct CollectiveMainloop {
         AccumulatorPipelineState accumulator_pipe_producer_state =
             cutlass::make_producer_start_state<AccumulatorPipeline>();
 
-        // The next tile's accumulator stage and first k-block are waited on
-        // right after the current tile's MMAs are issued, before the TMEM
-        // overlap barrier.
-        bool next_tile_ready = false;
+        // KStreamK=false only: prefetch the next tile's accumulator stage and
+        // first k-stage right after the MMAs are issued, hiding producer
+        // latency. With stream-K the K ranges differ, so every k-tile waits.
+        [[maybe_unused]] bool next_tile_ready = false;
 
         while (scheduler.is_valid()) {
-            if (!next_tile_ready) {
+            if constexpr (KStreamK) {
                 accumulator_pipeline.producer_acquire(
                     accumulator_pipe_producer_state);
+            } else {
+                if (!next_tile_ready) {
+                    accumulator_pipeline.producer_acquire(
+                        accumulator_pipe_producer_state);
+                }
             }
             epilogue_stage_idx = accumulator_pipe_producer_state.index();
 
@@ -925,38 +978,63 @@ struct CollectiveMainloop {
             }();
 
             tiled_mma.accumulate_ = cute::UMMA::ScaleOut::Zero;
-            for (uint32_t k_tile_id = 0; k_tile_id < tile_num_k; ++k_tile_id) {
+
+            // Stream-K: same K range the producer used (see tma_loadAB).
+            const uint32_t k_lo = scheduler.k_begin();
+            const uint32_t k_hi = scheduler.k_end();
+            for (uint32_t k_tile_id = k_lo; k_tile_id < k_hi; ++k_tile_id) {
                 prologue_stage_idx = mainloop_pipe_consumer_state.index();
-                if (k_tile_id != 0 || !next_tile_ready) {
+                // Data-parallel: the prefetched first k-stage was already
+                // waited on.
+                if constexpr (KStreamK) {
                     mainloop_pipeline.consumer_wait(
                         mainloop_pipe_consumer_state);
+                } else {
+                    if (k_tile_id != k_lo || !next_tile_ready) {
+                        mainloop_pipeline.consumer_wait(
+                            mainloop_pipe_consumer_state);
+                    }
                 }
-                if (select_thr) {
-                    cute::copy(
-                        tiled_copy_s2t_SFA,
-                        thr_sSFA_s2t(cute::_, cute::_, cute::_, cute::_,
-                                     prologue_stage_idx),
-                        thr_tSFA_s2t(cute::_, cute::_, cute::_, cute::_));
-                    cute::copy(
-                        tiled_copy_s2t_SFB,
-                        thr_sSFB_s2t(cute::_, cute::_, cute::_, cute::_,
-                                     prologue_stage_idx),
-                        thr_tSFB_s2t_tile(cute::_, cute::_, cute::_, cute::_));
+                // UTCCP copy of scale factors into TMEM (block-scaled only).
+                if constexpr (!KIsBF16) {
+                    if (select_thr) {
+                        copy(tiled_copy_s2t_SFA,
+                             thr_sSFA_s2t(cute::_, cute::_, cute::_, cute::_,
+                                          prologue_stage_idx),
+                             thr_tSFA_s2t(cute::_, cute::_, cute::_, cute::_));
+                        copy(tiled_copy_s2t_SFB,
+                             thr_sSFB_s2t(cute::_, cute::_, cute::_, cute::_,
+                                          prologue_stage_idx),
+                             thr_tSFB_s2t_tile(cute::_, cute::_, cute::_,
+                                               cute::_));
+                    }
                 }
 
                 CUTLASS_PRAGMA_UNROLL
                 for (uint32_t k_block_id = 0; k_block_id < iter_k;
                      ++k_block_id) {
-                    cute::gemm(tiled_mma.with(
-                                   tiled_mma.accumulate_,
-                                   tmem_SFA(cute::_, cute::_, k_block_id),
-                                   tmem_SFB_mma(cute::_, cute::_, k_block_id)),
-                               tile_rA(cute::_, cute::_, k_block_id,
-                                       prologue_stage_idx),
-                               tile_rB(cute::_, cute::_, k_block_id,
-                                       prologue_stage_idx),
-                               tmem_accumulators(cute::_, cute::_, cute::_,
-                                                 epilogue_stage_idx));
+                    if constexpr (KIsBF16) {
+                        // kind::f16 MMA: no scale factors, only the
+                        // accumulate flag.
+                        gemm(tiled_mma,
+                             tile_rA(cute::_, cute::_, k_block_id,
+                                     prologue_stage_idx),
+                             tile_rB(cute::_, cute::_, k_block_id,
+                                     prologue_stage_idx),
+                             tmem_accumulators(cute::_, cute::_, cute::_,
+                                               epilogue_stage_idx));
+                    } else {
+                        gemm(tiled_mma.with(
+                                 tiled_mma.accumulate_,
+                                 tmem_SFA(cute::_, cute::_, k_block_id),
+                                 tmem_SFB_mma(cute::_, cute::_, k_block_id)),
+                             tile_rA(cute::_, cute::_, k_block_id,
+                                     prologue_stage_idx),
+                             tile_rB(cute::_, cute::_, k_block_id,
+                                     prologue_stage_idx),
+                             tmem_accumulators(cute::_, cute::_, cute::_,
+                                               epilogue_stage_idx));
+                    }
                     tiled_mma.accumulate_ = cute::UMMA::ScaleOut::One;
                 }
 
@@ -971,11 +1049,17 @@ struct CollectiveMainloop {
 
             ++accumulator_pipe_producer_state;
             scheduler.advance();
-            next_tile_ready = scheduler.is_valid();
-            if (next_tile_ready) {
-                accumulator_pipeline.producer_acquire(
-                    accumulator_pipe_producer_state);
-                mainloop_pipeline.consumer_wait(mainloop_pipe_consumer_state);
+
+            if constexpr (!KStreamK) {
+                // Prefetch: acquire the next accumulator stage and wait on
+                // its first k-stage now.
+                next_tile_ready = scheduler.is_valid();
+                if (next_tile_ready) {
+                    accumulator_pipeline.producer_acquire(
+                        accumulator_pipe_producer_state);
+                    mainloop_pipeline.consumer_wait(
+                        mainloop_pipe_consumer_state);
+                }
             }
 
             // TMEM overlap sync: wait for the overlap warp-group to finish

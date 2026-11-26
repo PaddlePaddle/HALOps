@@ -52,6 +52,9 @@ class CollectiveEpilogue {
     using CopyOpT2R = typename KernelTraits::CopyOpT2R;
     using CopyOpT2R_Sub = typename KernelTraits::CopyOpT2R_Sub;
     using OverlapComputeTile = typename KernelTraits::OverlapComputeTile;
+    // One epilogue compute tile spans the whole per-CTA M.
+    static_assert(cute::size<0>(EpilogueTile{}) ==
+                  cute::size<0>(EpiComputeTile{}));
     // Bias uses plain TMA (no 2SM multicast); each CTA loads its own copy.
     using CopyOpG2S_Bias = cute::SM90_TMA_LOAD;
     using CopyOpS2R =
@@ -92,6 +95,11 @@ class CollectiveEpilogue {
         int rows_per_batch = 0;
         SituCoef situ{};
         int64_t gate_ld = 0;
+        // Batch D layout: false = [M, B * N] (default), true = [B, M, N].
+        bool batch_out_bmn = false;
+        // Stream-K fp32 partial workspace: [slot][CtaShape_M][KBlockN]; null
+        // when stream-K is off.
+        TypeAccumulate* ptr_partial = nullptr;
     };
 
     struct Params {
@@ -108,6 +116,8 @@ class CollectiveEpilogue {
         TypeC const* ptr_c = nullptr;
         int64_t d_ld;
         int64_t gate_ld;
+        bool batch_out_bmn = false;
+        TypeAccumulate* ptr_partial = nullptr;
     };
 
     static Params to_underlying_arguments(Arguments const& args) {
@@ -129,7 +139,10 @@ class CollectiveEpilogue {
         const bool batch = KernelTraits::KernelType == KernelMode::Batch;
         const int64_t q_n = n / KAccColsPerOut;
         const int64_t rows = batch ? args.rows_per_batch : m;
-        const int64_t d_ld = batch ? num_experts * q_n : q_n;
+        // Batch rows are B * N apart in the default layout, N when the caller
+        // asked for [B, M, N].
+        const int64_t d_ld =
+            batch ? (args.batch_out_bmn ? q_n : num_experts * q_n) : q_n;
         cute::TmaDescriptor d_desc{};
         if constexpr (KQuantD && !SwapAB) {
             EncodeTmaDesc<3>(
@@ -154,7 +167,9 @@ class CollectiveEpilogue {
                 args.situ,
                 args.ptr_c,
                 d_ld,
-                args.gate_ld};
+                args.gate_ld,
+                args.batch_out_bmn,
+                args.ptr_partial};
     }
 
     // Producer warp: TMA-loads one bias C stage per scheduled tile.
@@ -258,6 +273,34 @@ class CollectiveEpilogue {
             return (int64_t)scheduler.expert_idx() * (p.n / KAccColsPerOut);
         } else {
             return 0;
+        }
+    }
+    // Shift from the stacked-row D pointer to the tile's D. The default Batch
+    // layout moves batch b's rows to row 0, columns b * N; [B, M, N] keeps
+    // the stacked row.
+    CUTLASS_DEVICE static int64_t d_shift(
+        Params const& p, TileScheduler<KernelTraits> const& scheduler,
+        TileRows const& rows) {
+        if constexpr (KernelTraits::KernelType == KernelMode::Batch) {
+            const int64_t shift =
+                batch_col0(p, scheduler) - (int64_t)rows.lo * p.d_ld;
+            if constexpr (KernelTraits::KIsBF16) {
+                return p.batch_out_bmn ? 0 : shift;  // only BF16 takes it
+            } else {
+                return shift;
+            }
+        } else {
+            return 0;
+        }
+    }
+    // Per-expert alpha of the current tile; 1 when the traits carry none.
+    CUTLASS_DEVICE static float tile_alpha(
+        SharedStorage const& shared_storage,
+        TileScheduler<KernelTraits> const& scheduler) {
+        if constexpr (HasAlpha) {
+            return shared_storage.alpha[scheduler.expert_idx()];
+        } else {
+            return 1.0f;
         }
     }
     CUTLASS_DEVICE static int64_t d_row(Params const& p, TileRows const& rows,
@@ -447,10 +490,7 @@ class CollectiveEpilogue {
             const auto chunk_row = [&](int i) {
                 return (int64_t)rows.row0 + (wg + i * KEpilogueWgs) * kChunk;
             };
-            float alpha = 1.0f;
-            if constexpr (HasAlpha) {
-                alpha = shared_storage.alpha[scheduler.expert_idx()];
-            }
+            const float alpha = tile_alpha(shared_storage, scheduler);
             uint32_t g[KGateMul ? kMyChunks : 1][kLoads][kQuad];
             if constexpr (KGateMul) {
                 const TypeC* base = epilogue_params.ptr_gate + col0 +
@@ -710,7 +750,8 @@ class CollectiveEpilogue {
         }
     }
 
-    template <class TmemStorage>
+    // KStreamK: tail-only stream-K instantiation (BF16 only).
+    template <bool KStreamK = false, class TmemStorage>
     CUTLASS_DEVICE void epilogue(Params const& epilogue_params,
                                  AccumulatorPipeline& acc_pipeline,
                                  BiasPipeline& bias_pipeline,
@@ -757,6 +798,20 @@ class CollectiveEpilogue {
                 tiled_t2r_sub.get_slice(tx).partition_D(acc_sub_tile(
                     cute::_, cute::_, cute::_0{}, cute::_0{}, cute::_0{}))));
             constexpr int kN = decltype(cute::size(thr_rd_sub))::value;
+            static_assert(decltype(cute::size(tiled_t2r_sub))::value ==
+                          cutlass::NumThreadsPerWarpGroup);
+            // The raw unit load assumes N in TMEM columns (32dp, 4x1); BF16
+            // tiles also use the 16dp (64-row CTA) and 2SM "2x2" layouts, so
+            // they load through the partitioned tiled copy instead.
+            constexpr bool kPartitionedLoad = KernelTraits::KIsBF16;
+            // BF16 tiles never straddle a batch (the host requires whole
+            // tiles), so they clip against the stacked D; a per-batch bound
+            // keeps the batch range live across the store loop and spills.
+            constexpr bool kClipWholeD = KernelTraits::KIsBF16;
+            cute::Tensor thr_tacc_src_sub =
+                tiled_t2r_sub.get_slice(tx).partition_S(acc_sub_tile);
+            cute::Tensor thr_racc_sub =
+                cute::make_tensor<TypeAccumulate>(cute::shape(thr_rd_sub));
             const auto shape_d = SwapAB ? cute::make_shape(out_n, out_m, 1)
                                         : cute::make_shape(out_m, out_n, 1);
             cute::Tensor mD = cute::make_tensor(
@@ -790,6 +845,47 @@ class CollectiveEpilogue {
                     shared_storage.tensor_sC(), OverlapComputeTile{}));
             cute::Tensor thr_rC_sub =
                 cute::make_tensor<TypeC>(cute::shape(thr_rd_sub));
+            const TileRows whole_d{
+                0, out_m, 0,
+                out_m % (SwapAB ? KernelTraits::KBlockN
+                                : KernelTraits::KBlockM) ==
+                    0};
+            const auto clip_rows = [&](const TileRows& rows) -> const TileRows& {
+                if constexpr (kClipWholeD) {
+                    return whole_d;
+                } else {
+                    return rows;
+                }
+            };
+
+            // Stream-K partials go to a compact per-CTA [CtaShape_M][KBlockN]
+            // slot, through the D store's thread layout. Built once: building
+            // it per sub-tile spills. Empty when !KStreamK.
+            constexpr int kPartialM = cute::size<0>(CtaShape_MNK{});
+            constexpr int kPartialN = cute::size<1>(CtaShape_MNK{});
+            auto partial_store = [&]() {
+                if constexpr (KStreamK) {
+                    auto tiled_p = cute::make_tiled_copy_D(
+                        cute::Copy_Atom<
+                            cute::AutoVectorizingCopyWithAssumedAlignment<128>,
+                            TypeAccumulate>{},
+                        tiled_t2r_sub);
+                    auto thr_p = tiled_p.get_slice(tx);
+                    return cute::make_tuple(
+                        tiled_p, thr_p.retile_S(thr_racc_sub),
+                        thr_p.partition_D(cute::flat_divide(
+                            cute::make_tensor(
+                                cute::make_gmem_ptr(epilogue_params.ptr_partial),
+                                cute::make_layout(
+                                    cute::make_shape(cute::Int<kPartialM>{},
+                                                     cute::Int<kPartialN>{}),
+                                    cute::make_stride(cute::Int<kPartialN>{},
+                                                      cute::_1{}))),
+                            OverlapComputeTile{})));
+                } else {
+                    return cute::make_tuple();
+                }
+            }();
 
             uint8_t* const stage = reinterpret_cast<uint8_t*>(&shared_storage) +
                                    KStagedSmem +
@@ -802,6 +898,75 @@ class CollectiveEpilogue {
             }
 
             int buf_i = 0;
+            // Quantized D: one UE8M0 scale per kGroup columns, e4m3 data via
+            // the SMEM stage and TMA (direct stores for rows above the box),
+            // then the row's scale word.
+            const auto store_quant = [&](const __nv_bfloat162* vals,
+                                         const TileRows& rows, int64_t row,
+                                         bool row_ok, int64_t bcol0, int col0,
+                                         uint32_t expert) {
+                const int32_t box_row =
+                    (int32_t)((int64_t)rows.row0 - (int64_t)rows.lo);
+                SfWord sf_word = 0;
+                CUTLASS_PRAGMA_UNROLL
+                for (int g = 0; g < kGroups; ++g) {
+                    const __nv_bfloat162* v = &vals[g * kGroup / 2];
+                    const uint32_t m = exp8_pair(abs_max<kGroup / 2>(v));
+                    const uint32_t e =
+                        scale_of_exp8(::max(m & 0xffffu, m >> 16));
+                    sf_word |= (SfWord)(e << (8 * g));
+                    const uint32_t sc_bits = multiplier_bits(e) * 0x10001u;
+                    const __nv_bfloat162 sc =
+                        reinterpret_cast<const __nv_bfloat162&>(sc_bits);
+                    uint32_t q[kGroup / 4];
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int i = 0; i < kGroup / 4; ++i) {
+                        q[i] = e4m3x4(v[2 * i], v[2 * i + 1], sc);
+                    }
+                    const uint4 lo = make_uint4(q[0], q[1], q[2], q[3]);
+                    const uint4 hi = make_uint4(q[4], q[5], q[6], q[7]);
+                    if (box_row < 0) {
+                        if (row_ok) {
+                            uint4* dst = reinterpret_cast<uint4*>(
+                                reinterpret_cast<uint8_t*>(
+                                    epilogue_params.ptr_d) +
+                                d_row(epilogue_params, rows, row) + bcol0 +
+                                col0 + g * kGroup);
+                            dst[0] = lo;
+                            dst[1] = hi;
+                        }
+                        continue;
+                    }
+                    uint8_t* buf =
+                        stage + buf_i * KernelTraits::KEpiBufBytes;
+                    *reinterpret_cast<uint4*>(buf + st_off + st_x) = lo;
+                    *reinterpret_cast<uint4*>(buf + st_off +
+                                              (st_x ^ KVec)) = hi;
+                    cutlass::arch::fence_view_async_shared();
+                    if (issuer) {
+                        cute::tma_store_wait<0>();
+                    }
+                    cutlass::arch::NamedBarrier::sync(
+                        cutlass::NumThreadsPerWarpGroup, KEpiBarrier + wg);
+                    if (issuer) {
+                        cute::SM90_TMA_STORE_3D::copy(
+                            &epilogue_params.d_desc, buf, col0 + g * kGroup,
+                            box_row,
+                            KernelTraits::KernelType == KernelMode::Batch
+                                ? (int32_t)expert
+                                : 0);
+                        cute::tma_store_arrive();
+                    }
+                    buf_i ^= 1;
+                }
+                if (row_ok) {
+                    *reinterpret_cast<SfWord*>(
+                        epilogue_params.ptr_sfd +
+                        sf_offset(epilogue_params, rows, row,
+                                  bcol0 + col0)) = sf_word;
+                }
+            };
+
             AccumulatorPipelineState acc_pipe_consumer_state;
             BiasPipelineState bias_pipe_consumer_state;
             while (scheduler.is_valid()) {
@@ -810,12 +975,19 @@ class CollectiveEpilogue {
                     scheduler.m_idx() * KNumCTA + cta_v;
                 const TileRows rows =
                     tile_rows(scheduler, out_m, block_m_idx, n_idx);
-                float alpha = 1.0f;
-                if constexpr (HasAlpha) {
-                    alpha = shared_storage.alpha[scheduler.expert_idx()];
-                }
+                const float alpha = tile_alpha(shared_storage, scheduler);
                 const int64_t bcol0 = batch_col0(epilogue_params, scheduler);
-                const int64_t row_shift = bcol0 - (int64_t)rows.lo * d_ld;
+                const int64_t row_shift =
+                    d_shift(epilogue_params, scheduler, rows);
+                // < 0: this tile stores its final result.
+                [[maybe_unused]] int partial_slot = -1;
+                [[maybe_unused]] int64_t partial_off = 0;
+                if constexpr (KStreamK) {
+                    partial_slot = scheduler.partial_slot();
+                    partial_off =
+                        (static_cast<int64_t>(partial_slot) * KNumCTA + cta_v) *
+                        kPartialM * kPartialN;
+                }
                 const int64_t row = (int64_t)rows.row0 + tx;
                 const bool row_ok =
                     row >= (int64_t)rows.lo && row < (int64_t)rows.hi;
@@ -862,7 +1034,15 @@ class CollectiveEpilogue {
                      << 16) +
                     wg * kCols;
                 const auto load_unit = [&](int u, uint32_t(&r)[kU]) {
-                    copy_to_regs<UnitLoad>(acc + u * kU, r);
+                    if constexpr (kPartitionedLoad) {
+                        cute::copy(tiled_t2r_sub,
+                                   thr_tacc_src_sub(cute::_, cute::_, cute::_,
+                                                    cute::_0{}, wg * kUnits + u,
+                                                    stage_idx),
+                                   thr_racc_sub);
+                    } else {
+                        copy_to_regs<UnitLoad>(acc + u * kU, r);
+                    }
                 };
                 const auto consume = [&](int u, const uint32_t(&r)[kU]) {
                     if constexpr (KGlu) {
@@ -905,10 +1085,29 @@ class CollectiveEpilogue {
                         }
                     } else {
                         const int sub_idx = wg * kUnits + u;
-                        if constexpr (KernelTraits::IsSfbUnaligned && !SwapAB) {
+                        // The last N tile overhangs N (unaligned-SFB pair
+                        // tiles, BF16 N-tails); a sub-tile is all in or all
+                        // out because N is a multiple of the sub-tile width.
+                        if constexpr ((KernelTraits::IsSfbUnaligned &&
+                                       !SwapAB) ||
+                                      KernelTraits::KEpiNeedsNPredicate) {
                             if (n_idx * cute::size<1>(TileShape{}) +
                                     sub_idx * kSubN >=
                                 out_n) {
+                                return;
+                            }
+                        }
+                        // Stream-K tail chunk: store the raw fp32
+                        // accumulator; the reduce kernel sums and casts.
+                        if constexpr (KStreamK) {
+                            if (partial_slot >= 0) {
+                                auto dst_p = cute::get<2>(partial_store);
+                                dst_p.data() = dst_p.data() + partial_off;
+                                cute::copy(cute::get<0>(partial_store),
+                                           cute::get<1>(partial_store),
+                                           dst_p((cute::_, cute::_), cute::_,
+                                                 cute::_, cute::Int<0>{},
+                                                 sub_idx));
                                 return;
                             }
                         }
@@ -922,7 +1121,11 @@ class CollectiveEpilogue {
                         cutlass::Array<TypeAccumulate, kN> f;
                         CUTLASS_PRAGMA_UNROLL
                         for (int i = 0; i < kN; ++i) {
-                            f[i] = __uint_as_float(r[i]) * alpha;
+                            if constexpr (kPartitionedLoad) {
+                                f[i] = thr_racc_sub(i) * alpha;
+                            } else {
+                                f[i] = __uint_as_float(r[i]) * alpha;
+                            }
                             if constexpr (AddBias && KAct) {
                                 f[i] += static_cast<float>(thr_rC_sub[i]);
                             }
@@ -947,7 +1150,7 @@ class CollectiveEpilogue {
                                    dst_coords_sub((cute::_, cute::_), cute::_,
                                                   cute::_, cute::Int<0>{},
                                                   sub_idx, block_m_idx, n_idx),
-                                   rows);
+                                   clip_rows(rows));
                     }
                 };
                 const bool ovlp_wg =
@@ -988,66 +1191,8 @@ class CollectiveEpilogue {
                 }
 
                 if constexpr (KQuantD) {
-                    const int32_t box_row =
-                        (int32_t)((int64_t)rows.row0 - (int64_t)rows.lo);
-                    SfWord sf_word = 0;
-                    CUTLASS_PRAGMA_UNROLL
-                    for (int g = 0; g < kGroups; ++g) {
-                        const __nv_bfloat162* v = &vals[g * kGroup / 2];
-                        const uint32_t m = exp8_pair(abs_max<kGroup / 2>(v));
-                        const uint32_t e =
-                            scale_of_exp8(::max(m & 0xffffu, m >> 16));
-                        sf_word |= (SfWord)(e << (8 * g));
-                        const uint32_t sc_bits = multiplier_bits(e) * 0x10001u;
-                        const __nv_bfloat162 sc =
-                            reinterpret_cast<const __nv_bfloat162&>(sc_bits);
-                        uint32_t q[kGroup / 4];
-                        CUTLASS_PRAGMA_UNROLL
-                        for (int i = 0; i < kGroup / 4; ++i) {
-                            q[i] = e4m3x4(v[2 * i], v[2 * i + 1], sc);
-                        }
-                        const uint4 lo = make_uint4(q[0], q[1], q[2], q[3]);
-                        const uint4 hi = make_uint4(q[4], q[5], q[6], q[7]);
-                        if (box_row < 0) {
-                            if (row_ok) {
-                                uint4* dst = reinterpret_cast<uint4*>(
-                                    reinterpret_cast<uint8_t*>(
-                                        epilogue_params.ptr_d) +
-                                    d_row(epilogue_params, rows, row) + bcol0 +
-                                    col0 + g * kGroup);
-                                dst[0] = lo;
-                                dst[1] = hi;
-                            }
-                            continue;
-                        }
-                        uint8_t* buf =
-                            stage + buf_i * KernelTraits::KEpiBufBytes;
-                        *reinterpret_cast<uint4*>(buf + st_off + st_x) = lo;
-                        *reinterpret_cast<uint4*>(buf + st_off +
-                                                  (st_x ^ KVec)) = hi;
-                        cutlass::arch::fence_view_async_shared();
-                        if (issuer) {
-                            cute::tma_store_wait<0>();
-                        }
-                        cutlass::arch::NamedBarrier::sync(
-                            cutlass::NumThreadsPerWarpGroup, KEpiBarrier + wg);
-                        if (issuer) {
-                            cute::SM90_TMA_STORE_3D::copy(
-                                &epilogue_params.d_desc, buf, col0 + g * kGroup,
-                                box_row,
-                                KernelTraits::KernelType == KernelMode::Batch
-                                    ? (int32_t)scheduler.expert_idx()
-                                    : 0);
-                            cute::tma_store_arrive();
-                        }
-                        buf_i ^= 1;
-                    }
-                    if (row_ok) {
-                        *reinterpret_cast<SfWord*>(
-                            epilogue_params.ptr_sfd +
-                            sf_offset(epilogue_params, rows, row,
-                                      bcol0 + col0)) = sf_word;
-                    }
+                    store_quant(vals, rows, row, row_ok, bcol0, col0,
+                                scheduler.expert_idx());
                 }
                 scheduler.advance();
             }

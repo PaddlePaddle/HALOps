@@ -59,4 +59,9 @@ constexpr int AlignSfM(int m) {
     return (m + kSfAtomM - 1) / kSfAtomM * kSfAtomM;
 }
 
+inline void CheckDivisible(int64_t value, int64_t divisor, const char* name) {
+    TORCH_CHECK(value % divisor == 0, name, " must be divisible by ", divisor,
+                ", got ", value);
+}
+
 }  // namespace halops

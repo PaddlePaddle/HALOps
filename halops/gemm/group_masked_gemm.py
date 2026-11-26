@@ -26,8 +26,8 @@ __all__ = ["group_masked_gemm"]
 def group_masked_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
-    sfa: torch.Tensor,
-    sfb: torch.Tensor,
+    sfa: Optional[torch.Tensor],
+    sfb: Optional[torch.Tensor],
     masked_m: torch.Tensor,
     output: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
@@ -73,7 +73,9 @@ def group_masked_gemm(
             and K a multiple of 256.
         sm_count: Number of SMs to use (-1 for all available).
         mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"``, ``"w4a4-nvfp4"`` or
-            ``"w4a8-mxfp4"`` (FP8 activation x MXFP4 weight).
+            ``"w4a8-mxfp4"`` for quantized GEMM, or ``"bf16"`` for
+            native BF16 GEMM (no quantization; pass ``sfa=None,
+            sfb=None``).
 
     Returns:
         None. The result is written in-place to output.

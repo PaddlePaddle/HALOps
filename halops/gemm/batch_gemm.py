@@ -27,8 +27,8 @@ __all__ = ["batch_gemm"]
 def batch_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
-    sfa: torch.Tensor,
-    sfb: torch.Tensor,
+    sfa: Optional[torch.Tensor],
+    sfb: Optional[torch.Tensor],
     output: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     alpha: Optional[torch.Tensor] = None,
@@ -66,12 +66,17 @@ def batch_gemm(
         sfb: [B, N, sf_k] scale factor for B, dtype uint8, same SfAtom layout as sfa.
         output: [M, B * N] pre-allocated output tensor, dtype bfloat16, or
             float8_e4m3fn (``w8a8-mxfp8``) for an MXFP8-quantized output.
+            ``mode="bf16"`` also accepts the contiguous batch-major
+            ``[B, M, N]`` layout, which writes faster when ``B`` is large and
+            ``N`` is narrow.
         bias: Optional [B, N] bfloat16 bias vector. Only supported in w8a8-mxfp8 mode.
         alpha: Optional float32 per-batch scaling factor with shape [B], one
             value per batch item. Required for ``w4a4-nvfp4``; not accepted for
             ``w4a4-mxfp4``.
         sm_count: Number of SMs to use (-1 for all available).
-        mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"``.
+        mode: ``"w8a8-mxfp8"``, ``"w4a4-mxfp4"`` or ``"w4a4-nvfp4"`` for
+            quantized GEMM, or ``"bf16"`` for native BF16 GEMM (no
+            quantization; pass ``sfa=None, sfb=None``).
         epilogue: ``EpilogueOp.Identity``, ``EpilogueOp.Quant``,
             ``EpilogueOp.GateMulQuant`` or ``EpilogueOp.SigmoidGateMulQuant``
             (``w8a8-mxfp8``: float8_e4m3fn output, the result (times ``gate``,

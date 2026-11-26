@@ -23,6 +23,7 @@ from halops import EpilogueOp, batch_gemm
 from tests.utils.fp4_utils import MXFP4_BLOCK_SIZE, NVFP4_BLOCK_SIZE
 
 from tests.utils.gemm_utils import (
+    BF16_TOL,
     W4A4_TOL,
     W8A8_MXFP8_TOL,
     per_block_cast_to_nvfp4,
@@ -98,6 +99,15 @@ def ref_batch_gemm_fp4(x_fp4_float, w_fp4_float):
     for b in range(B):
         output[b] = torch.matmul(x_fp4_float[b], w_fp4_float[b].T).to(torch.bfloat16)
     return output
+
+
+def ref_batch_gemm_bf16(x, w):
+    """BF16 Batch GEMM reference: fp32 x[b] @ w[b]^T rounded to bf16, [B, M, N].
+    x: [B, M, K] bfloat16, w: [B, N, K] bfloat16
+    """
+    return torch.matmul(x.to(torch.float32), w.to(torch.float32).transpose(1, 2)).to(
+        torch.bfloat16
+    )
 
 
 # =====================================================================
@@ -713,6 +723,53 @@ def test_batch_gemm_mxfp4_determinism():
     batch_gemm(*args, out1, None, None, -1, "w4a4-mxfp4")
     batch_gemm(*args, out2, None, None, -1, "w4a4-mxfp4")
     assert torch.equal(out1, out2), "MXFP4 batch_gemm output is not deterministic"
+
+
+# =====================================================================
+# BF16 correctness tests
+# =====================================================================
+
+
+def make_bf16_inputs(B, M, N, K):
+    x = torch.randn([B, M, K], dtype=torch.bfloat16)
+    w = torch.randn([B, N, K], dtype=torch.bfloat16)
+    return x, w, ref_batch_gemm_bf16(x, w)
+
+
+@pytest.mark.parametrize(
+    "B, M, N, K",
+    [
+        pytest.param(4, 128, 256, 128, id="mid_m"),
+        pytest.param(4, 1024, 256, 128, id="large_m"),
+    ],
+)
+def test_batch_gemm_bf16(B, M, N, K):
+    x, w, ref_out = make_bf16_inputs(B, M, N, K)
+    output = torch.zeros([M, B * N], dtype=torch.bfloat16)
+    batch_gemm(x, w, None, None, output, mode="bf16")
+    assert_close_per_batch(
+        output, ref_out, BF16_TOL, f"BF16 B={B}, M={M}, N={N}, K={K}"
+    )
+
+
+@pytest.mark.parametrize(
+    "B, M, N, K",
+    [
+        pytest.param(4, 128, 256, 128, id="small_b"),
+        pytest.param(512, 64, 256, 64, id="large_b_narrow_n"),
+    ],
+)
+def test_batch_gemm_bf16_batch_major_output(B, M, N, K):
+    """mode="bf16" also accepts a contiguous [B, M, N] output."""
+    x, w, ref_out = make_bf16_inputs(B, M, N, K)
+    output = torch.zeros([B, M, N], dtype=torch.bfloat16)
+    batch_gemm(x, w, None, None, output, mode="bf16")
+    torch.testing.assert_close(
+        output.to(torch.float32),
+        ref_out.to(torch.float32),
+        **BF16_TOL,
+        msg=lambda s: f"BF16 [B, M, N] B={B}, M={M}, N={N}, K={K}: {s}",
+    )
 
 
 if __name__ == "__main__":

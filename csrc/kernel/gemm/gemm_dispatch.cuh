@@ -26,6 +26,7 @@
 #include "kernel/gemm/gemm_kernel.cuh"
 #include "kernel/gemm/gemm_tile.cuh"
 #include "kernel/gemm/gemm_tuned_dense_fp8.cuh"
+#include "kernel/gemm/gemm_utils.h"
 
 namespace halops {
 
@@ -356,13 +357,38 @@ inline int PickTile(const TileSpec* tiles, int count, MmaKind kind,
 // Dispatch
 using TileLauncher = void (*)(GemmParams&, const GemmShape&, cudaStream_t);
 
-template <MmaKind Kind, KernelMode Mode, std::size_t I, EpilogueOp Op>
+// Candidates is any type exposing `static constexpr tiles`; every kind
+// resolves through CandidateTiles<Kind> (gemm_tile.cuh).
+// Divisibility contract of a selected tile: the output M/N tile multiples
+// (N relaxes to %64 for predicated tails and %32 for non-power-of-2 widths),
+// K a KBlockK multiple. SwapAB swaps the roles: KBlockM tiles the weight
+// (output N), KBlockN the activation (output M).
+inline void CheckBF16TileShape(const char* what, const TileSpec& t, int m,
+                               int n, int k) {
+    const int n_mod =
+        t.force_ntail ? 64
+                      : (((t.block_n & (t.block_n - 1)) != 0) ? 32 : t.block_n);
+    const int m_div = t.swap_ab ? t.block_n : t.block_m;
+    const int n_div = t.swap_ab ? t.block_m : n_mod;
+    TORCH_CHECK(m % m_div == 0, what, " requires M to be divisible by ", m_div,
+                ", got ", m);
+    TORCH_CHECK(n % n_div == 0, what, " requires N to be divisible by ", n_div,
+                ", got ", n);
+    TORCH_CHECK(k % t.block_k == 0, what, " requires K to be divisible by ",
+                t.block_k, ", got ", k);
+}
+
+template <MmaKind Kind, KernelMode Mode, class Candidates, std::size_t I,
+          EpilogueOp Op>
 void LaunchTile(GemmParams& params, const GemmShape& shape,
                 cudaStream_t stream) {
-    constexpr TileSpec S = CandidateTiles<Kind>::tiles[I];
+    constexpr TileSpec S = Candidates::tiles[I];
     if constexpr (TileAllowedFor(S, Mode) &&
                   (!IsQuantOp(Op) ||
                    (Kind == MmaKind::MXFP8 && S.quantizes()))) {
+        if constexpr (Kind == MmaKind::BF16) {
+            CheckBF16TileShape("BF16 GEMM", S, shape.m, shape.n, shape.k);
+        }
         using T = MmaTraits<Kind>;
         using TypeD = cute::conditional_t<IsQuantOp(Op), cutlass::float_e4m3_t,
                                           typename T::Output>;
@@ -376,28 +402,39 @@ void LaunchTile(GemmParams& params, const GemmShape& shape,
     }
 }
 
-template <MmaKind Kind, KernelMode Mode, EpilogueOp Op, std::size_t... I>
+template <MmaKind Kind, KernelMode Mode, EpilogueOp Op, class Candidates,
+          std::size_t... I>
 constexpr std::array<TileLauncher, sizeof...(I)> MakeTileLaunchers(
     std::index_sequence<I...>) {
-    return {&LaunchTile<Kind, Mode, I, Op>...};
+    return {&LaunchTile<Kind, Mode, Candidates, I, Op>...};
 }
 
-template <MmaKind Kind, KernelMode Mode, EpilogueOp Op>
-inline constexpr auto kTileLaunchers = MakeTileLaunchers<Kind, Mode, Op>(
-    std::make_index_sequence<CandidateTiles<Kind>::tiles.size()>{});
+template <MmaKind Kind, KernelMode Mode, EpilogueOp Op,
+          class Candidates = CandidateTiles<Kind>>
+inline constexpr auto kTileLaunchers =
+    MakeTileLaunchers<Kind, Mode, Op, Candidates>(
+        std::make_index_sequence<Candidates::tiles.size()>{});
 
 inline bool GemmTraceEnabled() {
     static const bool on = std::getenv("IR_GEMM_TRACE") != nullptr;
     return on;
 }
 
+// BF16 picks from its rule ladder instead of the cost model; defined with the
+// ladder below.
+namespace bf16 {
+int PickBf16Tile(KernelMode mode, const GemmShape& shape);
+}  // namespace bf16
+
 template <KernelMode Mode, MmaKind Kind, EpilogueOp Op = EpilogueOp::Identity>
 void LaunchCfg(GemmParams& params, GemmShape shape, cudaStream_t stream) {
     shape.op = Op;
     constexpr auto& candidates = CandidateTiles<Kind>::tiles;
     const int pick =
-        PickTile(candidates.data(), static_cast<int>(candidates.size()), Kind,
-                 shape, Mode);
+        Kind == MmaKind::BF16
+            ? bf16::PickBf16Tile(Mode, shape)
+            : PickTile(candidates.data(), static_cast<int>(candidates.size()),
+                       Kind, shape, Mode);
     TORCH_CHECK(pick >= 0, "No ", ModeName(Mode), " ", MmaTraits<Kind>::kName,
                 " tile for M=", shape.m, " (grid M=", shape.m_grid,
                 "), N=", shape.n, ", K=", shape.k,
@@ -417,4 +454,555 @@ void LaunchCfg(GemmParams& params, GemmShape shape, cudaStream_t stream) {
     kTileLaunchers<Kind, Mode, Op>[pick](params, shape, stream);
 }
 
+// ===========================================================================
+// BF16 dispatch. Rule-based rather than cost-model based: the ladder below
+// encodes measured launch-shape bands (pair-UMMA gates, wave-fill judgements,
+// K-tile depth gates). A selector returns an index into the per-mode tile
+// tables in gemm_tile.cuh, or -1 when no tile supports the shape;
+// PickBf16Tile feeds that index to the shared LaunchCfg.
+// ===========================================================================
+namespace bf16 {
+
+// KBlockK of every BF16 tile.
+inline constexpr int kBlockK = 64;
+
+// Deep-pipeline tiles (14/18 stages) only pay off from this many K-tiles.
+inline constexpr int kDeepPipelineMinKTiles = 32;
+
+// The 64x96 / 128x64-pair deep tiles need at least this many K-tiles.
+inline constexpr int kMidMDeepMinKTiles = 54;
+
+// 256x128 re-reads A twice as often as 256x256; beyond this many K-tiles the
+// re-read outweighs any wave-packing gain.
+inline constexpr int kNarrowPairMaxKTiles = 64;
+
+// A 64-row tile has no multicast, so every extra N-tile re-reads A; cap the
+// re-read volume (k_tiles * n_tiles) before stepping down to one.
+inline constexpr int kRereadsCap = 2048;
+
+// True if the deep (14/18-stage) pipeline variant pays off at this K.
+inline bool UseDeepPipeline(int k) {
+    return k / kBlockK >= kDeepPipelineMinKTiles;
+}
+
+// CTAs the 128x64 pair-tile family yields (2 CTAs per cluster tile).
+inline int64_t Count128x64PairCtas(int m, int n) {
+    return 2 * int64_t(CeilDiv(m, 128)) * CeilDiv(n, 64);
+}
+
+// For m < 128: a plain (non-SwapAB) 64-row tile beats SwapAB when even
+// SwapAB's smallest tile leaves SMs idle.
+inline bool SkipSwapForThinM(int m, int n, int k, int sm_count) {
+    if (m % 64 != 0 || k % 64 != 0) {
+        return false;
+    }
+    const int target = sm_count > 0 ? sm_count : GetSmCount();
+    const int mt = CeilDiv(m, 64);
+    const bool narrow_ok = (n % 32 == 0) && (CeilDiv(n, 32) * mt <= target);
+    const bool square_ok = (n % 64 == 0);
+    if (!narrow_ok && !square_ok) {
+        return false;
+    }
+    return CeilDiv(n, 128) * CeilDiv(m, 32) < target;
+}
+
+// True if the fine grid keeps a larger fraction of SMs busy (ctas / waves).
+inline bool FillsLastWaveBetter(int64_t coarse_ctas, int64_t fine_ctas,
+                                int64_t target) {
+    const int64_t coarse_waves = (coarse_ctas + target - 1) / target;
+    const int64_t fine_waves = (fine_ctas + target - 1) / target;
+    return fine_ctas * coarse_waves > coarse_ctas * fine_waves;
+}
+
+// 256x128 instead of 256x256 when K is short, the grid is not too deep, and
+// 256x128 keeps more SMs busy.
+inline bool UseNarrowPairTile(int n, int k, int64_t coarse_ctas,
+                              int64_t fine_ctas, int64_t target) {
+    return (n % 128 == 0) && (k / kBlockK <= kNarrowPairMaxKTiles) &&
+           (coarse_ctas <= 4 * target) &&
+           FillsLastWaveBetter(coarse_ctas, fine_ctas, target);
+}
+
+// ---- Small-N (N <= 128) tiles ----------------------------------------------
+
+inline constexpr int kSmallNMaxN = 128;
+inline constexpr int kSmallNAlignN = 64;
+
+enum class SmallNTile { kNone, kPairM256N128, kM64N128, kPairM256N64, kM64N64 };
+
+struct SmallNRung {
+    SmallNTile tile;
+    int block_m;
+    int block_n;
+    int ctas_per_cluster;
+};
+
+inline bool FillsOneWave(int64_t ctas, int64_t target) {
+    return ctas <= target && 2 * ctas > target;
+}
+
+// N fits one tile, so all CTAs come from splitting M: pick the largest tile
+// whose CTA count lands in (0.5, 1.0] of one wave.
+inline SmallNTile PickSmallNTile(int m, int n, int64_t target) {
+    if (n > kSmallNMaxN || n % kSmallNAlignN != 0) {
+        return SmallNTile::kNone;
+    }
+    static constexpr SmallNRung kRungs[] = {
+        {SmallNTile::kPairM256N128, 256, 128, 2},
+        {SmallNTile::kM64N128, 64, 128, 1},
+        {SmallNTile::kPairM256N64, 256, 64, 2},
+        {SmallNTile::kM64N64, 64, 64, 1},
+    };
+    for (const SmallNRung& r : kRungs) {
+        const int64_t ctas = int64_t(r.ctas_per_cluster) *
+                             CeilDiv(m, r.block_m) * CeilDiv(n, r.block_n);
+        if (FillsOneWave(ctas, target)) {
+            return r.tile;
+        }
+    }
+    return SmallNTile::kNone;
+}
+
+// ---- Dense -----------------------------------------------------------------
+// Ids into kBF16Tiles (gemm_tile.cuh), derived from the tile itself.
+enum DenseTile : int {
+    kPair256x256 = Bf16TileId(kBF16_256x256_pair),
+    kPair256x256P7 = Bf16TileId(kBF16_256x256_pair_p7),
+    kPair256x128 = Bf16TileId(kBF16_256x128_pair),
+    kPair256x128Ntail = Bf16TileId(kBF16_256x128_pair_ntail),
+    kPair256x128P9 = Bf16TileId(kBF16_256x128_pair_p9),
+    kPair256x128P9Ntail = Bf16TileId(kBF16_256x128_pair_p9_ntail),
+    kPair256x192 = Bf16TileId(kBF16_256x192_pair),
+    kPair256x64 = Bf16TileId(kBF16_256x64_pair),
+    kM128x256 = Bf16TileId(kBF16_128x256),
+    kM128x128 = Bf16TileId(kBF16_128x128),
+    kM128x64 = Bf16TileId(kBF16_128x64),
+    kM128x32 = Bf16TileId(kBF16_128x32),
+    kPair128x64P18 = Bf16TileId(kBF16_128x64_pair_p18),
+    kM64x128 = Bf16TileId(kBF16_64x128),
+    kM64x96P11 = Bf16TileId(kBF16_64x96_p11),
+    kM64x224 = Bf16TileId(kBF16_64x224),
+    kM64x64 = Bf16TileId(kBF16_64x64),
+    kM64x64_1wg = Bf16TileId(kBF16_64x64_1wg),
+    kM64x64_1wgP14 = Bf16TileId(kBF16_64x64_1wg_p14),
+    kM64x32_1wg = Bf16TileId(kBF16_64x32_1wg),
+    kM64x32_1wgP18 = Bf16TileId(kBF16_64x32_1wg_p18),
+    kSwap128x64 = Bf16TileId(kBF16_128x64_swap),
+    kSwap128x32 = Bf16TileId(kBF16_128x32_swap),
+    kSwap256x64Pair = Bf16TileId(kBF16_256x64_swap_pair),
+    kSwap128x64K128 = Bf16TileId(kBF16_128x64x128_swap),
+};
+static_assert(kSwap128x64K128 >= 0 &&
+                  kSwap128x64K128 < static_cast<int>(kBF16Tiles.size()),
+              "BF16 dense tile id outside kBF16Tiles");
+
+// m >= 4096: pair tiles, with a small-N ladder for narrow N.
+inline int SelectLargeMTile(int m, int n, int k, int target) {
+    switch (PickSmallNTile(m, n, target)) {
+        case SmallNTile::kM64N128:
+            return kM64x128;
+        case SmallNTile::kM64N64:
+            return UseDeepPipeline(k) ? kM64x64_1wgP14 : kM64x64;
+        case SmallNTile::kPairM256N64:
+            return kPair256x64;
+        case SmallNTile::kPairM256N128:
+        case SmallNTile::kNone:
+            break;
+    }
+    const int64_t tiles_256 = int64_t(CeilDiv(m, 256)) * CeilDiv(n, 256);
+    // 256x128 (deeper pipeline) when it keeps more SMs busy on a short K.
+    if (UseNarrowPairTile(n, k, 2 * tiles_256,
+                          2 * int64_t(CeilDiv(m, 256)) * CeilDiv(n, 128),
+                          target)) {
+        return kPair256x128P9;
+    }
+    if (n % 256 == 0) {
+        return kPair256x256P7;
+    }
+    if (n % 128 == 0) {
+        return kPair256x128;
+    }
+    // n % 128 != 0 (e.g. 1600): predicated-tail 128-wide tile, else 256x64.
+    if (n % 64 == 0) {
+        return kPair256x128Ntail;
+    }
+    return kPair256x64;
+}
+
+// Halve the 128-row tile's N (256 -> 128 -> 64 -> 32) while the current width
+// leaves SMs idle. Returns the chosen N width.
+inline int Pick128xNWidth(int m, int n, int target) {
+    auto tiles = [&](int tm, int tn) {
+        return CeilDiv(m, tm) * CeilDiv(n, tn);
+    };
+    int pick = (n % 256 == 0) ? 0 : (n % 128 == 0) ? 1 : (n % 64 == 0) ? 2 : 3;
+    // Keep 128x256 when 128x128 would spill into a second wave.
+    const bool overshoots_128 =
+        m > 128 && tiles(128, 128) > target && 2 * tiles(128, 256) > target;
+    if (pick == 0 && tiles(128, 256) < target && (n % 128 == 0) &&
+        !overshoots_128) {
+        pick = 1;
+    }
+    if (pick == 1 && tiles(128, 128) < target && (n % 64 == 0)) {
+        pick = 2;
+    }
+    if (pick == 2 && tiles(128, 64) < target && (n % 32 == 0)) {
+        pick = 3;
+    }
+    return pick == 0 ? 256 : (pick == 1 ? 128 : (pick == 2 ? 64 : 32));
+}
+
+// 256xN pair-UMMA ladder for m % 256 == 0; returns -1 when its gates reject
+// the shape and the 128xN ladder should decide instead.
+inline int SelectPair256xNTile(int m, int n, int k, int target) {
+    if (n % 64 != 0) {
+        return -1;
+    }
+    auto pair_ctas = [&](int tn) {
+        return int64_t(m / 256) * CeilDiv(n, tn) * 2;
+    };
+    // Halve N only while the grid is under one wave, and never from >= half
+    // a wave into more than one wave.
+    auto step_ok = [&](int coarse, int fine) {
+        return pair_ctas(coarse) < target &&
+               !(pair_ctas(fine) > target && 2 * pair_ctas(coarse) > target);
+    };
+    int pair_tn = (n % 256 == 0) ? 256 : ((n % 128 == 0) ? 128 : 64);
+    // n % 128 != 0 (e.g. 1600): the 128-wide predicated-tail tile instead of
+    // 64 if it fills at least half a wave.
+    bool pair_n_tail = false;
+    if (pair_tn == 64 && (n % 128 != 0) && 2 * pair_ctas(128) >= target) {
+        pair_tn = 128;
+        pair_n_tail = true;
+    }
+    // Also 128 when the narrow-pair rule says so (multi-wave).
+    if (pair_tn == 256 && (n % 128 == 0) &&
+        (step_ok(256, 128) ||
+         UseNarrowPairTile(n, k, pair_ctas(256), pair_ctas(128), target))) {
+        pair_tn = 128;
+    }
+    // 192 if it fits one wave and keeps more SMs busy than both 256 and 128.
+    if (pair_tn != 64 && (n % 32 == 0) && pair_ctas(192) <= target &&
+        FillsLastWaveBetter(pair_ctas(256), pair_ctas(192), target) &&
+        FillsLastWaveBetter(pair_ctas(128), pair_ctas(192), target)) {
+        pair_tn = 192;
+        pair_n_tail = false;
+    }
+    if (!pair_n_tail && pair_tn == 128 && (n % 64 == 0) && step_ok(128, 64)) {
+        pair_tn = 64;
+    }
+    const int64_t cta_count = pair_ctas(pair_tn);
+    const int k_tiles = k / kBlockK;
+    // Prologue amortization: enough K-tiles to fill three pipelines, or a
+    // full wave of tiles.
+    const int stages =
+        pair_tn == 256 ? 6 : (pair_tn == 192 ? 8 : (pair_tn == 128 ? 8 : 10));
+    const bool amortizes = k_tiles >= 3 * stages || cta_count >= target;
+    // The 64-wide arm needs at least 0.8 of a wave.
+    const bool narrow_arm_fills = pair_tn != 64 || 5 * cta_count >= 4 * target;
+    // If n % 128 != 0 forced 256x64 and it spills past one wave, defer to the
+    // 64x96 / 64x224 tiles below.
+    const int ctas96 = CeilDiv(m, 64) * CeilDiv(n, 96);
+    const int ctas224 = CeilDiv(m, 64) * CeilDiv(n, 224);
+    const bool narrow_arm_overshoots =
+        pair_tn == 64 && cta_count > target && (m % 64 == 0) && (n % 32 == 0) &&
+        (!(k_tiles >= kMidMDeepMinKTiles) ||
+         FillsLastWaveBetter(ctas224, ctas96, target));
+    if (!amortizes || !narrow_arm_fills || narrow_arm_overshoots) {
+        return -1;
+    }
+    switch (pair_tn) {
+        case 256:
+            return kPair256x256;
+        case 192:
+            return kPair256x192;
+        case 128:
+            return pair_n_tail ? kPair256x128P9Ntail : kPair256x128P9;
+        default:
+            // With <= 32 K-tiles the 1-CTA 128x64 tile (same CTA count) is
+            // faster than the 256x64 pair.
+            return k_tiles <= 32 ? kM128x64 : kPair256x64;
+    }
+}
+
+// 128 <= m < 4096.
+inline int SelectMidMTile(int m, int n, int k, int target) {
+    if (m % 128 != 0 || n % 32 != 0 || k % 64 != 0) {
+        return -1;
+    }
+
+    // ---- 64-row tiles (64x64 / 64x32) ----------------------------------
+    // Smaller tiles add CTAs but, with no multicast, every extra N-tile
+    // re-reads A; use them only on a one-wave grid with bounded re-reads.
+    if (m % 64 == 0 && n % 64 == 0) {
+        const int tiles64 = CeilDiv(m, 64) * CeilDiv(n, 64);
+        const int64_t rereads = int64_t(k / kBlockK) * CeilDiv(n, 64);
+        if (tiles64 <= target && rereads <= kRereadsCap) {
+            // 1 epilogue warp group: required for 64x32, and it skips the
+            // inter-warp-group barrier on 64x64.
+            if (2 * tiles64 <= target && n % 32 == 0) {
+                return UseDeepPipeline(k) ? kM64x32_1wgP18 : kM64x32_1wg;
+            }
+            return UseDeepPipeline(k) ? kM64x64_1wgP14 : kM64x64_1wg;
+        }
+    }
+
+    // ---- 256xN pair-UMMA tiles (m % 256 == 0) --------------------------
+    if (m % 256 == 0) {
+        const int pair = SelectPair256xNTile(m, n, k, target);
+        if (pair >= 0) {
+            return pair;
+        }
+    }
+
+    // ---- 128xN width ----------------------------------------------------
+    const int pick_tn = Pick128xNWidth(m, n, target);
+    auto tiles = [&](int tm, int tn) {
+        return CeilDiv(m, tm) * CeilDiv(n, tn);
+    };
+
+    // ---- 64x96 / 64x224 fill tiles --------------------------------------
+    // Power-of-2 N widths can miss one wave entirely (n=7168: 112 or 224 CTAs
+    // on 152 SMs); 96/224 land in between.
+    const int ctas96 = CeilDiv(m, 64) * CeilDiv(n, 96);
+    const int ctas224 = CeilDiv(m, 64) * CeilDiv(n, 224);
+    // The incumbent is the 128xN choice, adjusted for the 64x128 wave fix
+    // below when that applies.
+    const int incumbent_ctas = (n % 128 == 0 && tiles(128, pick_tn) > target &&
+                                tiles(64, 128) <= target)
+                                   ? tiles(64, 128)
+                                   : tiles(128, pick_tn);
+    auto fills_better = [&](int64_t c) {
+        return c <= target && 2 * c > target &&
+               (incumbent_ctas > target || c > incumbent_ctas);
+    };
+    // The 256x64 pair arm deferred here in favour of 64x96; take it even
+    // though it exceeds one wave.
+    const bool pair_deferred_to_96 =
+        (m % 256 == 0) && (n % 64 == 0) && (n % 128 != 0) &&
+        (int64_t(m / 256) * CeilDiv(n, 64) * 2 > target);
+    if ((m % 64 == 0) && (n % 32 == 0) &&
+        (fills_better(ctas96) || pair_deferred_to_96) &&
+        (k / kBlockK) >= kMidMDeepMinKTiles) {
+        return kM64x96P11;
+    }
+    if ((m % 64 == 0) && (n % 32 == 0) && fills_better(ctas224)) {
+        return kM64x224;
+    }
+
+    // ---- 64x128 when the 128xN tile spills past one wave -----------------
+    if ((m % 64 == 0) && (n % 128 == 0) && tiles(128, pick_tn) > target &&
+        tiles(64, 128) <= target) {
+        return kM64x128;
+    }
+
+    // ---- 128x64 pair, 18 stages ------------------------------------------
+    // One wave with enough K-tiles, or the 128x128 incumbent (only 4 stages).
+    if ((m % 128 == 0) && (n % 128 == 0)) {
+        const int64_t pair_ctas = Count128x64PairCtas(m, n);
+        const int k_tiles = k / kBlockK;
+        const bool one_wave = pair_ctas <= target && 2 * pair_ctas > target;
+        const bool deep_enough = k_tiles >= kMidMDeepMinKTiles;
+        const bool shallow_incumbent = (pick_tn == 128);
+        if ((one_wave && deep_enough) || shallow_incumbent) {
+            // With <= 64 K-tiles the 64x64 1WG deep tile is faster.
+            if (one_wave && deep_enough && k_tiles <= 64 && (m % 64 == 0) &&
+                (n % 64 == 0)) {
+                return kM64x64_1wgP14;
+            }
+            return kPair128x64P18;
+        }
+    }
+
+    // ---- 128xN base ------------------------------------------------------
+    return pick_tn == 256
+               ? kM128x256
+               : (pick_tn == 128 ? kM128x128
+                                 : (pick_tn == 64 ? kM128x64 : kM128x32));
+}
+
+// m < 128 without SwapAB (SkipSwapForThinM): KBlockM=64 tiles give ceil(n/32)
+// CTAs; 64x32 if it fits one wave, else 64x64.
+inline int SelectThinMTile(int m, int n, int k, int target) {
+    const int nt32 = CeilDiv(n, 32);
+    const int mt = CeilDiv(m, 64);
+    if (n % 32 == 0 && nt32 * mt <= target) {
+        return UseDeepPipeline(k) ? kM64x32_1wgP18 : kM64x32_1wg;
+    }
+    return UseDeepPipeline(k) ? kM64x64_1wgP14 : kM64x64_1wg;
+}
+
+// m < 128 with SwapAB: the weight (N x K) becomes the MMA's A (M-dim 128),
+// the activation (M x K) the MMA's B (N-dim).
+inline int SelectSwapABTile(int m, int n, int k, int target) {
+    if (n % 128 != 0 || m % 64 != 0 || k % 64 != 0) {
+        return -1;
+    }
+    // KBlockK=128 from k >= 8192.
+    if (k % 128 == 0 && k >= 8192) {
+        return kSwap128x64K128;
+    }
+    // 256-wide pair tile when the 128-wide grid exceeds 2 waves.
+    const int tiles128 = CeilDiv(n, 128) * CeilDiv(m, 64);
+    if ((n % 256 == 0) && tiles128 > 2 * target) {
+        return kSwap256x64Pair;
+    }
+    // KBlockN=32 if that still fits one wave.
+    if (CeilDiv(n, 128) * CeilDiv(m, 32) <= target) {
+        return kSwap128x32;
+    }
+    return kSwap128x64;
+}
+
+// The dense ladder; -1 when no tile supports the shape.
+inline int SelectBF16Cfg(int m, int n, int k, int sm_count) {
+    const int target = sm_count > 0 ? sm_count : GetSmCount();
+    if (m >= 4096) {
+        return SelectLargeMTile(m, n, k, target);
+    }
+    if (m >= 128) {
+        return SelectMidMTile(m, n, k, target);
+    }
+    if (SkipSwapForThinM(m, n, k, sm_count)) {
+        return SelectThinMTile(m, n, k, target);
+    }
+    return SelectSwapABTile(m, n, k, target);
+}
+
+// ---- Grouped / batch -------------------------------------------------------
+
+// Ids into kBF16Tiles (gemm_tile.cuh), derived from the tile itself.
+enum ContiguousTile : int {
+    kContPair256x256 = Bf16TileId(kBF16_256x256_pair_p7),
+    kContPair256x128 = Bf16TileId(kBF16_256x128_pair_p9),
+    kContM128x256 = Bf16TileId(kBF16_128x256_ovlp16),
+    kContM128x128 = Bf16TileId(kBF16_128x128_p6),
+    kContM128x64 = Bf16TileId(kBF16_128x64_ovlp16),
+    kContSwap128x64 = Bf16TileId(kBF16_128x64_swap),
+};
+static_assert(kContSwap128x64 >= 0 &&
+                  kContSwap128x64 < static_cast<int>(kBF16Tiles.size()),
+              "BF16 contiguous tile id outside kBF16Tiles");
+
+// m is the total token count.
+inline int SelectBF16ContiguousCfg(int m, int n, int k, int sm_count) {
+    if (m >= 4096) {
+        return kContPair256x256;
+    }
+    if (m >= 128) {
+        // M stays 128 (the 1-CTA MMA requires M == 128); step finer on N
+        // only while the coarser tile underfills the grid.
+        const int target = sm_count > 0 ? sm_count : GetSmCount();
+        auto tiles = [&](int tm, int tn) {
+            return CeilDiv(m, tm) * CeilDiv(n, tn);
+        };
+        // 2-CTA pair-UMMA first: weight TMA-multicast across the pair. Each
+        // cluster spans 2 SMs, so require clusters * 2 >= target.
+        const int clusters = CeilDiv(m, 256) * CeilDiv(n, 256);
+        if (m % 256 == 0 && n % 256 == 0 && k % 64 == 0 &&
+            clusters * 2 >= target) {
+            // 256x128 frees a deeper pipeline; it pays only when 256x256 is
+            // lightly oversubscribed (<= ~2 waves).
+            const bool square_like = (n % 128 == 0) && (clusters <= 2 * target);
+            return square_like ? kContPair256x128 : kContPair256x256;
+        }
+        // 128x64 only on a <= 1-wave fit: halving N doubles the M*K panel
+        // reloads (costly on DRAM-bound mid-M).
+        if (tiles(128, 256) < target && (n % 128 == 0)) {
+            if (tiles(128, 64) <= target && (n % 64 == 0)) {
+                return kContM128x64;
+            }
+            return kContM128x128;
+        }
+        return kContM128x256;
+    }
+    return kContSwap128x64;
+}
+
+// Ids into kBF16Tiles (gemm_tile.cuh), derived from the tile itself.
+enum MaskedTile : int {
+    kMaskM128x256 = Bf16TileId(kBF16_128x256_ovlp16),
+    kMaskSwap128x64 = Bf16TileId(kBF16_128x64_swap),
+    kMaskM128x128 = Bf16TileId(kBF16_128x128_p6),
+    kMaskM128x64 = Bf16TileId(kBF16_128x64_ovlp16),
+    kMaskPair256x256 = Bf16TileId(kBF16_256x256_pair_p7),
+    kMaskPair256x128 = Bf16TileId(kBF16_256x128_pair_p9),
+};
+static_assert(kMaskPair256x128 >= 0 &&
+                  kMaskPair256x128 < static_cast<int>(kBF16Tiles.size()),
+              "BF16 masked tile id outside kBF16Tiles");
+
+// Masked pads every expert to max_m_per_expert, so the grid scales with
+// num_experts * ceil(max_m / tm) * ceil(n / tn).
+inline int SelectBF16MaskedCfg(int num_experts, int mm, int n, int k,
+                               int sm_count) {
+    if (mm >= 4096) {
+        return kMaskPair256x256;
+    }
+    if (mm >= 128) {
+        const int target = sm_count > 0 ? sm_count : GetSmCount();
+        auto tiles = [&](int tm, int tn) {
+            return num_experts * CeilDiv(mm, tm) * CeilDiv(n, tn);
+        };
+        const int clusters = num_experts * CeilDiv(mm, 256) * CeilDiv(n, 256);
+        if (mm % 256 == 0 && n % 256 == 0 && k % 64 == 0 &&
+            clusters * 2 >= target) {
+            const bool square_like = (n % 128 == 0) && (clusters <= 2 * target);
+            return square_like ? kMaskPair256x128 : kMaskPair256x256;
+        }
+        // Keep 128x256 (best B-reuse) unless it underfills the grid; a
+        // blanket 128x128 preference regresses oversubscribed mid-M.
+        if (tiles(128, 256) < target && (n % 128 == 0)) {
+            if (tiles(128, 64) <= target && (n % 64 == 0)) {
+                return kMaskM128x64;
+            }
+            return kMaskM128x128;
+        }
+        return kMaskM128x256;
+    }
+    return kMaskSwap128x64;
+}
+
+// Ids into kBF16Tiles (gemm_tile.cuh), derived from the tile itself.
+enum BatchTile : int {
+    kBatchPair256x256 = Bf16TileId(kBF16_256x256_pair),
+    kBatchM128x256 = Bf16TileId(kBF16_128x256_ovlp16),
+    kBatchSwap128x64 = Bf16TileId(kBF16_128x64_swap),
+};
+static_assert(kBatchSwap128x64 >= 0 &&
+                  kBatchSwap128x64 < static_cast<int>(kBF16Tiles.size()),
+              "BF16 batch tile id outside kBF16Tiles");
+
+// Pure alignment ladder (no runtime SM reasoning); m is one item's rows.
+inline int SelectBF16BatchCfg(int m, int n, int k) {
+    if (m % 256 == 0 && n % 256 == 0) {
+        return kBatchPair256x256;
+    }
+    if (m % 128 == 0 && n % 256 == 0) {
+        return kBatchM128x256;
+    }
+    if (m % 64 == 0 && n % 128 == 0) {
+        return kBatchSwap128x64;
+    }
+    return -1;
+}
+
+// BF16 picks from the rule ladder above, one table per mode.
+inline int PickBf16Tile(KernelMode mode, const GemmShape& shape) {
+    switch (mode) {
+        case KernelMode::Dense:
+            return SelectBF16Cfg(shape.m, shape.n, shape.k, shape.sm_count);
+        case KernelMode::Contiguous:
+            return SelectBF16ContiguousCfg(shape.m, shape.n, shape.k,
+                                           shape.sm_count);
+        case KernelMode::Masked:
+            return SelectBF16MaskedCfg(shape.m_grid / shape.m, shape.m, shape.n,
+                                       shape.k, shape.sm_count);
+        case KernelMode::Batch:
+            return SelectBF16BatchCfg(shape.m, shape.n, shape.k);
+    }
+    return -1;
+}
+
+}  // namespace bf16
 }  // namespace halops

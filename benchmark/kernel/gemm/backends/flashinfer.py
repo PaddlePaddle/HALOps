@@ -47,6 +47,16 @@ def run_fi_dense_gemm(inp: dict):
     # scales (M_padded * K_padded,).
     mode = inp.get("mode", "w8a8-mxfp8")
     backend = _fi_backend(inp)
+    if mode == "bf16":
+        # flashinfer's CUTLASS bf16 kernel is not sm100-tuned (~18% roofline);
+        # its documented default backend "cudnn" is ~2x faster on large shapes.
+        # Keep it overridable via inp["backend"] for per-shape experiments.
+        return flashinfer.mm_bf16(
+            inp["x"],
+            inp["w"].T,
+            out=inp["out"],
+            backend=backend,
+        )
     if mode == "w4a4-mxfp4":
         raise ValueError("flashinfer backend does not support mode 'w4a4-mxfp4' yet")
     if mode == "w4a4-nvfp4":
@@ -75,6 +85,25 @@ def run_fi_dense_gemm(inp: dict):
         )
 
 
+def run_fi_batch_gemm(inp: dict):
+    """Run FlashInfer batched BF16 GEMM (bmm_bf16).
+
+    This is FlashInfer's counterpart to torch.bmm for the per-token / per-expert
+    batched shapes. Like the dense bf16 path, its default "cudnn" backend is the
+    fast one; the CUTLASS one is offered separately so the gap between
+    FlashInfer's own kernels and its cuDNN fallback stays visible.
+    """
+    _check()
+    import flashinfer
+
+    return flashinfer.bmm_bf16(
+        inp["x"],
+        inp["bt"],
+        out=inp["out"],
+        backend=inp.get("backend", "cudnn"),
+    )
+
+
 def run_fi_group_masked_gemm(inp: dict):
     """Run FlashInfer grouped masked GEMM (W8A8-MXFP8 via grouped_mm_mxfp8, W4A4 via grouped_mm_fp4)."""
     _check()
@@ -83,6 +112,13 @@ def run_fi_group_masked_gemm(inp: dict):
     mode = inp.get("mode", "w8a8-mxfp8")
     m_indptr = inp["m_indptr"]
 
+    if mode == "bf16":
+        return flashinfer.grouped_mm_bf16(
+            inp["x"],
+            inp["w"],
+            m_indptr,
+            out=inp["out"],
+        )
     if mode == "w4a4-mxfp4":
         raise ValueError("flashinfer backend does not support mode 'w4a4-mxfp4' yet")
     if mode == "w4a4-nvfp4":
