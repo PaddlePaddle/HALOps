@@ -30,7 +30,7 @@ namespace halops::mla {
 // Head geometry shared by the HCA and DSA formats and the combine kernel;
 // kBlockDims (one bf16 SW128 row) is also the HCA UE8M0 scale block.
 template <int kHeads_, int kDim_>
-struct HeadLayout {
+struct DecodeHeadLayout {
     static constexpr int kHeads = kHeads_;
     static constexpr int kDim = kDim_;
     static constexpr int kHalfDims = kDim / 2;
@@ -46,7 +46,7 @@ struct HeadLayout {
 
 // PV MMA width and the fp32 split-pair partial planes over head layout L.
 template <class L>
-struct HcaPart {
+struct DecodePart {
     static constexpr int kPvN = 256;
     static constexpr int kPvMmas = L::kDim / kPvN;
     static constexpr int kPvBlocksPerMma = L::kLocalBlocks / kPvMmas;
@@ -63,13 +63,13 @@ struct HcaPart {
 
 // Combine-kernel config: the head layout plus its partial-plane layout.
 template <class L>
-struct HcaCombineCfg : L, HcaPart<L> {};
+struct DecodeCombineCfg : L, DecodePart<L> {};
 
 // HCA KV row: kNope fp8 dims, then the bf16 rope dims, then kSfBytes UE8M0
 // scales per row stored after the page's rows; one scale per kBlockDims dims.
 template <int kHeads_, int kDim_, int kNope_, int kRowBytes_, int kSfBytes_>
-struct HcaFormat : HeadLayout<kHeads_, kDim_> {
-    using Layout = HeadLayout<kHeads_, kDim_>;
+struct HcaFormat : DecodeHeadLayout<kHeads_, kDim_> {
+    using Layout = DecodeHeadLayout<kHeads_, kDim_>;
     static constexpr bool kDsa = false;
     static constexpr int kNope = kNope_;
     static constexpr int kRowBytes = kRowBytes_;
@@ -89,8 +89,8 @@ struct HcaFormat : HeadLayout<kHeads_, kDim_> {
 // DSA KV row: kNope fp8 dims, kNope / kScaleGroup fp32 scales, then kRope
 // bf16 rope dims; the value is the nope part, so kNope == kDim.
 template <int kHeads_, int kDim_, int kNope_, int kRope_, int kScaleGroup_>
-struct DsaFormat : HeadLayout<kHeads_, kDim_> {
-    using Layout = HeadLayout<kHeads_, kDim_>;
+struct DsaFormat : DecodeHeadLayout<kHeads_, kDim_> {
+    using Layout = DecodeHeadLayout<kHeads_, kDim_>;
     static constexpr bool kDsa = true;
     static constexpr int kDsaNope = kNope_;
     static constexpr int kDsaRope = kRope_;
@@ -122,7 +122,7 @@ struct DsaFormat : HeadLayout<kHeads_, kDim_> {
 // Tile, pipeline, warp-role and TMEM layout of a decode build over a KV
 // format; kFuse compiles in the fused merge.
 template <class Fmt, bool kFuseV>
-struct HcaTraits : Fmt, HcaPart<typename Fmt::Layout> {
+struct DecodeTraits : Fmt, DecodePart<typename Fmt::Layout> {
     static constexpr bool kFuse = kFuseV;
     static constexpr int kHcaTile = 64;
     static constexpr int kDsaTile = 64;
@@ -189,9 +189,9 @@ struct HcaTraits : Fmt, HcaPart<typename Fmt::Layout> {
 // Compile-time variant selector: DSA-only code is under
 // `if constexpr (C::kDsa)`, so an HCA format compiles the HCA path only.
 template <class Fmt, bool kFuseV = !Fmt::kDsa>
-struct Cfg : HcaTraits<Fmt, kFuseV> {
+struct DecodeCfg : DecodeTraits<Fmt, kFuseV> {
     using Format = Fmt;
-    using Traits = HcaTraits<Fmt, kFuseV>;
+    using Traits = DecodeTraits<Fmt, kFuseV>;
     using Smem =
         cute::conditional_t<Fmt::kDsa, DsaSmem<Traits>, HcaSmem<Traits>>;
     static constexpr int kSmemBytes = sizeof(Smem) + kSw128AtomBytes;
@@ -201,18 +201,18 @@ struct Cfg : HcaTraits<Fmt, kFuseV> {
 
 using HcaModelFormat = HcaFormat<64, 512, 448, 576, 8>;
 using DsaModelFormat = DsaFormat<64, 512, 512, 64, 128>;
-using HcaCfg = Cfg<HcaModelFormat>;
-using DsaCfg = Cfg<DsaModelFormat>;
+using HcaCfg = DecodeCfg<HcaModelFormat>;
+using DsaCfg = DecodeCfg<DsaModelFormat>;
 
 // Raw bytes per key row gathered by a CTA, dequantized in place in the KV
 // stage: CTA 0 the low fp8 dims, CTA 1 the rest plus rope.
 template <class C>
-CUTE_HOST_DEVICE constexpr int raw_pitch(int cta) {
+CUTE_HOST_DEVICE constexpr int decode_raw_pitch(int cta) {
     return cta == 0 ? C::kHalfDims : C::kRowBytes - C::kHalfDims;
 }
 
-// Bit fields and widths of the PTX operands built by hca_ptx.cuh.
-struct HcaIsa {
+// Bit fields and widths of the PTX operands built by ptx.cuh.
+struct DecodeIsa {
     static constexpr int kDescShift = 4;
     static constexpr int kInstrDescShift = 32;
     static constexpr int kTmemLaneShift = 16;

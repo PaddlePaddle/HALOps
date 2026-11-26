@@ -29,40 +29,40 @@
 
 namespace halops::mla {
 
-CUTE_DEVICE uint32_t smem_u32(const void* p) {
+CUTE_DEVICE uint32_t decode_smem_u32(const void* p) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
 // SW128 UMMA operand: K-major (lbo unused) or MN-major (lbo = next N atom).
-CUTE_DEVICE uint64_t sw128_desc(const void* p, uint32_t lbo) {
+CUTE_DEVICE uint64_t decode_sw128_desc(const void* p, uint32_t lbo) {
     cute::UMMA::SmemDescriptor d;
     d.version_ = 1;
     d.layout_type_ = uint8_t(cute::UMMA::LayoutType::SWIZZLE_128B);
-    d.start_address_ = smem_u32(p) >> HcaIsa::kDescShift;
-    d.leading_byte_offset_ = lbo >> HcaIsa::kDescShift;
-    d.stride_byte_offset_ = kSw128AtomBytes >> HcaIsa::kDescShift;
+    d.start_address_ = decode_smem_u32(p) >> DecodeIsa::kDescShift;
+    d.leading_byte_offset_ = lbo >> DecodeIsa::kDescShift;
+    d.stride_byte_offset_ = kSw128AtomBytes >> DecodeIsa::kDescShift;
     return d;
 }
 
 template <class C, int N, cute::UMMA::Major BMajor>
-CUTE_DEVICE uint32_t instr_desc() {
+CUTE_DEVICE uint32_t decode_instr_desc() {
     return static_cast<uint32_t>(
         cute::UMMA::make_runtime_instr_desc<
             cutlass::bfloat16_t, cutlass::bfloat16_t, float, 2 * C::kHeads, N,
             cute::UMMA::Major::K, BMajor>() >>
-        HcaIsa::kInstrDescShift);
+        DecodeIsa::kInstrDescShift);
 }
 
-CUTE_DEVICE void hca_umma_ss(uint32_t d, uint64_t a, uint64_t b, uint32_t idesc,
-                             bool accumulate) {
+CUTE_DEVICE void decode_umma_ss(uint32_t d, uint64_t a, uint64_t b,
+                                uint32_t idesc, bool accumulate) {
     asm volatile(
         "{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\n"
         "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;\n}\n" ::"r"(d),
         "l"(a), "l"(b), "r"(idesc), "r"(uint32_t(accumulate)));
 }
 
-CUTE_DEVICE void hca_umma_ts(uint32_t d, uint32_t a, uint64_t b, uint32_t idesc,
-                             bool accumulate) {
+CUTE_DEVICE void decode_umma_ts(uint32_t d, uint32_t a, uint64_t b,
+                                uint32_t idesc, bool accumulate) {
     asm volatile(
         "{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\n"
         "tcgen05.mma.cta_group::2.kind::f16 [%0], [%1], %2, %3, p;\n}\n" ::"r"(
@@ -70,15 +70,15 @@ CUTE_DEVICE void hca_umma_ts(uint32_t d, uint32_t a, uint64_t b, uint32_t idesc,
         "r"(a), "l"(b), "r"(idesc), "r"(uint32_t(accumulate)));
 }
 
-CUTE_DEVICE void hca_tma_gather4(const CUtensorMap* map, uint64_t* bar,
-                                 void* dst, int col, int r0, int r1, int r2,
-                                 int r3) {
+CUTE_DEVICE void decode_tma_gather4(const CUtensorMap* map, uint64_t* bar,
+                                    void* dst, int col, int r0, int r1, int r2,
+                                    int r3) {
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4.mbarrier:"
         ":complete_tx::bytes [%0], [%1, {%2, %3, %4, %5, %6}], [%7];" ::"r"(
-            smem_u32(dst)),
+            decode_smem_u32(dst)),
         "l"(map), "r"(col), "r"(r0), "r"(r1), "r"(r2), "r"(r3),
-        "r"(smem_u32(bar))
+        "r"(decode_smem_u32(bar))
         : "memory");
 }
 
@@ -86,7 +86,7 @@ CUTE_DEVICE void hca_tma_gather4(const CUtensorMap* map, uint64_t* bar,
 // not HCA's power-of-two UE8M0 code, so it is folded in as bf16 here (the P
 // matmul rounds to bf16 anyway).  A disabled key passes scale 0.0f, which
 // zeroes the dequantized row exactly as the HCA mask does.
-CUTE_DEVICE uint4 dequant8_f32(uint32_t lo, uint32_t hi, float scale) {
+CUTE_DEVICE uint4 decode_dequant8_f32(uint32_t lo, uint32_t hi, float scale) {
     const uint32_t raw[2] = {lo, hi};
     const auto* f8 = reinterpret_cast<const __nv_fp8x2_e4m3*>(raw);
     const nv_bfloat16 s = __float2bfloat16(scale);
@@ -100,69 +100,70 @@ CUTE_DEVICE uint4 dequant8_f32(uint32_t lo, uint32_t hi, float scale) {
 }
 
 template <int N>
-CUTE_DEVICE void tmem_ld(uint32_t addr, float (&v)[N]) {
+CUTE_DEVICE void decode_tmem_ld(uint32_t addr, float (&v)[N]) {
     tmem_ld_32dp32bNx<N>(addr, v);
     cutlass::arch::fence_view_async_tmem_load();
 }
 
-CUTE_DEVICE void cp_async4(int* dst, const int* src) {
+CUTE_DEVICE void decode_cp_async4(int* dst, const int* src) {
     asm volatile(
-        "cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(smem_u32(dst)),
+        "cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(decode_smem_u32(dst)),
         "l"(src)
         : "memory");
 }
 
-CUTE_DEVICE void cp_async8(void* dst, const void* src) {
+CUTE_DEVICE void decode_cp_async8(void* dst, const void* src) {
     asm volatile(
-        "cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(smem_u32(dst)),
+        "cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(decode_smem_u32(dst)),
         "l"(src)
         : "memory");
 }
 
-CUTE_DEVICE void cp_async16(void* dst, const void* src) {
+CUTE_DEVICE void decode_cp_async16(void* dst, const void* src) {
     asm volatile(
-        "cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_u32(dst)),
+        "cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(decode_smem_u32(dst)),
         "l"(src)
         : "memory");
 }
 
 // Arrives on bar once this thread's earlier cp.async copies have landed; the
 // barrier's expected count includes the arrival.
-CUTE_DEVICE void cp_async_arrive_noinc(uint64_t* bar) {
+CUTE_DEVICE void decode_cp_async_arrive_noinc(uint64_t* bar) {
     asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(
-                     smem_u32(bar))
+                     decode_smem_u32(bar))
                  : "memory");
 }
 
-CUTE_DEVICE void hca_tma_load_2d(const CUtensorMap* map, uint64_t* bar,
-                                 void* dst, int col, int row) {
+CUTE_DEVICE void decode_tma_load_2d(const CUtensorMap* map, uint64_t* bar,
+                                    void* dst, int col, int row) {
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::"
-        "complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" ::"r"(smem_u32(dst)),
-        "l"(map), "r"(col), "r"(row), "r"(smem_u32(bar))
+        "complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" ::"r"(
+            decode_smem_u32(dst)),
+        "l"(map), "r"(col), "r"(row), "r"(decode_smem_u32(bar))
         : "memory");
 }
 
-CUTE_DEVICE void tma_store_2d(const CUtensorMap* map, const void* src, int col,
-                              int row) {
+CUTE_DEVICE void decode_tma_store_2d(const CUtensorMap* map, const void* src,
+                                     int col, int row) {
     asm volatile(
         "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%2, %3}], "
         "[%1];" ::"l"(map),
-        "r"(smem_u32(src)), "r"(col), "r"(row)
+        "r"(decode_smem_u32(src)), "r"(col), "r"(row)
         : "memory");
 }
 
-CUTE_DEVICE void bulk_commit() {
+CUTE_DEVICE void decode_bulk_commit() {
     asm volatile("cp.async.bulk.commit_group;" ::: "memory");
 }
 
 // This thread's bulk stores have read their shared memory source.
-CUTE_DEVICE void bulk_wait_read() {
+CUTE_DEVICE void decode_bulk_wait_read() {
     asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
 }
 
 template <int Q>
-CUTE_DEVICE uint4 lds_chunk(uint32_t row_x) {
+CUTE_DEVICE uint4 decode_lds_chunk(uint32_t row_x) {
     uint4 v;
     asm volatile(
         "{\n\t.reg .b32 a;\n\txor.b32 a, %4, %5;\n\t"
@@ -174,8 +175,8 @@ CUTE_DEVICE uint4 lds_chunk(uint32_t row_x) {
 }
 
 template <int Q>
-CUTE_DEVICE void sts_chunk(uint32_t row_x, uint32_t a, uint32_t b, uint32_t c,
-                           uint32_t d) {
+CUTE_DEVICE void decode_sts_chunk(uint32_t row_x, uint32_t a, uint32_t b,
+                                  uint32_t c, uint32_t d) {
     asm volatile(
         "{\n\t.reg .b32 a;\n\txor.b32 a, %0, %1;\n\t"
         "st.shared.v4.u32 [a], {%2, %3, %4, %5};\n\t}" ::"r"(row_x),
@@ -184,7 +185,7 @@ CUTE_DEVICE void sts_chunk(uint32_t row_x, uint32_t a, uint32_t b, uint32_t c,
 }
 
 template <class C>
-CUTE_DEVICE void qo_sync_after(uint32_t x) {
+CUTE_DEVICE void decode_qo_sync_after(uint32_t x) {
     constexpr uint32_t kId =
         C::kQoBar +
         uint32_t(cutlass::arch::ReservedNamedBarriers::FirstUserBarrier);
@@ -196,12 +197,13 @@ CUTE_DEVICE void qo_sync_after(uint32_t x) {
 }
 
 template <int N>
-CUTE_DEVICE void store_out(__nv_bfloat16* dst, const float* v, float scale) {
+CUTE_DEVICE void decode_store_out(__nv_bfloat16* dst, const float* v,
+                                  float scale) {
     CUTLASS_PRAGMA_UNROLL
-    for (int q = 0; q < N; q += HcaIsa::kStoreElems) {
-        uint32_t w[HcaIsa::kStoreWords];
+    for (int q = 0; q < N; q += DecodeIsa::kStoreElems) {
+        uint32_t w[DecodeIsa::kStoreWords];
         CUTLASS_PRAGMA_UNROLL
-        for (int e = 0; e < HcaIsa::kStoreWords; ++e) {
+        for (int e = 0; e < DecodeIsa::kStoreWords; ++e) {
             const nv_bfloat162 b2 = __floats2bfloat162_rn(
                 v[q + 2 * e] * scale, v[q + 2 * e + 1] * scale);
             w[e] = reinterpret_cast<const uint32_t&>(b2);
@@ -210,12 +212,12 @@ CUTE_DEVICE void store_out(__nv_bfloat16* dst, const float* v, float scale) {
     }
 }
 
-CUTE_DEVICE void red_release_add(int* ptr, int v) {
+CUTE_DEVICE void decode_red_release_add(int* ptr, int v) {
     asm volatile("red.release.gpu.global.add.s32 [%0], %1;" ::"l"(ptr), "r"(v)
                  : "memory");
 }
 
-CUTE_DEVICE int ld_acquire(const int* ptr) {
+CUTE_DEVICE int decode_ld_acquire(const int* ptr) {
     int v;
     asm volatile("ld.acquire.gpu.global.b32 %0, [%1];"
                  : "=r"(v)
@@ -224,12 +226,12 @@ CUTE_DEVICE int ld_acquire(const int* ptr) {
     return v;
 }
 
-CUTE_DEVICE void bulk_load(void* dst, const void* src, uint32_t bytes,
-                           uint64_t* bar) {
+CUTE_DEVICE void decode_bulk_load(void* dst, const void* src, uint32_t bytes,
+                                  uint64_t* bar) {
     asm volatile(
         "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
-        "[%0], [%1], %2, [%3];" ::"r"(smem_u32(dst)),
-        "l"(src), "r"(bytes), "r"(smem_u32(bar))
+        "[%0], [%1], %2, [%3];" ::"r"(decode_smem_u32(dst)),
+        "l"(src), "r"(bytes), "r"(decode_smem_u32(bar))
         : "memory");
 }
 

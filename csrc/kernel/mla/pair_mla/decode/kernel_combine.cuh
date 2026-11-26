@@ -16,21 +16,22 @@
 
 #include <math_constants.h>
 
-#include "kernel/mla/pair_mla/decode/kernel_schedule.cuh"
+#include "kernel/mla/pair_mla/decode/scheduler_range.cuh"
 
 namespace halops::mla {
 
 template <class C>
-CUTE_DEVICE void merge_sync() {
-    NamedBar::sync(C::kMergeThreads, C::kMergeBar);
+CUTE_DEVICE void decode_merge_sync() {
+    DecodeNamedBar::sync(C::kMergeThreads, C::kMergeBar);
 }
 
 // acc[u] += sum over parts k in [k0, k1) of w[k][head] * part k's plane
 // pl0 + u * pstep (planes >= phi are skipped).
 template <class C, int UP, int UK>
-CUTE_DEVICE void merge_block(const HcaParams& p, const float* w, int first,
-                             int cta, int tsi, int head, int pl0, int pstep,
-                             int phi, int k0, int k1, float4* acc) {
+CUTE_DEVICE void decode_merge_block(const DecodeParams& p, const float* w,
+                                    int first, int cta, int tsi, int head,
+                                    int pl0, int pstep, int phi, int k0, int k1,
+                                    float4* acc) {
     for (int kb = k0; kb < k1; kb += UK) {
         float wk[UK];
         float4 v[UK][UP];
@@ -66,9 +67,9 @@ CUTE_DEVICE void merge_block(const HcaParams& p, const float* w, int first,
 }
 
 template <class C, int UP, int UK>
-CUTE_DEVICE void merge_slice(const HcaParams& p, const float* w, float4* red,
-                             uint2* stage, int first, int n, int cta, int plo,
-                             int phi, int token) {
+CUTE_DEVICE void decode_merge_slice(const DecodeParams& p, const float* w,
+                                    float4* red, uint2* stage, int first, int n,
+                                    int cta, int plo, int phi, int token) {
     const int wg = threadIdx.x / kWarpGroup, tsi = threadIdx.x % kWarpGroup;
     const int head = tsi % C::kHeads, half = tsi / C::kHeads;
     const bool ksplit = phi - plo < C::kMergeWgs;
@@ -81,11 +82,11 @@ CUTE_DEVICE void merge_slice(const HcaParams& p, const float* w, float4* red,
         CUTLASS_PRAGMA_UNROLL
         for (int u = 0; u < UP; ++u)
             acc[u] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        merge_block<C, UP, UK>(p, w, first, cta, tsi, head, pb, pstep, phi, k0,
-                               k1, acc);
+        decode_merge_block<C, UP, UK>(p, w, first, cta, tsi, head, pb, pstep,
+                                      phi, k0, k1, acc);
         if (ksplit) {
             if (wg == 1) red[tsi] = acc[0];
-            merge_sync<C>();
+            decode_merge_sync<C>();
             if (wg == 1) continue;
             const float4 o = red[tsi];
             acc[0].x += o.x, acc[0].y += o.y, acc[0].z += o.z, acc[0].w += o.w;
@@ -101,7 +102,7 @@ CUTE_DEVICE void merge_slice(const HcaParams& p, const float* w, float4* red,
                            *reinterpret_cast<const uint32_t*>(&hi));
         }
     }
-    merge_sync<C>();
+    decode_merge_sync<C>();
     static_assert(C::kHalfDims == C::kPlanes * C::kPlaneCols);
     for (int e = threadIdx.x; e < kWarpGroup * ns; e += C::kMergeThreads) {
         const int row = e / ns, c = e - row * ns;
@@ -115,8 +116,8 @@ CUTE_DEVICE void merge_slice(const HcaParams& p, const float* w, float4* red,
 }
 
 template <class C>
-CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
-                             int cluster) {
+CUTE_DEVICE void decode_fused_merge(const DecodeParams& p, typename C::Smem& sm,
+                                    int cta, int cluster) {
     constexpr int kMaxParts = sizeof(sm.kv[0]) / (C::kHeads * sizeof(float));
     static_assert(kMaxParts >= C::kMinMergeParts &&
                   sizeof(sm.kv[1]) >= kWarpGroup * sizeof(float4));
@@ -125,7 +126,7 @@ CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
     uint2* const stage = reinterpret_cast<uint2*>(sm.kv[2]);
     static_assert(sizeof(sm.kv) - 2 * sizeof(sm.kv[0]) >=
                   kWarpGroup * (C::kPlanes + 1) * sizeof(uint2));
-    merge_sync<C>();
+    decode_merge_sync<C>();
     const int pairs =
         (p.tokens / p.tokens_per_req) * ((p.tokens_per_req + 1) / 2);
     const int n_help = p.clusters - sm.sched;
@@ -143,11 +144,11 @@ CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
         __shared__ int shared_first;
         if (threadIdx.x == 0) {
             int c;
-            while (((c = ld_acquire(ctr)) & (C::kMergeShared - 1)) < n) {
+            while (((c = decode_ld_acquire(ctr)) & (C::kMergeShared - 1)) < n) {
             }
             shared_first = c >= C::kMergeShared;
         }
-        merge_sync<C>();
+        decode_merge_sync<C>();
         const int sh = shared_first, nn = n - sh, nm = nn + hq;
         const int rr = helper ? nn + hi : r - sh;
         const int plo = C::kPlanes * rr / nm, phi = C::kPlanes * (rr + 1) / nm;
@@ -168,7 +169,7 @@ CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
                 }
             }
             md[s * C::kHeads + h] = make_float2(m, den);
-            merge_sync<C>();
+            decode_merge_sync<C>();
             const float sink =
                 p.sink ? __ldg(p.sink + h) * CUDART_L2E_F : -CUDART_INF_F;
             float mx = sink;
@@ -187,21 +188,23 @@ CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
                 w[k * C::kHeads + h] =
                     l > -CUDART_INF_F ? exp2f(l - mx) * inv : 0.0f;
             }
-            merge_sync<C>();
+            decode_merge_sync<C>();
             if (n <= 2) {
-                merge_slice<C, C::kMergeLoads / 2, 2>(p, w, red, stage, first,
-                                                      n, cta, plo, phi, j.z);
+                decode_merge_slice<C, C::kMergeLoads / 2, 2>(
+                    p, w, red, stage, first, n, cta, plo, phi, j.z);
             } else if (n <= C::kMergeKMid) {
-                merge_slice<C, C::kMergeLoads / C::kMergeKMid, C::kMergeKMid>(
-                    p, w, red, stage, first, n, cta, plo, phi, j.z);
-            } else if (n <= C::kMergeKWide) {
-                merge_slice<C, C::kMergeLoads / C::kMergeKWide, C::kMergeKWide>(
-                    p, w, red, stage, first, n, cta, plo, phi, j.z);
-            } else {
-                merge_slice<C, 1, C::kMergeLoads>(p, w, red, stage, first, n,
+                decode_merge_slice<C, C::kMergeLoads / C::kMergeKMid,
+                                   C::kMergeKMid>(p, w, red, stage, first, n,
                                                   cta, plo, phi, j.z);
+            } else if (n <= C::kMergeKWide) {
+                decode_merge_slice<C, C::kMergeLoads / C::kMergeKWide,
+                                   C::kMergeKWide>(p, w, red, stage, first, n,
+                                                   cta, plo, phi, j.z);
+            } else {
+                decode_merge_slice<C, 1, C::kMergeLoads>(
+                    p, w, red, stage, first, n, cta, plo, phi, j.z);
             }
-            merge_sync<C>();
+            decode_merge_sync<C>();
         }
         if (threadIdx.x == 0 &&
             (atomicAdd(ctr, 1) & (C::kMergeShared - 1)) == n + nm - 1)
@@ -214,20 +217,21 @@ CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
 // register budgets rather than the aux groups' 56; the others go straight
 // to the teardown barrier.
 template <class C>
-CUTE_DEVICE void merge_tail(const HcaParams& p, typename C::Smem& sm, int cta,
-                            int cluster) {
+CUTE_DEVICE void decode_merge_tail(const DecodeParams& p, typename C::Smem& sm,
+                                   int cta, int cluster) {
     if constexpr (C::kFuse) {
         if (sm.comb && p.fuse) {
             pdl_trigger();
-            fused_merge<C>(p, sm, cta, cluster);
+            decode_fused_merge<C>(p, sm, cta, cluster);
         }
     }
 }
 
 template <class C>
-__global__ void hca_combine_kernel(const __grid_constant__ HcaParams p) {
-    __shared__ float red[HcaPlan::kCombSplit][kWarpGroup][C::kPlaneCols];
-    __shared__ float redmd[HcaPlan::kCombSplit][kWarpGroup][2];
+__global__ void decode_pair_mla_combine_kernel(
+    const __grid_constant__ DecodeParams p) {
+    __shared__ float red[DecodePlan::kCombSplit][kWarpGroup][C::kPlaneCols];
+    __shared__ float redmd[DecodePlan::kCombSplit][kWarpGroup][2];
     pdl_trigger();
     pdl_wait();
     const int sched = *p.eff_g;
@@ -248,12 +252,13 @@ __global__ void hca_combine_kernel(const __grid_constant__ HcaParams p) {
         const int first = pair_cluster_of(sched, total, j.w0);
         const int last = pair_cluster_of(sched, total, j.w0 + j.wn - 1);
         const auto empty = [&](int c) {
-            return range_lo(c + 1, total, sched) <= range_lo(c, total, sched);
+            return decode_range_lo(c + 1, total, sched) <=
+                   decode_range_lo(c, total, sched);
         };
         const auto sid = [&](int c) { return c * 2 + (c == first); };
         float m = -CUDART_INF_F, den = 0.0f;
         float acc[C::kPlaneCols] = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int c = first + grp; c <= last; c += HcaPlan::kCombSplit) {
+        for (int c = first + grp; c <= last; c += DecodePlan::kCombSplit) {
             if (empty(c)) continue;
             const float lse =
                 __ldg(p.lse_part + pair_part_row<C>(sid(c), cta, head));
@@ -280,14 +285,14 @@ __global__ void hca_combine_kernel(const __grid_constant__ HcaParams p) {
         if (grp == 0) {
             float mx = sink_log2;
             CUTLASS_PRAGMA_UNROLL
-            for (int g = 0; g < HcaPlan::kCombSplit; ++g)
+            for (int g = 0; g < DecodePlan::kCombSplit; ++g)
                 mx = fmaxf(mx, redmd[g][tsi][0]);
             float dtot =
                 sink_log2 > -CUDART_INF_F ? exp2f(sink_log2 - mx) : 0.0f;
             CUTLASS_PRAGMA_UNROLL
             for (int e = 0; e < C::kPlaneCols; ++e) acc[e] = 0.0f;
             CUTLASS_PRAGMA_UNROLL
-            for (int g = 0; g < HcaPlan::kCombSplit; ++g) {
+            for (int g = 0; g < DecodePlan::kCombSplit; ++g) {
                 const float sc = exp2f(redmd[g][tsi][0] - mx);
                 dtot += redmd[g][tsi][1] * sc;
                 CUTLASS_PRAGMA_UNROLL

@@ -26,9 +26,9 @@
 namespace halops::mla {
 
 template <class C>
-void set_pool(HcaParams& p, HcaMaps& maps, int seg, const torch::Tensor& pool,
-              const torch::Tensor& idx, const torch::Tensor& len,
-              int64_t tokens) {
+void decode_set_pool(DecodeParams& p, DecodeMaps& maps, int seg,
+                     const torch::Tensor& pool, const torch::Tensor& idx,
+                     const torch::Tensor& len, int64_t tokens) {
     TORCH_CHECK(pool.dim() == 4 && pool.scalar_type() == torch::kByte &&
                     pool.size(2) == 1 &&
                     pool.size(3) == C::kRowBytes + C::kSfBytes &&
@@ -57,7 +57,7 @@ void set_pool(HcaParams& p, HcaMaps& maps, int seg, const torch::Tensor& pool,
     for (int c = 0; c < 2; ++c) {
         maps.raw[c][seg] = pair_make_pool_map<C>(
             base, CU_TENSOR_MAP_DATA_TYPE_UINT16, pool, C::kRowBytes / 2,
-            raw_pitch<C>(c) / 2, CU_TENSOR_MAP_SWIZZLE_NONE,
+            decode_raw_pitch<C>(c) / 2, CU_TENSOR_MAP_SWIZZLE_NONE,
             "hca_decode_attention");
     }
 }
@@ -65,8 +65,8 @@ void set_pool(HcaParams& p, HcaMaps& maps, int seg, const torch::Tensor& pool,
 // DSA tensor map: UINT16 view of the 656 B inline rows, box = this CTA's 256 B
 // fp8 nope half (128 uint16), gathered per key row like HCA's raw map.
 template <class C>
-CUtensorMap make_map_dsa(const void* ptr, const torch::Tensor& pool,
-                         uint64_t cols, uint32_t box) {
+CUtensorMap decode_make_map_dsa(const void* ptr, const torch::Tensor& pool,
+                                uint64_t cols, uint32_t box) {
     CUtensorMap map;
     EncodeTmaDesc<2>(
         &map, CU_TENSOR_MAP_DATA_TYPE_UINT16, ptr,
@@ -80,9 +80,9 @@ CUtensorMap make_map_dsa(const void* ptr, const torch::Tensor& pool,
 // segment.  Seg 1 is cloned from seg 0 with ld == 0 so the shared scheduler's
 // unconditional length reads touch valid memory yet yield zero SWA keys.
 template <class C>
-void set_pool_dsa(HcaParams& p, HcaMaps& maps, const torch::Tensor& pool,
-                  const torch::Tensor& idx, const torch::Tensor& len,
-                  int64_t tokens) {
+void decode_set_pool_dsa(DecodeParams& p, DecodeMaps& maps,
+                         const torch::Tensor& pool, const torch::Tensor& idx,
+                         const torch::Tensor& len, int64_t tokens) {
     TORCH_CHECK(pool.dim() == 4 && pool.scalar_type() == torch::kByte &&
                     pool.size(2) == 1 && pool.size(3) == C::kDsaRowBytes &&
                     pool.stride(0) % C::kDsaRowBytes == 0,
@@ -108,8 +108,8 @@ void set_pool_dsa(HcaParams& p, HcaMaps& maps, const torch::Tensor& pool,
     p.pool_tokens[0] = pool.size(0) * pool.size(1);
     const uint8_t* base = pool.data_ptr<uint8_t>();
     for (int c = 0; c < 2; ++c) {
-        maps.raw[c][0] = make_map_dsa<C>(base, pool, C::kDsaRowBytes / 2,
-                                         C::kDsaNopeHalf / 2);
+        maps.raw[c][0] = decode_make_map_dsa<C>(base, pool, C::kDsaRowBytes / 2,
+                                                C::kDsaNopeHalf / 2);
     }
     p.idx[1] = p.idx[0];
     p.len[1] = p.len[0];
@@ -125,16 +125,16 @@ void set_pool_dsa(HcaParams& p, HcaMaps& maps, const torch::Tensor& pool,
 
 // Split-pair partials and counters, kept per device: the counters start at
 // zero and the last part of each split pair resets its own.
-struct Workspace {
+struct DecodeWorkspace {
     torch::Tensor o_part, lse_part, counter, jobs, total_g, eff_g;
 };
 
 template <class C>
-Workspace& workspace(const torch::Tensor& q, int clusters) {
+DecodeWorkspace& decode_workspace(const torch::Tensor& q, int clusters) {
     static std::mutex mu;
-    static std::unordered_map<int, Workspace> cache;
+    static std::unordered_map<int, DecodeWorkspace> cache;
     const std::lock_guard<std::mutex> lock(mu);
-    Workspace& ws = cache[q.get_device()];
+    DecodeWorkspace& ws = cache[q.get_device()];
     if (!ws.counter.defined() || ws.counter.size(0) != clusters) {
         const auto f32 = q.options().dtype(torch::kFloat);
         const auto i32 = q.options().dtype(torch::kInt);

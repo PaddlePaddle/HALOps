@@ -100,7 +100,7 @@ setup(
                 "csrc/kernel/mla/mega_mla/combine/combine_with_rope_quant.cu",
                 "csrc/kernel/mla/mega_mla/vha_postmix/vha_postmix_quant.cu",
                 "csrc/kernel/mla/pair_mla/prefill/prefill_pair_mla.cu",
-                "csrc/kernel/mla/pair_mla/decode/hca_decode_attention.cu",
+                "csrc/kernel/mla/pair_mla/decode/decode_pair_mla.cu",
                 "csrc/kernel/moe/mega_ll_moe.cu",
                 "csrc/kernel/mhc/megallmhc.cu",
                 "csrc/kernel/mhc/fused_all_reduce_mhc.cu",

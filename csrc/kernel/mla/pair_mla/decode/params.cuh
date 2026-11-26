@@ -26,7 +26,7 @@ namespace halops::mla {
 
 // Host schedule defaults and the combine-kernel launch shape.  kNoCap marks
 // an uncapped split.
-struct HcaPlan {
+struct DecodePlan {
     static constexpr int kNoCap = 0x7fffffff;
     static constexpr int kDefaultSmax = 6;
     static constexpr int kCapFloor = 8;
@@ -36,9 +36,9 @@ struct HcaPlan {
     static constexpr int kEffSized = 1, kEffCost = 2, kEffAligned = 3;
 };
 
-// Measured cost model of find_range (eff == kEffCost) and the host's
+// Measured cost model of decode_find_range (eff == kEffCost) and the host's
 // split-count fit: base + per-tile * tiles + per-pair * pairs.
-struct HcaCost {
+struct DecodeCost {
     static constexpr int kUnsplitBase = 1005, kUnsplitPerTile = 114,
                          kUnsplitPerPair = 3;
     static constexpr int kSplitBase = 1410, kSplitPerTile = 116,
@@ -64,13 +64,13 @@ struct HcaCost {
     static constexpr float kKsBase = 0.077f, kKsPerPair = 0.062f;
 };
 
-struct HcaMaps {
+struct DecodeMaps {
     CUtensorMap raw[2][2];
     CUtensorMap q;
     CUtensorMap out;
 };
 
-struct HcaParams {
+struct DecodeParams {
     const int* idx[2];
     const int* len[2];
     int ld[2];
@@ -104,7 +104,7 @@ struct HcaParams {
     float scale_log2;
 };
 
-using Bar = cutlass::arch::ClusterBarrier;
-using NamedBar = cutlass::arch::NamedBarrier;
+using DecodeBar = cutlass::arch::ClusterBarrier;
+using DecodeNamedBar = cutlass::arch::NamedBarrier;
 
 }  // namespace halops::mla

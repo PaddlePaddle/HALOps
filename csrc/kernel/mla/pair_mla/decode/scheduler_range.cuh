@@ -17,67 +17,17 @@
 #include <cute/arch/cluster_sm90.hpp>
 
 #include "kernel/mla/pair_mla/decode/config.cuh"
-#include "kernel/mla/pair_mla/decode/hca_ptx.cuh"
-#include "kernel/mla/pair_mla/decode/hca_schedule.cuh"
 #include "kernel/mla/pair_mla/decode/params.cuh"
+#include "kernel/mla/pair_mla/decode/ptx.cuh"
+#include "kernel/mla/pair_mla/decode/scheduler.cuh"
 
 namespace halops::mla {
-
-// Persistent schedule: cluster c takes tiles [c * total / C, (c + 1) * total
-// / C) of the stream.  A unit is the part of one pair inside a cluster's
-// range; the parts of a split pair after its first write normalized partial
-// O and log2 sums to slot c of their cluster, merged by the first part.
-CUTE_DEVICE int range_lo(int c, int total, int clusters) {
-    return int(uint32_t(c) * uint32_t(total) / uint32_t(clusters));
-}
-
-// A pair's schedule weight is w = min(n_tiles, cap).  A part owning weight
-// offset [a, b) of the pair owns real tiles [w_to_tile(a), w_to_tile(b)); so a
-// long pair is spread over fewer clusters (bounded merge fan-in) while each of
-// those clusters does proportionally more of its tiles.
-CUTE_DEVICE int w_to_tile(int wofs, int n_tiles, int w) {
-    return int(int64_t(wofs) * n_tiles / w);
-}
-
-// The effective per-pair weight cap for a launch.  A manual override (p.cap)
-// wins; otherwise the adaptive policy keeps a long pair's split near p.smax
-// parts: a cluster owns about total/clusters tiles, so capping a pair at
-// smax * ceil(total / clusters) bounds its span (and its serial merge tail) to
-// ~smax clusters, while short pairs (n_tiles below the cap) are left untouched.
-CUTE_DEVICE int effective_cap(const HcaParams& p, int total_unc, int clusters) {
-    if (p.cap != HcaPlan::kNoCap) return p.cap;
-    if (p.smax <= 0) return HcaPlan::kNoCap;
-    const int quota = (total_unc + clusters - 1) / clusters;
-    return max(p.smax * quota, HcaPlan::kCapFloor);
-}
-
-// ceil(x / d) for 0 <= x < 2^20, d > 0: a float estimate and an integer
-// correction, as integer division is a long dependent chain in find_range.
-CUTE_DEVICE int ceil_div_f(int x, int d) {
-    int q = __float2int_rz(__fdividef(float(x), float(d)));
-    q += (q + 1) * d <= x;
-    q -= q * d > x;
-    return q + (q * d < x);
-}
-
-// Clusters to actually schedule this launch.  With p.eff the kernel is launched
-// wide (p.clusters == max) and sizes itself to the batch: ~p.tpc tiles per
-// cluster keeps every split part a couple of UMMA tiles (below that a pair
-// fragments into sub-tile parts the combine must then re-merge, which the
-// pole-length sweep showed regresses short-KV batches).  Clusters past the
-// scheduled count see an empty range and exit, like the tiny-batch path.
-CUTE_DEVICE int sched_clusters(const HcaParams& p, int total_unc) {
-    if (!p.eff || p.eff == HcaPlan::kEffAligned) return p.clusters;
-    const int tpc = p.tpc > 0 ? p.tpc : HcaPlan::kDefaultTpc;
-    int s = ceil_div_f(total_unc, tpc);
-    return max(1, min(s, p.clusters));
-}
 
 // All threads count the tiles of every pair and scan them; the result is
 // the first pair and tile of this cluster's range.
 template <class C>
-CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
-                            int cluster) {
+CUTE_DEVICE void decode_find_range(const DecodeParams& p, typename C::Smem& sm,
+                                   int cluster) {
     __shared__ int part[C::kThreads / kWarp], part_max[C::kThreads / kWarp];
     __shared__ int part2[C::kThreads / kWarp];
     const int pairs =
@@ -98,18 +48,18 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
             }
             return PairLens{{{v.x, v.y}, {v.z, v.w}}};
         }
-        return load_lens(p, q);
+        return decode_load_lens(p, q);
     };
 
     int sum_unc = 0, max_unc = 0;
     for (int q = first, j = 0; q < min(first + per, pairs); ++q, ++j) {
-        const PairLens l = load_lens(p, q);
+        const PairLens l = decode_load_lens(p, q);
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < C::kKeep; ++k) {
             if (j == k)
                 keep[k] = make_int4(l.v[0][0], l.v[0][1], l.v[1][0], l.v[1][1]);
         }
-        const int n = pair_geom(p, q, l, C::kTile).n_tiles;
+        const int n = decode_pair_geom(p, q, l, C::kTile).n_tiles;
         sum_unc += n;
         max_unc = max(max_unc, n);
     }
@@ -134,37 +84,39 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
         total_unc += part[w];
         n_max = max(n_max, part_max[w]);
     }
-    int sched = sched_clusters(p, total_unc);
+    int sched = decode_sched_clusters(p, total_unc);
     bool comb = p.combine;
     bool aligned = false;
-    if (p.eff == HcaPlan::kEffCost) {
+    if (p.eff == DecodePlan::kEffCost) {
         bool spread = false;
         const int pp = max(pairs, 1);
-        const int h0 =
-            max(ceil_div_f(total_unc, 2 * pp),
-                (n_max + HcaPlan::kDefaultSmax - 1) / HcaPlan::kDefaultSmax);
-        const int h1 = ceil_div_f(total_unc, sched);
+        const int h0 = max(
+            decode_ceil_div_f(total_unc, 2 * pp),
+            (n_max + DecodePlan::kDefaultSmax - 1) / DecodePlan::kDefaultSmax);
+        const int h1 = decode_ceil_div_f(total_unc, sched);
         if (p.fuse) {
-            const int cu = HcaCost::kUnsplitBase +
-                           HcaCost::kUnsplitPerTile * n_max +
-                           HcaCost::kUnsplitPerPair * pp;
-            const int c0 = HcaCost::kSplitBase + HcaCost::kSplitPerTile * h0 +
-                           HcaCost::kSplitPerPair * pp;
-            const int c1 = HcaCost::kCombBase + HcaCost::kCombPerTile * h1 +
-                           HcaCost::kCombPerPair * pp;
+            const int cu = DecodeCost::kUnsplitBase +
+                           DecodeCost::kUnsplitPerTile * n_max +
+                           DecodeCost::kUnsplitPerPair * pp;
+            const int c0 = DecodeCost::kSplitBase +
+                           DecodeCost::kSplitPerTile * h0 +
+                           DecodeCost::kSplitPerPair * pp;
+            const int c1 = DecodeCost::kCombBase +
+                           DecodeCost::kCombPerTile * h1 +
+                           DecodeCost::kCombPerPair * pp;
             comb = p.combine && c1 < min(c0, cu);
             aligned = !comb && cu <= c0;
-            if (float(p.clusters) * p.ks_rp < HcaCost::kFewClustersPerPair) {
-                const int d0 = HcaCost::kFewSplitBase +
-                               HcaCost::kFewSplitPerTile * h0 +
-                               HcaCost::kFewSplitPerPair * pp;
-                const int d1 = HcaCost::kFewCombBase +
-                               HcaCost::kFewCombPerTile * h1 +
-                               HcaCost::kFewCombPerPair * pp;
-                const int d3 = HcaCost::kSpreadBase +
-                               HcaCost::kSpreadPerTile * h1 +
-                               HcaCost::kSpreadPerPair * pp +
-                               __float2int_rn(HcaCost::kSpreadPerCluster *
+            if (float(p.clusters) * p.ks_rp < DecodeCost::kFewClustersPerPair) {
+                const int d0 = DecodeCost::kFewSplitBase +
+                               DecodeCost::kFewSplitPerTile * h0 +
+                               DecodeCost::kFewSplitPerPair * pp;
+                const int d1 = DecodeCost::kFewCombBase +
+                               DecodeCost::kFewCombPerTile * h1 +
+                               DecodeCost::kFewCombPerPair * pp;
+                const int d3 = DecodeCost::kSpreadBase +
+                               DecodeCost::kSpreadPerTile * h1 +
+                               DecodeCost::kSpreadPerPair * pp +
+                               __float2int_rn(DecodeCost::kSpreadPerCluster *
                                               sched * p.ks_rp);
                 const int dm = min(min(d0, d1), d3);
                 aligned = cu <= dm;
@@ -172,26 +124,27 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
                 comb = p.combine && !aligned && !spread && d1 < d0;
             }
             const int kmax = min(n_max, p.ks_kmax);
-            if (C::kFuse && !aligned && kmax >= HcaCost::kMinSplit &&
+            if (C::kFuse && !aligned && kmax >= DecodeCost::kMinSplit &&
                 n_max * pp == total_unc) {
                 const float n = float(n_max), b = p.ks_b, fs = sched * p.ks_rp;
                 const float hmin =
-                    ceilf(__fdividef(n, kmax) - HcaCost::kCeilEps);
+                    ceilf(__fdividef(n, kmax) - DecodeCost::kCeilEps);
                 const float hs = fmaxf(floorf(n * rsqrtf(n * p.ks_a)), hmin);
                 float bc =
-                    comb ? HcaCost::kTileCost * h1 + b * fs +
-                               (fabsf(fs - rintf(fs)) > HcaCost::kFracEps
-                                    ? HcaCost::kFracPenalty
+                    comb ? DecodeCost::kTileCost * h1 + b * fs +
+                               (fabsf(fs - rintf(fs)) > DecodeCost::kFracEps
+                                    ? DecodeCost::kFracPenalty
                                     : 0.f)
-                         : HcaCost::kTileCost * ((n_max + 1) / 2) + 2.f * b;
-                bc -= HcaCost::kCombBias;
+                         : DecodeCost::kTileCost * ((n_max + 1) / 2) + 2.f * b;
+                bc -= DecodeCost::kCombBias;
                 int best = 0;
                 CUTLASS_PRAGMA_UNROLL
                 for (int j = 0; j < 2; ++j) {
                     const float h = hs + j;
-                    const float k = ceilf(__fdividef(n, h) - HcaCost::kCeilEps);
-                    const float c = HcaCost::kTileCost * h + b * k;
-                    if (k >= HcaCost::kMinSplit && c < bc) {
+                    const float k =
+                        ceilf(__fdividef(n, h) - DecodeCost::kCeilEps);
+                    const float c = DecodeCost::kTileCost * h + b * k;
+                    if (k >= DecodeCost::kMinSplit && c < bc) {
                         bc = c;
                         best = int(k);
                     }
@@ -202,21 +155,21 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
                 }
             }
         } else {
-            comb = p.combine &&
-                   HcaCost::kPlainTileWeight * (h0 - h1) >
-                       HcaCost::kPlainPairWeight * pp - HcaCost::kPlainPairBias;
+            comb = p.combine && DecodeCost::kPlainTileWeight * (h0 - h1) >
+                                    DecodeCost::kPlainPairWeight * pp -
+                                        DecodeCost::kPlainPairBias;
         }
         if (!comb && !spread) sched = min((aligned ? 1 : 2) * pp, p.clusters);
-    } else if (p.eff == HcaPlan::kEffAligned) {
+    } else if (p.eff == DecodePlan::kEffAligned) {
         const int wide = (total_unc + p.clusters - 1) / p.clusters;
-        if (n_max - wide < HcaCost::kAlignSlack) {
+        if (n_max - wide < DecodeCost::kAlignSlack) {
             sched = min(max(pairs, 1), p.clusters);
             aligned = pairs <= p.clusters;
         }
     }
-    const int cap = (p.eff == HcaPlan::kEffCost && comb) || aligned
-                        ? HcaPlan::kNoCap
-                        : effective_cap(p, total_unc, sched);
+    const int cap = (p.eff == DecodePlan::kEffCost && comb) || aligned
+                        ? DecodePlan::kNoCap
+                        : decode_effective_cap(p, total_unc, sched);
     if (threadIdx.x == 0) {
         sm.cap = cap;
         sm.sched = sched;
@@ -228,7 +181,8 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
     if (cap < n_max) {
         sum = 0;
         for (int q = first; q < min(first + per, pairs); ++q)
-            sum += min(pair_geom(p, q, lens_of(q), C::kTile).n_tiles, cap);
+            sum +=
+                min(decode_pair_geom(p, q, lens_of(q), C::kTile).n_tiles, cap);
         incl = sum;
         CUTLASS_PRAGMA_UNROLL
         for (int d = 1; d < kWarp; d *= 2) {
@@ -244,42 +198,45 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
             total += part2[w];
         }
     }
-    const int lo = range_lo(min(cluster, sched), total, sched);
-    const int hi = range_lo(min(cluster + 1, sched), total, sched);
+    const int lo = decode_range_lo(min(cluster, sched), total, sched);
+    const int hi = decode_range_lo(min(cluster + 1, sched), total, sched);
     int pre = base + incl - sum;
     if (aligned) {
         if (first <= cluster && cluster < min(first + per, pairs)) {
             for (int q = first; q < cluster; ++q)
-                pre += pair_geom(p, q, lens_of(q), C::kTile).n_tiles;
+                pre += decode_pair_geom(p, q, lens_of(q), C::kTile).n_tiles;
             sm.start[0] = cluster;
             sm.wstart = pre;
             sm.start[1] = 0;
             sm.start[2] =
-                pair_geom(p, cluster, lens_of(cluster), C::kTile).n_tiles;
+                decode_pair_geom(p, cluster, lens_of(cluster), C::kTile)
+                    .n_tiles;
         } else if (threadIdx.x == 0 && cluster >= pairs) {
             sm.start[0] = 0;
             sm.start[2] = 0;
         }
     } else if (sum > 0 && pre <= lo && lo < pre + sum) {
         for (int q = first;; ++q) {
-            const PairGeom g = pair_geom(p, q, lens_of(q), C::kTile);
+            const PairGeom g = decode_pair_geom(p, q, lens_of(q), C::kTile);
             const int w = min(g.n_tiles, cap);
             if (lo < pre + w) {
                 sm.start[0] = q;
                 sm.wstart = pre;
-                if (cap == HcaPlan::kNoCap) {
+                if (cap == DecodePlan::kNoCap) {
                     sm.start[1] = lo - pre;
                     sm.start[2] = hi - lo;
                 } else {
-                    sm.start[1] = w_to_tile(lo - pre, g.n_tiles, w);
+                    sm.start[1] = decode_w_to_tile(lo - pre, g.n_tiles, w);
                     int tiles =
-                        w_to_tile(min(hi - pre, w), g.n_tiles, w) - sm.start[1];
+                        decode_w_to_tile(min(hi - pre, w), g.n_tiles, w) -
+                        sm.start[1];
                     int wpos = pre + w;
                     for (int qq = q + 1; wpos < hi; ++qq) {
                         const PairGeom g2 =
-                            pair_geom(p, qq, lens_of(qq), C::kTile);
+                            decode_pair_geom(p, qq, lens_of(qq), C::kTile);
                         const int w2 = min(g2.n_tiles, cap);
-                        tiles += w_to_tile(min(hi - wpos, w2), g2.n_tiles, w2);
+                        tiles += decode_w_to_tile(min(hi - wpos, w2),
+                                                  g2.n_tiles, w2);
                         wpos += w2;
                     }
                     sm.start[2] = tiles;
@@ -305,9 +262,10 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
             if (q >= first && q < min(first + per, pairs)) {
                 int wq = base + incl - sum;
                 for (int qq = first; qq < q; ++qq)
-                    wq += min(pair_geom(p, qq, lens_of(qq), C::kTile).n_tiles,
-                              cap);
-                const PairGeom g = pair_geom(p, q, lens_of(q), C::kTile);
+                    wq += min(
+                        decode_pair_geom(p, qq, lens_of(qq), C::kTile).n_tiles,
+                        cap);
+                const PairGeom g = decode_pair_geom(p, q, lens_of(q), C::kTile);
                 const int f = pair_cluster_of(sched, total, wq);
                 const int l =
                     pair_cluster_of(sched, total, wq + min(g.n_tiles, cap) - 1);
@@ -331,20 +289,12 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
         } else if (threadIdx.x < C::kTableUnits &&
                    sm.start[0] + int(threadIdx.x) < pairs) {
             const int q = sm.start[0] + threadIdx.x;
-            const PairLens l = load_lens(p, q);
+            const PairLens l = decode_load_lens(p, q);
             sm.unit_lens[threadIdx.x] =
                 make_int4(l.v[0][0], l.v[0][1], l.v[1][0], l.v[1][1]);
         }
     }
     __syncthreads();
-}
-
-template <class C>
-CUTE_DEVICE UnitCursor<C> start_cursor(const HcaParams& p,
-                                       const typename C::Smem& sm,
-                                       int cluster) {
-    return {sm.start[0], sm.start[1], sm.start[2], sm.wstart,
-            cluster,     sm.start[0], sm.cap,      C::kTile};
 }
 
 }  // namespace halops::mla

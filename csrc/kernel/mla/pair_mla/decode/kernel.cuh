@@ -21,35 +21,36 @@
 #include "kernel/mla/pair_mla/decode/kernel_combine.cuh"
 #include "kernel/mla/pair_mla/decode/kernel_epilogue.cuh"
 #include "kernel/mla/pair_mla/decode/kernel_mainloop.cuh"
-#include "kernel/mla/pair_mla/decode/kernel_schedule.cuh"
+#include "kernel/mla/pair_mla/decode/scheduler_range.cuh"
 
 namespace halops::mla {
 
 template <class C>
-CUTE_DEVICE void init_barriers(typename C::Smem& sm) {
+CUTE_DEVICE void decode_init_barriers(typename C::Smem& sm) {
     constexpr int kPairWarps = 2 * kWarpsPerGroup;
-    Bar::init(&sm.q_full, kPairWarps);
-    Bar::init(&sm.q_empty, 1);
-    Bar::init(&sm.o_full, 1);
-    for (int i = 0; i < C::kMergeBuf; ++i) Bar::init(&sm.merge_full[i], 1);
-    Bar::init(&sm.qs_full, 1);
+    DecodeBar::init(&sm.q_full, kPairWarps);
+    DecodeBar::init(&sm.q_empty, 1);
+    DecodeBar::init(&sm.o_full, 1);
+    for (int i = 0; i < C::kMergeBuf; ++i)
+        DecodeBar::init(&sm.merge_full[i], 1);
+    DecodeBar::init(&sm.qs_full, 1);
     for (int b = 0; b < 2; ++b) {
-        Bar::init(&sm.o_empty[b], kPairWarps);
-        Bar::init(&sm.ml_full[b], kWarpsPerGroup);
-        Bar::init(&sm.ml_empty[b], kWarpsPerGroup);
-        Bar::init(&sm.s_full[b], 1);
-        Bar::init(&sm.s_empty[b], kPairWarps);
-        Bar::init(&sm.p_full[b], kPairWarps);
-        Bar::init(&sm.pv_done[b], 1);
+        DecodeBar::init(&sm.o_empty[b], kPairWarps);
+        DecodeBar::init(&sm.ml_full[b], kWarpsPerGroup);
+        DecodeBar::init(&sm.ml_empty[b], kWarpsPerGroup);
+        DecodeBar::init(&sm.s_full[b], 1);
+        DecodeBar::init(&sm.s_empty[b], kPairWarps);
+        DecodeBar::init(&sm.p_full[b], kPairWarps);
+        DecodeBar::init(&sm.pv_done[b], 1);
     }
     for (int s = 0; s < C::kIdxStages; ++s) {
-        Bar::init(&sm.idx_full[s], C::kIndexWarps);
-        Bar::init(&sm.idx_empty[s], 2 * kWarpsPerGroup);
+        DecodeBar::init(&sm.idx_full[s], C::kIndexWarps);
+        DecodeBar::init(&sm.idx_empty[s], 2 * kWarpsPerGroup);
     }
     for (int s = 0; s < C::kStages; ++s) {
-        Bar::init(&sm.raw_full[s], C::kIndexWarps * (1 + kWarp));
-        Bar::init(&sm.kv_full[s], kPairWarps);
-        Bar::init(&sm.kv_empty[s], 1);
+        DecodeBar::init(&sm.raw_full[s], C::kIndexWarps * (1 + kWarp));
+        DecodeBar::init(&sm.kv_full[s], kPairWarps);
+        DecodeBar::init(&sm.kv_empty[s], 1);
     }
     cutlass::arch::fence_barrier_init();
 }
@@ -58,11 +59,13 @@ CUTE_DEVICE void init_barriers(typename C::Smem& sm) {
 // 0 softmax, 1 Q/O, 2 dequant, 3 the QK^T and PV warps (CTA 0) and the two
 // index warps (one also allocates TMEM).
 template <class C>
-CUTE_DEVICE void run_decode(const HcaParams& p, const HcaMaps& maps) {
+CUTE_DEVICE void decode_run_attention(const DecodeParams& p,
+                                      const DecodeMaps& maps) {
     extern __shared__ uint8_t smem_raw[];
     typename C::Smem& sm = *reinterpret_cast<typename C::Smem*>(
-        smem_raw + (kSw128AtomBytes - smem_u32(smem_raw) % kSw128AtomBytes) %
-                       kSw128AtomBytes);
+        smem_raw +
+        (kSw128AtomBytes - decode_smem_u32(smem_raw) % kSw128AtomBytes) %
+            kSw128AtomBytes);
     const int cta = cute::block_rank_in_cluster();
     const int cluster = blockIdx.x / 2;
     const int warp = __shfl_sync(~0u, threadIdx.x / kWarp, 0);
@@ -74,7 +77,7 @@ CUTE_DEVICE void run_decode(const HcaParams& p, const HcaMaps& maps) {
         cute::TMEM::Allocator2Sm().allocate(kTmemCols, &sm.tmem_base);
         cute::TMEM::Allocator2Sm().release_allocation_lock();
     } else if (threadIdx.x == 0) {
-        init_barriers<C>(sm);
+        decode_init_barriers<C>(sm);
     }
     const float sink_log2 =
         p.sink ? __ldg(p.sink + t % C::kHeads) * CUDART_L2E_F : -CUDART_INF_F;
@@ -84,39 +87,39 @@ CUTE_DEVICE void run_decode(const HcaParams& p, const HcaMaps& maps) {
     const uint32_t tmem = sm.tmem_base;
 
     pdl_wait();
-    find_range<C>(p, sm, cluster);
+    decode_find_range<C>(p, sm, cluster);
     const int n = sm.start[2];
     if (C::kFuse && wg < 2) {
         if (wg == 0) {
             cutlass::arch::warpgroup_reg_alloc<C::kSoftmaxRegs>();
-            softmax_wg<C>(p, sm, tmem, t, cluster);
+            decode_softmax_wg<C>(p, sm, tmem, t, cluster);
         } else {
             cutlass::arch::warpgroup_reg_alloc<C::kQoRegs>();
-            qo_wg<C>(p, maps, sm, tmem, sink_log2, cta, t, cluster);
+            decode_qo_wg<C>(p, maps, sm, tmem, sink_log2, cta, t, cluster);
         }
-        merge_tail<C>(p, sm, cta, cluster);
+        decode_merge_tail<C>(p, sm, cta, cluster);
     } else if (wg == 0) {
         cutlass::arch::warpgroup_reg_alloc<C::kSoftmaxRegs>();
-        softmax_wg<C>(p, sm, tmem, t, cluster);
+        decode_softmax_wg<C>(p, sm, tmem, t, cluster);
     } else if (wg == 1) {
         cutlass::arch::warpgroup_reg_alloc<C::kQoRegs>();
-        qo_wg<C>(p, maps, sm, tmem, sink_log2, cta, t, cluster);
+        decode_qo_wg<C>(p, maps, sm, tmem, sink_log2, cta, t, cluster);
     } else if (wg == 2) {
         cutlass::arch::warpgroup_reg_dealloc<C::kDequantRegs>();
         if (cta == 0) {
-            dequant_wg<0, C>(sm, n, t);
+            decode_dequant_wg<0, C>(sm, n, t);
         } else {
-            dequant_wg<1, C>(sm, n, t);
+            decode_dequant_wg<1, C>(sm, n, t);
         }
     } else {
         cutlass::arch::warpgroup_reg_dealloc<C::kAuxRegs>();
         if (warp == C::kQkWarp) {
-            if (cta == 0) qk_warp<C>(p, sm, tmem, cluster);
+            if (cta == 0) decode_qk_warp<C>(p, sm, tmem, cluster);
         } else if (warp == C::kPvWarp) {
-            if (cta == 0) pv_warp<C>(p, sm, tmem, cluster);
+            if (cta == 0) decode_pv_warp<C>(p, sm, tmem, cluster);
         } else if (warp - C::kIndexWarp < C::kIndexWarps) {
-            index_warp<C>(p, maps, sm, cta, warp - C::kIndexWarp, lane,
-                          cluster);
+            decode_index_warp<C>(p, maps, sm, cta, warp - C::kIndexWarp, lane,
+                                 cluster);
         }
     }
     pdl_trigger();
@@ -130,23 +133,23 @@ CUTE_DEVICE void run_decode(const HcaParams& p, const HcaMaps& maps) {
 
 template <class C>
 __global__ void __launch_bounds__(C::kThreads, 1)
-    hca_decode_attention_kernel(const __grid_constant__ HcaParams p,
-                                const __grid_constant__ HcaMaps maps) {
-    run_decode<C>(p, maps);
+    decode_pair_mla_hca_kernel(const __grid_constant__ DecodeParams p,
+                               const __grid_constant__ DecodeMaps maps) {
+    decode_run_attention<C>(p, maps);
 }
 
 template <class C>
 __global__ void __launch_bounds__(C::kThreads, 1)
-    hca_plain_attention_kernel(const __grid_constant__ HcaParams p,
-                               const __grid_constant__ HcaMaps maps) {
-    run_decode<C>(p, maps);
+    decode_pair_mla_plain_kernel(const __grid_constant__ DecodeParams p,
+                                 const __grid_constant__ DecodeMaps maps) {
+    decode_run_attention<C>(p, maps);
 }
 
 template <class C>
 __global__ void __launch_bounds__(C::kThreads, 1)
-    dsa_decode_attention_kernel(const __grid_constant__ HcaParams p,
-                                const __grid_constant__ HcaMaps maps) {
-    run_decode<C>(p, maps);
+    decode_pair_mla_dsa_kernel(const __grid_constant__ DecodeParams p,
+                               const __grid_constant__ DecodeMaps maps) {
+    decode_run_attention<C>(p, maps);
 }
 
 }  // namespace halops::mla

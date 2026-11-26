@@ -142,7 +142,7 @@ std::vector<torch::Tensor> MegaLlMhc(
     double hc_post_mult_value, int64_t sinkhorn_repeat, double norm_eps,
     bool mhc_align_fleet, const std::optional<torch::Tensor>& shared,
     bool use_pdl, bool use_swizzle, int64_t token_tiles);
-torch::Tensor HcaDecodeAttention(
+torch::Tensor DecodePairMlaHca(
     const torch::Tensor& q, const torch::Tensor& swa_k_cache,
     const torch::Tensor& swa_indices, const torch::Tensor& swa_lengths,
     const torch::Tensor& c128_k_cache, const torch::Tensor& c128_indices,
@@ -151,7 +151,7 @@ torch::Tensor HcaDecodeAttention(
     const int64_t tokens_per_req, const std::optional<torch::Tensor>& out,
     const bool use_pdl);
 
-torch::Tensor DsaDecodeAttention(
+torch::Tensor DecodePairMlaDsa(
     const torch::Tensor& q, const torch::Tensor& k_cache,
     const torch::Tensor& indices, const torch::Tensor& lengths,
     const std::optional<torch::Tensor>& attn_sink, const double softmax_scale,
@@ -352,14 +352,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("cu_pairs"), py::arg("use_pdl") = true,
           py::arg("swa_shift") = 1, py::arg("q_positions") = py::none(),
           py::arg("q_freqs") = py::none(), py::arg("q_norm_eps") = 1e-6);
-    m.def("hca_decode_attention", &halops::HcaDecodeAttention, py::arg("q"),
+    m.def("hca_decode_attention", &halops::DecodePairMlaHca, py::arg("q"),
           py::arg("swa_k_cache"), py::arg("swa_indices"),
           py::arg("swa_lengths"), py::arg("c128_k_cache"),
           py::arg("c128_indices"), py::arg("c128_lengths"),
           py::arg("attn_sink"), py::arg("softmax_scale"),
           py::arg("tokens_per_req"), py::arg("out") = py::none(),
           py::arg("use_pdl") = true);
-    m.def("dsa_decode_attention", &halops::DsaDecodeAttention, py::arg("q"),
+    m.def("dsa_decode_attention", &halops::DecodePairMlaDsa, py::arg("q"),
           py::arg("k_cache"), py::arg("indices"), py::arg("lengths"),
           py::arg("attn_sink"), py::arg("softmax_scale"),
           py::arg("tokens_per_req"), py::arg("out") = py::none(),

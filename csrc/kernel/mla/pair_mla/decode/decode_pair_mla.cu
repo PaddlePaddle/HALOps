@@ -21,19 +21,20 @@
 #include "common/sm100_arch.cuh"
 #include "kernel/gemm/gemm_utils.h"
 #include "kernel/mla/pair_mla/decode/config.cuh"
-#include "kernel/mla/pair_mla/decode/hca_host.h"
 #include "kernel/mla/pair_mla/decode/kernel.cuh"
+#include "kernel/mla/pair_mla/decode/launcher.h"
 #include "kernel/mla/pair_mla/decode/params.cuh"
 
 namespace halops::mla {
 
 // Scheduling, workspace sizing and the two kernel launches, shared by the HCA
 // and DSA entry points.  The callers differ only in the K-cache pool layout
-// (set_pool vs set_pool_dsa) and the Q tensor-map column count, all already in
-// p / maps by the time they call here, so the launch tail itself is identical.
+// (decode_set_pool vs decode_set_pool_dsa) and the Q tensor-map column count,
+// all already in p / maps by the time they call here, so the launch tail itself
+// is identical.
 template <class C>
-void launch_decode(HcaParams& p, const HcaMaps& maps, const torch::Tensor& q,
-                   bool use_pdl) {
+void decode_launch_attention(DecodeParams& p, const DecodeMaps& maps,
+                             const torch::Tensor& q, bool use_pdl) {
     const int max_clusters = GetSmCount() / 2;
     const int64_t pairs =
         int64_t(p.tokens) / p.tokens_per_req * ((p.tokens_per_req + 1) / 2);
@@ -43,36 +44,38 @@ void launch_decode(HcaParams& p, const HcaMaps& maps, const torch::Tensor& q,
     const bool is_dsa = C::kDsa;
     const int eff_mul = is_dsa ? 8 : 2;
     p.eff = eff_mul * pairs <= max_clusters
-                ? (is_dsa ? HcaPlan::kEffSized : HcaPlan::kEffCost)
+                ? (is_dsa ? DecodePlan::kEffSized : DecodePlan::kEffCost)
                 : 0;
     if (!is_dsa && p.eff == 0 && pairs <= max_clusters)
-        p.eff = HcaPlan::kEffAligned;
-    p.tpc = HcaPlan::kDefaultTpc;
+        p.eff = DecodePlan::kEffAligned;
+    p.tpc = DecodePlan::kDefaultTpc;
     p.clusters = p.eff ? max_clusters : heuristic;
-    p.smax = p.eff == HcaPlan::kEffSized ? 0 : HcaPlan::kDefaultSmax;
-    p.cap = HcaPlan::kNoCap;
+    p.smax = p.eff == DecodePlan::kEffSized ? 0 : DecodePlan::kDefaultSmax;
+    p.cap = DecodePlan::kNoCap;
     p.nomerge = 0;
     p.pipe = 1;
     p.combine =
-        p.eff == HcaPlan::kEffSized || p.eff == HcaPlan::kEffCost ? 1 : 0;
+        p.eff == DecodePlan::kEffSized || p.eff == DecodePlan::kEffCost ? 1 : 0;
     if (pairs > max_clusters) p.combine = 0;
     p.fuse = is_dsa ? 0 : 1;
-    p.ks_kmax = p.eff == HcaPlan::kEffCost && p.combine && p.fuse && pairs > 0
-                    ? p.clusters / int(pairs)
-                    : 0;
-    p.ks_b = HcaCost::kKsBase + HcaCost::kKsPerPair * float(pairs);
-    p.ks_a = HcaCost::kTileCost / p.ks_b;
+    p.ks_kmax =
+        p.eff == DecodePlan::kEffCost && p.combine && p.fuse && pairs > 0
+            ? p.clusters / int(pairs)
+            : 0;
+    p.ks_b = DecodeCost::kKsBase + DecodeCost::kKsPerPair * float(pairs);
+    p.ks_a = DecodeCost::kTileCost / p.ks_b;
     p.ks_rp = pairs > 0 ? 1.f / float(pairs) : 0.f;
-    void (*kernel)(HcaParams, HcaMaps);
+    void (*kernel)(DecodeParams, DecodeMaps);
     if constexpr (C::kDsa)
-        kernel = dsa_decode_attention_kernel<C>;
+        kernel = decode_pair_mla_dsa_kernel<C>;
     else if (p.combine && p.fuse)
-        kernel = hca_decode_attention_kernel<C>;
+        kernel = decode_pair_mla_hca_kernel<C>;
     else
-        kernel = hca_plain_attention_kernel<Cfg<typename C::Format, false>>;
+        kernel =
+            decode_pair_mla_plain_kernel<DecodeCfg<typename C::Format, false>>;
     const int smem_bytes = C::kSmemBytes;
-    Workspace& ws =
-        workspace<HcaCombineCfg<typename C::Layout>>(q, max_clusters);
+    DecodeWorkspace& ws =
+        decode_workspace<DecodeCombineCfg<typename C::Layout>>(q, max_clusters);
     p.o_part = ws.o_part.data_ptr<float>();
     p.lse_part = ws.lse_part.data_ptr<float>();
     p.counter = ws.counter.data_ptr<int>();
@@ -87,16 +90,17 @@ void launch_decode(HcaParams& p, const HcaMaps& maps, const torch::Tensor& q,
         smem_bytes, stream, use_pdl, p, maps));
     if (p.combine && !p.fuse) {
         HALOPS_CUDA_CHECK(LaunchKernelWithPdl(
-            hca_combine_kernel<HcaCombineCfg<typename C::Layout>>,
+            decode_pair_mla_combine_kernel<
+                DecodeCombineCfg<typename C::Layout>>,
             dim3(C::kPlanes, 2,
-                 int(std::min<int64_t>(pairs, HcaPlan::kCombJobs))),
-            dim3(HcaPlan::kCombSplit * kWarpGroup), kNoCluster, 0, stream,
+                 int(std::min<int64_t>(pairs, DecodePlan::kCombJobs))),
+            dim3(DecodePlan::kCombSplit * kWarpGroup), kNoCluster, 0, stream,
             use_pdl, p));
     }
 }
 
 template <class C>
-torch::Tensor hca_decode_attention(
+torch::Tensor decode_pair_mla_hca(
     const torch::Tensor& q, const torch::Tensor& swa_k_cache,
     const torch::Tensor& swa_indices, const torch::Tensor& swa_lengths,
     const torch::Tensor& c128_k_cache, const torch::Tensor& c128_indices,
@@ -132,10 +136,12 @@ torch::Tensor hca_decode_attention(
         "attn_sink must be a contiguous float32 [", C::kHeads, "] tensor");
     if (tokens == 0) return out;
 
-    HcaParams p{};
-    HcaMaps maps{};
-    set_pool<C>(p, maps, 0, c128_k_cache, c128_indices, c128_lengths, tokens);
-    set_pool<C>(p, maps, 1, swa_k_cache, swa_indices, swa_lengths, tokens);
+    DecodeParams p{};
+    DecodeMaps maps{};
+    decode_set_pool<C>(p, maps, 0, c128_k_cache, c128_indices, c128_lengths,
+                       tokens);
+    decode_set_pool<C>(p, maps, 1, swa_k_cache, swa_indices, swa_lengths,
+                       tokens);
     p.q = reinterpret_cast<const __nv_bfloat16*>(q.data_ptr());
     p.sink = attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr;
     p.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
@@ -152,7 +158,7 @@ torch::Tensor hca_decode_attention(
                      {uint64_t(C::kDim) * sizeof(__nv_bfloat16)},
                      {uint32_t(C::kQBoxDims), uint32_t(C::kHeads)},
                      CU_TENSOR_MAP_SWIZZLE_128B, "hca_decode_attention out");
-    launch_decode<C>(p, maps, q, use_pdl);
+    decode_launch_attention<C>(p, maps, q, use_pdl);
     return out;
 }
 
@@ -161,7 +167,7 @@ torch::Tensor hca_decode_attention(
 // There is no SWA segment.  Everything past the pool layout and the 576-wide Q
 // tensor map is the shared launch / scheduling / combine path.
 template <class C>
-torch::Tensor dsa_decode_attention(
+torch::Tensor decode_pair_mla_dsa(
     const torch::Tensor& q, const torch::Tensor& k_cache,
     const torch::Tensor& indices, const torch::Tensor& lengths,
     const std::optional<torch::Tensor>& attn_sink, const double softmax_scale,
@@ -197,9 +203,9 @@ torch::Tensor dsa_decode_attention(
         "attn_sink must be a contiguous float32 [", C::kHeads, "] tensor");
     if (tokens == 0) return out;
 
-    HcaParams p{};
-    HcaMaps maps{};
-    set_pool_dsa<C>(p, maps, k_cache, indices, lengths, tokens);
+    DecodeParams p{};
+    DecodeMaps maps{};
+    decode_set_pool_dsa<C>(p, maps, k_cache, indices, lengths, tokens);
     p.q = reinterpret_cast<const __nv_bfloat16*>(q.data_ptr());
     p.sink = attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr;
     p.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
@@ -216,7 +222,7 @@ torch::Tensor dsa_decode_attention(
                      {uint64_t(C::kDim) * sizeof(__nv_bfloat16)},
                      {uint32_t(C::kQBoxDims), uint32_t(C::kHeads)},
                      CU_TENSOR_MAP_SWIZZLE_128B, "dsa_decode_attention out");
-    launch_decode<C>(p, maps, q, use_pdl);
+    decode_launch_attention<C>(p, maps, q, use_pdl);
     return out;
 }
 
@@ -224,7 +230,7 @@ torch::Tensor dsa_decode_attention(
 
 namespace halops {
 
-torch::Tensor HcaDecodeAttention(
+torch::Tensor DecodePairMlaHca(
     const torch::Tensor& q, const torch::Tensor& swa_k_cache,
     const torch::Tensor& swa_indices, const torch::Tensor& swa_lengths,
     const torch::Tensor& c128_k_cache, const torch::Tensor& c128_indices,
@@ -242,13 +248,13 @@ torch::Tensor HcaDecodeAttention(
         ", k cache row bytes=", row, "; supported: heads=", mla::HcaCfg::kHeads,
         ", dim=", mla::HcaCfg::kDim,
         ", k cache row bytes=", mla::HcaCfg::kRowBytes + mla::HcaCfg::kSfBytes);
-    return mla::hca_decode_attention<mla::HcaCfg>(
+    return mla::decode_pair_mla_hca<mla::HcaCfg>(
         q, swa_k_cache, swa_indices, swa_lengths, c128_k_cache, c128_indices,
         c128_lengths, attn_sink, softmax_scale, tokens_per_req, out_opt,
         use_pdl);
 }
 
-torch::Tensor DsaDecodeAttention(
+torch::Tensor DecodePairMlaDsa(
     const torch::Tensor& q, const torch::Tensor& k_cache,
     const torch::Tensor& indices, const torch::Tensor& lengths,
     const std::optional<torch::Tensor>& attn_sink, const double softmax_scale,
@@ -264,7 +270,7 @@ torch::Tensor DsaDecodeAttention(
                 "; supported: heads=", mla::DsaCfg::kHeads,
                 ", qk dim=", mla::DsaCfg::kDsaQk,
                 ", k cache row bytes=", mla::DsaCfg::kDsaRowBytes);
-    return mla::dsa_decode_attention<mla::DsaCfg>(
+    return mla::decode_pair_mla_dsa<mla::DsaCfg>(
         q, k_cache, indices, lengths, attn_sink, softmax_scale, tokens_per_req,
         out_opt, use_pdl);
 }

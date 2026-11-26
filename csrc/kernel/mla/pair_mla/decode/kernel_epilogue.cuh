@@ -16,7 +16,7 @@
 
 #include <math_constants.h>
 
-#include "kernel/mla/pair_mla/decode/kernel_schedule.cuh"
+#include "kernel/mla/pair_mla/decode/scheduler_range.cuh"
 
 namespace halops::mla {
 
@@ -24,8 +24,8 @@ namespace halops::mla {
 // head row is strided, and direct loads of it occupy the L1 a row per lane,
 // stalling the softmax's shared memory accesses meanwhile.
 template <class C>
-CUTE_DEVICE void fetch_q(const HcaMaps& maps, typename C::Smem& sm, int token,
-                         int t, uint4 (&v)[C::kQVecs]) {
+CUTE_DEVICE void decode_fetch_q(const DecodeMaps& maps, typename C::Smem& sm,
+                                int token, int t, uint4 (&v)[C::kQVecs]) {
     CUTLASS_PRAGMA_UNROLL
     for (int r = 0; r < C::kQoRounds; ++r) {
         if (t == 0) {
@@ -33,28 +33,28 @@ CUTE_DEVICE void fetch_q(const HcaMaps& maps, typename C::Smem& sm, int token,
                 &sm.qs_full, 2 * C::kQBoxBytes);
             CUTLASS_PRAGMA_UNROLL
             for (int h = 0; h < 2; ++h) {
-                hca_tma_load_2d(&maps.q, &sm.qs_full, sm.qo_stage[h],
-                                (h * C::kQoRounds + r) * C::kQBoxDims,
-                                token * C::kHeads);
+                decode_tma_load_2d(&maps.q, &sm.qs_full, sm.qo_stage[h],
+                                   (h * C::kQoRounds + r) * C::kQBoxDims,
+                                   token * C::kHeads);
             }
         }
-        Bar::wait(&sm.qs_full, r & 1);
+        DecodeBar::wait(&sm.qs_full, r & 1);
         const uint32_t row =
             pair_swizzled_row(sm.qo_stage[t / C::kHeads], t % C::kHeads);
         cute::for_each(cute::make_int_sequence<C::kChunksPerBox>{},
                        [&](auto q) {
                            v[r * C::kChunksPerBox + q] =
-                               lds_chunk<decltype(q)::value>(row);
+                               decode_lds_chunk<decltype(q)::value>(row);
                        });
-        qo_sync_after<C>(
+        decode_qo_sync_after<C>(
             pair_xor_words(v + r * C::kChunksPerBox, C::kChunksPerBox));
     }
 }
 
 template <class C>
-CUTE_DEVICE void store_q(const HcaParams& p, typename C::Smem& sm,
-                         uint32_t lane_base, int token, int cta, int t,
-                         const uint4 (&v)[C::kQVecs]) {
+CUTE_DEVICE void decode_store_q(const DecodeParams& p, typename C::Smem& sm,
+                                uint32_t lane_base, int token, int cta, int t,
+                                const uint4 (&v)[C::kQVecs]) {
     CUTLASS_PRAGMA_UNROLL
     for (int q = 0; q < C::kQVecs; ++q) {
         tmem_st_32dp32bNx<kQuad>(lane_base + C::kTmemQ + kQuad * q, &v[q]);
@@ -77,33 +77,34 @@ CUTE_DEVICE void store_q(const HcaParams& p, typename C::Smem& sm,
     cutlass::arch::fence_view_async_tmem_store();
     tcgen05_before_thread_sync();
     __syncwarp();
-    if (t % kWarp == 0) Bar::arrive(&sm.q_full, 0, 1);
+    if (t % kWarp == 0) DecodeBar::arrive(&sm.q_full, 0, 1);
 }
 
 template <class C>
-CUTE_DEVICE void store_round(const HcaMaps& maps, typename C::Smem& sm,
-                             int token, int t, int r, const uint32_t* w) {
+CUTE_DEVICE void decode_store_round(const DecodeMaps& maps,
+                                    typename C::Smem& sm, int token, int t,
+                                    int r, const uint32_t* w) {
     if (r > 0) {
-        if (t == 0) bulk_wait_read();
-        NamedBar::sync(kWarpGroup, C::kQoBar);
+        if (t == 0) decode_bulk_wait_read();
+        DecodeNamedBar::sync(kWarpGroup, C::kQoBar);
     }
     const uint32_t row =
         pair_swizzled_row(sm.qo_stage[t / C::kHeads], t % C::kHeads);
     cute::for_each(cute::make_int_sequence<C::kChunksPerBox>{}, [&](auto q) {
         constexpr int Q = decltype(q)::value;
-        sts_chunk<Q>(row, w[kQuad * Q], w[kQuad * Q + 1], w[kQuad * Q + 2],
-                     w[kQuad * Q + kQuad - 1]);
+        decode_sts_chunk<Q>(row, w[kQuad * Q], w[kQuad * Q + 1],
+                            w[kQuad * Q + 2], w[kQuad * Q + kQuad - 1]);
     });
     cutlass::arch::fence_view_async_shared();
-    NamedBar::sync(kWarpGroup, C::kQoBar);
+    DecodeNamedBar::sync(kWarpGroup, C::kQoBar);
     if (t == 0) {
         CUTLASS_PRAGMA_UNROLL
         for (int h = 0; h < 2; ++h) {
-            tma_store_2d(&maps.out, sm.qo_stage[h],
-                         (h * C::kQoRounds + r) * C::kQBoxDims,
-                         token * C::kHeads);
+            decode_tma_store_2d(&maps.out, sm.qo_stage[h],
+                                (h * C::kQoRounds + r) * C::kQBoxDims,
+                                token * C::kHeads);
         }
-        bulk_commit();
+        decode_bulk_commit();
     }
 }
 
@@ -113,9 +114,10 @@ CUTE_DEVICE void store_round(const HcaMaps& maps, typename C::Smem& sm,
 // The cluster's last unit stages all of O at once in the idle KV stages, so
 // no round waits for the previous one's box to be read.
 template <class C>
-CUTE_DEVICE void store_out_rows(const HcaMaps& maps, typename C::Smem& sm,
-                                int token, uint32_t lane_base, int t,
-                                float scale, bool write, bool last) {
+CUTE_DEVICE void decode_store_out_rows(const DecodeMaps& maps,
+                                       typename C::Smem& sm, int token,
+                                       uint32_t lane_base, int t, float scale,
+                                       bool write, bool last) {
     static_assert(2 * C::kQoRounds * C::kQBoxBytes <= sizeof(sm.kv));
     if (!C::kDsa && last && write) {
         const auto box = [&](int h, int r) {
@@ -133,28 +135,29 @@ CUTE_DEVICE void store_out_rows(const HcaMaps& maps, typename C::Smem& sm,
                 cute::for_each(
                     cute::make_int_sequence<C::kChunksPerBox>{}, [&](auto q) {
                         constexpr int Q = decltype(q)::value;
-                        sts_chunk<Q>(row, wr[kQuad * Q], wr[kQuad * Q + 1],
-                                     wr[kQuad * Q + 2],
-                                     wr[kQuad * Q + kQuad - 1]);
+                        decode_sts_chunk<Q>(
+                            row, wr[kQuad * Q], wr[kQuad * Q + 1],
+                            wr[kQuad * Q + 2], wr[kQuad * Q + kQuad - 1]);
                     });
             }
             cutlass::arch::fence_view_async_shared();
-            NamedBar::sync(kWarpGroup, C::kQoBar);
+            DecodeNamedBar::sync(kWarpGroup, C::kQoBar);
             if (t == 0) {
                 CUTLASS_PRAGMA_UNROLL
                 for (int k = 0; k < 2; ++k) {
                     CUTLASS_PRAGMA_UNROLL
                     for (int h = 0; h < 2; ++h) {
                         const int r = 2 * mh + k;
-                        tma_store_2d(&maps.out, box(h, r),
-                                     (h * C::kQoRounds + r) * C::kQBoxDims,
-                                     token * C::kHeads);
+                        decode_tma_store_2d(
+                            &maps.out, box(h, r),
+                            (h * C::kQoRounds + r) * C::kQBoxDims,
+                            token * C::kHeads);
                     }
                 }
-                bulk_commit();
+                decode_bulk_commit();
             }
         }
-        if (t == 0) bulk_wait_read();
+        if (t == 0) decode_bulk_wait_read();
         return;
     }
     CUTLASS_PRAGMA_UNROLL
@@ -162,23 +165,25 @@ CUTE_DEVICE void store_out_rows(const HcaMaps& maps, typename C::Smem& sm,
         uint32_t w[C::kOHalf / 2];
         pair_read_o_bf16<C>(sm, lane_base, t, mh, scale, w);
         if (write) {
-            store_round<C>(maps, sm, token, t, 2 * mh, w);
-            store_round<C>(maps, sm, token, t, 2 * mh + 1, w + C::kRoundWords);
+            decode_store_round<C>(maps, sm, token, t, 2 * mh, w);
+            decode_store_round<C>(maps, sm, token, t, 2 * mh + 1,
+                                  w + C::kRoundWords);
         }
     }
-    if (write && t == 0) bulk_wait_read();
+    if (write && t == 0) decode_bulk_wait_read();
 }
 
 // Calls f(c) for the parts of a split pair in cluster order: clusters
 // first.. up to the one holding the pair's last tile, skipping clusters with
 // an empty range.
 template <class F>
-CUTE_DEVICE void for_parts(int clusters, const Unit& u, int first, int total,
-                           F&& f) {
+CUTE_DEVICE void decode_for_parts(int clusters, const DecodeUnit& u, int first,
+                                  int total, F&& f) {
     const int end = u.w0 + u.wn;
-    for (int c = first; c < clusters && range_lo(c, total, clusters) < end;
-         ++c) {
-        if (range_lo(c + 1, total, clusters) > range_lo(c, total, clusters)) {
+    for (int c = first;
+         c < clusters && decode_range_lo(c, total, clusters) < end; ++c) {
+        if (decode_range_lo(c + 1, total, clusters) >
+            decode_range_lo(c, total, clusters)) {
             f(c);
         }
     }
@@ -192,10 +197,11 @@ CUTE_DEVICE void for_parts(int clusters, const Unit& u, int first, int total,
 // in cluster order, in fp32 in TMEM, so it does not depend on timing.  Each
 // half of O is released to the next unit's first PV once it is read.
 template <class C>
-CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
-                         typename C::Smem& sm, const Unit& u, int unit, int cta,
-                         int cluster, uint32_t lane_base, int t,
-                         float sink_log2, bool final_unit) {
+CUTE_DEVICE void decode_store_o(const DecodeParams& p, const DecodeMaps& maps,
+                                typename C::Smem& sm, const DecodeUnit& u,
+                                int unit, int cta, int cluster,
+                                uint32_t lane_base, int t, float sink_log2,
+                                bool final_unit) {
     const int head = t % C::kHeads, half = t / C::kHeads;
     const int b = unit % 2;
     const int total = sm.total;
@@ -206,7 +212,7 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
     const auto part_cluster = [&](int j) {
         if (dense) return first + j;
         int c_j = first, n = 0;
-        for_parts(sched, u, first, total, [&](int c) {
+        decode_for_parts(sched, u, first, total, [&](int c) {
             if (n++ == j) c_j = c;
         });
         return c_j;
@@ -214,7 +220,7 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
     int n_parts = last - first + 1;
     if (u.split && !dense) {
         n_parts = 0;
-        for_parts(sched, u, first, total, [&](int) { ++n_parts; });
+        decode_for_parts(sched, u, first, total, [&](int) { ++n_parts; });
     }
     const int others = n_parts - 1;
     if (u.split && first == cluster && t < C::kPartBoxes && !sm.comb) {
@@ -226,7 +232,7 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
     pair_qo_wait<C>(&sm.ml_full[b], (unit / 2) & 1, t);
     const float2 own = sm.ml[b][t], other = sm.ml[b][t ^ C::kHeads];
     __syncwarp();
-    if (t % kWarp == 0) Bar::arrive(&sm.ml_empty[b]);
+    if (t % kWarp == 0) DecodeBar::arrive(&sm.ml_empty[b]);
     const float m = own.x, sum = own.y + other.y;
     const bool lone = cta == 1 && !u.g.has_b;
     if (!u.split) {
@@ -235,8 +241,8 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
             sum > 0.0f ? 1.0f / (sum + exp2f(sink_log2 - m)) : 0.0f;
         pair_qo_wait<C>(&sm.o_full, unit & 1, t);
         tcgen05_after_thread_sync();
-        store_out_rows<C>(maps, sm, u.g.a + cta, lane_base, t, scale, !lone,
-                          final_unit);
+        decode_store_out_rows<C>(maps, sm, u.g.a + cta, lane_base, t, scale,
+                                 !lone, final_unit);
         return;
     }
     int* const ctr = p.counter + first * 2 + cta;
@@ -252,7 +258,7 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
             float o[C::kOHalf];
             pair_read_o_half<C>(sm, lane_base, t, 0, o);
             pair_read_o_half<C>(sm, lane_base, t, 1, o);
-            NamedBar::sync(kWarpGroup, C::kQoBar);
+            DecodeNamedBar::sync(kWarpGroup, C::kQoBar);
         }
         return;
     }
@@ -277,11 +283,11 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
                                 o[kQuad * q + kQuad - 1] * own_scale);
             }
         }
-        NamedBar::sync(kWarpGroup, C::kQoBar);
+        DecodeNamedBar::sync(kWarpGroup, C::kQoBar);
         if (C::kFuse && sm.comb && p.fuse) {
             if (t == 0) {
                 const bool shared = first == cluster && sm.n_mj > 0;
-                red_release_add(ctr, 1 + (shared ? C::kMergeShared : 0));
+                decode_red_release_add(ctr, 1 + (shared ? C::kMergeShared : 0));
                 sm.mj[sm.n_mj++] =
                     make_int4(first, last, u.g.a, u.pair * 2 + u.g.has_b);
             }
@@ -290,29 +296,30 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
                 p.jobs[u.pair] = PairMergeJob{u.g.a, u.g.has_b, u.w0, u.wn};
             }
         } else if (t == 0) {
-            red_release_add(ctr, 1);
+            decode_red_release_add(ctr, 1);
         }
         return;
     }
     if (t == 0) {
-        while (ld_acquire(ctr) != others) {
+        while (decode_ld_acquire(ctr) != others) {
         }
         *ctr = 0;
         fence_proxy_async_global();
     }
-    NamedBar::sync(kWarpGroup, C::kQoBar);
+    DecodeNamedBar::sync(kWarpGroup, C::kQoBar);
     const auto stage_part = [&](int k) {
         if (t == 0) {
             cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(
                 &sm.merge_full[0], C::kPlanes * C::kPlaneBytes);
         }
-        NamedBar::sync(kWarpGroup, C::kQoBar);
+        DecodeNamedBar::sync(kWarpGroup, C::kQoBar);
         static_assert(C::kPartBoxes == kWarpsPerGroup);
         if (t % kWarp == 0) {
             const int bx = t / kWarp;
-            bulk_load(sm.kv[0] + bx * C::kPartBoxPlanes * C::kPlaneBytes,
-                      pair_part_box<C>(p, part_cluster(k + 1), cta, bx),
-                      C::kPartBoxPlanes * C::kPlaneBytes, &sm.merge_full[0]);
+            decode_bulk_load(sm.kv[0] + bx * C::kPartBoxPlanes * C::kPlaneBytes,
+                             pair_part_box<C>(p, part_cluster(k + 1), cta, bx),
+                             C::kPartBoxPlanes * C::kPlaneBytes,
+                             &sm.merge_full[0]);
         }
     };
     float lse_r[C::kLseRegs];
@@ -364,7 +371,7 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
             tmem_st_32dp32bNx<C::kMergeCols>(cols + db * C::kMergeCols, x);
         }
         cutlass::arch::fence_view_async_tmem_store();
-        NamedBar::sync(kWarpGroup, C::kQoBar);
+        DecodeNamedBar::sync(kWarpGroup, C::kQoBar);
         constexpr int kSubPerBox =
             C::kPartBoxPlanes / (C::kMergeCols / C::kPlaneCols);
         constexpr int kMergeBoxBytes = C::kPartBoxPlanes * C::kPlaneBytes;
@@ -377,10 +384,10 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
             if (t == 0) {
                 cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(
                     &sm.merge_full[buf], C::kPartBoxPlanes * C::kPlaneBytes);
-                bulk_load(merge_buf(buf),
-                          pair_part_box<C>(p, part_cluster(k), cta, bx),
-                          C::kPartBoxPlanes * C::kPlaneBytes,
-                          &sm.merge_full[buf]);
+                decode_bulk_load(merge_buf(buf),
+                                 pair_part_box<C>(p, part_cluster(k), cta, bx),
+                                 C::kPartBoxPlanes * C::kPlaneBytes,
+                                 &sm.merge_full[buf]);
             }
         };
         const int nbox = others * C::kPartBoxes;
@@ -394,7 +401,7 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
                 const float lse = lse_at(k);
                 w = lse > -CUDART_INF_F ? exp2f(lse - mx) * inv : 0.0f;
             }
-            Bar::wait(&sm.merge_full[buf], (g / C::kMergeBuf) & 1);
+            DecodeBar::wait(&sm.merge_full[buf], (g / C::kMergeBuf) & 1);
             CUTLASS_PRAGMA_UNROLL
             for (int sub = 0; sub < kSubPerBox; ++sub) {
                 const int db = bx * kSubPerBox + sub;
@@ -415,14 +422,15 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
                     x[kQuad * q + kQuad - 1] += v.w * w;
                 }
                 if (k == others) {
-                    store_out<C::kMergeCols>(out + db * C::kMergeCols, x, 1.0f);
+                    decode_store_out<C::kMergeCols>(out + db * C::kMergeCols, x,
+                                                    1.0f);
                 } else {
                     tmem_st_32dp32bNx<C::kMergeCols>(cols + db * C::kMergeCols,
                                                      x);
                 }
             }
             cutlass::arch::fence_view_async_tmem_store();
-            NamedBar::sync(kWarpGroup, C::kQoBar);
+            DecodeNamedBar::sync(kWarpGroup, C::kQoBar);
             const int g2 = g + C::kMergeBuf;
             if (g2 < nbox)
                 load_box(1 + g2 / C::kPartBoxes, g2 % C::kPartBoxes,
@@ -434,7 +442,7 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
             const float lse = lse_at(k + 1);
             const float w = lse > -CUDART_INF_F ? exp2f(lse - mx) * inv : 0.0f;
             if (k > 0) stage_part(k);
-            Bar::wait(&sm.merge_full[0], k & 1);
+            DecodeBar::wait(&sm.merge_full[0], k & 1);
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < C::kHalfDims / C::kMergeCols; j += 2) {
                 float x[2][C::kMergeCols];
@@ -465,8 +473,8 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
                         x[jj][kQuad * q + kQuad - 1] += v.w * w;
                     }
                     if (k == others - 1) {
-                        store_out<C::kMergeCols>(out + (j + jj) * C::kMergeCols,
-                                                 x[jj], 1.0f);
+                        decode_store_out<C::kMergeCols>(
+                            out + (j + jj) * C::kMergeCols, x[jj], 1.0f);
                     } else {
                         tmem_st_32dp32bNx<C::kMergeCols>(
                             cols + (j + jj) * C::kMergeCols, x[jj]);
@@ -474,40 +482,40 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
                 }
             }
             cutlass::arch::fence_view_async_tmem_store();
-            NamedBar::sync(kWarpGroup, C::kQoBar);
+            DecodeNamedBar::sync(kWarpGroup, C::kQoBar);
         }
     }
 }
 
 template <class C>
-CUTE_DEVICE void qo_wg(const HcaParams& p, const HcaMaps& maps,
-                       typename C::Smem& sm, uint32_t tmem, float sink_log2,
-                       int cta, int t, int cluster) {
+CUTE_DEVICE void decode_qo_wg(const DecodeParams& p, const DecodeMaps& maps,
+                              typename C::Smem& sm, uint32_t tmem,
+                              float sink_log2, int cta, int t, int cluster) {
     const uint32_t lane_base =
-        tmem + ((t / kWarp * kWarp) << HcaIsa::kTmemLaneShift);
-    UnitCursor<C> cur = start_cursor<C>(p, sm, cluster);
-    Unit u, prev;
+        tmem + ((t / kWarp * kWarp) << DecodeIsa::kTmemLaneShift);
+    DecodeUnitCursor<C> cur = decode_start_cursor<C>(p, sm, cluster);
+    DecodeUnit u, prev;
     bool more = cur.next(p, sm.unit_lens, u);
     int unit = 0;
     for (; more; ++unit) {
         uint4 qv[C::kQVecs];
         const int q_token = u.g.a + (cta == 1 && !u.g.has_b ? 0 : cta);
-        fetch_q<C>(maps, sm, q_token, t, qv);
+        decode_fetch_q<C>(maps, sm, q_token, t, qv);
         if (unit > 0) {
             pair_qo_wait<C>(&sm.q_empty, (unit - 1) & 1, t);
             tcgen05_after_thread_sync();
         }
-        store_q<C>(p, sm, lane_base, q_token, cta, t, qv);
+        decode_store_q<C>(p, sm, lane_base, q_token, cta, t, qv);
         if (unit > 0) {
-            store_o<C>(p, maps, sm, prev, unit - 1, cta, cluster, lane_base, t,
-                       sink_log2, false);
+            decode_store_o<C>(p, maps, sm, prev, unit - 1, cta, cluster,
+                              lane_base, t, sink_log2, false);
         }
         prev = u;
         more = cur.next(p, sm.unit_lens, u);
     }
     if (unit > 0) {
-        store_o<C>(p, maps, sm, prev, unit - 1, cta, cluster, lane_base, t,
-                   sink_log2, true);
+        decode_store_o<C>(p, maps, sm, prev, unit - 1, cta, cluster, lane_base,
+                          t, sink_log2, true);
     }
     if (t == 0) bulk_store_wait_all();
 }
