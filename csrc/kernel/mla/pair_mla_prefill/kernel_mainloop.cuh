@@ -22,61 +22,52 @@
 #include <cute/arch/mma_sm100_desc.hpp>
 
 #include "kernel/mla/common/intrinsics.cuh"
-#include "kernel/mla/pair_mla_prefill/prefill_pair_mla_scheduler.cuh"
+#include "kernel/mla/pair_mla_prefill/config.cuh"
+#include "kernel/mla/pair_mla_prefill/scheduler_range.cuh"
 
-namespace halops::mla::prefill_pair {
+namespace halops::mla {
 
 // SW128 bf16 UMMA descriptor: K-major (QK^T) or MN-major (PV) operand.
 template <class C, cute::UMMA::Major kMajor>
-CUTE_DEVICE uint64_t sw128_desc(const void* p) {
+CUTE_DEVICE uint64_t prefill_sw128_desc(const void* p) {
     using namespace cute;
-    using E = cutlass::bfloat16_t;
-    constexpr int kRowElems = C::kRowPitch / sizeof(E);
-    const auto ptr = make_smem_ptr(static_cast<const E*>(p));
+    constexpr int kRowElems = C::kRowPitch / sizeof(cutlass::bfloat16_t);
+    const auto ptr = make_smem_ptr(static_cast<const cutlass::bfloat16_t*>(p));
     if constexpr (kMajor == UMMA::Major::K) {
         return UMMA::make_umma_desc<UMMA::Major::K>(make_tensor(
-            ptr, tile_to_shape(UMMA::Layout_K_SW128_Atom<E>{},
+            ptr, tile_to_shape(UMMA::Layout_K_SW128_Atom<cutlass::bfloat16_t>{},
                                Shape<Int<C::kTile>, Int<kRowElems>>{})));
     } else {
         return UMMA::make_umma_desc<UMMA::Major::MN>(make_tensor(
-            ptr, tile_to_shape(UMMA::Layout_MN_SW128_Atom<E>{},
-                               Shape<Int<C::kPvN / 2>, Int<C::kTile>>{},
-                               Step<_2, _1>{})));
+            ptr,
+            tile_to_shape(UMMA::Layout_MN_SW128_Atom<cutlass::bfloat16_t>{},
+                          Shape<Int<C::kPvN / 2>, Int<C::kTile>>{},
+                          Step<_2, _1>{})));
     }
 }
 
+// Instruction descriptor of the 2-CTA bf16 UMMA with N columns.
 template <class C, int N, cute::UMMA::Major BMajor>
-CUTE_DEVICE uint64_t instr_desc() {
+CUTE_DEVICE uint64_t prefill_instr_desc() {
     return cute::UMMA::make_runtime_instr_desc<
         cutlass::bfloat16_t, cutlass::bfloat16_t, float, 2 * C::kHeads, N,
         cute::UMMA::Major::K, BMajor>();
 }
 
-// 2-CTA bf16 UMMA (M = 2 x 64 heads), A from TMEM (QK^T) or smem (PV).
-template <class C, int N, cute::UMMA::Major BMajor>
-using UmmaTs =
-    cute::SM100_MMA_F16BF16_2x1SM_TS<cutlass::bfloat16_t, cutlass::bfloat16_t,
-                                     float, 2 * C::kHeads, N,
-                                     cute::UMMA::Major::K, BMajor>;
-template <class C, int N, cute::UMMA::Major BMajor>
-using UmmaSs =
-    cute::SM100_MMA_F16BF16_2x1SM_SS<cutlass::bfloat16_t, cutlass::bfloat16_t,
-                                     float, 2 * C::kHeads, N,
-                                     cute::UMMA::Major::K, BMajor>;
-
 // Row r and its swizzled 16-byte chunk c in a SW128 tile of 8-row atoms.
 template <class C>
-CUTE_DEVICE int row_offset(int r) {
+CUTE_DEVICE int prefill_row_offset(int r) {
     return (r / C::kAtomRows) * C::kAtomBytes +
            (r % C::kAtomRows) * C::kRowPitch;
 }
 template <class C>
-CUTE_DEVICE int sw128_offset(int r, int c) {
-    return row_offset<C>(r) + (c ^ (r % C::kAtomRows)) * C::kChunk;
+CUTE_DEVICE int prefill_sw128_offset(int r, int c) {
+    return prefill_row_offset<C>(r) + (c ^ (r % C::kAtomRows)) * C::kChunk;
 }
 
+// Eight fp8 e4m3 values times the e8 block scale, as bf16.
 template <class C>
-CUTE_DEVICE uint4 dequant8(uint32_t lo, uint32_t hi, uint8_t e8) {
+CUTE_DEVICE uint4 prefill_dequant8(uint32_t lo, uint32_t hi, uint8_t e8) {
     const uint32_t raw[2] = {lo, hi};
     const auto* f8 = reinterpret_cast<const __nv_fp8x2_e4m3*>(raw);
     const nv_bfloat16 scale =
@@ -91,25 +82,21 @@ CUTE_DEVICE uint4 dequant8(uint32_t lo, uint32_t hi, uint8_t e8) {
 }
 
 // Index warp w resolves keys [32w, 32w + 32) of each tile and gathers their
-// rows into the KV stage; c128-only tiles load the bf16 copy by TMA.
-struct KeyRaw {
-    bool in_a, in_b;
-    int seg;
-    int bf;  // first row in the bf16 copy (all-c128 tile), else -1
-};
-
+// rows into the KV stage once PV(i - kKvStages) frees it; c128-only tiles
+// load the bf16 copy by TMA when both tokens' lists are prefixes of it.
 template <class C>
-CUTE_DEVICE void index_warp(const PairMlaParams& p, const PairMlaMaps& maps,
-                            typename C::Smem& sm, int cta, int w, int lane) {
+CUTE_DEVICE void prefill_index_warp(const PrefillParams& p,
+                                    const PrefillMaps& maps,
+                                    typename C::Smem& sm, int cta, int w,
+                                    int lane) {
     const int j = w * C::kWarp + lane;
-    UnitCursor ahead = start_cursor<C>(p, sm);
-    Unit au;
+    PrefillUnitCursor ahead = prefill_start_cursor<C>(p, sm);
+    PrefillUnit au;
     int a_left = 0, a_tile = 0, a_bf = -1;
-    const auto fetch = [&](KeyRaw& r, int slot) {
+    const auto fetch = [&](PrefillKeyRaw& r, int slot) {
         if (a_left == 0 && ahead.next<C>(p, sm.unit_lens, au)) {
             a_left = au.n;
             a_tile = au.off;
-            // Both tokens' c128 lists must be prefixes of their request's copy.
             a_bf = -1;
             if constexpr (!C::kFp8) {
                 const int ba = __ldg(p.c128_base + au.g.a);
@@ -140,10 +127,10 @@ CUTE_DEVICE void index_warp(const PairMlaParams& p, const PairMlaMaps& maps,
         cute::cp_async_fence();
     };
     const int n = sm.start[2];
-    KeyRaw ring[C::kIndexDepth];
+    PrefillKeyRaw ring[C::kIndexDepth];
     CUTLASS_PRAGMA_UNROLL
     for (int k = 0; k < C::kIndexDepth; ++k) fetch(ring[k], k);
-    const auto step = [&](int i, KeyRaw& r, int slot) {
+    const auto step = [&](int i, PrefillKeyRaw& r, int slot) {
         cute::cp_async_wait<C::kIndexDepth - 1>();
         __syncwarp();
         const int ka = r.in_a ? sm.idx_raw[w][slot][lane][0] : -1;
@@ -167,7 +154,6 @@ CUTE_DEVICE void index_warp(const PairMlaParams& p, const PairMlaMaps& maps,
             if (w == 0) sm.bf[is] = !C::kFp8 && r.bf >= 0;
             cutlass::arch::ClusterBarrier::arrive(&sm.idx_full[is]);
         }
-        // The tile's stage is free once PV(i - kKvStages) is done.
         const int s = i % C::kKvStages;
         cutlass::arch::ClusterBarrier::wait(&sm.kv_empty[s],
                                             ((i / C::kKvStages) & 1) ^ 1);
@@ -182,7 +168,7 @@ CUTE_DEVICE void index_warp(const PairMlaParams& p, const PairMlaMaps& maps,
                     cute::SM90_TMA_LOAD_2D::copy(
                         &maps.bf16, &sm.raw_full[s], C::kBf16L2Hint,
                         sm.kv[s] + b * C::kBlockBytes +
-                            row_offset<C>(w * C::kWarp),
+                            prefill_row_offset<C>(w * C::kWarp),
                         cta * C::kHalfDims + b * C::kBlockDims,
                         r.bf + w * C::kWarp);
                 }
@@ -203,7 +189,7 @@ CUTE_DEVICE void index_warp(const PairMlaParams& p, const PairMlaMaps& maps,
             const int r0 = __shfl_sync(~0u, coord, src);
             const int r1 = __shfl_sync(~0u, coord, src + 1);
             const int r2 = __shfl_sync(~0u, coord, src + 2);
-            const int r3 = __shfl_sync(~0u, coord, src + 3);
+            const int r3 = __shfl_sync(~0u, coord, src + (C::kGather - 1));
             const int gseg = __shfl_sync(~0u, seg, src);
             if (lane == 0) {
                 cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(
@@ -227,7 +213,7 @@ CUTE_DEVICE void index_warp(const PairMlaParams& p, const PairMlaMaps& maps,
 #pragma unroll 1
     for (int i = 0; i < n; ++i) {
         step(i, ring[0], i % C::kIndexDepth);
-        const KeyRaw r = ring[0];
+        const PrefillKeyRaw r = ring[0];
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k + 1 < C::kIndexDepth; ++k) ring[k] = ring[k + 1];
         ring[C::kIndexDepth - 1] = r;
@@ -236,7 +222,7 @@ CUTE_DEVICE void index_warp(const PairMlaParams& p, const PairMlaMaps& maps,
 
 // s + x * x for the low (H = 0) or high bf16 of w, as one exact FFMA.
 template <int H>
-CUTE_DEVICE float square_add(uint32_t w, float s) {
+CUTE_DEVICE float prefill_square_add(uint32_t w, float s) {
     float d;
     if constexpr (H == 0) {
         asm("{\n\t.reg .b16 l, h;\n\tmov.b32 {l, h}, %1;\n\t"
@@ -252,15 +238,18 @@ CUTE_DEVICE float square_add(uint32_t w, float s) {
     return d;
 }
 
-CUTE_DEVICE float square_chain(const uint4& c, float s) {
-    const uint32_t w[4] = {c.x, c.y, c.z, c.w};
+// s plus the squares of the eight bf16 of c, in element order.
+template <class C>
+CUTE_DEVICE float prefill_square_chain(const uint4& c, float s) {
+    const uint32_t w[C::kVecLen] = {c.x, c.y, c.z, c.w};
     CUTLASS_PRAGMA_UNROLL
-    for (int k = 0; k < 4; ++k) s = square_add<1>(w[k], square_add<0>(w[k], s));
+    for (int k = 0; k < C::kVecLen; ++k)
+        s = prefill_square_add<1>(w[k], prefill_square_add<0>(w[k], s));
     return s;
 }
 
 // (xr, xi) * (fr, fi), rounded as the reference.
-CUTE_DEVICE void rope_pair(uint32_t& w, float fr, float fi) {
+CUTE_DEVICE void prefill_rope_pair(uint32_t& w, float fr, float fi) {
     const float xr = bf16_lo(w), xi = bf16_hi(w);
     float re;
     asm("{\n\t.reg .f32 m;\n\tmul.rn.f32 m, %1, %2;\n\tneg.f32 m, m;\n\t"
@@ -270,20 +259,11 @@ CUTE_DEVICE void rope_pair(uint32_t& w, float fr, float fi) {
     w = pack_bf16_rn(re, fma_rn_f32(xr, fi, mul_rn_f32(xi, fr)));
 }
 
-// Dequantizes the KV stage in place: all reads, a barrier, then the writes.
-template <class C, int kCta>
-struct DequantPlan {
-    static constexpr int kFp8Chunks =
-        (kCta == 0 ? C::kHalfDims : C::kNopeBytes1) / C::kChunk;
-    static constexpr int kFp8Loads = C::kTile * kFp8Chunks / C::kWarpGroup;
-    static constexpr int kRopeChunks =
-        kCta == 0 ? 0 : (C::kRowBytes - C::kNope) / C::kChunk;
-    static constexpr int kRopeLoads = C::kTile * kRopeChunks / C::kWarpGroup;
-};
-
+// Dequantizes each KV stage in place (PrefillDequantPlan); bf16-copy
+// tiles only pass the stage on.
 template <int kCta, class C>
-CUTE_DEVICE void dequant_wg(typename C::Smem& sm, int n, int t) {
-    using Plan = DequantPlan<C, kCta>;
+CUTE_DEVICE void prefill_dequant_wg(typename C::Smem& sm, int n, int t) {
+    using Plan = PrefillDequantPlan<C, kCta>;
     constexpr int kPitch = C::raw_pitch(kCta);
     for (int i = 0; i < n; ++i) {
         const int s = i % C::kKvStages, is = i % C::kIdxStages;
@@ -310,10 +290,10 @@ CUTE_DEVICE void dequant_wg(typename C::Smem& sm, int n, int t) {
             const int row = e / Plan::kFp8Chunks, c = e % Plan::kFp8Chunks;
             raw[k] = *reinterpret_cast<const uint4*>(stage + row * kPitch +
                                                      c * C::kChunk);
-            const uint8_t sf = sm.sf[s][row][kCta * C::kLocalBlocks + c / 4];
+            const uint8_t sf = sm.sf[s][row][kCta * C::kLocalBlocks +
+                                             c / C::kFp8ChunksPerBlock];
             e8[k] = (any[row / C::kWarp] >> (row % C::kWarp)) & 1 ? sf : 0;
         }
-        // Only CTA 1 holds rope dims; the max() keeps CTA 0's dead code legal.
         constexpr int kRopeChunks = cute::max(Plan::kRopeChunks, 1);
         uint4 rope[cute::max(Plan::kRopeLoads, 1)];
         CUTLASS_PRAGMA_UNROLL
@@ -331,25 +311,26 @@ CUTE_DEVICE void dequant_wg(typename C::Smem& sm, int n, int t) {
         for (int k = 0; k < Plan::kFp8Loads; ++k) {
             const int e = t + k * C::kWarpGroup;
             const int row = e / Plan::kFp8Chunks, c = e % Plan::kFp8Chunks;
-            const bool odd = (c / 4) & 1;
-            const int q0 = c % 4 * 2;
-            uint8_t* const block = stage + c / 4 * C::kBlockBytes;
-            const uint4 first = dequant8<C>(odd ? raw[k].z : raw[k].x,
-                                            odd ? raw[k].w : raw[k].y, e8[k]);
-            const uint4 second = dequant8<C>(odd ? raw[k].x : raw[k].z,
-                                             odd ? raw[k].y : raw[k].w, e8[k]);
-            *reinterpret_cast<uint4*>(block + sw128_offset<C>(row, q0 + odd)) =
-                first;
-            *reinterpret_cast<uint4*>(block + sw128_offset<C>(row, q0 + !odd)) =
-                second;
+            const bool odd = (c / C::kFp8ChunksPerBlock) & 1;
+            const int q0 = c % C::kFp8ChunksPerBlock * 2;
+            uint8_t* const block =
+                stage + c / C::kFp8ChunksPerBlock * C::kBlockBytes;
+            const uint4 first = prefill_dequant8<C>(
+                odd ? raw[k].z : raw[k].x, odd ? raw[k].w : raw[k].y, e8[k]);
+            const uint4 second = prefill_dequant8<C>(
+                odd ? raw[k].x : raw[k].z, odd ? raw[k].y : raw[k].w, e8[k]);
+            *reinterpret_cast<uint4*>(
+                block + prefill_sw128_offset<C>(row, q0 + odd)) = first;
+            *reinterpret_cast<uint4*>(
+                block + prefill_sw128_offset<C>(row, q0 + !odd)) = second;
         }
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < Plan::kRopeLoads; ++k) {
             const int e = t + k * C::kWarpGroup;
             const int row = e / kRopeChunks, c = e % kRopeChunks;
-            *reinterpret_cast<uint4*>(stage +
-                                      (C::kLocalBlocks - 1) * C::kBlockBytes +
-                                      sw128_offset<C>(row, c)) = rope[k];
+            *reinterpret_cast<uint4*>(
+                stage + (C::kLocalBlocks - 1) * C::kBlockBytes +
+                prefill_sw128_offset<C>(row, c)) = rope[k];
         }
         cutlass::arch::fence_view_async_shared();
         __syncwarp();
@@ -360,12 +341,13 @@ CUTE_DEVICE void dequant_wg(typename C::Smem& sm, int n, int t) {
 
 // QK^T(i) into S buffer i & 1 once stage i is dequantized and S(i - 2) read.
 template <class C>
-CUTE_DEVICE void qk_warp(const PairMlaParams& p, typename C::Smem& sm,
-                         uint32_t tmem) {
-    using Mma = UmmaTs<C, 2 * C::kTile, cute::UMMA::Major::K>;
-    const uint64_t idesc = instr_desc<C, 2 * C::kTile, cute::UMMA::Major::K>();
-    UnitCursor cur = start_cursor<C>(p, sm);
-    Unit u;
+CUTE_DEVICE void prefill_qk_warp(const PrefillParams& p, typename C::Smem& sm,
+                                 uint32_t tmem) {
+    using Mma = PrefillUmmaTs<C, 2 * C::kTile, cute::UMMA::Major::K>;
+    const uint64_t idesc =
+        prefill_instr_desc<C, 2 * C::kTile, cute::UMMA::Major::K>();
+    PrefillUnitCursor cur = prefill_start_cursor<C>(p, sm);
+    PrefillUnit u;
     for (int i = 0, unit = 0; cur.next<C>(p, sm.unit_lens, u); ++unit) {
         cutlass::arch::ClusterBarrier::wait(&sm.q_full, unit & 1);
         for (int k = 0; k < u.n; ++k, ++i) {
@@ -379,7 +361,7 @@ CUTE_DEVICE void qk_warp(const PairMlaParams& p, typename C::Smem& sm,
             for (int ks = 0; ks < C::kQkSteps; ++ks) {
                 Mma::fma(
                     tmem + C::kTmemQ + ks * C::kUmmaK / 2,
-                    sw128_desc<C, cute::UMMA::Major::K>(
+                    prefill_sw128_desc<C, cute::UMMA::Major::K>(
                         sm.kv[s] + ks / C::kKStepsPerBlock * C::kBlockBytes +
                         ks % C::kKStepsPerBlock * C::kKStepBytes),
                     tmem + C::kTmemS + sb * C::kTmemSCols, ks > 0, idesc);
@@ -396,12 +378,13 @@ CUTE_DEVICE void qk_warp(const PairMlaParams& p, typename C::Smem& sm,
 
 // PV(i) once P(i) is written; it frees the KV stage and the P buffer.
 template <class C>
-CUTE_DEVICE void pv_warp(const PairMlaParams& p, typename C::Smem& sm,
-                         uint32_t tmem) {
-    using Mma = UmmaSs<C, C::kPvN, cute::UMMA::Major::MN>;
-    const uint64_t idesc = instr_desc<C, C::kPvN, cute::UMMA::Major::MN>();
-    UnitCursor cur = start_cursor<C>(p, sm);
-    Unit u;
+CUTE_DEVICE void prefill_pv_warp(const PrefillParams& p, typename C::Smem& sm,
+                                 uint32_t tmem) {
+    using Mma = PrefillUmmaSs<C, C::kPvN, cute::UMMA::Major::MN>;
+    const uint64_t idesc =
+        prefill_instr_desc<C, C::kPvN, cute::UMMA::Major::MN>();
+    PrefillUnitCursor cur = prefill_start_cursor<C>(p, sm);
+    PrefillUnit u;
     for (int i = 0, unit = 0; cur.next<C>(p, sm.unit_lens, u); ++unit) {
         for (int k = 0; k < u.n; ++k, ++i) {
             const int s = i % C::kKvStages, pb = i % 2;
@@ -415,9 +398,9 @@ CUTE_DEVICE void pv_warp(const PairMlaParams& p, typename C::Smem& sm,
                 CUTLASS_PRAGMA_UNROLL
                 for (int ks = 0; ks < C::kPvSteps; ++ks) {
                     Mma::fma(
-                        sw128_desc<C, cute::UMMA::Major::K>(
+                        prefill_sw128_desc<C, cute::UMMA::Major::K>(
                             sm.p[pb] + ks * C::kKStepBytes),
-                        sw128_desc<C, cute::UMMA::Major::MN>(
+                        prefill_sw128_desc<C, cute::UMMA::Major::MN>(
                             sm.kv[s] + m * C::kPvBlocksPerMma * C::kBlockBytes +
                             ks * C::kUmmaK * C::kRowPitch),
                         tmem + C::kTmemO + m * C::kPvN / 2, k > 0 || ks > 0,
@@ -439,26 +422,29 @@ CUTE_DEVICE void pv_warp(const PairMlaParams& p, typename C::Smem& sm,
 
 // Softmax thread t owns TMEM lane t (head t % 64, dims half t / 64).
 template <class C>
-CUTE_DEVICE void pair_sync(int t) {
+CUTE_DEVICE void prefill_pair_sync(int t) {
     cutlass::arch::NamedBarrier::sync(2 * C::kWarp,
                                       C::kPairBar + t / C::kWarp % 2);
 }
 
+// Waits for PV(j).
 template <class C>
-CUTE_DEVICE void wait_pv(typename C::Smem& sm, int j) {
+CUTE_DEVICE void prefill_wait_pv(typename C::Smem& sm, int j) {
     cutlass::arch::ClusterBarrier::wait(&sm.pv_done[j % 2], (j / 2) & 1);
 }
 
-// Online softmax of tile i, adding the partner lane's partial S.
+// Online softmax of tile i, adding the partner lane's partial S (exchanged
+// through bank-swizzled xchg rows). kQnr scales by the head's 1 / rms. O is
+// rescaled only after PV(i - 1), and P buffer i % 2 is reused after PV(i - 2).
 template <class C>
-CUTE_DEVICE void softmax_tile(const PairMlaParams& p, typename C::Smem& sm,
-                              int i, int k, uint32_t lane_base, int t, int b,
-                              float& m, float& l) {
+CUTE_DEVICE void prefill_softmax_tile(const PrefillParams& p,
+                                      typename C::Smem& sm, int i, int k,
+                                      uint32_t lane_base, int t, int b,
+                                      float& m, float& l) {
     const int head = t % C::kHeads, half = t / C::kHeads;
-    // kQnr: scores also scale by the head's 1 / rms.
     const float scale_log2 = C::kQnr ? sm.rs[b][head] : p.scale_log2;
     const int is = i % C::kIdxStages, sb = i % 2;
-    constexpr int kQuads = C::kHalf / 4;
+    constexpr int kQuads = C::kHalf / C::kVecLen;
     const uint32_t ph_idx = (i / C::kIdxStages) & 1, ph_s = (i / 2) & 1;
     const bool idx_ok =
         cutlass::arch::ClusterBarrier::test_wait(&sm.idx_full[is], ph_idx, 1);
@@ -467,12 +453,10 @@ CUTE_DEVICE void softmax_tile(const PairMlaParams& p, typename C::Smem& sm,
     const bool pv_ok = cutlass::arch::ClusterBarrier::test_wait(
         &sm.pv_done[sb], ph_s ^ 1, i > 1);
     if (!idx_ok) cutlass::arch::ClusterBarrier::wait(&sm.idx_full[is], ph_idx);
-    // Valid word `half` holds this thread's keys [half * kHalf, +kHalf).
     static_assert(C::kHalf == C::kWarp, "one valid word per half");
     const uint32_t valid = sm.valid[is][half];
     if (!s_ok) cutlass::arch::ClusterBarrier::wait(&sm.s_full[sb], ph_s);
     tcgen05_after_thread_sync();
-    // xchg rows are swizzled by chunk to spread accesses over the banks.
     float4* const peer = reinterpret_cast<float4*>(sm.xchg[t ^ C::kHeads]);
     float own[C::kHalf], other[C::kHalf];
     tmem_ld_32dp32bNx<C::kHalf>(
@@ -484,7 +468,8 @@ CUTE_DEVICE void softmax_tile(const PairMlaParams& p, typename C::Smem& sm,
     CUTLASS_PRAGMA_UNROLL
     for (int q = 0; q < kQuads; ++q) {
         peer[q ^ (t % kQuads)] = make_float4(
-            other[4 * q], other[4 * q + 1], other[4 * q + 2], other[4 * q + 3]);
+            other[C::kVecLen * q], other[C::kVecLen * q + 1],
+            other[C::kVecLen * q + 2], other[C::kVecLen * q + C::kVecW]);
     }
     tcgen05_before_thread_sync();
     __syncwarp();
@@ -492,7 +477,7 @@ CUTE_DEVICE void softmax_tile(const PairMlaParams& p, typename C::Smem& sm,
         cutlass::arch::ClusterBarrier::arrive(&sm.s_empty[sb], 0, 1);
         cutlass::arch::ClusterBarrier::arrive(&sm.idx_empty[is]);
     }
-    pair_sync<C>(t);
+    prefill_pair_sync<C>(t);
     const float4* const got = reinterpret_cast<const float4*>(sm.xchg[t]);
     float2* const own2 = reinterpret_cast<float2*>(own);
     CUTLASS_PRAGMA_UNROLL
@@ -512,14 +497,14 @@ CUTE_DEVICE void softmax_tile(const PairMlaParams& p, typename C::Smem& sm,
     for (int c = 0; c < C::kHalf / 2; ++c)
         mx[c] = fmaxf(own[2 * c], own[2 * c + 1]);
     CUTLASS_PRAGMA_UNROLL
-    for (int w = C::kHalf / 4; w >= 1; w /= 2) {
+    for (int w = C::kHalf / 2 / 2; w >= 1; w /= 2) {
         CUTLASS_PRAGMA_UNROLL
         for (int c = 0; c < w; ++c) mx[c] = fmaxf(mx[c], mx[c + w]);
     }
     float local = mx[0];
     local *= scale_log2;
     sm.red[t] = local;
-    pair_sync<C>(t);
+    prefill_pair_sync<C>(t);
     const float cur = fmaxf(local, sm.red[t ^ C::kHeads]);
     float factor = 1.0f;
     if (__any_sync(~0u, cur - m > C::kRescaleLog2)) {
@@ -540,9 +525,8 @@ CUTE_DEVICE void softmax_tile(const PairMlaParams& p, typename C::Smem& sm,
         pk[c / 2] = reinterpret_cast<const uint32_t&>(b2);
     }
     l = l * factor + (sum.x + sum.y);
-    // O may be rescaled only after PV(i - 1).
     if (k > 0 && __any_sync(~0u, factor != 1.0f)) {
-        wait_pv<C>(sm, i - 1);
+        prefill_wait_pv<C>(sm, i - 1);
         tcgen05_after_thread_sync();
         CUTLASS_PRAGMA_UNROLL
         for (int c0 = 0; c0 < C::kHalfDims; c0 += C::kTmemLd) {
@@ -554,13 +538,12 @@ CUTE_DEVICE void softmax_tile(const PairMlaParams& p, typename C::Smem& sm,
         }
         cutlass::arch::fence_view_async_tmem_store();
     }
-    // P buffer i % 2 is free once PV(i - 2) is done.
-    if (i > 1 && !pv_ok) wait_pv<C>(sm, i - 2);
+    if (i > 1 && !pv_ok) prefill_wait_pv<C>(sm, i - 2);
     CUTLASS_PRAGMA_UNROLL
     for (int q = 0; q < C::kHalf / C::kElemsPerChunk; ++q) {
         *reinterpret_cast<uint4*>(
-            sm.p[sb] +
-            sw128_offset<C>(head, half * C::kHalf / C::kElemsPerChunk + q)) =
+            sm.p[sb] + prefill_sw128_offset<C>(
+                           head, half * C::kHalf / C::kElemsPerChunk + q)) =
             reinterpret_cast<const uint4*>(pk)[q];
     }
     cutlass::arch::fence_view_async_shared();
@@ -572,18 +555,20 @@ CUTE_DEVICE void softmax_tile(const PairMlaParams& p, typename C::Smem& sm,
 
 // Per unit: online softmax over its tiles, row max and sum to the Q/O WG.
 template <class C>
-CUTE_DEVICE void softmax_wg(const PairMlaParams& p, typename C::Smem& sm,
-                            uint32_t tmem, int t) {
-    const uint32_t lane_base = tmem + ((t / C::kWarp * C::kWarp) << 16);
-    UnitCursor cur = start_cursor<C>(p, sm);
-    Unit u;
+CUTE_DEVICE void prefill_softmax_wg(const PrefillParams& p,
+                                    typename C::Smem& sm, uint32_t tmem,
+                                    int t) {
+    const uint32_t lane_base =
+        tmem + ((t / C::kWarp * C::kWarp) << C::kTmemLaneShift);
+    PrefillUnitCursor cur = prefill_start_cursor<C>(p, sm);
+    PrefillUnit u;
     for (int i = 0, unit = 0; cur.next<C>(p, sm.unit_lens, u); ++unit) {
         const int b = unit % 2;
         if constexpr (C::kQnr)
             cutlass::arch::ClusterBarrier::wait(&sm.rs_full[b], (unit / 2) & 1);
         float m = C::kMaxInit, l = 0.0f;
         for (int k = 0; k < u.n; ++k, ++i) {
-            softmax_tile<C>(p, sm, i, k, lane_base, t, b, m, l);
+            prefill_softmax_tile<C>(p, sm, i, k, lane_base, t, b, m, l);
         }
         cutlass::arch::ClusterBarrier::wait(&sm.ml_empty[b],
                                             ((unit / 2) & 1) ^ 1);
@@ -594,4 +579,4 @@ CUTE_DEVICE void softmax_wg(const PairMlaParams& p, typename C::Smem& sm,
     }
 }
 
-}  // namespace halops::mla::prefill_pair
+}  // namespace halops::mla
