@@ -31,10 +31,8 @@ using namespace mla;
 
 namespace halops::detail {
 
-// Head geometry shared by the HCA and DSA formats and the combine kernel.
-// kBlockDims is one SW128 row of bf16, 64 dims: the unit of the K-major smem
-// layout, of a UMMA K block, and of the HCA UE8M0 scale, so the HCA format
-// fixes its scale block to it instead of taking a separate parameter.
+// Head geometry shared by the HCA and DSA formats and the combine kernel;
+// kBlockDims (one bf16 SW128 row) is also the HCA UE8M0 scale block.
 template <int kHeads_, int kDim_>
 struct HeadLayout {
     static constexpr int kHeads = kHeads_;
@@ -125,9 +123,8 @@ struct DsaFormat : HeadLayout<kHeads_, kDim_> {
                   "the rope K and Q tiles are one SW128 row per key or head");
 };
 
-// Tile, pipeline, warp-role and TMEM layout of one decode kernel build over a
-// KV format.  kFuse compiles in the fused merge; the launches that cannot use
-// it run a build without it, whose main loop the merge code would slow down.
+// Tile, pipeline, warp-role and TMEM layout of a decode build over a KV
+// format; kFuse compiles in the fused merge.
 template <class Fmt, bool kFuseV>
 struct HcaTraits : Fmt, HcaPart<typename Fmt::Layout> {
     static constexpr bool kFuse = kFuseV;
@@ -193,10 +190,8 @@ struct HcaTraits : Fmt, HcaPart<typename Fmt::Layout> {
                   "O, Q and the two S buffers must fit the 512 TMEM columns");
 };
 
-// Compile-time variant selector.  An HCA format reproduces HCA byte-for-byte
-// (every DSA-only statement lives under `if constexpr (C::kDsa)`); a DSA
-// format selects the DSA smem and the inline-scale row path.  Every
-// tile-derived constant is a member so the shared code reads C::kX.
+// Compile-time variant selector: DSA-only code is under
+// `if constexpr (C::kDsa)`, so an HCA format compiles the HCA path only.
 template <class Fmt, bool kFuseV = !Fmt::kDsa>
 struct Cfg : HcaTraits<Fmt, kFuseV> {
     using Format = Fmt;
@@ -213,9 +208,8 @@ using DsaModelFormat = DsaFormat<64, 512, 512, 64, 128>;
 using HcaCfg = Cfg<HcaModelFormat>;
 using DsaCfg = Cfg<DsaModelFormat>;
 
-// Raw bytes per key row gathered by a CTA: the fp8 dims [0, kHalfDims) for
-// CTA 0, the remaining fp8 dims and the bf16 rope dims for CTA 1.  The rows
-// land at the start of the KV stage and are dequantized in place.
+// Raw bytes per key row gathered by a CTA, dequantized in place in the KV
+// stage: CTA 0 the low fp8 dims, CTA 1 the rest plus rope.
 template <class C>
 CUTE_HOST_DEVICE constexpr int raw_pitch(int cta) {
     return cta == 0 ? C::kHalfDims : C::kRowBytes - C::kHalfDims;

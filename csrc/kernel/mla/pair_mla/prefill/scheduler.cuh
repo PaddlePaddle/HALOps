@@ -18,8 +18,7 @@
 
 namespace halops::mla {
 
-// The pair's first token: the last request r with cu_pairs[r] <= pair (empty
-// requests are skipped); kQnr with one request needs no search.
+// First token of pair: last request r with cu_pairs[r] <= pair.
 template <class C>
 CUTE_DEVICE PairMap prefill_pair_map(const PrefillParams& p, int pair) {
     PairMap m;
@@ -41,8 +40,7 @@ CUTE_DEVICE PairMap prefill_pair_map(const PrefillParams& p, int pair) {
     return m;
 }
 
-// cu_pairs is never null; the null check keeps ptxas register allocation of
-// the kQnr = false kernels as it is.
+// The never-true null check keeps the kQnr = false register allocation.
 CUTE_DEVICE int prefill_num_pairs(const PrefillParams& p) {
     if (!p.cu_pairs) return 0;
     return __ldg(p.cu_pairs + p.n_req);
@@ -84,8 +82,7 @@ CUTE_DEVICE int prefill_sched_clusters(const PrefillParams& p, int total) {
     return max(1, min(s, p.clusters));
 }
 
-// Walks a cluster's tile range unit by unit; pair lengths come from the
-// shared table for the first kTableUnits pairs of the range.
+// Walks a cluster's tile range unit by unit.
 struct PrefillUnitCursor {
     int pair, off, left, wpair0, first_pair;
     template <class C>
