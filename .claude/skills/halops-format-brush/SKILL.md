@@ -40,6 +40,17 @@ model-constexpr、ns-constexpr、local-constexpr、format-tuning、shape-templat
 
 架构和 ISA 常量（warp 大小、UMMA K、swizzle atom、TMEM 列数、smem 容量 `kSmemCapacity`）不属于这四层，放在 `csrc/common/sm100_arch.cuh`，先查已有定义。kernel 和 device 函数写成 `template <class C>`，读 `C::kX`。launcher 按张量 shape 选实例：`if (heads == V4HcaFormat::kHeads && dim == V4HcaFormat::kDim) return run<HcaCfg<V4HcaFormat>>(...);`，没有实例时 `TORCH_CHECK(false, ...)` 写出支持的取值。不要在 kernel 里直接读某个模型别名（`V4HcaFormat::kHeads`），只通过 `C` 读。
 
+## kernel 文件分层
+
+`csrc/kernel/` 下的文件按文件名分角色，lint 按角色检查（对应 FlashMLA 的 `kernel.h` / `config.h` / `kernel.cuh` / `instantiations/*.cu`）：
+
+| 文件 | 放什么 | 硬规则 |
+|---|---|---|
+| `kernel*.cuh` | 只放计算过程：`template <class C>` 的 device 函数和 `__global__` kernel | ≤900 行；不定义 struct/class/enum/namespace 作用域别名（kernel-struct）；没有 host 代码（kernel-host）；除 0、1、2 外不写数字（kernel-magic） |
+| `config.cuh`、`params.cuh`、`traits.cuh` 等 | Format、Config、Smem、barrier、Params、Plan 结构体和具名常量 | ≤300 行；常量按"kernel 配置分层"归层 |
+| 其他 `.cuh`/`.h` | 共用 device helper（PTX 封装、加载、量化）和 host helper | ≤300 行；device 函数体里不写数字（kernel-magic） |
+| `.cu` | launcher：参数检查、shape 分发、TMA descriptor、launch、显式实例化 | ≤300 行；不定义 `__global__`（global-location） |
+
 ## 修法
 
 | 规则 | 修法 |
@@ -57,7 +68,11 @@ model-constexpr、ns-constexpr、local-constexpr、format-tuning、shape-templat
 | shape-template | 运行时 shape 做模板参数会让 kernel 只能跑一种 batch 或长度。参数实际是编译期容量上限时，改名为 `kMaxXxx` 并在 launcher 加 `TORCH_CHECK(n <= C::kMaxXxx, ...)`。参数确实是运行时 shape 时，改成运行时参数会改变生成代码，格式刷不改，记为"无法修复"并写明位置。 |
 | smem-cap | 字面量 smem 上限（232448、`227 * 1024`、`228 * 1024`）换成 `kSmemCapacity`，include `common/sm100_arch.cuh`。原来是 `228 * 1024` 的断言会变严格（SM100 每个 block 的 opt-in 上限是 232448 B），编译通过即可，编译失败记为"无法修复"。 |
 | unused-alias | 删掉这个 `using`。如果它是为将来的变体准备的，同样删掉，需要时再加。 |
-| file-too-long | 按 FlashMLA 的拆法只搬代码不改代码：`<op>_config.cuh` 放 Format、Config、Smem、Plan，`<op>_kernel.cuh` 放 device 函数和 `template <class C>` 的 `__global__` kernel，`<op>.cu` 放 launcher、shape 分发和显式实例化。新 `.cuh` 里的非模板函数加 `inline`，`setup.py` 的 sources 不变（仍只编译 `<op>.cu`）。 |
+| file-too-long, file-lines | 按"kernel 文件分层"只搬代码不改代码。核心文件 `kernel*.cuh` 不超过 900 行（目标 800），其他文件不超过 300 行。一个 kernel 的 device 代码太长时按阶段拆成多个核心文件（`kernel.cuh`、`kernel_mainloop.cuh`、`kernel_epilogue.cuh`），结构体按用途拆成多个 config/params/traits 头文件。新 `.cuh` 里的非模板函数加 `inline`。不新增 `.cu`，`setup.py` 只在文件搬目录时改 sources 路径。 |
+| kernel-struct | 把 struct/class/enum 和 namespace 作用域的 `using`/`typedef` 移到同目录的 `config.cuh`（Format、Config、Smem、barrier 枚举）、`params.cuh`（运行时参数结构体）或 `traits.cuh`（由 Config 推导的类型）。函数体内的 `using T = typename C::X;` 不报，可以留下。 |
+| kernel-host | `TORCH_CHECK`、torch/ATen、`<<<`、`cudaFuncSetAttribute`、`LaunchKernelWithPdl`、`std::mutex` 等 host 代码移到 `.cu` launcher 或 `host_utils.h`。 |
+| kernel-magic | 把数字换成具名常量：调优量和由模型推导的量放进 Config 的 `static constexpr`（kernel 里读 `C::kX`），ISA 常量用 `csrc/common/sm100_arch.cuh`，cute 静态整数写成 `cute::Int<C::kX>{}`。只允许 0、1、2。值不变，SASS 只允许 identical 或 renamed。 |
+| global-location | 把 `__global__` kernel 移到 `kernel*.cuh`，`.cu` 只留 launcher、shape 分发和显式实例化。 |
 | test-seed | 删掉全局 seed。需要固定随机数时改用局部 `torch.Generator(device=...).manual_seed(<原来的值>)`，并传给生成随机数的调用，让生成的数据和原来一致。 |
 | new-namespace, binding-location, new-ext, new-extension | 涉及接口和目录结构，按 lint 消息改；改动会影响 Python 接口时先列进评论，不改。 |
 

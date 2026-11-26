@@ -52,6 +52,11 @@ RULES = {
     "comment": ("error", "comment"),
     "comment-density": ("error", "comment"),
     "file-too-long": ("error", "layout"),
+    "file-lines": ("error", "layout"),
+    "kernel-struct": ("error", "layout"),
+    "kernel-host": ("error", "layout"),
+    "kernel-magic": ("error", "magic"),
+    "global-location": ("error", "layout"),
     "hpp": ("error", "layout"),
     "new-ext": ("error", "layout"),
     "new-extension": ("error", "layout"),
@@ -196,6 +201,27 @@ BANNER = re.compile(r"[=\-#*~/]{6,}")
 ARG_CMT = re.compile(r"^\s*\w+\s*=\s*$")
 CHECK_BUDGET = 6
 NEW_FILE_MAX_LINES = 600
+KERNEL_DIR = "csrc/kernel/"
+CORE_FILE = re.compile(r"(^|/)kernel\w*\.cuh$")
+CORE_MAX_LINES = 900
+AUX_MAX_LINES = 300
+DEVICE_QUAL = re.compile(
+    r"\b(CUTE_DEVICE|CUTLASS_DEVICE|CUTE_HOST_DEVICE|CUTLASS_HOST_DEVICE|__device__|"
+    r"__global__)\b"
+)
+NUMBER = re.compile(
+    r"(?<![\w.])(0[xX][0-9a-fA-F']+|(\d[\d']*\.?\d*|\.\d+)([eE][-+]?\d+)?)[uUlLfF]*(?![\w.])"
+    r"|(?<![\w.])_(\d+)\b"
+)
+TYPE_DEF = re.compile(
+    r"^\s*(template\s*<.*>\s*)?(struct|class|union|enum)\b(\s+(class|struct))?"
+    r"(\s+alignas\([^)]*\))?(\s+\w+)?\s*(final\s*)?(:[^;]*)?(\{|$)"
+)
+HOST_CODE = re.compile(
+    r"\bTORCH_CHECK\b|\btorch::|\bat::|\bc10::|<<<|\bcudaFuncSetAttribute\b|"
+    r"\bLaunchKernelWithPdl\b|\bcudaStream_t\b|\bstd::(mutex|unordered_map|map|vector|"
+    r"string|lock_guard)\b|#\s*include\s*<(torch|ATen|c10)/"
+)
 CMT_DENSITY_MAX = 0.10  # p90 on main is 0.091
 LICENSE_LINES = 14
 
@@ -680,6 +706,129 @@ def common_index(read):
     return names, asms
 
 
+def device_code(rows):
+    """Per line: the code that sits inside the body of a device or global function."""
+    out, depth, body, pending, paren = [], 0, None, False, 0
+    for code, _ in rows:
+        code = strip_strings(code)
+        if code.startswith("#"):
+            out.append("")
+            continue
+        quals = [m.end() for m in DEVICE_QUAL.finditer(code)]
+        kept = ""
+        for i, ch in enumerate(code):
+            if quals and i >= quals[0]:
+                quals.pop(0)
+                if body is None:
+                    pending, paren = True, 0
+            if body is not None:
+                kept += ch
+            if ch == "(":
+                paren += 1
+            elif ch == ")":
+                paren -= 1
+            elif ch == ";" and pending and paren <= 0:
+                pending = False
+            elif ch == "{":
+                depth += 1
+                if pending and body is None and paren <= 0:
+                    body, pending = depth, False
+            elif ch == "}":
+                if body is not None and depth == body:
+                    body = None
+                depth -= 1
+        out.append(kept)
+    return out
+
+
+def magic_literals(code):
+    """Numeric literals in code other than 0, 1 and 2."""
+    out = []
+    for m in NUMBER.finditer(code):
+        tok = (m.group(4) or m.group(1)).replace("'", "")
+        hexa = tok[:2] in ("0x", "0X")
+        digits = re.sub(r"[uUlL]+$" if hexa else r"[uUlLfF]+$", "", tok)
+        try:
+            value = int(digits, 16) if hexa else float(digits)
+        except ValueError:
+            continue
+        if value not in (0, 1, 2):
+            out.append(m.group(0))
+    return out
+
+
+def layout_findings(path, text, rows, scopes, added, is_new):
+    """File-role rules for csrc/kernel: kernel*.cuh holds only device compute, every
+    other file stays small, and __global__ kernels live only in kernel*.cuh."""
+    if not path.startswith(KERNEL_DIR):
+        return []
+    f, lines = [], text.splitlines()
+    core = bool(CORE_FILE.search(path))
+    cap = CORE_MAX_LINES if core else AUX_MAX_LINES
+    if (is_new or len(added) >= len(lines)) and len(lines) > cap:
+        role = "core kernel file (kernel*.cuh)" if core else "helper or launcher file"
+        f.append(
+            (
+                1,
+                "file-lines",
+                f"{len(lines)} lines > {cap} for a {role}; split structs and constants "
+                "into config/params/traits headers and helpers into their own files",
+            )
+        )
+    dev = device_code(rows)
+    for no in sorted(added):
+        if no > len(rows):
+            continue
+        code = strip_strings(rows[no - 1][0])
+        at_ns = scopes[no - 1][0] if no <= len(scopes) else False
+        if core and (
+            TYPE_DEF.match(code)
+            or (
+                at_ns
+                and re.match(
+                    r"^\s*(template\s*<.*>\s*)?(using\s+\w+\s*=|typedef\b)", code
+                )
+            )
+        ):
+            f.append(
+                (
+                    no,
+                    "kernel-struct",
+                    "no struct, class, enum or namespace-scope type alias in kernel*.cuh; "
+                    "move it to the kernel's config/params/traits header",
+                )
+            )
+        if core and HOST_CODE.search(code):
+            f.append(
+                (
+                    no,
+                    "kernel-host",
+                    "host code (checks, torch, launch, attributes) belongs in the .cu "
+                    "launcher, not in kernel*.cuh",
+                )
+            )
+        if not core and re.search(r"\b__global__\b", code):
+            f.append(
+                (
+                    no,
+                    "global-location",
+                    "__global__ kernels live in kernel*.cuh; the .cu file only launches",
+                )
+            )
+        scan = "" if code.startswith("#") else (code if core else dev[no - 1])
+        lits = magic_literals(scan)
+        if lits:
+            f.append(
+                (
+                    no,
+                    "kernel-magic",
+                    f"bare number {lits[0]} in kernel code; name it in the Config "
+                    "(C::kX) or use the csrc/common/sm100_arch.cuh constant",
+                )
+            )
+    return f
+
+
 def check_cpp(path, text, added, is_new, index):
     f = []
     scopes = scope_map(text)
@@ -700,6 +849,7 @@ def check_cpp(path, text, added, is_new, index):
     for first, last, msg in comment_findings(rows, doc_target):
         if any(no in added for no in range(first, last + 1)):
             f.append((first, "comment", msg))
+    f += layout_findings(path, text, rows, scopes, added, is_new)
     for no, name, is_type in template_params(text):
         if no in added and not is_type and SHAPE_PARAM.match(name):
             f.append(

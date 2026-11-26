@@ -77,6 +77,286 @@
    "code": "// Non-persistent: 3D grid = {num_n_block, kv_head_num, batch_size}"
   },
   {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(KernelTraits::kThreads, 1)"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "__align__(16) __shared__ int mask[kBlockM * kNumStagesQ];"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "const int lane_idx = thread_idx % 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "4 * kNumThreadsPerWarp);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "4 * kNumThreadsPerWarp);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "} else if (warp_idx == 3) {"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "} else if (warp_idx == 4) {"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "4 * kNumThreadsPerWarp);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "} else if (warp_idx == 5) {"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "8 * kNumThreadsPerWarp);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "} else if (warp_idx == 6) {"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "4 * kNumThreadsPerWarp);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "} else if (warp_idx == 7) {"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "(4 + kNumStagesQ * 4) * kNumThreadsPerWarp);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "kBlockM * kNumStagesQ / 4);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(KernelTraits::kThreads, 1)"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "__align__(16) __shared__ int mask[kBlockM];"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "4 * kNumThreadsPerWarp);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "} else if (warp_idx == 3) {"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "4 * kNumThreadsPerWarp);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(KernelTraits::kThreads, 1)"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::initialize_barrier(shared_storage.mbar_load_q_empty, 32);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "4 * kNumThreadsPerWarp);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "} else if (warp_idx == 3) {"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "4 * kNumThreadsPerWarp);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "4 * kNumThreadsPerWarp);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kFixedLaunchBlocks = 148;"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int offset = 16; offset > 0; offset >>= 1) {"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "__shfl_down_sync(0xffffffff, local_active_partitions, offset);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "other = __shfl_down_sync(0xffffffff, local_min_partitions, offset);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "other = __shfl_down_sync(0xffffffff, local_max_seqlen_k, offset);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "other = __shfl_down_sync(0xffffffff, local_min_seqlen_k, offset);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "other = __shfl_down_sync(0xffffffff, local_max_seqlen_q, offset);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "other = __shfl_down_sync(0xffffffff, local_min_seqlen_q, offset);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kNumWarps = KernelTraits::kThreads / 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "active_partitions_smem[3 * kNumWarps + warp_idx] ="
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "active_partitions_smem[4 * kNumWarps + warp_idx] ="
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "active_partitions_smem[5 * kNumWarps + warp_idx] ="
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "active_partitions_smem[3 * kNumWarps + lane_idx])"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "active_partitions_smem[4 * kNumWarps + lane_idx])"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "active_partitions_smem[5 * kNumWarps + lane_idx])"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int offset = 16; offset > 0; offset >>= 1) {"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "__shfl_down_sync(0xffffffff, max_active_partitions, offset);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "other = __shfl_down_sync(0xffffffff, min_active_partitions, offset);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "other = __shfl_down_sync(0xffffffff, max_seqlen_k, offset);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "other = __shfl_down_sync(0xffffffff, min_seqlen_k, offset);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "other = __shfl_down_sync(0xffffffff, max_seqlen_q, offset);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "other = __shfl_down_sync(0xffffffff, min_seqlen_q, offset);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "active_partitions_smem[3] = static_cast<float>(min_seqlen_k);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "active_partitions_smem[4] = static_cast<float>(max_seqlen_q);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "active_partitions_smem[5] = static_cast<float>(min_seqlen_q);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "const int uniform_seqlen_q = static_cast<int>(active_partitions_smem[4]);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "uniform_seqlen_k == static_cast<int>(active_partitions_smem[3]) &&"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "uniform_seqlen_q == static_cast<int>(active_partitions_smem[5]);"
+  },
+  {
+   "path": "csrc/kernel/attention/attention_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "const int warp_group = thread_idx / (4 * kNumThreadsPerWarp);"
+  },
+  {
    "path": "csrc/kernel/attention/cachekv.cu",
    "rule": "local-constexpr",
    "code": "constexpr int kPackSize = 16 / sizeof(T);"
@@ -307,6 +587,361 @@
    "code": "// Quantize and write new tokens."
   },
   {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "for (int offset = 8; offset > 0; offset >>= 1) {"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "sum_sq += __shfl_down_sync(mask, sum_sq, offset, 16);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "float rms = rsqrt(sum_sq * head_dim_inv + 1e-6f);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "rms = __shfl_sync(mask, rms, src_lane, 16);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "global-location",
+   "code": "__global__ void read_cachekv_encoder("
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kPackSize = 16 / sizeof(T);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "(read_row & ~3) | ((read_row & 1) << 1) | ((read_row & 2) >> 1);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "global-location",
+   "code": "__global__ void read_fp8_cachekv_encoder("
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kFP8PackSize = 8;  // FP8 values per uint2 load."
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "cache_row = (cache_row & ~7) | ((cache_row & 1) << 2) |"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "((cache_row & 6) >> 1);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "nv_bfloat162 bf16_out[4];"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "for (int k = 0; k < 4; ++k) {"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "global-location",
+   "code": "__global__ void write_cachekv_encoder("
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kPackSize = 16 / sizeof(T);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kHalfVecs = kVecsPerTok / 4;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kRopeDim = kHeadDim / 4;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "store_row = (store_row & ~3) | ((store_row & 1) << 1) |"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "global-location",
+   "code": "__global__ void write_cachekv_encoder_c8("
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kPackSize = 16 / sizeof(T);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kToksPerWarp = 32 / kVecsPerTok;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kNumWarps = kBlockSize / 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int warp_id = tid >> 5;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int lane_id = tid & 31;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int lane_tok = lane_id >> 4;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int lane_vec = lane_id & 15;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "alignas(16) __shared__ float4 smem_kv[kHeadDim * kBlockSize / 8];"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int src_lane = lane_id & ~0xF;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "1e-6f);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "1e-6f);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "store_row = (store_row & ~7) | ((store_row & 1) << 2) |"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "((store_row & 6) >> 1);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(kThreads, 8) write_cachekv_decoder("
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kPackSize = 16 / sizeof(T);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int src_lane = tidx % 32 & ~0xF;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kBlockM = 64;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "store_row = (store_row & ~3) | ((store_row & 1) << 1) |"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "for (int i = 0; i < 8; ++i)"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "return s + (phys_blk * kv_head_num + kv_h) * 4 + 0;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "return s + (phys_blk * kv_head_num + kv_h) * 4 + 1;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "global-location",
+   "code": "__global__ void write_cachekv_decoder_c8("
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kQThreads = 128;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kKVThreads = 128;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kQWarps = kQThreads / 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kKVWarps = kKVThreads / 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kVecSize = 16 / sizeof(T);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "__shared__ float smem[kQWarps + 4 * kKVWarps];"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "float* const vf_smem = smem + kQWarps + 3 * kKVWarps;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int kMaxQ = 8;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int src_lane = tid % 32 & ~0xF;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int row = vi >> 4;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int vec = vi & 15;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "for (int mask = 16; mask > 0; mask >>= 1)"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, mask));"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int global_wid = tid >> 5;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int lid = tid & 31;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "q_max_f = fmaxf(__shfl_sync(0xffffffff, v, 0), 1e-6f);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "k_partial_f = fmaxf(__shfl_sync(0xffffffff, vp, 0), 1e-6f);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "k_fresh_f = fmaxf(__shfl_sync(0xffffffff, vf, 0), 1e-6f);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "v_partial_f = fmaxf(__shfl_sync(0xffffffff, vp, 0), 1e-6f);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "v_fresh_f = fmaxf(__shfl_sync(0xffffffff, vf, 0), 1e-6f);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr float kLog2e = 1.4426950408889634074f;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr float kLog2kHeadDim = 11.313708498984f;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "q_output + (batch * kv_head_num + kv_h) * 64 * kHeadDim;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "k_tile + (vi >> 4) * kHeadDim + (vi & 15) * kVecSize);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "v_tile + (vi >> 4) * kHeadDim + (vi & 15) * kVecSize);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int voff = (koff & ~7) | ((koff & 1) << 2) | ((koff & 6) >> 1);"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "global-location",
+   "code": "__global__ void get_qk_token_kernel(const int* seq_lens_encoder,"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "const int kblock_size = 128 * 8;"
+  },
+  {
+   "path": "csrc/kernel/attention/cachekv.cu",
+   "rule": "kernel-magic",
+   "code": "max_token_num[3] = k_tokens;"
+  },
+  {
    "path": "csrc/kernel/attention/decoder_attention.cu",
    "rule": "local-constexpr",
    "code": "constexpr int kMaxCtasPerSm = 1;"
@@ -462,6 +1097,296 @@
    "code": "using OutputType = cutlass::bfloat16_t;"
   },
   {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "struct AttentionParams {"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "struct SharedStorage {"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "union {"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "struct {"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) uint32_t tmem_holding_buf;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_load_q_full[kNumStagesQ];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_P_full_O_rescaled[2];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_S_full[2];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_O_full[2];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_pv_done[2];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_softmax_corr_full[kNumStagesQ];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_softmax_corr_empty[kNumStagesQ];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_tmem_dealloc;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_P_full_2[kNumStagesQ];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_corr_epi_full[kNumStagesQ];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "struct SharedStorageFp8 {"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(128) cute::array_aligned<"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "struct {"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "float sScale[128];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "float local_max[128 * kNumBarrierSlots];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "float loacl_sum[128];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) uint32_t tmem_holding_buf;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_load_q_full;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_load_q_empty;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_tmem_dealloc;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_P_full_O_rescaled[kNumBarrierSlots];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_S_full[kNumBarrierSlots];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_O_full[kNumBarrierSlots];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint64_t mbar_P_full_2[kNumBarrierSlots];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) int smem_block_tables[kNumBarrierSlots];"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "struct AttentionKernelTraits {"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kNumUnrolledKvBlocks = 4;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kHeadDim == 128);"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kCorrection0WarpStartIds = 8;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kEpilogueWarpStartIds = 8;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kMmaWarpIds = kUseEncoderWarpLayout ? 12 : 4;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kLoadWarpIds = kUseEncoderWarpLayout ? 13 : 5;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kEmptyWarpStartIds = 14;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "? 32 * (kEmptyWarpStartIds + 2)"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": ": 32 * (kLoadWarpIds + 1);"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int num_regs_softmax = 200;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int num_regs_correction = 64;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int num_regs_other = 48;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int num_regs_empty = 24;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "using SmemLayout2D = decltype(cute::tile_to_shape(SmemSelector{}, Shape2D{}));"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "using SmemLayout3D = decltype(cute::tile_to_shape(SmemSelector{}, Shape3D{}));"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "struct AttentionFp8KernelTraits {"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kHeadDim = 128;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kNumStagesKV = 4;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kSoftmaxEndWarpIds = 8;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kMmaWarpIds = 12;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kLoadWarpIds = 13;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kNumWarps = (kLoadWarpIds + 1 + 3) / 4 * 4;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int kThreads = 32 * kNumWarps;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int num_regs_softmax = 128;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int num_regs_correction = 128;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int num_regs_other = 48;"
+  },
+  {
+   "path": "csrc/kernel/attention/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int num_regs_empty = 24;"
+  },
+  {
    "path": "csrc/kernel/attention/mainloop_fwd.cuh",
    "rule": "local-constexpr",
    "code": "constexpr int kCacheLine = 128;"
@@ -585,6 +1510,361 @@
    "path": "csrc/kernel/attention/mainloop_fwd.cuh",
    "rule": "dup-asm",
    "code": "asm volatile(\"prefetch.global.L2 [%0];\" ::\"l\"("
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kElemBytes = cutlass::sizeof_bits_v<Element> / 8;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kCacheLine = 128;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kLinesPerLane = kLinesPerBlock / 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "int line_idx = lane_idx + l * 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "kBlockN / 32 * cute::sizeof_bits_v<Element>;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "(lane_idx / 4) + 8 * (lane_idx % 2) + warp_idx * 16;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "const int col_offset = lane_idx % 4 / 2;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "__ballot_sync(0xffffffff, acc_scale < 1.0f) != 0;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "softmax.row_sum += __shfl_xor_sync(0xffffffff, softmax.row_sum, 2);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "kSplitKV ? 1.0f : 1.0f / (softmax.row_sum + 0.0000001f);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "bidh * kBlockM + thread_idx / 4 * 2 + thread_idx % 2;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "if (thread_idx % 4 < 2) {"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int corr_tile_size = 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::ceil_div(128, cute::sizeof_bits_v<Element>);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kOutputRowStride = kHeadDim / (128 / kBlockM);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "(mem_row & -32) | ((mem_row & 31) >> 1) | ((mem_row & 1) << 4);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kBlockM == 64);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::ceil_div(128, cute::sizeof_bits_v<Element>);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "kHeadDim / (128 / kBlockM) / kNumVecElem;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kHeadDimStride = kHeadDim / (128 / kBlockM);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int mem_row = store_row_idx; mem_row < 128; mem_row += kNumRows) {"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "const int lane_idx = mem_row % 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "const int warp_idx = mem_row / 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "(lane_idx / 4) + 8 * (lane_idx % 2) + warp_idx * 16;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int corr_tile_size = 64 * 8 / cutlass::sizeof_bits_v<Element>;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::ceil_div(128, cute::sizeof_bits_v<Element>);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "kHeadDim / (128 / kBlockM) / kNumVecElem;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "tidx * (kHeadDim / (128 / kBlockM)) +"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "tidx * (kHeadDim / (128 / kBlockM)) +"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "kBlockN / 32 * cute::sizeof_bits_v<Element>;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int phase = cute::size<2>(tStP_r2t) / 4 * 3;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int corr_tile_size = 16;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int corr_tile_size = 32 * 8 / cutlass::sizeof_bits_v<Element>;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::ceil_div(128, cute::sizeof_bits_v<Element>);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "__ballot_sync(0xffffffff, scale < 1.0f) != 0;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kCacheLine = 128;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kLinesPerLane = kLinesPerBlock / 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "int line_idx = lane_idx + l * 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "(lane_idx / 4) + 8 * (lane_idx % 2) + warp_idx * 16;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "const int col_offset = lane_idx % 4 / 2;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = 3; i < VecLen; i += 2) {"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "const float neginhbor_max = __shfl_xor_sync(0xffffffff, cur_max, 2);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = 0; i < VecLen / 2; i += 4) {"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "acc_f[i + 3] = exp2f(acc_f[i + 3]);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cur_sum = add_packed_f32x2(cur_sum, {acc_f[i + 2], acc_f[i + 3]});"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "acc_s[i / 4] = floats4_to_fp8x4(acc_f[i], acc_f[i + 1],"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "acc_f[i + 2], acc_f[i + 3]);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "data_offset, acc_s, std::make_index_sequence<VecLen / 8>{});"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = VecLen / 2; i < VecLen; i += 4) {"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "acc_f[i + 3] = exp2f(acc_f[i + 3]);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cur_sum = add_packed_f32x2(cur_sum, {acc_f[i + 2], acc_f[i + 3]});"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "acc_s[i / 4] = floats4_to_fp8x4(acc_f[i], acc_f[i + 1],"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "acc_f[i + 2], acc_f[i + 3]);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "data_offset + VecLen / 4, acc_s + VecLen / 8,"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "std::make_index_sequence<VecLen / 8>{});"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "shared_storage.local_max[si_stage * 128 + thread_idx] = cur_max;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": ".local_max[si_stage * 128 - 128 + thread_idx] -"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "const int warp_group = thread_idx / 128;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "const int tidx = thread_idx % 128;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "bidh * kBlockM + tidx / 4 * 2 + tidx % 2;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cur_sum += __shfl_xor_sync(0xffffffff, cur_sum, 2);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "if (tidx % 4 < 2) {"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "shared_storage.local_max[tidx + n_block_max * 128 - 128],"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "const int tidx = thread_idx % 128;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "exp2f(shared_storage.local_max[iter * 128 - 128 + tidx] -"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "shared_storage.local_max[iter * 128 + tidx]);"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "const int tidx_lane = tidx % 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "(tidx_lane / 4) + 8 * (tidx_lane % 2) + (tidx / 32) * 16;"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = 0; i < 8; ++i) {"
+  },
+  {
+   "path": "csrc/kernel/attention/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "out_ptr[tidx * 8 + i] = reinterpret_cast<float4 *>(&acc_o)[i];"
   },
   {
    "path": "csrc/kernel/attention/reduce_kernel.cuh",
@@ -712,14 +1992,299 @@
    "code": "static int SelectAttentionReduceRowsPerCta(const int total_rows,"
   },
   {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kNumThreadGroups >= 8,"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "if (num_partitions <= 24) return 4;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "if (num_partitions <= 48) return 8;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kGroupsPerWarp = 32 / kThreadsPerGroup;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "const int row_in_warp = logical_row % 16;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "return logical_row / 16 * 16 + row_in_warp % 8 * 2 + row_in_warp / 8;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "const int warp_idx = logical_row / 16;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "const int row_in_warp = logical_row % 16;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "return warp_idx * 32 + (row_in_warp % 8) * 4 + parity * 2 + row_in_warp / 8;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kThreadsPerGroup <= 32 && 32 % kThreadsPerGroup == 0,"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "kThreadsPerGroup == 32 ? 0xffffffffU : (1U << kThreadsPerGroup) - 1U;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "return kMask << (threadIdx.x & (32 - kThreadsPerGroup));"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "static_cast<unsigned int>(__bfloat16_as_ushort(pair.y)) << 16;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "packed[2 * i] = __byte_perm(even_bits, odd_bits, 0x5410);"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "packed[2 * i + 1] = __byte_perm(even_bits, odd_bits, 0x7632);"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kWarpSize = 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "return __shfl_sync(0xffffffffU, global_max, 0);"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "__shfl_xor_sync(0xffffffffU, local_max, offset));"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "return __shfl_sync(0xffffffffU, global_max, 0);"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kWarpSize = 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "const float global_max = reduce_partition_max<kMaxWarps, 8>("
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kValsPerThread == 8, \"one 16 B vector load per thread\");"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kWarpSize = 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "acc2[i].x += __shfl_down_sync(0xffffffffU, acc2[i].x, kThreadsPerGroup);"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "acc2[i].y += __shfl_down_sync(0xffffffffU, acc2[i].y, kThreadsPerGroup);"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "global_sum += __shfl_down_sync(0xffffffffU, global_sum, kThreadsPerGroup);"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "const float inv_sum = 1.0f / (global_sum + 0.0000001f);"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(kNumThreadGroups *kThreadsPerGroup,"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kBlockM == 64);"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kThreadsPerGroup * 8 == kHeadDim,"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kThreads % 32 == 0 && kThreadsPerGroup <= 32,"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "attention_reduce_active_warps<kThreadsPerGroup>(active_groups) * 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(kRowsPerCta *kThreadsPerGroup,"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kBlockM == 64);"
+  },
+  {
+   "path": "csrc/kernel/attention/reduce_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(32 % kThreadsPerGroup == 0,"
+  },
+  {
    "path": "csrc/kernel/attention/softmax.cuh",
    "rule": "local-constexpr",
+   "code": "constexpr int frg_tile = 32;"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "float local_max[4] = {"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "fmax(acc_S_row[0], acc_S_row[1]), fmax(acc_S_row[2], acc_S_row[3]),"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "fmax(acc_S_row[4], acc_S_row[5]), fmax(acc_S_row[6], acc_S_row[7])};"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int len = cute::size(Tensor0{}) / 8 - 1;"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int i = index * 8 + 8;"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "fmax_3_input(local_max[1], acc_S_row[i + 2], acc_S_row[i + 3]);"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "fmax_3_input(local_max[2], acc_S_row[i + 4], acc_S_row[i + 5]);"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "local_max[3] ="
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "fmax_3_input(local_max[3], acc_S_row[i + 6], acc_S_row[i + 7]);"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "local_max[0] = fmax_3_input(local_max[0], local_max[2], local_max[3]);"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "__shfl_xor_sync(0xffffffff, local_max[0], 2);"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "float2 local_sum_1 = {acc_S_row_exp[2], acc_S_row_exp[3]};"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "float2 local_sum_2 = {acc_S_row_exp[4], acc_S_row_exp[5]};"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "float2 local_sum_3 = {acc_S_row_exp[6], acc_S_row_exp[7]};"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int len = cute::size(Tensor0{}) / 8 - 1;"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int i = index * 8 + 8;"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "local_sum_1, {acc_S_row_exp[i + 2], acc_S_row_exp[i + 3]});"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "local_sum_2, {acc_S_row_exp[i + 4], acc_S_row_exp[i + 5]});"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
+   "code": "local_sum_3, {acc_S_row_exp[i + 6], acc_S_row_exp[i + 7]});"
+  },
+  {
+   "path": "csrc/kernel/attention/softmax.cuh",
+   "rule": "kernel-magic",
    "code": "constexpr int frg_tile = 32;"
   },
   {
    "path": "csrc/kernel/attention/tile_scheduler.cuh",
    "rule": "comment",
    "code": "int const size_l2 = 50 * 1024 * 1024;  // 50 MB for K & V"
+  },
+  {
+   "path": "csrc/kernel/attention/tile_scheduler.cuh",
+   "rule": "kernel-magic",
+   "code": "__shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);"
   },
   {
    "path": "csrc/kernel/attention/utils.cuh",
@@ -770,6 +2335,96 @@
    "path": "csrc/kernel/attention/utils.cuh",
    "rule": "ns-static",
    "code": "CUTLASS_DEVICE static void tmem_store(uint32_t dst_addr, uint32_t *arr,"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int pause = cute::size<2>(Tensor0{}) / 4 * 3;"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::gemm(tiled_mma, tCrA(cute::_, cute::_, 3), tCrB(cute::_, cute::_, 3),"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "T partial_sum = __shfl_up_sync(0xffffffff, val, i);"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int mask = 8; mask > 0; mask /= 2) {"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "a = bf16_abs_max(a, __shfl_xor_sync(0xffffffff, a, mask));"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = 0; i < 4; i++) {"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = 0; i < 4; i++) {"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "reinterpret_cast<uint32_t *>(&src)[3]);"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr float poly_ex2_deg3[4] = {1.0f, 0.695146143436431884765625f,"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "0.227564394474029541015625f,"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "0.077119089663028717041015625f};"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr float fp32_round_int = float((1 << 23) + (1 << 22));"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "x = fmax(x, -127.0f);"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "y = fmax(y, -127.0f);"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "float2 xy_frac_ex2 = {poly_ex2_deg3[3], poly_ex2_deg3[3]};"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "range_constexpr<3>([&](auto index) {"
+  },
+  {
+   "path": "csrc/kernel/attention/utils.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(PackSize == 8);"
   },
   {
    "path": "csrc/kernel/gemm/batch_gemm.cu",
@@ -855,6 +2510,126 @@
    "path": "csrc/kernel/gemm/epilogue.cuh",
    "rule": "comment",
    "code": "cute::block_rank_in_cluster() - cta_v, true /*pred*/);"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "auto tx_in_warp = threadIdx.x % 32;"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr uint32_t kHalfLanes = cutlass::NumThreadsPerHalfWarp << 16;"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kVals = 4 / KAccColsPerOut;"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "((uint32_t)(w * cutlass::NumThreadsPerWarp) << 16);"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "using ChunkRaw = uint32_t[kLoads][2][4];"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "a, r[l][0][0], r[l][0][1], r[l][0][2], r[l][0][3]);"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "r[l][1][3]);"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t e_lo = scale_of_exp8(m[l] & 0xffffu);"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t e_hi = scale_of_exp8(m[l] >> 16);"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "multiplier_bits(e_lo) | multiplier_bits(e_hi) << 16;"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "e4m3x4(v[l][2], v[l][3], sc), dst);"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "reinterpret_cast<const uint32_t(&)[4]>(v[l]);"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::SM90_U16x8_STSM_T::copy(u[0], u[1], u[2], u[3],"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "if (i + 3 == kMyChunks) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "kGroups == 4, uint32_t,"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "<< 16) +"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "scale_of_exp8(::max(m & 0xffffu, m >> 16));"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "sf_word |= (SfWord)(e << (8 * g));"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t sc_bits = multiplier_bits(e) * 0x10001u;"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "uint32_t q[kGroup / 4];"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = 0; i < kGroup / 4; ++i) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint4 lo = make_uint4(q[0], q[1], q[2], q[3]);"
+  },
+  {
+   "path": "csrc/kernel/gemm/epilogue.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint4 hi = make_uint4(q[4], q[5], q[6], q[7]);"
   },
   {
    "path": "csrc/kernel/gemm/epilogue_op.h",
@@ -1030,6 +2805,501 @@
    "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
    "rule": "check-budget",
    "code": "TORCH_CHECK(token_nums_per_expert.is_contiguous(),"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "uint8_t sign = (val < 0.0f) ? 0x8 : 0x0;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "if (abs_val < 0.25f)"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "else if (abs_val < 0.75f)"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "else if (abs_val < 1.25f)"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "else if (abs_val < 1.75f)"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "mag = 3;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "else if (abs_val < 2.5f)"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "mag = 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "else if (abs_val < 3.5f)"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "mag = 5;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "else if (abs_val < 5.0f)"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "mag = 6;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "mag = 7;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "global-location",
+   "code": "__global__ void FusedSwigluQuantKernel("
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int SFATOM_TILE = 4 * QUANT_GROUP_SIZE;  // 64 (FP4) or 128 (FP8)"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int VEC_BF16 = 8;                        // 128-bit bf16 load"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int VEC_FP8 = 16;                        // 128-bit fp8 store"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int lane = tid & 31;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int warp = tid >> 5;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int num_warps = blockDim.x >> 5;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "expert = __shfl_sync(0xffffffff, expert, 0);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "token_in_expert = __shfl_sync(0xffffffff, token_in_expert, 0);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "cached_expert = __shfl_sync(0xffffffff, cached_expert, 0);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "cached_cumsum_lo = __shfl_sync(0xffffffff, cached_cumsum_lo, 0);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "cached_cumsum_hi = __shfl_sync(0xffffffff, cached_cumsum_hi, 0);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "if constexpr (QUANT_GROUP_SIZE == 16) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr int VEC_8 = 8;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int num_k_tiles = kb_dim / 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int n_tile = static_cast<int>(token_in_expert) / 128;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int pos = static_cast<int>(token_in_expert) % 128;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int mn_i = pos % 32;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int mn_j = pos / 32;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "static_cast<int64_t>(n_tile) * num_k_tiles * 512 + mn_i * 16 +"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "mn_j * 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "(fp4_codes[i + 1] << 4) | fp4_codes[i];"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int k_tile = g / 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int sf_l = g % 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int64_t sf_offset = sfatom_mn_base + k_tile * 512 + sf_l;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "const int64_t n_scale = ceil_div_i64(hidden_size_scale, 4);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "const int64_t hs4_sfatom = n_scale * 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int n_tile = static_cast<int>(token_in_expert) / 128;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int pos = static_cast<int>(token_in_expert) % 128;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int lane_sfatom = 4 * (pos % 32) + pos / 32;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "static_cast<int64_t>(n_tile) * hs4_sfatom * 512 +"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "lane_sfatom * 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "for (int64_t iter_quad = warp; iter_quad < num_iters / 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int64_t iter0 = iter_quad * 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "fmaxf(my_amax, __shfl_xor_sync(0xffffffff, my_amax, 1));"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int biased_exp = static_cast<int>((raw_bits >> 23) & 0xFFu);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int has_frac = (raw_bits & 0x007FFFFF) ? 1 : 0;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int ue8m0_exp = min(biased_exp + has_frac, 254);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "float inv_scale = __int_as_float((254 - ue8m0_exp) << 23);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int g1 = __shfl_sync(0xffffffff, ue8m0_exp, (lane & ~7) | 2);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int g2 = __shfl_sync(0xffffffff, ue8m0_exp, (lane & ~7) | 4);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int g3 = __shfl_sync(0xffffffff, ue8m0_exp, (lane & ~7) | 6);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "if ((lane & 7) == 0) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int group_idx = lane >> 3;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "(static_cast<uint32_t>(g1) << 8) |"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "(static_cast<uint32_t>(g2) << 16) |"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "(static_cast<uint32_t>(g3) << 24);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "(iter0 + group_idx) * 512) ="
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int64_t quad_done = (num_iters / 4) * 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "if (i < 4)"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "fmaxf(my_amax, __shfl_xor_sync(0xffffffff, my_amax, 1));"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "fmaxf(p1, __shfl_xor_sync(0xffffffff, p1, 2));"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int bexp_s = static_cast<int>((bits_s >> 23) & 0xFFu);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int hfrac_s = (bits_s & 0x007FFFFF) ? 1 : 0;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int ue_exp = min(bexp_s + hfrac_s, 254);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "float inv_s = __int_as_float((254 - ue_exp) << 23);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int half_base = (lane < 16) ? 0 : 16;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int e1 = __shfl_sync(0xffffffff, ue_exp, half_base + 4);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int e2 = __shfl_sync(0xffffffff, ue_exp, half_base + 8);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int e3 = __shfl_sync(0xffffffff, ue_exp, half_base + 12);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "if ((lane & 0xF) == 0) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "(static_cast<uint32_t>(e1) << 8) |"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "(static_cast<uint32_t>(e2) << 16) |"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "(static_cast<uint32_t>(e3) << 24);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int64_t my_iter = (lane < 16) ? iter0 : (iter0 + 1);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "my_iter * 512) = packed;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "using VecBF16_4 = AlignedVector<T, 4>;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "using VecFP8_4 = AlignedVector<c10::Float8_e4m3fn, 4>;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int64_t rbase = iter * SFATOM_TILE + lane * 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "float rv[4];"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "for (int i = 0; i < 4; ++i) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "for (int offset = 4; offset > 0; offset >>= 1)"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "__shfl_xor_sync(0xffffffff, ramax, offset));"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int bexp_r = static_cast<int>((bits_r >> 23) & 0xFFu);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int hfrac_r = (bits_r & 0x007FFFFF) ? 1 : 0;"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int ue_exp_r = min(bexp_r + hfrac_r, 254);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "float inv_sr = __int_as_float((254 - ue_exp_r) << 23);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "for (int i = 0; i < 4; ++i) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int s1 = __shfl_sync(0xffffffff, ue_exp_r, 8);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int s2 = __shfl_sync(0xffffffff, ue_exp_r, 16);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "int s3 = __shfl_sync(0xffffffff, ue_exp_r, 24);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "(static_cast<uint32_t>(s1) << 8) |"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "(static_cast<uint32_t>(s2) << 16) |"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "(static_cast<uint32_t>(s3) << 24);"
+  },
+  {
+   "path": "csrc/kernel/gemm/fused_swiglu_quant.cu",
+   "rule": "kernel-magic",
+   "code": "out_scale + sfatom_token_base + iter * 512) ="
   },
   {
    "path": "csrc/kernel/gemm/gemm_dispatch.cuh",
@@ -1222,6 +3492,11 @@
    "code": "static const bool on = std::getenv(\"IR_GEMM_TRACE\") != nullptr;"
   },
   {
+   "path": "csrc/kernel/gemm/gemm_dispatch.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
    "path": "csrc/kernel/gemm/gemm_kernel.cuh",
    "rule": "comment",
    "code": "// Every warp role walks the same tile sequence with its own copy."
@@ -1315,6 +3590,31 @@
    "path": "csrc/kernel/gemm/gemm_kernel.cuh",
    "rule": "check-budget",
    "code": "TORCH_CHECK(params.ptr_b != nullptr,"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_kernel.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_kernel.cuh",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(KernelTraits::KThreads, 1)"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "auto tx_in_warp = tx % 32;"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::size(AtomThrShapeMNK{}) * NumEpilogueWarps * 32;"
+  },
+  {
+   "path": "csrc/kernel/gemm/gemm_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "bias_pipeline_params.consumer_arv_count = NumEpilogueWarps * 32;"
   },
   {
    "path": "csrc/kernel/gemm/gemm_tile.cuh",
@@ -1607,6 +3907,11 @@
    "code": "using Output = cutlass::bfloat16_t;"
   },
   {
+   "path": "csrc/kernel/gemm/gemm_tile.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
    "path": "csrc/kernel/gemm/gemm_tuned_dense_fp8.cuh",
    "rule": "ns-constexpr",
    "code": "inline constexpr TunedRow kDenseFp8TunedN1536K4096[] = {"
@@ -1702,6 +4007,36 @@
    "code": "__device__ __forceinline__ float ue4m3_to_float32(uint8_t bits) {"
   },
   {
+   "path": "csrc/kernel/gemm/group_wise_quant.cu",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/gemm/group_wise_quant.cu",
+   "rule": "kernel-magic",
+   "code": "const uint32_t a = b & 0x7fffffffu;"
+  },
+  {
+   "path": "csrc/kernel/gemm/group_wise_quant.cu",
+   "rule": "kernel-magic",
+   "code": "((a - 0x3fa00000u) & ~0x01800000u) == 0 || a == 0x3e800000u;"
+  },
+  {
+   "path": "csrc/kernel/gemm/group_wise_quant.cu",
+   "rule": "global-location",
+   "code": "__global__ void group_wise_quant_kernel("
+  },
+  {
+   "path": "csrc/kernel/gemm/group_wise_quant.cu",
+   "rule": "kernel-magic",
+   "code": "static_assert(GROUP_SIZE == 16 || GROUP_SIZE == 32,"
+  },
+  {
+   "path": "csrc/kernel/gemm/group_wise_quant.cu",
+   "rule": "kernel-magic",
+   "code": "using Packed = cute::conditional_t<GROUP_SIZE == 32, uint4, uint2>;"
+  },
+  {
    "path": "csrc/kernel/gemm/kernel_traits.cuh",
    "rule": "model-constexpr",
    "code": "static constexpr int KMaxAlphaExperts = 256;"
@@ -1765,6 +4100,246 @@
    "path": "csrc/kernel/gemm/kernel_traits.cuh",
    "rule": "comment",
    "code": "// Pair-UMMA overlap: the peer CTA's overlap WG must finish T2R before"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "struct GemmParams {"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "struct TmemStorage {"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "struct GemmKernelTraits {"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int KMaxAlphaExperts = 256;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "!SwapAB && !IsPairUmma && !KernelConfig_::KIsFP4 && KBlockK == 128;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int KMmaK = KIsFP4 ? 64 : 32;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "!KIsFP4 && cute::sizeof_bits_v<TypeB> == 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "!KIsFP4 && cute::sizeof_bits_v<TypeA> == 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int KEpilogueWarpEndId = KEpilogueWarpGroupCount * 4 - 1;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int KThreads = 32 * KNumWarp;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int KNumRegsOther = 88;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "KEpiComputeN == 128 || KEpiComputeN == 64 || KEpiComputeN == 32 ||"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "KEpiComputeN == 16 || KEpiComputeN == 8;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "(KTmemOverlapCols == 0 && KEpiComputeNHasAtom) ? KEpiComputeN : 16;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "(KTmemOverlapCols == 16 || KTmemOverlapCols == 32 ||"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "KTmemOverlapCols == 64 || KTmemOverlapCols == 128);"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "KEpiComputeN == 128, cute::SM100_TMEM_LOAD_32dp32b128x,"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "KEpiComputeN == 64, cute::SM100_TMEM_LOAD_32dp32b64x,"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "KEpiComputeN == 32, cute::SM100_TMEM_LOAD_32dp32b32x,"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::conditional_t<KEpiComputeN == 8,"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "SwapAB || KBlockN % 128 == 0, typename TiledMma::MMA_ScaleFactor,"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "TypeSF, KBlockM / KNumCTA, 128, KSFVecSize,"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "TypeSF, KBlockM / KNumCTA, 128,"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int IsCtaN64 = cute::size<1>(CtaShape_MNK{}) == 64;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "!KIsFP4 && (!SwapAB || KernelConfig_::KSwapSfbRun) && KBlockN > 128 &&"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "KBlockN % 128 != 0;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(!IsSfbUnaligned || KBlockN % 32 == 0,"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "!IsSfbUnaligned ? 0 : (KBlockN % 64 == 0 ? 64 : 96);"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "(KBlockN + KSfbMaxOffset + 127) / 128 * 128;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int KSfbAtoms = KSfbLoadN / 128;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(!IsSfbRowShift || KSfbLoadN >= KBlockN + 32,"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::Step<cute::_1, cute::_2, cute::_3>{}));"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::Step<cute::_1, cute::_2, cute::_3>{}));"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "using SmemLayoutC = decltype(cute::append<3>("
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "using SmemLayoutBiasC = decltype(cute::append<3>("
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-struct",
+   "code": "struct SharedStorage {"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "128) cute::ArrayEngine<TypeA_Smem, cute::cosize_v<SmemLayoutA>> A;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "128) cute::ArrayEngine<TypeB_Smem, cute::cosize_v<SmemLayoutB>> B;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "128) cute::ArrayEngine<TypeSF, cute::cosize_v<SmemLayoutSFA>> SFA;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "128) cute::ArrayEngine<TypeSF, cute::cosize_v<SmemLayoutSFB>> SFB;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(128) cute::ArrayEngine<"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) float alpha[HasAlpha ? KMaxAlphaExperts : 0];"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) cute::uint32_t tmem_base_ptr;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) MainloopPipelineStorage mainloop;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(16) AccumulatorPipelineStorage accumulator;"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(8) typename cutlass::arch::ClusterBarrier::ValueType"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "alignas(8) typename cutlass::arch::ClusterTransactionBarrier::ValueType"
+  },
+  {
+   "path": "csrc/kernel/gemm/kernel_traits.cuh",
+   "rule": "kernel-magic",
+   "code": "static constexpr int KSmemSwizzleAlign = 1024;"
   },
   {
    "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
@@ -1842,6 +4417,176 @@
    "code": "// An idle CTA would exit with its sfa bulk copy in flight."
   },
   {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "const int lane = threadIdx.x & 31;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = lane; i < k / Tile::KGroupK; i += 32)"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = lane; i < Tile::KSfbStages; i += 32) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = lane; i < Tile::KWarpsK * Tile::KStages; i += 32)"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = lane; i < Tile::KStages; i += 32)"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = lane; i < Tile::KAccCols; i += 32) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int row = lane; row < params.m; row += 32) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "const int lane = threadIdx.x & 31;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "bar->arrive_and_expect_tx(4 * Tile::KBlockN *"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "const int lane = threadIdx.x & 31;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "const int col = lane & 3;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "const int warp = threadIdx.x >> 5;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "float acc[Tile::KScaleGroups][KMmas][4] = {};"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "if constexpr (KSwap || Tile::KRowsA == 16)"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t frag_a[4] = {a_top.x, a_bottom.x, a_top.y,"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "if constexpr (KSwap || Tile::KRowsA == 16) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "o[3] += acc[group][j][3] *"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "slot[split * 32 * Tile::KOuts +"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "} else if constexpr (Tile::KOuts == 4) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "*reinterpret_cast<float4*>(slot + (split * 32 + lane) * 4) ="
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "make_float4(o[0], o[1], o[2], o[3]);"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "*reinterpret_cast<float2*>(slot + (split * 32 + lane) * 2) ="
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr float kScale = 0x1p-64f;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "const int lane = threadIdx.x & 31;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "const int warp_n = (threadIdx.x >> 5) - Tile::KConsumerWarps - 1;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "out[i] += slot[split * 32 * Tile::KOuts + i];"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "tile * Tile::KBlockN + warp_n * Tile::KMmaN + 2 * (lane & 3);"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "if constexpr (Tile::KRowsA == 16) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "__floats2bfloat162_rn(out[2], out[3]);"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(Tile::KThreads, 1)"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "extern __shared__ __align__(16) uint8_t smem_buf[];"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "if (threadIdx.x < 32) ll_init_barriers<Tile>(smem, params.k);"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_mma_gemm.cuh",
+   "rule": "kernel-magic",
+   "code": "const int warp = threadIdx.x >> 5;"
+  },
+  {
    "path": "csrc/kernel/gemm/low_latency_utils.cuh",
    "rule": "model-constexpr",
    "code": "static constexpr int KScaleGroupK = 32;"
@@ -1895,6 +4640,76 @@
    "path": "csrc/kernel/gemm/low_latency_utils.cuh",
    "rule": "comment",
    "code": "// Ties go to more warps, then to the wider tile."
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": ": \"+f\"(c[0]), \"+f\"(c[1]), \"+f\"(c[2]), \"+f\"(c[3])"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": ": \"r\"(a[0]), \"r\"(a[1]), \"r\"(a[2]), \"r\"(a[3]), \"r\"(b[0]), \"r\"(b[1]));"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "return __int_as_float(((packed >> (group * 8)) & 0xffu) << 23);"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint8_t* const row_ptr = atom + row * 128 + col * 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const int chunk0 = ((2 * group) ^ row) & 7;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const int chunk1 = ((2 * group + 1) ^ row) & 7;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "*reinterpret_cast<const uint32_t*>(row_ptr + chunk0 * 16),"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "*reinterpret_cast<const uint32_t*>(row_ptr + chunk1 * 16));"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const int words = (k / LlGemmConfig::KGroupK + 3) & ~3;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "return (words & 4) ? words : words + 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const int sfa_bytes = 4 * LlGemmConfig::KMaxM * sfa_pitch;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const int sfb_bytes = 4 * LlGemmConfig::KSfbStages * sfb_slot_ints;"
+  },
+  {
+   "path": "csrc/kernel/gemm/low_latency_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const int acc_bytes = acc_cols * acc_splits * 32 * outs * sizeof(float);"
   },
   {
    "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
@@ -2032,6 +4847,86 @@
    "code": "// Wait for all CTAs' overlap wgs to arrive."
   },
   {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "rows % 8 == 0)) {"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::group_modes<0, 3>(cta_sA), cute::group_modes<0, 3>(cta_gA));"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::group_modes<0, 3>(cta_sB), cute::group_modes<0, 3>(cta_gB));"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::group_modes<0, 3>(cta_sSFA),"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::group_modes<0, 3>(cta_gSFA));"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::group_modes<0, 3>(cta_sSFB),"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::group_modes<0, 3>(cta_gSFB));"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::size<0>(mainloop_params.layout_B), 128));"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "expert_atoms + static_cast<int32_t>(b_row0 / 128));"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::cosize(cute::take<0, 3>(SmemLayoutB{})) /"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "base + atom * kSfbAtomBytes + lane * 16);"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "*reinterpret_cast<uint4*>(base + atom * kSfbAtomBytes + lane * 16) ="
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "const bool odd = ((sfb_row0(walk) % 128) / 32) & 1;"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t sfb_row_col = (sfb_row0(scheduler) % 128) / 32;"
+  },
+  {
+   "path": "csrc/kernel/gemm/mainloop_fwd.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int overlap_bar_threads = 4 * 32 + 32;"
+  },
+  {
    "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
    "rule": "ns-constexpr",
    "code": "constexpr int FUSED_BLOCK_THREADS = 256;"
@@ -2077,6 +4972,61 @@
    "code": "static inline bool IsFusedAlignedTo(const void* ptr, uintptr_t alignment) {"
   },
   {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(256, 5) PrefillPermuteToMaskedGemmKernel("
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "kernel-magic",
+   "code": "const int x_num_vecs = hidden * static_cast<int>(sizeof(T)) / 16;"
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "kernel-magic",
+   "code": "int n_tile = off / 128;"
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "kernel-magic",
+   "code": "int pos = off % 128;"
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "kernel-magic",
+   "code": "static_cast<int64_t>(n_tile) * hidden_scale * 512;"
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "kernel-magic",
+   "code": "smem_lane[slot] = 4 * (pos % 32) + pos / 32;"
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "kernel-magic",
+   "code": "(BROADCAST_SCALE ? 1 : 4);"
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "kernel-magic",
+   "code": "const int WRITES_PER_SLOT = 4;"
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "kernel-magic",
+   "code": "expanded = static_cast<uint32_t>(val) * 0x01010101u;"
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "kernel-magic",
+   "code": "int64_t s_offset = static_cast<int64_t>(s) << 11;"
+  },
+  {
+   "path": "csrc/kernel/gemm/prefill_permute_to_masked_gemm.cu",
+   "rule": "kernel-magic",
+   "code": "b * 128 + smem_lane[slot];"
+  },
+  {
    "path": "csrc/kernel/gemm/rms_norm_quant.cu",
    "rule": "ns-constexpr",
    "code": "constexpr int kRmsMaxThreads = 256;"
@@ -2090,6 +5040,16 @@
    "path": "csrc/kernel/gemm/rms_norm_quant.cu",
    "rule": "anon-namespace",
    "code": "namespace {"
+  },
+  {
+   "path": "csrc/kernel/gemm/rms_norm_quant.cu",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(kRmsMaxThreads)"
+  },
+  {
+   "path": "csrc/kernel/gemm/sigmoid_gate_mul_group_quant.cu",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(kSgBlock)"
   },
   {
    "path": "csrc/kernel/gemm/tile_scheduler.cuh",
@@ -2252,6 +5212,16 @@
    "code": "// Checks use cluster-level coords so all CTAs agree (pair-UMMA)."
   },
   {
+   "path": "csrc/kernel/gemm/tile_scheduler.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/gemm/tile_scheduler.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = 0; i < 3; ++i) {"
+  },
+  {
    "path": "csrc/kernel/gemm/utils.cuh",
    "rule": "comment",
    "code": "static constexpr bool IsPairUmma = true;  // 2-CTA pair-UMMA"
@@ -2287,9 +5257,339 @@
    "code": "static constexpr int get_num_warps(int load_c_warp_id, bool add_bias) {"
   },
   {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "mxfp8::exp8_pair(__float2bfloat162_rn(amax)) & 0xffu);"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "const float inv = __uint_as_float(mxfp8::multiplier_bits(e) << 16);"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(MhcTile<kHidden>::kBlock, 1)"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "extern __shared__ __align__(16) uint8_t smem_raw[];"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "for (int i = tid; i < 3 + S::kMix; i += L::kBlock) {"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "if (i < 3) {"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "sm.hcb[i - 3] = p.hc_base[i - 3];"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr uint32_t kNegZeroPair = 0x8000u;"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "for (int j = 0; j < 4; ++j) {"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "for (int i = lt; i < 3 + S::kMix; i += nl) {"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "if (i < 3) {"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "sm.hcb[i - 3] = p.hc_base[i - 3];"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "float4 r = reinterpret_cast<const float4&>(sm.red[0][t][4 * k]);"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "r = reinterpret_cast<const float4&>(sm.red[wi][t][4 * k]);"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "cute::cast_smem_ptr_to_uint(&sm.cl[rank][t][4 * k]), dst),"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(cutlass::NumThreadsPerWarp)"
+  },
+  {
+   "path": "csrc/kernel/mhc/fused_all_reduce_mhc.cu",
+   "rule": "kernel-magic",
+   "code": "constexpr uint32_t kChunk = 64 * 1024;"
+  },
+  {
    "path": "csrc/kernel/mhc/megallmhc.cuh",
    "rule": "comment",
    "code": "// Padding rows all lie in the last atom: add its base once, then index"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "const int c = 2 * static_cast<int>(threadIdx.x / 32) + (lane >> 4);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "slot + (lane & 15) * Traits::kSwizzleRowBytes +"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "((c ^ (lane & 7)) << 4));"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "const int g = lane >> 2, t = lane & 3;"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "uint32_t xa[4], sa[4], ra[kHc][4];"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "uint32_t a[kHc][4];"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int k = 0; k < 4; ++k) {"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "const float* pp = pcs + (g + 8 * (k & 1)) * kHc;"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "pcs + Traits::kCombOff + (g + 8 * (k & 1)) * kHc * kHc - kHc;"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "a[j][0], a[j][1], a[j][2], a[j][3],"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "float cc[kNTiles][2][4];"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "cc[nt][h][0] = cc[nt][h][1] = cc[nt][h][2] = cc[nt][h][3] = 0.0f;"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "float(&d)[4] = cc[nt][j & 1];"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "d[0], d[1], d[2], d[3], a[j][0], a[j][1], a[j][2], a[j][3],"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "wb[nt][j][s][0], wb[nt][j][s][1], d[0], d[1], d[2], d[3]);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "float c[kNTiles][4];"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int e = 0; e < 4; ++e) c[nt][e] = cc[nt][0][e] + cc[nt][1][e];"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "&red[(g + 8) * kRedStride + Traits::kNTile * nt + 2 * t]) ="
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "make_float2(c[nt][2], c[nt][3]);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = lane; i < Traits::kMTile * kMixDim / 4; i += 32) {"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "const int tk = i / (kMixDim / 4), q4 = i % (kMixDim / 4);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "&red[(w * Traits::kMTile + tk) * kRedStride + 4 * q4]);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "4 * q4]) = s;"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(Traits::kPartThreads)"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "const int g = lane >> 2, t = lane & 3;"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "split_bf16x2(__ldg(reinterpret_cast<const float2*>(src + 8)), hi);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(Traits::kFinThreads, Traits::kFinMinBlocks)"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "__shared__ alignas(16) float red[kFinComputeWarps][Traits::kPartW];"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int o = Traits::kPartVecs; o < 32; o <<= 1) {"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "s.x += __shfl_xor_sync(0xffffffffu, s.x, o);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "s.y += __shfl_xor_sync(0xffffffffu, s.y, o);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "s.z += __shfl_xor_sync(0xffffffffu, s.z, o);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "s.w += __shfl_xor_sync(0xffffffffu, s.w, o);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int o = 16; o > 0; o >>= 1)"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "sq += __shfl_xor_sync(0xffffffffu, sq, o);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "if (lane == Traits::kSqSlot / 4) s.x = sq;"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "*reinterpret_cast<float4*>(&red[warp][4 * lane]) = s;"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "const float sq = __shfl_sync(0xffffffffu, t, Traits::kSqSlot);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "c[k] = __shfl_sync(0xffffffffu, z, 2 * kHc + k);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int k = 0; k < kHc * kHc / 4; ++k)"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "dst[k] = make_float4(c[4 * k], c[4 * k + 1], c[4 * k + 2],"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "c[4 * k + 3]);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int o = 16; o > 0; o >>= 1)"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "ysq += __shfl_xor_sync(0xffffffffu, ysq, o);"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc.cuh",
+   "rule": "kernel-magic",
+   "code": "amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));"
   },
   {
    "path": "csrc/kernel/mhc/megallmhc_utils.cuh",
@@ -2300,6 +5600,16 @@
    "path": "csrc/kernel/mhc/megallmhc_utils.cuh",
    "rule": "reuse-helper",
    "code": "CUTE_DEVICE float sigmoid(float z) { return 1.0f / (1.0f + expf(0.0f - z)); }"
+  },
+  {
+   "path": "csrc/kernel/mhc/megallmhc_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr float kLog2e = 1.4426950408889634f;"
+  },
+  {
+   "path": "csrc/kernel/mhc/mhc_post_hc_mean.cu",
+   "rule": "global-location",
+   "code": "__global__ void __launch_bounds__(kHcMeanThreads, 1)"
   },
   {
    "path": "csrc/kernel/mla/hca_decode_attention.cu",
@@ -4242,6 +7552,11 @@
    "code": "TORCH_CHECK(std::isfinite(situ_beta) && std::isfinite(situ_linear_beta),"
   },
   {
+   "path": "csrc/kernel/moe/mega_ll_moe.cu",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
    "path": "csrc/kernel/moe/mma_core.cuh",
    "rule": "comment",
    "code": "// Each 128-row M atom has its own SMEM and TMEM scale slab."
@@ -4295,6 +7610,31 @@
    "path": "csrc/kernel/moe/mma_core.cuh",
    "rule": "type-alias",
    "code": "using ElementAcc = float;"
+  },
+  {
+   "path": "csrc/kernel/moe/mma_core.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/mma_core.cuh",
+   "rule": "kernel-magic",
+   "code": "\"r\"(static_cast<std::uint32_t>(idescE >> 32)), \"r\"(scaleC),"
+  },
+  {
+   "path": "csrc/kernel/moe/mma_core.cuh",
+   "rule": "kernel-magic",
+   "code": "sfa_addr &= 0xFFFFu;"
+  },
+  {
+   "path": "csrc/kernel/moe/mma_core.cuh",
+   "rule": "kernel-magic",
+   "code": "sfb_addr &= 0xFFFFu;"
+  },
+  {
+   "path": "csrc/kernel/moe/mma_core.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t lane_idx = threadIdx.x % 32u;"
   },
   {
    "path": "csrc/kernel/moe/moe_configs.cuh",
@@ -4432,6 +7772,31 @@
    "code": "__host__ __device__ static constexpr std::uint32_t sf_atom_offset("
   },
   {
+   "path": "csrc/kernel/moe/moe_configs.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_configs.cuh",
+   "rule": "kernel-magic",
+   "code": "return (mn % 32u) * 16u + ((mn / 32u) % 4u) * 4u + (k % 4u) +"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_configs.cuh",
+   "rule": "kernel-magic",
+   "code": "(k / 4u) * 512u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_configs.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kCalcWarpCount * kThreadsPerWarp == 256,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_configs.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(warp_idx_begin >= 0 && warp_idx_begin + num_warps <= 32,"
+  },
+  {
    "path": "csrc/kernel/moe/moe_cta_comm.cuh",
    "rule": "comment",
    "code": "// Per-block launch counter; its parity selects the double-buffer half."
@@ -4520,6 +7885,21 @@
    "path": "csrc/kernel/moe/moe_kernel.cuh",
    "rule": "smem-cap",
    "code": "static_assert(sizeof(MoESharedStorage<Dims>) <= 228 * 1024,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_kernel.cuh",
+   "rule": "global-location",
+   "code": "__global__ __launch_bounds__(KernelTraits::kThreads, 1) void fused_moe_kernel("
+  },
+  {
+   "path": "csrc/kernel/moe/moe_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(sizeof(MoESharedStorage<Dims>) <= 228 * 1024,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_kernel.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(Dims::kNumTokens <= 16,"
   },
   {
    "path": "csrc/kernel/moe/moe_mainloop.cuh",
@@ -4637,6 +8017,26 @@
    "code": "// Every lane acquires readiness before pushing its output to the tail."
   },
   {
+   "path": "csrc/kernel/moe/moe_mainloop.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kExpertsPerThread = Dims::kNumExperts / 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop.cuh",
+   "rule": "kernel-magic",
+   "code": "} else if (warp_idx == 3 && Router::is_router_cta()) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop.cuh",
+   "rule": "kernel-magic",
+   "code": "if (warp_idx == 3 && lane_idx == 0) {"
+  },
+  {
    "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
    "rule": "local-constexpr",
    "code": "constexpr std::uint32_t kSfAtomBytes = 512u;"
@@ -4675,6 +8075,156 @@
    "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
    "rule": "dup-asm",
    "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "return kNarrowSlab ? warp_idx : 2u * (warp_idx & 3u) + (warp_idx >> 2);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "return kNarrowSlab ? 32u * warp_idx : 16u * up_group_idx(warp_idx);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "return kAllWarpsRead || warp_idx * 16u < UpGemm::kTileShapeM;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::Int<UpGemm::kTileShapeM>{}, cute::_8{}))));"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "acc_col + group * 8u),"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kSfAtomBytes = 512u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kSfKBlocksPerRow = UpGemm::kGemmK / 128u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kSlabsPerTileK = UpGemm::kTileShapeK / 128u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "float values[4];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t t0 = WarpRole::get_lane_idx() & 3u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "float values[4];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "const float as = act_scale[group * 8u + 2u * t0 + i];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "values[i] = act[WarpRole::get_lane_idx() + i * 32u][token];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t feature = 8u * up_group_idx(warp) + (lane >> 2);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t token = group * 8u + 2u * (lane & 3u) + i;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t feature = 8u * up_group_idx(warp) + (lane >> 2);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t token = group * 8u + 2u * (lane & 3u) + i;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "gate += cluster_load_f32(shares[n] + 4u * at);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "4u * (kPlaneElems + at));"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "cute::Int<MmaCore::kAtomShapeM>{}, cute::_8{}))));"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(DownGemm::kTileShapeK == 128u,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kSfKBlocksPerRow = DownGemm::kGemmK / 128u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kSfAtomBytes = 512u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "std::uint32_t rows[4];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t gq = 0; gq < 4u; ++gq) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "row_base + atom * 128u + 32u * gq + lane;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "k_tile * 4u);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "lane * 16u) ="
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_expert_base.cuh",
+   "rule": "kernel-magic",
+   "code": "make_uint4(rows[0], rows[1], rows[2], rows[3]);"
   },
   {
    "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
@@ -4847,6 +8397,281 @@
    "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
   },
   {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "__device__ static std::uint32_t tile_idx() { return row_base() / 128u; }"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "return kNarrowAtom ? warp_idx : 2u * (warp_idx & 3u) + (warp_idx >> 2);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "return kNarrowAtom ? 32u * warp_idx : 16u * group_idx(warp_idx);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "if (warp_idx >= kTileShapeM / 16u) return;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t row = 16u * group_idx(warp_idx) + lane_idx / 4u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t t0 = lane_idx & 3u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t i = 0; i < 4u; ++i) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "smem->latent_down.splited_mma_out[row + 8u * (i / 2u)]"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "[8u * g + 2u * t0 + i % 2u] ="
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "if (warp_idx >= kTileShapeM / 16u) return;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t row = 16u * group_idx(warp_idx) + lane_idx / 4u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t t0 = lane_idx & 3u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t i = 0; i < 4u; ++i) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t at = (row + 8u * (i / 2u)) * kTileShapeN +"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "(8u * g + 2u * t0 + i % 2u);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "v += cluster_load_f32(shares[n] + 4u * at);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kWriterWarps = kTileShapeM / 16u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "row_base() + 16u * group_idx(warp_idx) + lane_idx / 4u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t tok_local = 8u * g + 2u * (lane_idx & 3u);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t i = 0; i < 4u; ++i) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "row + 8u * (i / 2u) - row_base();"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "float acc[kTokenWindows][4] = {};"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "(128u * (LatentDownGemm::kTileShapeK / 32u)) / 4u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "natural + static_cast<std::size_t>(tile) * 128u * kScaleKBlocks;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t task = threadIdx.x; task < 32u * kScaleGroups;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t ml = task % 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t kg = task / 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "std::uint32_t rows[4][4];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t mh = 0; mh < 4u; ++mh) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "static_cast<std::size_t>(32u * mh + ml) * kScaleKBlocks +"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "16u * kg);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t j = 0; j < 4u; ++j) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "make_uint4(rows[0][j], rows[1][j], rows[2][j], rows[3][j]);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "*reinterpret_cast<uint4*>(dst + (4u * kg + j) * kSfAtomBytes +"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "ml * 16u) = chunk;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t i = threadIdx.x; i < kTileBytes / 4u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "float acc[Base::kTokenWindows][4] = {};"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "128u, SwizzleBoxK<DataType::ElementA>::value,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kReaderWarps = Base::kTileShapeM / 16u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "tmem_addr(smem->tmem_ptr, Base::lane_base(warp_idx), g * 8u),"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kGroupRows = 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "0xffffffffu, __float_as_uint((mag == mag) ? mag : 0.0f)));"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "std::uint32_t biased = 127u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "packed |= biased << (8u * g);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "float acc[Base::kTokenWindows][4] = {};"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "return fmaxf(cluster_token_max(smem, tok), 1e-10f);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kReaderWarps = Base::kTileShapeM / 16u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t t0 = lane_idx & 3u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "float v[4];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "sub * MmaCore::kAtomShapeN + g * 8u),"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": ".scale[block][token_base + 8u * g + 2u * t0];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": ".scale[block][token_base + 8u * g + 2u * t0 + 1u];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t i = 0; i < 4u; ++i) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_latent_down.cuh",
+   "rule": "kernel-magic",
+   "code": "__reduce_max_sync(0xffffffffu, __float_as_uint(amax)));"
+  },
+  {
    "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
    "rule": "comment",
    "code": "// The up phase's weight ring depth, which the down ring aliases at 2:1."
@@ -4962,6 +8787,71 @@
    "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
   },
   {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "kernel-magic",
+   "code": "base_m + m_tile_idx * 128u + lane_base + lane_idx;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "kernel-magic",
+   "code": "tma_load_2d(tma_down_activations_desc, /*coord0=*/k_iter_id * 128u,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const unsigned m_tile_idx = warp_idx / 4u;  // WG0 -> m-tile 0, WG1 -> 1"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const unsigned lane_base = (warp_idx & 3u) * 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "kernel-magic",
+   "code": "DownGemm::kGemmK / 32u);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "kernel-magic",
+   "code": "expert_id * (DownGemm::kGemmM / 128u) + base_m / 128u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kGroups = DownGemm::kTileShapeK / 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "kernel-magic",
+   "code": "kGroups == 4u && DownGemm::kTileShapeN <= WarpRole::kThreadsPerWarp,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const unsigned m_tile_idx = warp_idx / 4u;  // WG0 -> m-tile 0, WG1 -> 1"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "kernel-magic",
+   "code": "const unsigned lane_base = (warp_idx & 3u) * 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "kernel-magic",
+   "code": "(nb * 128u) / Traits::RoutedUpGemm::kOutputQuantBlock;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_down.cuh",
+   "rule": "kernel-magic",
+   "code": "for (unsigned i = lane_idx; i < kTotal; i += 32u) {"
+  },
+  {
    "path": "csrc/kernel/moe/moe_mainloop_routed_up.cuh",
    "rule": "comment",
    "code": "// `rank_of` returns 0xFF when the token misses this expert."
@@ -5010,6 +8900,36 @@
    "path": "csrc/kernel/moe/moe_mainloop_routed_up.cuh",
    "rule": "comment",
    "code": "// Commit from the issuing warp; other warps' empty commits add a group."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_up.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_up.cuh",
+   "rule": "kernel-magic",
+   "code": "if (rank == 0xFFu) return false;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_up.cuh",
+   "rule": "kernel-magic",
+   "code": "(i / 2u) * 8u + 2u * (WarpRole::get_lane_idx() & 3u) + i % 2u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_up.cuh",
+   "rule": "kernel-magic",
+   "code": "out[i * 32u + lane_idx] = quantized[i];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_up.cuh",
+   "rule": "kernel-magic",
+   "code": "expert_id * (UpGemm::kGemmM / 128u) + weight_row_base / 128u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_routed_up.cuh",
+   "rule": "kernel-magic",
+   "code": "for (uint32_t i = lane_idx; i < 2 * kNumScaleBlocksK; i += 32u) {"
   },
   {
    "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
@@ -5162,6 +9082,71 @@
    "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
   },
   {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "kernel-magic",
+   "code": "while (__any_sync(0xffffffffu, pending)) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(RouterGemm::kTileShapeN % 8u == 0u,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kTileShapeM <= 128u,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kRowsPerRead = 16u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "kernel-magic",
+   "code": "tmem_ld_tokens(tmem_addr(smem->tmem_ptr, 32u * warp_idx, 0u), v);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t local = lane_idx / 4u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t col = 2u * (lane_idx & 3u);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "kernel-magic",
+   "code": "cell[(col + 1u) * kTileShapeM + row1] = acc[m][3];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kQuads = kTileShapeM / 4u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "kernel-magic",
+   "code": "&smem->router.mma_out[w][tok][4u * q]);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "kernel-magic",
+   "code": "tile * kTileShapeM + 4u * q) ="
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_router.cuh",
+   "rule": "kernel-magic",
+   "code": "tile * kTileShapeM + 4u * q) ="
+  },
+  {
    "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
    "rule": "comment",
    "code": "// TMA byte count for the staged BF16 input tile."
@@ -5217,6 +9202,201 @@
    "code": "// The routed down's readout: warp w covers lanes 32*(w&3)+16*(w>>2)."
   },
   {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "32u * (warp_idx & 3u) + 16u * (warp_idx >> 2);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t t0 = lane_idx & 3u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "row_base() + atom * 128u + lane_base + t1 + 8u * r;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t tok = group * 8u + 2u * t0 + i;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "sizeof(smem->shared_expert.quantized_input.scale) / 4u);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "SharedUpGemm::kTileShapeK, 128u, Base::kInputSwizzleBoxK,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kQuantGroups = Base::kOutputFeatureBlock / 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "Base::slab_idx() / (128u / Base::kOutputFeatureBlock);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "(Base::slab_idx() * Base::kOutputFeatureBlock % 128u) / 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t feat = lane_idx + i * 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t tok = batch_size + warp_idx; tok < 128u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kQuantGroups = Base::kOutputFeatureBlock / 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t feat = lane_idx + i * 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t row_atom = Base::row_base() / 128u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "Base::row_base(), k_iter_id, SharedDownGemm::kGemmK / 32u);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "32u * (warp_idx & 3u) + 16u * (warp_idx >> 2);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "group < SharedDownGemm::kTileShapeN / 8u; ++group) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "float values[4];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "atom * SharedDownGemm::kTileShapeN + group * 8u, lane_base,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "32u * (warp_idx & 3u) + 16u * (warp_idx >> 2);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t t0 = lane_idx & 3u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "group < SharedDownGemm::kTileShapeN / 8u; ++group) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "float acc[4] = {};"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "float v[4];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "s * SharedDownGemm::kTileShapeN + group * 8u,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_shared.cuh",
+   "rule": "kernel-magic",
+   "code": "s][group * 8u + 2u * t0],"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_tail.cuh",
+   "rule": "kernel-magic",
+   "code": "params.tail_fc2_scale + row0 * (Dims::kLatentSize / 32),"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_tail.cuh",
+   "rule": "kernel-magic",
+   "code": "kRows * (Dims::kLatentSize / 32));"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_tail.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t lane = threadIdx.x & 31u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_tail.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t grp = lane & ~7u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_tail.cuh",
+   "rule": "kernel-magic",
+   "code": "std::uint32_t w[4];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_tail.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int j = 0; j < 4; ++j) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_tail.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t lo = __shfl_sync(0xffffffffu, raw, grp + 2 * j);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_tail.cuh",
+   "rule": "kernel-magic",
+   "code": "__shfl_sync(0xffffffffu, raw, grp + 2 * j + 1);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_tail.cuh",
+   "rule": "kernel-magic",
+   "code": "w[j] = lo | (hi << 16);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_tail.cuh",
+   "rule": "kernel-magic",
+   "code": "if ((lane & 7u) == 0u) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_tail.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint4 u = make_uint4(w[0], w[1], w[2], w[3]);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_mainloop_tail.cuh",
+   "rule": "kernel-magic",
+   "code": "static_cast<int>(tok), Dims::kLatentSize, col >> 3);"
+  },
+  {
    "path": "csrc/kernel/moe/moe_routing.cuh",
    "rule": "comment",
    "code": "// Each expert's routed tokens; any thread may set a bit of any mask."
@@ -5240,6 +9420,61 @@
    "path": "csrc/kernel/moe/moe_routing.cuh",
    "rule": "comment",
    "code": "// The slot's row: its expert's slab, then the tokens below it."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(MoERoutingTables<Dims>::kMaxActiveExperts < 65536u &&"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing.cuh",
+   "rule": "kernel-magic",
+   "code": "kNumSlots < 65536u,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing.cuh",
+   "rule": "kernel-magic",
+   "code": "((__popc(masks.x) + __popc(masks.y)) << 16) |"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t off = 1u; off < 32u; off *= 2u) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t t = __shfl_up_sync(0xFFFFFFFFu, scan, off);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing.cuh",
+   "rule": "kernel-magic",
+   "code": "if (lane == 31u) scratch.warp_counts[warp] = scan;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing.cuh",
+   "rule": "kernel-magic",
+   "code": "std::uint32_t row = (before + scan - own) >> 16;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing.cuh",
+   "rule": "kernel-magic",
+   "code": "std::uint32_t pos = (before + scan - own) & 0xFFFFu;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing.cuh",
+   "rule": "kernel-magic",
+   "code": "tables.expert_token_cumsum[total & 0xFFFFu] ="
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing.cuh",
+   "rule": "kernel-magic",
+   "code": "static_cast<std::uint16_t>(total >> 16);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing.cuh",
+   "rule": "kernel-magic",
+   "code": "tables.active_expert_count = total & 0xFFFFu;"
   },
   {
    "path": "csrc/kernel/moe/moe_routing_topk.cuh",
@@ -5330,6 +9565,221 @@
    "path": "csrc/kernel/moe/moe_routing_topk.cuh",
    "rule": "comment",
    "code": "// Sigmoid scores were applied where the rows were published."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kLineBytes = 128u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kExpertsPerThread % 8u == 0u,"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t v = 0; v < kExpertsPerThread / 4u; ++v) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "slice[4u * v + 0u] = raw.x;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "slice[4u * v + 1u] = raw.y;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "slice[4u * v + 2u] = raw.z;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "slice[4u * v + 3u] = raw.w;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t v = 0; v < kExpertsPerThread / 8u; ++v) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t word[4] = {raw.x, raw.y, raw.z, raw.w};"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t j = 0; j < 4u; ++j) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "slice[8u * v + 2u * j + 0u] = __bfloat162float("
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "slice[8u * v + 2u * j + 1u] ="
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "static_cast<unsigned short>(word[j] >> 16)));"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int off = 16; off >= 1; off /= 2)"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "local_sum += __shfl_xor_sync(0xFFFFFFFFu, local_sum, off, 32);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t moe = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t best = __reduce_max_sync(0xFFFFFFFFu, moe);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "__reduce_min_sync(0xFFFFFFFFu, (moe == best) ? my_expert : 0xFFFFFFFFu);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "(best & 0x80000000u) ? (best & 0x7FFFFFFFu) : ~best;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "if ((bits & 0x7F80u) == 0x7F80u) bits = 0xFF7Fu;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "if ((bits & 0x7FFFu) == 0u) bits = 0u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t moe = (bits & 0x8000u) ? (bits ^ 0xFFFFu) : (bits | 0x8000u);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "return (moe << 16) | (expert_id ^ 0xFFFFu);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "uint32_t max_expert = 0xFFFFFFFFu;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "selected_packed_score = __reduce_max_sync(0xFFFFFFFFu, best[0]);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t moe = packed_score >> 16;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t bits = (moe & 0x8000u) ? (moe & 0x7FFFu) : (moe ^ 0xFFFFu);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "expert_id = (packed_score ^ 0xFFFFu) & 0xFFFFu;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "const float rank_v = __shfl_sync(0xFFFFFFFFu, v, k);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(kMaxTopk <= 32u, \"one lane per rank\");"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "return __uint_as_float((key & 0x80000000u) ? (key & 0x7FFFFFFFu) : ~key);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t top = __reduce_max_sync(0xFFFFFFFFu, best[0]);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "__ffs(__ballot_sync(0xFFFFFFFFu, best[0] == top)) - 1u;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "__shfl_sync(0xFFFFFFFFu, best_weight[0], winner);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t winner_expert = __shfl_sync(0xFFFFFFFFu, expert, winner);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "if (__any_sync(0xFFFFFFFFu, repeated)) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t top = __reduce_max_sync(0xFFFFFFFFu, head[0]);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t ties = __ballot_sync(0xFFFFFFFFu, tied);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "at = __shfl_sync(0xFFFFFFFFu, key[i], my_lane) == my_key ? i : at;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "const float w = __shfl_sync(0xFFFFFFFFu, weights[i], my_lane);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_routing_topk.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(Dims::kNumExperts % 32u == 0u,"
   },
   {
    "path": "csrc/kernel/moe/moe_scheduler.cuh",
@@ -5427,6 +9877,21 @@
    "code": "using ExpertId = std::uint32_t;"
   },
   {
+   "path": "csrc/kernel/moe/moe_shared_storage.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_shared_storage.cuh",
+   "rule": "kernel-magic",
+   "code": "if (((mask >> token) & 1u) == 0u) return 0xFFu;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_shared_storage.cuh",
+   "rule": "kernel-magic",
+   "code": "sizeof(MoESharedStorage<Dims>) <= 224 * 1024,"
+  },
+  {
    "path": "csrc/kernel/moe/moe_tail.cuh",
    "rule": "comment",
    "code": "// A staged CTA runs its rows in passes of kBlockRows through kStageBufs"
@@ -5502,6 +9967,256 @@
    "code": "using Frag = uint4;"
   },
   {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "f = *reinterpret_cast<const uint4*>(p + sb * 64);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "ld_global_16B(f, p + sb * 64, 0);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "xlo = *reinterpret_cast<const uint4*>(xs + sb * 64);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "xhi = *reinterpret_cast<const uint4*>(xs + sb * 64 + 8);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "xb[0] = xlo.x, xb[1] = xlo.y, xb[2] = xlo.z, xb[3] = xlo.w;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "xb[4] = xhi.x, xb[5] = xhi.y, xb[6] = xhi.z, xb[7] = xhi.w;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t aw[4] = {A.x, A.y, A.z, A.w},"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "bw[4] = {B.x, B.y, B.z, B.w};"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int mm = 0; mm < 4; ++mm) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint8_t* const a = sf + row * (L / 32) + ks * kNG + parity(tig);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "return State{a, a + 8 * (L / 32)};"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "f = *reinterpret_cast<const uint4*>(p + sb * 64);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "ld_global_16B(f, p + sb * 64, 0);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "xlo = *reinterpret_cast<const uint4*>(xs + sb * 64);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "xhi = *reinterpret_cast<const uint4*>(xs + sb * 64 + 8);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "xb[0] = xlo.x, xb[1] = xlo.y, xb[2] = xlo.z, xb[3] = xlo.w;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "xb[4] = xhi.x, xb[5] = xhi.y, xb[6] = xhi.z, xb[7] = xhi.w;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "return __uint_as_float(uint32_t(sf[2 * sb]) << 23);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t aw[4] = {A.x, A.y, A.z, A.w},"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "bw[4] = {B.x, B.y, B.z, B.w};"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int mm = 0; mm < 4; ++mm) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "total.x += __shfl_xor_sync(0xffffffffu, total.x, kOther);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "total.y += __shfl_xor_sync(0xffffffffu, total.y, kOther);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "total.z += __shfl_xor_sync(0xffffffffu, total.z, kOther);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "total.w += __shfl_xor_sync(0xffffffffu, total.w, kOther);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kNSB = KR / 64;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(TPG >= 1 && TPG <= 8, \"mma N is 8\");"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t grp = lane >> 2, tig = lane & 3;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "const int row = tile * 16 + int(grp);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "wa + (STAGED ? int64_t(8) * w_stride : int64_t(8) * L);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "uint32_t xb[8];"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "const int r = tile * 16 + int(grp);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "dst[(2 * tig) * ROWS + r + 8] = total.z;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "dst[(2 * tig + 1) * ROWS + r + 8] = total.w;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "const int r = int(c.tid & 31u) * int(kWarps) + int(c.tid >> 5);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kGroups = L / 32;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr int kAtomBytes = (kGroups / 4) * 512;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "c.s_sf[i] = sf[(row / 128) * kAtomBytes +"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "sf_atom_offset(uint32_t(row % 128),"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "bulk_g2s(c.s_sf, c.p.tail_fc2_scale + row0(c) * (L / 32),"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int j = 0; j < 4; ++j) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "if ((tid & 31) == 0) c.s_warp[tid >> 5] = sq;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int j = 0; j < 4; ++j) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int j = 0; j < 4; ++j) {"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "reinterpret_cast<uint8_t*>(&c.s_x[c.grank * kXStride]) + tid * 16) ="
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "reinterpret_cast<uint8_t*>(&c.s_x[r * kXStride]) + c.tid * 16) ="
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint32_t warp = c.tid >> 5, lane = c.tid & 31;"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "const uint8_t* sf = c.s_sf + blk * kBlockRows * (L / 32);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_fused.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int e = 0; e < 4; ++e) {"
+  },
+  {
    "path": "csrc/kernel/moe/moe_tail_prims.cuh",
    "rule": "ns-constexpr",
    "code": "constexpr uint32_t kNegZeroPair ="
@@ -5517,6 +10232,21 @@
    "code": "namespace tail {"
   },
   {
+   "path": "csrc/kernel/moe/moe_tail_prims.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int off = 16; off > 0; off >>= 1)"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_prims.cuh",
+   "rule": "kernel-magic",
+   "code": "v += __shfl_xor_sync(0xffffffffu, v, off);"
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tail_prims.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int j = 0; j < 4; ++j) {"
+  },
+  {
    "path": "csrc/kernel/moe/moe_tma.cuh",
    "rule": "ns-constexpr",
    "code": "inline constexpr std::uint32_t kInputChunksBoxChunks = 4u;"
@@ -5530,6 +10260,11 @@
    "path": "csrc/kernel/moe/moe_tma.cuh",
    "rule": "comment",
    "code": "// Input tile box: four 128-byte K chunks."
+  },
+  {
+   "path": "csrc/kernel/moe/moe_tma.cuh",
+   "rule": "kernel-magic",
+   "code": "SwizzleBoxK * sizeof(DataType::ElementA) == 128u,"
   },
   {
    "path": "csrc/kernel/moe/moe_traits.cuh",
@@ -5582,6 +10317,11 @@
    "code": "// tcgen05.alloc takes a power-of-two column count in [32, 512]."
   },
   {
+   "path": "csrc/kernel/moe/moe_traits.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
    "path": "csrc/kernel/moe/moe_workspace.cuh",
    "rule": "comment",
    "code": "// One 128-token SfAtom slab per up K tile holds that tile's 32-K groups."
@@ -5622,6 +10362,11 @@
    "code": "using ScaleType = float;"
   },
   {
+   "path": "csrc/kernel/moe/moe_workspace.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
    "path": "csrc/kernel/moe/ptx_utils.cuh",
    "rule": "comment",
    "code": "// Device-scope acquire load of a 32-bit word (ld.acquire.gpu)."
@@ -5655,6 +10400,81 @@
    "path": "csrc/kernel/moe/ptx_utils.cuh",
    "rule": "dup-asm",
    "code": "asm volatile(\"fence.proxy.async.shared::cta;\" ::: \"memory\");"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "return base + (lane_base << 16) + column;"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "std::uint32_t v[8];"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "addr, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = 0; i < 8; ++i) d[i] = __int_as_float(v[i]);"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(N % 8u == 0u, \"whole 8-column reads\");"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t i = 0; i < N / 8u; ++i) {"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "float v[8];"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "tmem_ld_x8(addr + i * 8u, v);"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "for (std::uint32_t j = 0; j < 8u; ++j) d[i * 8u + j] = v[j];"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "std::uint32_t v[4];"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "v[2], v[3]);"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = 0; i < 4; ++i) d[i] = __int_as_float(v[i]);"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(alignof(V) == 16 && sizeof(V) == 16);"
+  },
+  {
+   "path": "csrc/kernel/moe/ptx_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "mc_addr = static_cast<std::uint8_t*>(mc_addr) + vec_offset * 16;"
   },
   {
    "path": "csrc/kernel/moe/quant_utils.cuh",
@@ -5740,6 +10560,226 @@
    "path": "csrc/kernel/moe/quant_utils.cuh",
    "rule": "comment",
    "code": "// Row-major input uses the global source-row index."
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "file-lines",
+   "code": "// Copyright (c) 2026 PaddlePaddle Authors. All Rights Reserved."
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "for (int i = 16; i >= 1; i /= 2) {"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "value = fmaxf(__shfl_xor_sync(0xffffffff, value, i, 32), value);"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr float kFp8Max = 448.f;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr float kFp8MaxInv = 1.0f / 448.f;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t col = lane * 4u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t kc = chunk_at + col / 16u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t ki = col % 16u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "blk_max = fmaxf(blk_max, 1e-10f);"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "fp8_act[kc][row][ki + 3] = (DataType::ElementQA)(v.w * blk_inv_scale);"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr float kFp8MaxInv = 1.0f / 448.0f;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "__float_as_uint(fmaxf(amax, 1e-10f) * kFp8MaxInv);"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t exp_field = (scaled_bits >> 23) & 0xFFu;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t round_up = (scaled_bits & 0x7FFFFFu) != 0u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "biased = raw_biased < 254u ? raw_biased : 254u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "return __uint_as_float((254u - biased) << 23);"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kGroupValuesPerThread = Quant::kBlockSize / 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "__reduce_max_sync(0xffffffffu, __float_as_uint(local_max)));"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "block_max = fmaxf(block_max, 1e-10f);"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr float kFp8Max = 448.0f;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "0xffffffffu, __float_as_uint(fabsf(values[i]))));"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(QuantBlock == 128u,"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kChunksPerBlock = QuantBlock / 16u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kSubBlocks = QuantBlock / 32u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t col = lane * 4u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t sub = lane / 8u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const bool leader = (lane % 8u) == 0u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t chunk = (rel % SwizzleBoxK) / 8u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "src_row * SwizzleBoxK + (chunk ^ (src_row % 8u)) * 8u +"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "rel % 8u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t kc = chunk_at + col / 16u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t ki = col % 16u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "128u * (QuantBlock * BlocksPerStage / 32u);"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "if (leader) *scale = 127u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 1, 8));"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 2, 8));"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 4, 8));"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "(static_cast<std::uint32_t>(hi) << 16);"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "static_assert(NumRows <= 16u, \"FP8 quantize supports BS<=16\");"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "constexpr std::uint32_t kChunksPerBlock = QuantBlock / 16u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t col = WarpRole::get_lane_idx() * 4u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "const std::uint32_t chunk = (rel % SwizzleBoxK) / 8u;"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "src_row * SwizzleBoxK + (chunk ^ (src_row % 8u)) * 8u +"
+  },
+  {
+   "path": "csrc/kernel/moe/quant_utils.cuh",
+   "rule": "kernel-magic",
+   "code": "rel % 8u;"
   },
   {
    "path": "halops/__init__.py",
