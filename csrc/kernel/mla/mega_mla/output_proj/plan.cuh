@@ -19,24 +19,31 @@
 #include <algorithm>
 #include <type_traits>
 
-#include "kernel/mla/mega_mla/output_proj_pair.cuh"
-#include "kernel/mla/mega_mla/output_proj_swapab.cuh"
+#include "kernel/mla/mega_mla/output_proj/config_pair.cuh"
+#include "kernel/mla/mega_mla/output_proj/config_swapab.cuh"
 
 namespace halops::mla {
 
-constexpr int kPairMaxGroupTokens =
-    OutputProjLayout::MaxTokens / OutputProjLayout::MaxTokenGroups;
-
-constexpr int swapab_tile(int tokens) {
+/// Token tile of the swap-AB path: the narrowest tile width that holds tokens.
+constexpr int oproj_swapab_tile(int tokens) {
     for (int width : KernelBase::Tile::Widths)
         if (tokens <= width) return width;
     return KernelBase::Tile::Widest;
 }
 
+/// Scale-factor layout of the pair path's activation operand.
+template <class C>
+CUTE_HOST auto oproj_pair_act_sf_layout(int rows, int t_pad_sf, int k) {
+    return C::Tr::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(
+        cute::make_shape(rows, t_pad_sf, k, 1));
+}
+
+/// Shape of the wo_a / wo_b weights, checked against the output projection's
+/// tiling.
 inline OutputProjShape output_proj_shape(const torch::Tensor& wo_a_weight,
                                          const torch::Tensor& wo_b_weight,
                                          const char* op) {
-    constexpr int kMaxBK = swapab::k_block<KernelBase::Tile::Smallest>();
+    constexpr int kMaxBK = OprojSwapabTile<KernelBase::Tile::Smallest>::BK;
     static_assert((OutputProjLayout::ClusterSize * kMaxBK) %
                           (4 * OutputProjLayout::RowTile) ==
                       0,
@@ -68,7 +75,12 @@ inline OutputProjShape output_proj_shape(const torch::Tensor& wo_a_weight,
     return shape;
 }
 
+/// Token grouping of one output projection call and the byte offsets of its
+/// buffers in the workspace.
 struct OutputProjPlan {
+    static constexpr int kPairMaxGroupTokens =
+        OutputProjLayout::MaxTokens / OutputProjLayout::MaxTokenGroups;
+
     int num_tokens;
     bool pair;
     int group_tokens, groups, n_parts;
@@ -88,11 +100,11 @@ struct OutputProjPlan {
             n_parts = per_group > Sm100::UmmaMaxN ? 2 : 1;
             group_tokens = std::max(
                 SfLayout::MnPerTile,
-                cute::round_up(per_group, n_parts * pair_umma::kSlice));
+                cute::round_up(per_group, n_parts * OprojPairBase::kSlice));
         } else {
             groups = 1;
             n_parts = 1;
-            group_tokens = swapab_tile(tokens);
+            group_tokens = oproj_swapab_tile(tokens);
         }
         t_pad = cute::round_up(groups * group_tokens, SfLayout::MnPerTile);
         t_pad_sf = groups * n_parts *
@@ -120,9 +132,12 @@ void call_output_proj_tile(Fn& fn) {
        std::integral_constant<int, NH>{});
 }
 
+/// Calls fn(pair, tokens per group, UMMA N parts) with the plan's tile as
+/// compile-time constants.
 template <class Fn>
 void dispatch_output_proj_tile(const OutputProjPlan& plan, const char* op,
                                Fn&& fn) {
+    constexpr int kPairMax = OutputProjPlan::kPairMaxGroupTokens;
     if (plan.pair) {
         switch (plan.group_tokens) {
             case 128:
@@ -135,8 +150,8 @@ void dispatch_output_proj_tile(const OutputProjPlan& plan, const char* op,
                 return call_output_proj_tile<true, 224, 1>(fn);
             case 256:
                 return call_output_proj_tile<true, 256, 1>(fn);
-            case kPairMaxGroupTokens:
-                return call_output_proj_tile<true, kPairMaxGroupTokens, 2>(fn);
+            case kPairMax:
+                return call_output_proj_tile<true, kPairMax, 2>(fn);
             default:
                 TORCH_CHECK(false, op, ": no pair tile for ", plan.group_tokens,
                             " tokens per group");
@@ -162,18 +177,19 @@ void dispatch_output_proj_tile(const OutputProjPlan& plan, const char* op,
     }
 }
 
+/// Scale-factor layout of the flattened attention output, the wo_a activation.
 template <bool Pair, int TT, int NH>
 auto output_proj_flat_o_sf_layout(const OutputProjShape& shape,
                                   const OutputProjPlan& plan, uint8_t* flat_o,
                                   uint8_t* flat_o_sf) {
     if constexpr (Pair) {
-        return pair_umma::act_sf_layout<TT, NH>(shape.olora, plan.t_pad_sf,
-                                                ModelDims::OTotal);
+        return oproj_pair_act_sf_layout<OprojPairCfg<TT, NH>>(
+            shape.olora, plan.t_pad_sf, ModelDims::OTotal);
     } else {
-        using Cfg = typename swapab::Shape<TT>::Cfg;
-        return sf_layout(make_act_atoms<Cfg>(flat_o, flat_o_sf, shape.olora,
-                                             plan.t_pad, ModelDims::OTotal,
-                                             plan.t_pad_sf));
+        using Gemm = typename OprojSwapabCfg<TT>::Gemm;
+        return sf_layout(make_act_atoms<Gemm>(flat_o, flat_o_sf, shape.olora,
+                                              plan.t_pad, ModelDims::OTotal,
+                                              plan.t_pad_sf));
     }
 }
 

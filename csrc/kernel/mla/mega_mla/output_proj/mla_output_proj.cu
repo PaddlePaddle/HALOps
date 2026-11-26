@@ -12,32 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "kernel/mla/mega_mla/mla_output_proj_plan.cuh"
 #include "kernel/mla/mega_mla/mla_params.cuh"
+#include "kernel/mla/mega_mla/output_proj/kernel_pair.cuh"
+#include "kernel/mla/mega_mla/output_proj/kernel_swapab.cuh"
+#include "kernel/mla/mega_mla/output_proj/plan.cuh"
 
 namespace halops {
-using namespace mla;
+namespace mla {
 
-namespace {
-
-template <class Gemm>
-struct OutputProjParams {
-    Gemm wo_a;
-    Gemm wo_b;
-    cutlass::float_e4m3_t* olora_fp8;
-    uint8_t* olora_sf;
-    cutlass::bfloat16_t* out;
-    int* flags;
-    int num_tokens;
-    const uint8_t* wo_b_raw;
-    OutputProjShape shape;
-};
-
-void check_output_proj_inputs(
-    const torch::Tensor& wo_a_weight, const torch::Tensor& wo_a_sf,
-    const torch::Tensor& wo_b_weight, const torch::Tensor& wo_b_sf,
-    const torch::Tensor& out, const torch::Tensor& workspace,
-    int64_t workspace_bytes, const OutputProjShape& shape) {
+void oproj_check_inputs(const torch::Tensor& wo_a_weight,
+                        const torch::Tensor& wo_a_sf,
+                        const torch::Tensor& wo_b_weight,
+                        const torch::Tensor& wo_b_sf, const torch::Tensor& out,
+                        const torch::Tensor& workspace, int64_t workspace_bytes,
+                        const OutputProjShape& shape) {
     check_sfatom_weight(wo_a_weight, wo_a_sf, "mla_output_proj");
     check_sfatom_weight(wo_b_weight, wo_b_sf, "mla_output_proj");
     TORCH_CHECK(out.scalar_type() == at::kBFloat16 && out.is_contiguous() &&
@@ -49,7 +37,9 @@ void check_output_proj_inputs(
                 " bytes, got ", workspace.numel());
 }
 
-}  // namespace
+}  // namespace mla
+
+using namespace mla;
 
 void MlaOutputProj(const torch::Tensor& wo_a_weight,
                    const torch::Tensor& wo_a_sf,
@@ -62,15 +52,15 @@ void MlaOutputProj(const torch::Tensor& wo_a_weight,
     const OutputProjPlan plan((int)out.size(0), shape, "mla_output_proj");
     const int64_t proj_off = MlaWorkspace::layout(plan.num_tokens, grid_x())
                                  .output_proj_off(shape.hidden);
-    check_output_proj_inputs(wo_a_weight, wo_a_sf, wo_b_weight, wo_b_sf, out,
-                             workspace, proj_off + plan.bytes, shape);
+    oproj_check_inputs(wo_a_weight, wo_a_sf, wo_b_weight, wo_b_sf, out,
+                       workspace, proj_off + plan.bytes, shape);
     uint8_t* proj = workspace.data_ptr<uint8_t>() + proj_off;
     uint8_t* flat_o = proj + plan.off_flat_o;
     uint8_t* flat_o_sf = proj + plan.off_flat_o_sf;
     uint8_t* olora = proj + plan.off_olora;
     uint8_t* olora_sf = proj + plan.off_olora_sf;
     auto make_params = [&](auto wo_a, auto wo_b) {
-        return OutputProjParams<decltype(wo_a)>{
+        return OprojParams<decltype(wo_a)>{
             .wo_a = wo_a,
             .wo_b = wo_b,
             .olora_fp8 = reinterpret_cast<cutlass::float_e4m3_t*>(olora),
@@ -86,7 +76,7 @@ void MlaOutputProj(const torch::Tensor& wo_a_weight,
         plan, "mla_output_proj", [&](auto pair, auto tt, auto nh) {
             constexpr int TT = decltype(tt)::value, NH = decltype(nh)::value;
             if constexpr (decltype(pair)::value) {
-                using Sh = pair_umma::Shape<TT, NH>;
+                using C = OprojPairCfg<TT, NH>;
                 auto mainloop = [&](const void* weight, const void* weight_sf,
                                     int rows, const void* act,
                                     const void* act_sf, int k_weight,
@@ -98,16 +88,16 @@ void MlaOutputProj(const torch::Tensor& wo_a_weight,
                         cute::make_shape(plan.t_pad, k_act, 1),
                         cute::make_stride(k_act, cute::Int<1>{}, 0));
                     auto layout_sfa =
-                        Sh::Tr::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
+                        C::Tr::Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(
                             cute::make_shape(rows, plan.t_pad, k_weight, 1));
-                    return Sh::ML::to_underlying_arguments(
+                    return C::ML::to_underlying_arguments(
                         {static_cast<const cutlass::float_e4m3_t*>(weight),
                          static_cast<const cutlass::float_e4m3_t*>(act),
                          static_cast<const cutlass::float_ue8m0_t*>(weight_sf),
                          static_cast<const cutlass::float_ue8m0_t*>(act_sf),
                          layout_a, layout_b, layout_sfa,
-                         pair_umma::act_sf_layout<TT, NH>(rows, plan.t_pad_sf,
-                                                          k_act),
+                         oproj_pair_act_sf_layout<C>(rows, plan.t_pad_sf,
+                                                     k_act),
                          k_weight, rows, 1});
                 };
                 auto prm = make_params(
@@ -117,35 +107,32 @@ void MlaOutputProj(const torch::Tensor& wo_a_weight,
                     mainloop(wo_b_weight.data_ptr(), wo_b_sf.data_ptr(),
                              shape.hidden, olora, olora_sf, shape.olora,
                              shape.olora));
-                launch_pdl(
-                    pair_umma::mla_output_proj_pair_kernel<TT, NH,
-                                                           decltype(prm)>,
-                    {shape.grid(), KernelBase::NumThreads,
-                     pair_umma::kSmemLaunchBytes<TT, NH>,
-                     OutputProjLayout::ClusterSize},
-                    prm);
+                launch_pdl(mla_output_proj_pair_kernel<C, decltype(prm)>,
+                           {shape.grid(), KernelBase::NumThreads,
+                            C::kSmemLaunchBytes, OutputProjLayout::ClusterSize},
+                           prm);
             } else {
-                using Cfg = typename swapab::Shape<TT>::Cfg;
+                using C = OprojSwapabCfg<TT>;
+                using Gemm = typename C::Gemm;
                 auto prm = make_params(
-                    swapab::Operands<Cfg>{
-                        .weight = make_weight_atoms<Cfg>(
+                    OprojSwapabOperands<Gemm>{
+                        .weight = make_weight_atoms<Gemm>(
                             wo_a_weight.data_ptr(), wo_a_sf.data_ptr(),
                             shape.olora, shape.group_k),
-                        .act = make_act_atoms<Cfg>(
+                        .act = make_act_atoms<Gemm>(
                             flat_o, flat_o_sf, shape.olora, plan.t_pad,
                             ModelDims::OTotal, plan.t_pad_sf)},
-                    swapab::Operands<Cfg>{
-                        .weight = make_weight_atoms<Cfg>(
+                    OprojSwapabOperands<Gemm>{
+                        .weight = make_weight_atoms<Gemm>(
                             wo_b_weight.data_ptr(), wo_b_sf.data_ptr(),
                             shape.hidden, shape.olora),
-                        .act = make_act_atoms<Cfg>(
+                        .act = make_act_atoms<Gemm>(
                             olora, olora_sf, shape.hidden, plan.t_pad,
                             shape.olora, plan.t_pad_sf)});
-                launch_pdl(
-                    swapab::mla_output_proj_swapab_kernel<TT, decltype(prm)>,
-                    {shape.grid(), KernelBase::NumThreads,
-                     swapab::Smem<TT>::Total, OutputProjLayout::ClusterSize},
-                    prm);
+                launch_pdl(mla_output_proj_swapab_kernel<C, decltype(prm)>,
+                           {shape.grid(), KernelBase::NumThreads, C::kSmemBytes,
+                            OutputProjLayout::ClusterSize},
+                           prm);
             }
         });
 }

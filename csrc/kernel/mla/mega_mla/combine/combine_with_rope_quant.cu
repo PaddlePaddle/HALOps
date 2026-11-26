@@ -13,26 +13,30 @@
 // limitations under the License.
 
 #include "common/cuda_utils.h"
-#include "kernel/mla/mega_mla/combine_with_rope_quant.cuh"
-#include "kernel/mla/mega_mla/mla_output_proj_plan.cuh"
+#include "kernel/mla/mega_mla/combine/kernel.cuh"
+#include "kernel/mla/mega_mla/output_proj/plan.cuh"
 
 namespace halops {
-using namespace mla;
+namespace mla {
 
-void check_combine_with_rope_quant_inputs(
+template <class C>
+void combine_rope_quant_check_inputs(
     const torch::Tensor& q_or_x, const torch::Tensor& freqs_real,
     const std::optional<torch::Tensor>& attn_sink,
     const torch::Tensor& workspace, int64_t workspace_bytes) {
     TORCH_CHECK(q_or_x.scalar_type() == at::kBFloat16 &&
-                    q_or_x.is_contiguous() &&
-                    q_or_x.size(1) == ModelDims::OTotal,
+                    q_or_x.is_contiguous() && q_or_x.size(1) == C::kOTotal,
                 "combine_with_rope_quant: q_or_x must be contiguous bf16 [T, ",
-                ModelDims::OTotal, "]");
+                C::kOTotal, "]");
     check_rope_and_sink(freqs_real, attn_sink, "combine_with_rope_quant");
     TORCH_CHECK(workspace.numel() >= workspace_bytes,
                 "combine_with_rope_quant: workspace needs ", workspace_bytes,
                 " bytes, got ", workspace.numel());
 }
+
+}  // namespace mla
+
+using namespace mla;
 
 void CombineWithRopeQuant(const torch::Tensor& q_or_x,
                           const torch::Tensor& positions,
@@ -43,14 +47,15 @@ void CombineWithRopeQuant(const torch::Tensor& q_or_x,
                           const torch::Tensor& wo_b_weight,
                           const torch::Tensor& workspace) {
     const CudaDeviceGuard device_guard(q_or_x.device());
+    using C = CombineCfg<ModelDims>;
     const int num_tokens = (int)q_or_x.size(0);
     const OutputProjShape shape =
         output_proj_shape(wo_a_weight, wo_b_weight, "combine_with_rope_quant");
     const OutputProjPlan plan(num_tokens, shape, "combine_with_rope_quant");
     const MlaWorkspace::Layout wsl = MlaWorkspace::layout(num_tokens, grid_x());
     const int64_t proj_off = wsl.output_proj_off(shape.hidden);
-    check_combine_with_rope_quant_inputs(q_or_x, freqs_real, attn_sink,
-                                         workspace, proj_off + plan.bytes);
+    combine_rope_quant_check_inputs<C>(q_or_x, freqs_real, attn_sink, workspace,
+                                       proj_off + plan.bytes);
     uint8_t* base = workspace.data_ptr<uint8_t>();
     uint8_t* proj = base + proj_off;
     uint8_t* flat_o = proj + plan.off_flat_o;
@@ -59,13 +64,11 @@ void CombineWithRopeQuant(const torch::Tensor& q_or_x,
                                     wsl.plan_off[c128_attn_len.has_value()],
                                     num_tokens, grid_x());
     const bool slice = 2 * num_tokens <= grid_x();
-    const int slices = num_tokens * ModelDims::OTotal / CombineCfg::SliceDims;
+    const int slices = num_tokens * C::kOTotal / C::SliceDims;
     const LaunchDims dims =
-        slice ? LaunchDims{(slices + CombineCfg::SliceThreads - 1) /
-                               CombineCfg::SliceThreads,
-                           CombineCfg::SliceThreads}
-              : LaunchDims{num_tokens * CombineCfg::RowsPerToken,
-                           CombineCfg::RowThreads};
+        slice ? LaunchDims{(slices + C::SliceThreads - 1) / C::SliceThreads,
+                           C::SliceThreads}
+              : LaunchDims{num_tokens * C::RowsPerToken, C::RowThreads};
     dispatch_output_proj_tile(
         plan, "combine_with_rope_quant", [&](auto pair, auto tt, auto nh) {
             const auto layout_sf =
@@ -104,8 +107,8 @@ void CombineWithRopeQuant(const torch::Tensor& q_or_x,
                     std::max(
                         {params.n_pbar, params.n_c128_flags, params.n_flags}),
                 "combine_with_rope_quant: grid too small to reset barriers");
-            launch_pdl(slice ? combine_with_rope_quant_slice_kernel<LayoutSF>
-                             : combine_with_rope_quant_row_kernel<LayoutSF>,
+            launch_pdl(slice ? combine_with_rope_quant_slice_kernel<C, LayoutSF>
+                             : combine_with_rope_quant_row_kernel<C, LayoutSF>,
                        dims, params);
         });
 }
