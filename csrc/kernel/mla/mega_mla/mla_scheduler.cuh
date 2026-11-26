@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "kernel/mla/mla_params.cuh"
+#include "kernel/mla/mega_mla/mla_params.cuh"
 
 namespace halops::mla {
 struct PipelineOffsets {

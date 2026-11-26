@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #include "common/cuda_utils.h"
-#include "kernel/mla/mla_attention_kernel.cuh"
+#include "kernel/mla/mega_mla/mla_attention_kernel.cuh"
 
 namespace halops {
 namespace mla {

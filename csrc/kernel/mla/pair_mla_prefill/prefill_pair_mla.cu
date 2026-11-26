@@ -25,8 +25,8 @@
 
 #include "common/pdl.cuh"
 #include "kernel/gemm/gemm_utils.h"
-#include "kernel/mla/mla_host_utils.h"
-#include "kernel/mla/prefill_pair_mla_kernel.cuh"
+#include "kernel/mla/common/host_utils.h"
+#include "kernel/mla/pair_mla_prefill/prefill_pair_mla_kernel.cuh"
 
 namespace halops::mla::prefill_pair {
 

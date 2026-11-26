@@ -19,8 +19,8 @@
 #include <optional>
 #include <type_traits>
 
-#include "kernel/mla/mla_gemm.cuh"
-#include "kernel/mla/mla_workspace.cuh"
+#include "kernel/mla/mega_mla/mla_gemm.cuh"
+#include "kernel/mla/mega_mla/mla_workspace.cuh"
 
 namespace halops::mla {
 struct MlaAttentionArguments {

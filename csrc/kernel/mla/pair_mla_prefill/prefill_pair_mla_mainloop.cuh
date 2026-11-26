@@ -21,8 +21,8 @@
 #include <cute/arch/copy_sm90_tma.hpp>
 #include <cute/arch/mma_sm100_desc.hpp>
 
-#include "kernel/mla/mla_intrinsics.cuh"
-#include "kernel/mla/prefill_pair_mla_scheduler.cuh"
+#include "kernel/mla/common/intrinsics.cuh"
+#include "kernel/mla/pair_mla_prefill/prefill_pair_mla_scheduler.cuh"
 
 namespace halops::mla::prefill_pair {
 

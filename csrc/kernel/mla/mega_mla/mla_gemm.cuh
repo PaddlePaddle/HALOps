@@ -21,9 +21,9 @@
 
 #include "kernel/gemm/kernel_traits.cuh"
 #include "kernel/gemm/mainloop_fwd.cuh"
-#include "kernel/mla/mla_intrinsics.cuh"
-#include "kernel/mla/mla_traits.cuh"
-#include "kernel/mla/mla_utils.cuh"
+#include "kernel/mla/common/intrinsics.cuh"
+#include "kernel/mla/common/traits.cuh"
+#include "kernel/mla/mega_mla/mla_utils.cuh"
 
 namespace halops::mla {
 template <int KBlockN_, int KPrologueStages_ = 1, int KEpilogueStages_ = 1,

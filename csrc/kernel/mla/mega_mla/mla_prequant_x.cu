@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "kernel/mla/mla_params.cuh"
+#include "kernel/mla/mega_mla/mla_params.cuh"
 
 namespace halops::mla {
 namespace {

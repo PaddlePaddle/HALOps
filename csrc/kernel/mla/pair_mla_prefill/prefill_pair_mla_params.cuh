@@ -19,7 +19,7 @@
 
 #include <cstdint>
 
-#include "kernel/mla/prefill_pair_mla_traits.cuh"
+#include "kernel/mla/pair_mla_prefill/prefill_pair_mla_traits.cuh"
 
 namespace halops::mla::prefill_pair {
 

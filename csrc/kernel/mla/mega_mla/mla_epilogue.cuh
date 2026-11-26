@@ -21,7 +21,7 @@
 #include <cfloat>
 #include <cute/tensor.hpp>
 
-#include "kernel/mla/mla_mainloop.cuh"
+#include "kernel/mla/mega_mla/mla_mainloop.cuh"
 
 namespace halops::mla {
 template <int TileTokens, class LayoutSFB, class Arrive>

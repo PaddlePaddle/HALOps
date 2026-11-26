@@ -16,7 +16,7 @@
 
 #include <math_constants.h>
 
-#include "kernel/mla/prefill_pair_mla_mainloop.cuh"
+#include "kernel/mla/pair_mla_prefill/prefill_pair_mla_mainloop.cuh"
 
 namespace halops::mla::prefill_pair {
 

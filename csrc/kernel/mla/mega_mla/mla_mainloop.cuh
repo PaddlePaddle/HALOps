@@ -19,10 +19,10 @@
 
 #include <cute/tensor.hpp>
 
-#include "kernel/mla/mla_gemm.cuh"
-#include "kernel/mla/mla_params.cuh"
-#include "kernel/mla/mla_scheduler.cuh"
-#include "kernel/mla/mla_utils.cuh"
+#include "kernel/mla/mega_mla/mla_gemm.cuh"
+#include "kernel/mla/mega_mla/mla_params.cuh"
+#include "kernel/mla/mega_mla/mla_scheduler.cuh"
+#include "kernel/mla/mega_mla/mla_utils.cuh"
 
 namespace halops::mla {
 

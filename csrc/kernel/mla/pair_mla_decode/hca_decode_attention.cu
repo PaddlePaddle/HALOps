@@ -33,7 +33,7 @@
 #include "common/ptx.cuh"
 #include "common/sm100_arch.cuh"
 #include "kernel/gemm/gemm_utils.h"
-#include "kernel/mla/mla_intrinsics.cuh"
+#include "kernel/mla/common/intrinsics.cuh"
 
 namespace halops {
 

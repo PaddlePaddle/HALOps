@@ -19,8 +19,8 @@
 #include <algorithm>
 #include <type_traits>
 
-#include "kernel/mla/output_proj_pair.cuh"
-#include "kernel/mla/output_proj_swapab.cuh"
+#include "kernel/mla/mega_mla/output_proj_pair.cuh"
+#include "kernel/mla/mega_mla/output_proj_swapab.cuh"
 
 namespace halops::mla {
 

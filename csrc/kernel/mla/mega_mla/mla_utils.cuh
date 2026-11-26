@@ -21,8 +21,8 @@
 
 #include <cute/tensor.hpp>
 
-#include "kernel/mla/mla_intrinsics.cuh"
-#include "kernel/mla/mla_traits.cuh"
+#include "kernel/mla/common/intrinsics.cuh"
+#include "kernel/mla/common/traits.cuh"
 
 namespace halops::mla {
 template <class Bar>

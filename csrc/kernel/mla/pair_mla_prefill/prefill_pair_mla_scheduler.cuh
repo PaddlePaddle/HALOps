@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "kernel/mla/prefill_pair_mla_params.cuh"
+#include "kernel/mla/pair_mla_prefill/prefill_pair_mla_params.cuh"
 
 namespace halops::mla::prefill_pair {
 

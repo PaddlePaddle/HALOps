@@ -17,8 +17,8 @@
 #include <algorithm>
 #include <iterator>
 
-#include "kernel/mla/mla_host_utils.h"
-#include "kernel/mla/mla_traits.cuh"
+#include "kernel/mla/common/host_utils.h"
+#include "kernel/mla/common/traits.cuh"
 
 namespace halops::mla {
 struct alignas(16) CtaWork {

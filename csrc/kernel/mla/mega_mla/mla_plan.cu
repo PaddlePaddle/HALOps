@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "kernel/mla/mla_output_proj_plan.cuh"
-#include "kernel/mla/mla_params.cuh"
+#include "kernel/mla/mega_mla/mla_output_proj_plan.cuh"
+#include "kernel/mla/mega_mla/mla_params.cuh"
 
 namespace halops {
 using namespace mla;

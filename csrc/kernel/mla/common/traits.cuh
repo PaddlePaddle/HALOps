@@ -17,7 +17,7 @@
 #include <cutlass/arch/barrier.h>
 #include <cutlass/numeric_types.h>
 
-#include "kernel/mla/mla_intrinsics.cuh"
+#include "kernel/mla/common/intrinsics.cuh"
 
 namespace halops::mla {
 struct Sm100 {

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 #include "common/cuda_utils.h"
-#include "kernel/mla/combine_with_rope_quant.cuh"
-#include "kernel/mla/mla_output_proj_plan.cuh"
+#include "kernel/mla/mega_mla/combine_with_rope_quant.cuh"
+#include "kernel/mla/mega_mla/mla_output_proj_plan.cuh"
 
 namespace halops {
 using namespace mla;

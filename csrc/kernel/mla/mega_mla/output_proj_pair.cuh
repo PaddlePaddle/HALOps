@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "kernel/mla/mla_gemm.cuh"
+#include "kernel/mla/mega_mla/mla_gemm.cuh"
 
 namespace halops::mla::pair_umma {
 

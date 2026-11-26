@@ -18,8 +18,8 @@
 
 #include <cute/arch/tmem_allocator_sm100.hpp>
 
-#include "kernel/mla/mla_epilogue.cuh"
-#include "kernel/mla/mla_scheduler.cuh"
+#include "kernel/mla/mega_mla/mla_epilogue.cuh"
+#include "kernel/mla/mega_mla/mla_scheduler.cuh"
 
 namespace halops::mla {
 template <class KT>

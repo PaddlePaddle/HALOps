@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <cute/arch/copy_sm90_desc.hpp>
 
-#include "kernel/mla/mla_traits.cuh"
+#include "kernel/mla/common/traits.cuh"
 
 namespace halops::mla::prefill_pair {
 

@@ -20,7 +20,7 @@
 #include <cute/arch/tmem_allocator_sm100.hpp>
 
 #include "common/pdl.cuh"
-#include "kernel/mla/prefill_pair_mla_epilogue.cuh"
+#include "kernel/mla/pair_mla_prefill/prefill_pair_mla_epilogue.cuh"
 
 namespace halops::mla::prefill_pair {
 
