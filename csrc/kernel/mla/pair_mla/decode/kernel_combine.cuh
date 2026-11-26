@@ -16,7 +16,7 @@
 
 #include <math_constants.h>
 
-#include "kernel/mla/pair_mla_decode/kernel_schedule.cuh"
+#include "kernel/mla/pair_mla/decode/kernel_schedule.cuh"
 
 namespace halops::detail {
 
@@ -157,9 +157,9 @@ CUTE_DEVICE void fused_merge(const HcaParams& p, typename C::Smem& sm, int cta,
             const int h = threadIdx.x % C::kHeads, s = threadIdx.x / C::kHeads;
             float m = -CUDART_INF_F, den = 0.0f;
             for (int k = s; k < n; k += kS) {
-                const float l =
-                    __ldcg(p.lse_part +
-                           part_row<C>((first + k) * 2 + (k == 0), cta, h));
+                const float l = __ldcg(
+                    p.lse_part +
+                    pair_part_row<C>((first + k) * 2 + (k == 0), cta, h));
                 w[k * C::kHeads + h] = l;
                 if (l > -CUDART_INF_F) {
                     const float nm = fmaxf(m, l);
@@ -243,10 +243,10 @@ __global__ void hca_combine_kernel(const __grid_constant__ HcaParams p) {
     const int pairs =
         (p.tokens / p.tokens_per_req) * ((p.tokens_per_req + 1) / 2);
     for (int z = blockIdx.z; z < pairs; z += gridDim.z) {
-        const MergeJob j = p.jobs[z];
+        const PairMergeJob j = p.jobs[z];
         if (j.wn == 0 || (cta == 1 && !j.has_b)) continue;
-        const int first = cluster_of(sched, total, j.w0);
-        const int last = cluster_of(sched, total, j.w0 + j.wn - 1);
+        const int first = pair_cluster_of(sched, total, j.w0);
+        const int last = pair_cluster_of(sched, total, j.w0 + j.wn - 1);
         const auto empty = [&](int c) {
             return range_lo(c + 1, total, sched) <= range_lo(c, total, sched);
         };
@@ -256,7 +256,7 @@ __global__ void hca_combine_kernel(const __grid_constant__ HcaParams p) {
         for (int c = first + grp; c <= last; c += HcaPlan::kCombSplit) {
             if (empty(c)) continue;
             const float lse =
-                __ldg(p.lse_part + part_row<C>(sid(c), cta, head));
+                __ldg(p.lse_part + pair_part_row<C>(sid(c), cta, head));
             if (!(lse > -CUDART_INF_F)) continue;
             const float nm = fmaxf(m, lse);
             const float sc = exp2f(m - nm), e = exp2f(lse - nm);

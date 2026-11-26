@@ -23,7 +23,9 @@
 
 #include "common/sm100_arch.cuh"
 #include "kernel/mla/common/intrinsics.cuh"
-#include "kernel/mla/pair_mla_decode/config.cuh"
+#include "kernel/mla/pair_mla/common/pipeline.cuh"
+#include "kernel/mla/pair_mla/common/sw128.cuh"
+#include "kernel/mla/pair_mla/decode/config.cuh"
 
 namespace halops::detail {
 
@@ -77,29 +79,6 @@ CUTE_DEVICE void tma_gather4(const CUtensorMap* map, uint64_t* bar, void* dst,
         "l"(map), "r"(col), "r"(r0), "r"(r1), "r"(r2), "r"(r3),
         "r"(smem_u32(bar))
         : "memory");
-}
-
-// Row r and its swizzled 16-byte chunk c in a SW128 tile of 8-row atoms.
-CUTE_DEVICE int row_offset(int r) {
-    return (r / kSw128AtomRows) * kSw128AtomBytes +
-           (r % kSw128AtomRows) * kSw128AtomRowBytes;
-}
-CUTE_DEVICE int sw128_offset(int r, int c) {
-    return row_offset(r) + (c ^ (r % kSw128AtomRows)) * kChunk;
-}
-
-CUTE_DEVICE uint4 dequant8(uint32_t lo, uint32_t hi, uint8_t e8) {
-    const uint32_t raw[2] = {lo, hi};
-    const auto* f8 = reinterpret_cast<const __nv_fp8x2_e4m3*>(raw);
-    const nv_bfloat16 scale =
-        __ushort_as_bfloat16(uint16_t(e8) << kBf16MantissaBits);
-    uint4 out;
-    auto* o = reinterpret_cast<nv_bfloat162*>(&out);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < kElemsPerChunk / 2; ++i) {
-        o[i] = fp8x2_to_bf16x2_with_scale(f8[i], scale);
-    }
-    return out;
 }
 
 // DSA variant: the scale is a direct fp32 multiplier (one per 128-dim group),
@@ -181,14 +160,6 @@ CUTE_DEVICE void bulk_wait_read() {
     asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
 }
 
-// A lane's row of a 128-byte swizzled box: its address with the row's
-// swizzle phase xor'ed in, so chunk Q is at row_x ^ 16Q.  The xor is done at
-// each access: precomputed chunk addresses are 8 registers per box row.
-CUTE_DEVICE uint32_t swizzled_row(const void* box, int row) {
-    return (smem_u32(box) + row * kSw128AtomRowBytes) |
-           (row % kSw128AtomRows) * kChunk;
-}
-
 template <int Q>
 CUTE_DEVICE uint4 lds_chunk(uint32_t row_x) {
     uint4 v;
@@ -209,16 +180,6 @@ CUTE_DEVICE void sts_chunk(uint32_t row_x, uint32_t a, uint32_t b, uint32_t c,
         "st.shared.v4.u32 [a], {%2, %3, %4, %5};\n\t}" ::"r"(row_x),
         "n"(Q * kChunk), "r"(a), "r"(b), "r"(c), "r"(d)
         : "memory");
-}
-
-// The Q/O warp group's named barrier, taking a value derived from data just
-// loaded from shared memory: the barrier then waits for those loads, so a
-// TMA write into their source issued after it cannot overtake loads still in
-// flight (a plain bar.sync does not order them before the async proxy).
-CUTE_DEVICE uint32_t xor_words(const uint4* v, int n) {
-    uint32_t x = 0;
-    for (int i = 0; i < n; ++i) x ^= v[i].x ^ v[i].w;
-    return x;
 }
 
 template <class C>

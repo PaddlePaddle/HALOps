@@ -14,15 +14,15 @@
 
 #pragma once
 
-#include "kernel/mla/pair_mla_prefill/params.cuh"
+#include "kernel/mla/pair_mla/prefill/params.cuh"
 
 namespace halops::mla {
 
 // The pair's first token: the last request r with cu_pairs[r] <= pair (empty
 // requests are skipped); kQnr with one request needs no search.
 template <class C>
-CUTE_DEVICE PrefillPairMap prefill_pair_map(const PrefillParams& p, int pair) {
-    PrefillPairMap m;
+CUTE_DEVICE PairMap prefill_pair_map(const PrefillParams& p, int pair) {
+    PairMap m;
     if (C::kQnr && p.n_req == 1) {
         m.a = 2 * pair;
         m.has_b = m.a + 1 < p.tokens;
@@ -50,38 +50,16 @@ CUTE_DEVICE int prefill_num_pairs(const PrefillParams& p) {
 
 // Raw c128 and SWA list lengths of both tokens of a pair.
 template <class C>
-CUTE_DEVICE PrefillPairLens prefill_load_lens(const PrefillParams& p,
-                                              int pair) {
-    const PrefillPairMap m = prefill_pair_map<C>(p, pair);
-    PrefillPairLens l;
-    CUTLASS_PRAGMA_UNROLL
-    for (int seg = 0; seg < 2; ++seg) {
-        l.v[seg][0] = __ldg(p.len[seg] + m.a);
-        l.v[seg][1] = m.has_b ? __ldg(p.len[seg] + m.a + 1) : 0;
-    }
-    return l;
+CUTE_DEVICE PairLens prefill_load_lens(const PrefillParams& p, int pair) {
+    return pair_load_lens(p, prefill_pair_map<C>(p, pair));
 }
 
 // The pair's clamped lengths and its key stream extents in rows and tiles.
 template <class C>
-CUTE_DEVICE PrefillPairGeom prefill_pair_geom(const PrefillParams& p, int pair,
-                                              const PrefillPairLens& l) {
-    PrefillPairGeom g;
-    const PrefillPairMap m = prefill_pair_map<C>(p, pair);
-    g.a = m.a;
-    g.has_b = m.has_b;
-    CUTLASS_PRAGMA_UNROLL
-    for (int seg = 0; seg < 2; ++seg) {
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < 2; ++i) {
-            g.len[seg][i] = max(min(l.v[seg][i], p.ld[seg]), 0);
-        }
-    }
-    const int n_c = max(g.len[0][0], g.len[0][1]);
-    g.n_c4 = (n_c + C::kGather - 1) / C::kGather * C::kGather;
-    g.n_s = max(g.len[1][1], g.len[1][0] > 0 ? g.len[1][0] + p.swa_shift : 0);
-    g.n_tiles = max((g.n_c4 + g.n_s + C::kTile - 1) / C::kTile, 1);
-    return g;
+CUTE_DEVICE PairGeom prefill_pair_geom(const PrefillParams& p, int pair,
+                                       const PairLens& l) {
+    return pair_make_geom(p, prefill_pair_map<C>(p, pair), l, p.swa_shift,
+                          C::kTile);
 }
 
 // Cluster c takes stream tiles [bound[c], bound[c + 1]) of an even split.
@@ -114,7 +92,7 @@ struct PrefillUnitCursor {
     CUTE_DEVICE bool next(const PrefillParams& p, const int4* table,
                           PrefillUnit& u) {
         if (left == 0) return false;
-        PrefillPairLens lens;
+        PairLens lens;
         const int rel = pair - first_pair;
         if (rel < PrefillSchedTraits::kTableUnits) {
             const int4 v = table[rel];

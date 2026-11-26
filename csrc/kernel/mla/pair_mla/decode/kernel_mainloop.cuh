@@ -18,7 +18,7 @@
 
 #include <cute/arch/copy_sm80.hpp>
 
-#include "kernel/mla/pair_mla_decode/kernel_schedule.cuh"
+#include "kernel/mla/pair_mla/decode/kernel_schedule.cuh"
 
 namespace halops::detail {
 
@@ -63,8 +63,9 @@ CUTE_DEVICE void index_warp(const HcaParams& p, const HcaMaps& maps,
             for (int s = 0; s < C::kStages; ++s) {
                 CUTLASS_PRAGMA_UNROLL
                 for (int c = 0; c < C::kDsaRopeBytes / kChunk; ++c) {
-                    *reinterpret_cast<uint4*>(
-                        sm.rope_kv[s] + sw128_offset(j, c)) = uint4{0, 0, 0, 0};
+                    *reinterpret_cast<uint4*>(sm.rope_kv[s] +
+                                              pair_sw128_offset(j, c)) =
+                        uint4{0, 0, 0, 0};
                 }
             }
             cutlass::arch::fence_view_async_shared();
@@ -108,7 +109,7 @@ CUTE_DEVICE void index_warp(const HcaParams& p, const HcaMaps& maps,
                 if (cta == 0) {
                     CUTLASS_PRAGMA_UNROLL
                     for (int c = 0; c < C::kDsaRopeBytes / kChunk; ++c) {
-                        cp_async16(sm.rope_kv[s] + sw128_offset(j, c),
+                        cp_async16(sm.rope_kv[s] + pair_sw128_offset(j, c),
                                    base + C::kDsaRopeOff + c * kChunk);
                     }
                 }
@@ -219,17 +220,17 @@ CUTE_DEVICE void dequant_wg(typename C::Smem& sm, int n, int t) {
                 const uint4 second =
                     dequant8_f32(odd ? raw[k].x : raw[k].z,
                                  odd ? raw[k].y : raw[k].w, sc[k]);
-                *reinterpret_cast<uint4*>(block + sw128_offset(row, q0 + odd)) =
-                    first;
                 *reinterpret_cast<uint4*>(
-                    block + sw128_offset(row, q0 + !odd)) = second;
+                    block + pair_sw128_offset(row, q0 + odd)) = first;
+                *reinterpret_cast<uint4*>(
+                    block + pair_sw128_offset(row, q0 + !odd)) = second;
             }
             cutlass::arch::fence_view_async_shared();
             __syncwarp();
             if (t % kWarp == 0) Bar::arrive(&sm.kv_full[s], 0, 1);
         }
     } else {
-        using Plan = DequantPlan<kCta, C>;
+        using Plan = PairDequantPlan<kCta, C>;
         constexpr int kPitch = raw_pitch<C>(kCta);
         for (int i = 0; i < n; ++i) {
             const int s = i % C::kStages, is = i % C::kIdxStages;
@@ -269,14 +270,16 @@ CUTE_DEVICE void dequant_wg(typename C::Smem& sm, int n, int t) {
                 const int q0 = c % C::kFp8BlockChunks * 2;
                 uint8_t* const block =
                     stage + c / C::kFp8BlockChunks * C::kBlockBytes;
-                const uint4 first = dequant8(odd ? raw[k].z : raw[k].x,
-                                             odd ? raw[k].w : raw[k].y, e8[k]);
-                const uint4 second = dequant8(odd ? raw[k].x : raw[k].z,
-                                              odd ? raw[k].y : raw[k].w, e8[k]);
-                *reinterpret_cast<uint4*>(block + sw128_offset(row, q0 + odd)) =
-                    first;
+                const uint4 first =
+                    pair_dequant8(odd ? raw[k].z : raw[k].x,
+                                  odd ? raw[k].w : raw[k].y, e8[k]);
+                const uint4 second =
+                    pair_dequant8(odd ? raw[k].x : raw[k].z,
+                                  odd ? raw[k].y : raw[k].w, e8[k]);
                 *reinterpret_cast<uint4*>(
-                    block + sw128_offset(row, q0 + !odd)) = second;
+                    block + pair_sw128_offset(row, q0 + odd)) = first;
+                *reinterpret_cast<uint4*>(
+                    block + pair_sw128_offset(row, q0 + !odd)) = second;
             }
             CUTLASS_PRAGMA_UNROLL
             for (int k = 0; k < Plan::kRopeLoads; ++k) {
@@ -284,7 +287,7 @@ CUTE_DEVICE void dequant_wg(typename C::Smem& sm, int n, int t) {
                 const int row = e / kRopeChunks, c = e % kRopeChunks;
                 *reinterpret_cast<uint4*>(
                     stage + (C::kLocalBlocks - 1) * C::kBlockBytes +
-                    sw128_offset(row, c)) = rope[k];
+                    pair_sw128_offset(row, c)) = rope[k];
             }
             cutlass::arch::fence_view_async_shared();
             __syncwarp();
@@ -389,20 +392,6 @@ CUTE_DEVICE void pv_warp(const HcaParams& p, typename C::Smem& sm,
     }
 }
 
-// Thread t of the softmax warp group owns TMEM lane t: head t % 64 of this
-// CTA's token with the dims half t / 64.  Per tile it adds the partner lane's
-// (t ^ 64, warp w ^ 2) partial S of its 32 keys and runs the online softmax
-// on them; partners exchange the row max.
-template <class C>
-CUTE_DEVICE void pair_sync(int t) {
-    NamedBar::sync(2 * kWarp, C::kPairBar + t / kWarp % 2);
-}
-
-template <class C>
-CUTE_DEVICE void wait_pv(typename C::Smem& sm, int j) {
-    Bar::wait(&sm.pv_done[j % 2], (j / 2) & 1);
-}
-
 // The online softmax of tile i (k-th of its unit): this lane's partial S of
 // the partner's keys goes to the partner first, then its own keys are read;
 // the masked sums give the row max (with the partner's), P and the row sum.
@@ -437,7 +426,7 @@ CUTE_DEVICE void softmax_tile(const HcaParams& p, typename C::Smem& sm, int i,
         Bar::arrive(&sm.s_empty[sb], 0, 1);
         Bar::arrive(&sm.idx_empty[is]);
     }
-    pair_sync<C>(t);
+    pair_lane_sync<C>(t);
     const float4* const got = reinterpret_cast<const float4*>(sm.xchg[t]);
     float local = -CUDART_INF_F;
     CUTLASS_PRAGMA_UNROLL
@@ -454,7 +443,7 @@ CUTE_DEVICE void softmax_tile(const HcaParams& p, typename C::Smem& sm, int i,
     }
     local *= p.scale_log2;
     sm.red[t] = local;
-    pair_sync<C>(t);
+    pair_lane_sync<C>(t);
     const float cur = fmaxf(local, sm.red[t ^ C::kHeads]);
     float factor = 1.0f;
     if (cur - m > C::kRescaleLog2) {
@@ -474,7 +463,7 @@ CUTE_DEVICE void softmax_tile(const HcaParams& p, typename C::Smem& sm, int i,
     }
     l = l * factor + sum;
     if (k > 0 && __any_sync(~0u, factor != 1.0f)) {
-        wait_pv<C>(sm, i - 1);
+        pair_wait_pv<C>(sm, i - 1);
         tcgen05_after_thread_sync();
         CUTLASS_PRAGMA_UNROLL
         for (int c0 = 0; c0 < C::kHalfDims; c0 += kTmemLd) {
@@ -486,11 +475,12 @@ CUTE_DEVICE void softmax_tile(const HcaParams& p, typename C::Smem& sm, int i,
         }
         cutlass::arch::fence_view_async_tmem_store();
     }
-    if (i > 1) wait_pv<C>(sm, i - 2);
+    if (i > 1) pair_wait_pv<C>(sm, i - 2);
     CUTLASS_PRAGMA_UNROLL
     for (int q = 0; q < kHalf / kElemsPerChunk; ++q) {
         *reinterpret_cast<uint4*>(
-            sm.p[sb] + sw128_offset(head, half * kHalf / kElemsPerChunk + q)) =
+            sm.p[sb] +
+            pair_sw128_offset(head, half * kHalf / kElemsPerChunk + q)) =
             reinterpret_cast<const uint4*>(pk)[q];
     }
     cutlass::arch::fence_view_async_shared();

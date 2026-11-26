@@ -20,8 +20,8 @@
 #include <optional>
 
 #include "common/pdl.cuh"
-#include "kernel/mla/pair_mla_prefill/kernel.cuh"
-#include "kernel/mla/pair_mla_prefill/launcher.h"
+#include "kernel/mla/pair_mla/prefill/kernel.cuh"
+#include "kernel/mla/pair_mla/prefill/launcher.h"
 
 namespace halops::mla {
 
@@ -60,7 +60,7 @@ void prefill_launch_attention(PrefillParams& p, const PrefillMaps& maps,
     p.o_part = ws.o_part.data_ptr<float>();
     p.lse_part = ws.lse_part.data_ptr<float>();
     p.counter = ws.counter.data_ptr<int>();
-    p.jobs = reinterpret_cast<PrefillMergeJob*>(ws.jobs.data_ptr<int>());
+    p.jobs = reinterpret_cast<PairMergeJob*>(ws.jobs.data_ptr<int>());
     p.total_g = ws.total_g.data_ptr<int>();
     p.sched_g = ws.sched_g.data_ptr<int>();
     setup_kernel_once(reinterpret_cast<const void*>(kernel),

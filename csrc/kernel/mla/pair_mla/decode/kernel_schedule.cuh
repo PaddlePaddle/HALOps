@@ -16,10 +16,10 @@
 
 #include <cute/arch/cluster_sm90.hpp>
 
-#include "kernel/mla/pair_mla_decode/config.cuh"
-#include "kernel/mla/pair_mla_decode/hca_ptx.cuh"
-#include "kernel/mla/pair_mla_decode/hca_schedule.cuh"
-#include "kernel/mla/pair_mla_decode/params.cuh"
+#include "kernel/mla/pair_mla/decode/config.cuh"
+#include "kernel/mla/pair_mla/decode/hca_ptx.cuh"
+#include "kernel/mla/pair_mla/decode/hca_schedule.cuh"
+#include "kernel/mla/pair_mla/decode/params.cuh"
 
 namespace halops::detail {
 
@@ -29,13 +29,6 @@ namespace halops::detail {
 // O and log2 sums to slot c of their cluster, merged by the first part.
 CUTE_DEVICE int range_lo(int c, int total, int clusters) {
     return int(uint32_t(c) * uint32_t(total) / uint32_t(clusters));
-}
-
-// The cluster whose range holds stream tile pos: the last c with
-// range_lo(c) <= pos, i.e. c * total < (pos + 1) * clusters.  A split pair's
-// parts are in the clusters from the one holding its first tile on.
-CUTE_DEVICE int cluster_of(int clusters, int total, int pos) {
-    return int((uint64_t(pos + 1) * clusters - 1) / uint64_t(total));
 }
 
 // A pair's schedule weight is w = min(n_tiles, cap).  A part owning weight
@@ -315,9 +308,9 @@ CUTE_DEVICE void find_range(const HcaParams& p, typename C::Smem& sm,
                     wq += min(pair_geom(p, qq, lens_of(qq), C::kTile).n_tiles,
                               cap);
                 const PairGeom g = pair_geom(p, q, lens_of(q), C::kTile);
-                const int f = cluster_of(sched, total, wq);
+                const int f = pair_cluster_of(sched, total, wq);
                 const int l =
-                    cluster_of(sched, total, wq + min(g.n_tiles, cap) - 1);
+                    pair_cluster_of(sched, total, wq + min(g.n_tiles, cap) - 1);
                 if (l > f && (cute::block_rank_in_cluster() == 0 || g.has_b)) {
                     sm.mj[0] = make_int4(f, l, g.a, q * 2 + g.has_b);
                     sm.n_mj = 1;

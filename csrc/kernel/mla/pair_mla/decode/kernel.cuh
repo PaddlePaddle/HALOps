@@ -18,10 +18,10 @@
 
 #include <cute/arch/tmem_allocator_sm100.hpp>
 
-#include "kernel/mla/pair_mla_decode/kernel_combine.cuh"
-#include "kernel/mla/pair_mla_decode/kernel_epilogue.cuh"
-#include "kernel/mla/pair_mla_decode/kernel_mainloop.cuh"
-#include "kernel/mla/pair_mla_decode/kernel_schedule.cuh"
+#include "kernel/mla/pair_mla/decode/kernel_combine.cuh"
+#include "kernel/mla/pair_mla/decode/kernel_epilogue.cuh"
+#include "kernel/mla/pair_mla/decode/kernel_mainloop.cuh"
+#include "kernel/mla/pair_mla/decode/kernel_schedule.cuh"
 
 namespace halops::detail {
 

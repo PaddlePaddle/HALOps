@@ -19,7 +19,8 @@
 
 #include <cstdint>
 
-#include "kernel/mla/pair_mla_prefill/config.cuh"
+#include "kernel/mla/pair_mla/common/schedule.cuh"
+#include "kernel/mla/pair_mla/prefill/config.cuh"
 
 namespace halops::mla {
 
@@ -29,11 +30,6 @@ struct PrefillMaps {
     CUtensorMap bf16;
     CUtensorMap q;
     CUtensorMap out;
-};
-
-// A split pair for the combine kernel (wn 0: no job).
-struct PrefillMergeJob {
-    int a, has_b, w0, wn;
 };
 
 // Kernel arguments; segment 0 is c128 and 1 is SWA, c128_base[t] is token t's
@@ -63,7 +59,7 @@ struct PrefillParams {
     int swa_shift;
     int clusters;
     int combine;
-    PrefillMergeJob* jobs;
+    PairMergeJob* jobs;
     int* total_g;
     int* sched_g;
     float scale_log2;
@@ -74,25 +70,9 @@ struct PrefillParams {
     float q_eps;
 };
 
-// Key stream of pair (a, b): the c128 rows, then b's SWA window and a's oldest
-// swa_shift rows; len is [seg][token of pair], no b for a lone token.
-struct PrefillPairGeom {
-    int a, len[2][2], n_c4, n_s, n_tiles;
-    bool has_b;
-};
-
-struct PrefillPairLens {
-    int v[2][2];
-};
-
-struct PrefillPairMap {
-    int a;
-    bool has_b;
-};
-
 // Tiles [off, off + n) of a pair whose stream tiles are [w0, w0 + wn).
 struct PrefillUnit {
-    PrefillPairGeom g;
+    PairGeom g;
     int off, n;
     int w0, wn;
     bool split;

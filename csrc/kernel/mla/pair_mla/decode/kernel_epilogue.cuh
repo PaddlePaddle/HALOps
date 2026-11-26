@@ -16,7 +16,7 @@
 
 #include <math_constants.h>
 
-#include "kernel/mla/pair_mla_decode/kernel_schedule.cuh"
+#include "kernel/mla/pair_mla/decode/kernel_schedule.cuh"
 
 namespace halops::detail {
 
@@ -40,13 +40,14 @@ CUTE_DEVICE void fetch_q(const HcaMaps& maps, typename C::Smem& sm, int token,
         }
         Bar::wait(&sm.qs_full, r & 1);
         const uint32_t row =
-            swizzled_row(sm.qo_stage[t / C::kHeads], t % C::kHeads);
+            pair_swizzled_row(sm.qo_stage[t / C::kHeads], t % C::kHeads);
         cute::for_each(cute::make_int_sequence<C::kChunksPerBox>{},
                        [&](auto q) {
                            v[r * C::kChunksPerBox + q] =
                                lds_chunk<decltype(q)::value>(row);
                        });
-        qo_sync_after<C>(xor_words(v + r * C::kChunksPerBox, C::kChunksPerBox));
+        qo_sync_after<C>(
+            pair_xor_words(v + r * C::kChunksPerBox, C::kChunksPerBox));
     }
 }
 
@@ -66,7 +67,8 @@ CUTE_DEVICE void store_q(const HcaParams& p, typename C::Smem& sm,
                 C::kDsaNope;
             CUTLASS_PRAGMA_UNROLL
             for (int c = 0; c < C::kDsaRope / kElemsPerChunk; ++c) {
-                *reinterpret_cast<uint4*>(sm.q_rope + sw128_offset(head, c)) =
+                *reinterpret_cast<uint4*>(sm.q_rope +
+                                          pair_sw128_offset(head, c)) =
                     *reinterpret_cast<const uint4*>(src + c * kElemsPerChunk);
             }
         }
@@ -78,31 +80,6 @@ CUTE_DEVICE void store_q(const HcaParams& p, typename C::Smem& sm,
     if (t % kWarp == 0) Bar::arrive(&sm.q_full, 0, 1);
 }
 
-// The Q/O warp group's waits are long (a unit or more): one warp polls the
-// barrier while the others sleep on a named barrier, so the polling does not
-// take issue slots from the other roles.
-template <class C>
-CUTE_DEVICE void qo_wait(uint64_t* bar, int phase, int t) {
-    if (t < kWarp) Bar::wait(bar, phase);
-    NamedBar::sync(kWarpGroup, C::kQoBar);
-}
-
-// Reads O columns [m * 128, m * 128 + 128) of this lane, then frees them
-// for the next unit's first PV.
-template <class C>
-CUTE_DEVICE void read_o_half(typename C::Smem& sm, uint32_t lane_base, int t,
-                             int m, float (&o)[C::kOHalf]) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int c = 0; c < C::kOHalf; c += kTmemLd) {
-        tmem_ld_32dp32bNx<kTmemLd>(lane_base + C::kTmemO + m * C::kOHalf + c,
-                                   o + c);
-    }
-    cutlass::arch::fence_view_async_tmem_load();
-    tcgen05_before_thread_sync();
-    __syncwarp();
-    if (t % kWarp == 0) Bar::arrive(&sm.o_empty[m], 0, 1);
-}
-
 template <class C>
 CUTE_DEVICE void store_round(const HcaMaps& maps, typename C::Smem& sm,
                              int token, int t, int r, const uint32_t* w) {
@@ -111,7 +88,7 @@ CUTE_DEVICE void store_round(const HcaMaps& maps, typename C::Smem& sm,
         NamedBar::sync(kWarpGroup, C::kQoBar);
     }
     const uint32_t row =
-        swizzled_row(sm.qo_stage[t / C::kHeads], t % C::kHeads);
+        pair_swizzled_row(sm.qo_stage[t / C::kHeads], t % C::kHeads);
     cute::for_each(cute::make_int_sequence<C::kChunksPerBox>{}, [&](auto q) {
         constexpr int Q = decltype(q)::value;
         sts_chunk<Q>(row, w[kQuad * Q], w[kQuad * Q + 1], w[kQuad * Q + 2],
@@ -128,28 +105,6 @@ CUTE_DEVICE void store_round(const HcaMaps& maps, typename C::Smem& sm,
         }
         bulk_commit();
     }
-}
-
-// Reads half mh (128 columns) of this lane's O, scaled, as bf16 pairs, and
-// releases it to the next unit's first PV.
-template <class C>
-CUTE_DEVICE void read_o_bf16(typename C::Smem& sm, uint32_t lane_base, int t,
-                             int mh, float scale,
-                             uint32_t (&w)[C::kOHalf / 2]) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int c = 0; c < C::kOHalf; c += kTmemLd) {
-        float o[kTmemLd];
-        tmem_ld(lane_base + C::kTmemO + mh * C::kOHalf + c, o);
-        CUTLASS_PRAGMA_UNROLL
-        for (int e = 0; e < kTmemLd / 2; ++e) {
-            const nv_bfloat162 b2 =
-                __floats2bfloat162_rn(o[2 * e] * scale, o[2 * e + 1] * scale);
-            w[c / 2 + e] = reinterpret_cast<const uint32_t&>(b2);
-        }
-    }
-    tcgen05_before_thread_sync();
-    __syncwarp();
-    if (t % kWarp == 0) Bar::arrive(&sm.o_empty[mh], 0, 1);
 }
 
 // The bf16 output of an unsplit unit, a half at a time.  `write` is false for
@@ -169,11 +124,11 @@ CUTE_DEVICE void store_out_rows(const HcaMaps& maps, typename C::Smem& sm,
         CUTLASS_PRAGMA_UNROLL
         for (int mh = 0; mh < 2; ++mh) {
             uint32_t w[C::kOHalf / 2];
-            read_o_bf16<C>(sm, lane_base, t, mh, scale, w);
+            pair_read_o_bf16<C>(sm, lane_base, t, mh, scale, w);
             CUTLASS_PRAGMA_UNROLL
             for (int k = 0; k < 2; ++k) {
-                const uint32_t row =
-                    swizzled_row(box(t / C::kHeads, 2 * mh + k), t % C::kHeads);
+                const uint32_t row = pair_swizzled_row(
+                    box(t / C::kHeads, 2 * mh + k), t % C::kHeads);
                 const uint32_t* wr = w + k * C::kRoundWords;
                 cute::for_each(
                     cute::make_int_sequence<C::kChunksPerBox>{}, [&](auto q) {
@@ -205,7 +160,7 @@ CUTE_DEVICE void store_out_rows(const HcaMaps& maps, typename C::Smem& sm,
     CUTLASS_PRAGMA_UNROLL
     for (int mh = 0; mh < 2; ++mh) {
         uint32_t w[C::kOHalf / 2];
-        read_o_bf16<C>(sm, lane_base, t, mh, scale, w);
+        pair_read_o_bf16<C>(sm, lane_base, t, mh, scale, w);
         if (write) {
             store_round<C>(maps, sm, token, t, 2 * mh, w);
             store_round<C>(maps, sm, token, t, 2 * mh + 1, w + C::kRoundWords);
@@ -245,8 +200,8 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
     const int b = unit % 2;
     const int total = sm.total;
     const int sched = sm.sched;
-    const int first = cluster_of(sched, total, u.w0);
-    const int last = cluster_of(sched, total, u.w0 + u.wn - 1);
+    const int first = pair_cluster_of(sched, total, u.w0);
+    const int last = pair_cluster_of(sched, total, u.w0 + u.wn - 1);
     const bool dense = total >= sched;
     const auto part_cluster = [&](int j) {
         if (dense) return first + j;
@@ -264,11 +219,11 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
     const int others = n_parts - 1;
     if (u.split && first == cluster && t < C::kPartBoxes && !sm.comb) {
         for (int k = 1; k <= others; ++k) {
-            prefetch_l2_bulk(part_box<C>(p, part_cluster(k), cta, t),
+            prefetch_l2_bulk(pair_part_box<C>(p, part_cluster(k), cta, t),
                              C::kPartBoxPlanes * C::kPlaneBytes);
         }
     }
-    qo_wait<C>(&sm.ml_full[b], (unit / 2) & 1, t);
+    pair_qo_wait<C>(&sm.ml_full[b], (unit / 2) & 1, t);
     const float2 own = sm.ml[b][t], other = sm.ml[b][t ^ C::kHeads];
     __syncwarp();
     if (t % kWarp == 0) Bar::arrive(&sm.ml_empty[b]);
@@ -278,7 +233,7 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
         if (sm.comb && !p.fuse && cta == 0 && t == 0) p.jobs[u.pair].wn = 0;
         const float scale =
             sum > 0.0f ? 1.0f / (sum + exp2f(sink_log2 - m)) : 0.0f;
-        qo_wait<C>(&sm.o_full, unit & 1, t);
+        pair_qo_wait<C>(&sm.o_full, unit & 1, t);
         tcgen05_after_thread_sync();
         store_out_rows<C>(maps, sm, u.g.a + cta, lane_base, t, scale, !lone,
                           final_unit);
@@ -290,27 +245,27 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
         half * C::kHalfDims;
     const float own_scale = sum > 0.0f ? 1.0f / sum : 0.0f;
     const float own_lse = sum > 0.0f ? m + log2f(sum) : -CUDART_INF_F;
-    qo_wait<C>(&sm.o_full, unit & 1, t);
+    pair_qo_wait<C>(&sm.o_full, unit & 1, t);
     tcgen05_after_thread_sync();
     if (lone) {
         if (first != cluster) {
             float o[C::kOHalf];
-            read_o_half<C>(sm, lane_base, t, 0, o);
-            read_o_half<C>(sm, lane_base, t, 1, o);
+            pair_read_o_half<C>(sm, lane_base, t, 0, o);
+            pair_read_o_half<C>(sm, lane_base, t, 1, o);
             NamedBar::sync(kWarpGroup, C::kQoBar);
         }
         return;
     }
     if (first != cluster || p.nomerge || sm.comb) {
         const int sid = sm.comb ? cluster * 2 + (first == cluster) : cluster;
-        if (half == 0) p.lse_part[part_row<C>(sid, cta, head)] = own_lse;
+        if (half == 0) p.lse_part[pair_part_row<C>(sid, cta, head)] = own_lse;
         float* const dst =
             p.o_part + (int64_t(sid * 2 + cta) * C::kPlanes * kWarpGroup + t) *
                            C::kPlaneCols;
         CUTLASS_PRAGMA_UNROLL
         for (int mh = 0; mh < 2; ++mh) {
             float o[C::kOHalf];
-            read_o_half<C>(sm, lane_base, t, mh, o);
+            pair_read_o_half<C>(sm, lane_base, t, mh, o);
             CUTLASS_PRAGMA_UNROLL
             for (int q = 0; q < C::kOHalf / C::kPlaneCols; ++q) {
                 const int pl = mh * C::kOHalf / C::kPlaneCols + q;
@@ -332,7 +287,7 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
             }
         } else if (sm.comb) {
             if (first == cluster && cta == 0 && t == 0) {
-                p.jobs[u.pair] = MergeJob{u.g.a, u.g.has_b, u.w0, u.wn};
+                p.jobs[u.pair] = PairMergeJob{u.g.a, u.g.has_b, u.w0, u.wn};
             }
         } else if (t == 0) {
             red_release_add(ctr, 1);
@@ -356,22 +311,23 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
         if (t % kWarp == 0) {
             const int bx = t / kWarp;
             bulk_load(sm.kv[0] + bx * C::kPartBoxPlanes * C::kPlaneBytes,
-                      part_box<C>(p, part_cluster(k + 1), cta, bx),
+                      pair_part_box<C>(p, part_cluster(k + 1), cta, bx),
                       C::kPartBoxPlanes * C::kPlaneBytes, &sm.merge_full[0]);
         }
     };
     float lse_r[C::kLseRegs];
     CUTLASS_PRAGMA_UNROLL
     for (int j = 0; j < C::kLseRegs; ++j) {
-        lse_r[j] =
-            j >= n_parts ? -CUDART_INF_F
-            : j == 0
-                ? own_lse
-                : __ldcg(p.lse_part + part_row<C>(part_cluster(j), cta, head));
+        lse_r[j] = j >= n_parts ? -CUDART_INF_F
+                   : j == 0
+                       ? own_lse
+                       : __ldcg(p.lse_part +
+                                pair_part_row<C>(part_cluster(j), cta, head));
     }
     const auto lse_at = [&](int j) {
         if (j >= C::kLseRegs)
-            return __ldcg(p.lse_part + part_row<C>(part_cluster(j), cta, head));
+            return __ldcg(p.lse_part +
+                          pair_part_row<C>(part_cluster(j), cta, head));
         float v = 0.0f;
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < C::kLseRegs; ++k) {
@@ -421,9 +377,10 @@ CUTE_DEVICE void store_o(const HcaParams& p, const HcaMaps& maps,
             if (t == 0) {
                 cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(
                     &sm.merge_full[buf], C::kPartBoxPlanes * C::kPlaneBytes);
-                bulk_load(
-                    merge_buf(buf), part_box<C>(p, part_cluster(k), cta, bx),
-                    C::kPartBoxPlanes * C::kPlaneBytes, &sm.merge_full[buf]);
+                bulk_load(merge_buf(buf),
+                          pair_part_box<C>(p, part_cluster(k), cta, bx),
+                          C::kPartBoxPlanes * C::kPlaneBytes,
+                          &sm.merge_full[buf]);
             }
         };
         const int nbox = others * C::kPartBoxes;
@@ -537,7 +494,7 @@ CUTE_DEVICE void qo_wg(const HcaParams& p, const HcaMaps& maps,
         const int q_token = u.g.a + (cta == 1 && !u.g.has_b ? 0 : cta);
         fetch_q<C>(maps, sm, q_token, t, qv);
         if (unit > 0) {
-            qo_wait<C>(&sm.q_empty, (unit - 1) & 1, t);
+            pair_qo_wait<C>(&sm.q_empty, (unit - 1) & 1, t);
             tcgen05_after_thread_sync();
         }
         store_q<C>(p, sm, lane_base, q_token, cta, t, qv);

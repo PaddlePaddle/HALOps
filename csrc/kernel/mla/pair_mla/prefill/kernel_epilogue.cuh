@@ -16,7 +16,7 @@
 
 #include <math_constants.h>
 
-#include "kernel/mla/pair_mla_prefill/kernel_mainloop.cuh"
+#include "kernel/mla/pair_mla/prefill/kernel_mainloop.cuh"
 
 namespace halops::mla {
 
@@ -29,20 +29,6 @@ CUTE_DEVICE void prefill_load_q_box(const PrefillMaps& maps, uint64_t* bar,
     } else {
         tma_load_2d_no_hint(&maps.q, bar, dst, col, row);
     }
-}
-
-// A lane's row in a 128-byte swizzled box; chunk Q is at row_x ^ 16Q.
-template <class C>
-CUTE_DEVICE uint32_t prefill_swizzled_row(const void* box, int row) {
-    return (cute::cast_smem_ptr_to_uint(box) + row * C::kRowPitch) |
-           (row % C::kAtomRows) * C::kChunk;
-}
-
-// Orders the group's shared loads before a later TMA write to the source.
-CUTE_DEVICE uint32_t prefill_xor_words(const uint4* v, int n) {
-    uint32_t x = 0;
-    for (int i = 0; i < n; ++i) x ^= v[i].x ^ v[i].w;
-    return x;
 }
 
 // Named-barrier sync of the Q/O warp group that consumes x.
@@ -69,14 +55,14 @@ CUTE_DEVICE void prefill_fetch_q(const PrefillMaps& maps, typename C::Smem& sm,
         }
         cutlass::arch::ClusterBarrier::wait(&sm.qs_full, r & 1);
         const uint32_t srow =
-            prefill_swizzled_row<C>(sm.qo_stage[t / C::kHeads], t % C::kHeads);
+            pair_swizzled_row(sm.qo_stage[t / C::kHeads], t % C::kHeads);
         cute::for_each(
             cute::make_int_sequence<C::kChunksPerBox>{}, [&](auto q) {
                 v[r * C::kChunksPerBox + q] =
                     lds_128b_xor<decltype(q)::value * C::kChunk>(srow);
             });
         prefill_qo_sync_after<C>(
-            prefill_xor_words(v + r * C::kChunksPerBox, C::kChunksPerBox));
+            pair_xor_words(v + r * C::kChunksPerBox, C::kChunksPerBox));
     }
 }
 
@@ -101,7 +87,7 @@ CUTE_DEVICE void prefill_fetch_q2(const PrefillMaps& maps, typename C::Smem& sm,
     CUTLASS_PRAGMA_UNROLL
     for (int r = 0; r < C::kQoRounds; ++r) {
         cutlass::arch::ClusterBarrier::wait(&sm.qb.qb_full[r % 2], (r / 2) & 1);
-        const uint32_t srow = prefill_swizzled_row<C>(
+        const uint32_t srow = pair_swizzled_row(
             sm.qb.q_stage[r % 2][t / C::kHeads], t % C::kHeads);
         cute::for_each(
             cute::make_int_sequence<C::kChunksPerBox>{}, [&](auto q) {
@@ -109,7 +95,7 @@ CUTE_DEVICE void prefill_fetch_q2(const PrefillMaps& maps, typename C::Smem& sm,
                     lds_128b_xor<decltype(q)::value * C::kChunk>(srow);
             });
         prefill_qo_sync_after<C>(
-            prefill_xor_words(v + r * C::kChunksPerBox, C::kChunksPerBox));
+            pair_xor_words(v + r * C::kChunksPerBox, C::kChunksPerBox));
         if (r + 2 < C::kQoRounds && t == 0)
             prefill_issue_q<C>(maps, sm, row, r + 2);
     }
@@ -197,7 +183,7 @@ CUTE_DEVICE void prefill_qo_norm_rope(const PrefillParams& p,
         }
     }
     cutlass::arch::fence_view_async_shared();
-    prefill_qo_sync_after<C>(prefill_xor_words(v + C::kQVecs - 1, 1));
+    prefill_qo_sync_after<C>(pair_xor_words(v + C::kQVecs - 1, 1));
 }
 
 // A unit's Q into this lane's TMEM Q columns, then q_full.
@@ -216,25 +202,8 @@ CUTE_DEVICE void prefill_store_q(typename C::Smem& sm, uint32_t lane_base,
         cutlass::arch::ClusterBarrier::arrive(&sm.q_full, 0, 1);
 }
 
-// Long Q/O waits: one warp polls, the others sleep on a named barrier.
-template <class C>
-CUTE_DEVICE void prefill_qo_wait(uint64_t* bar, int phase, int t) {
-    if (t < C::kWarp) cutlass::arch::ClusterBarrier::wait(bar, phase);
-    cutlass::arch::NamedBarrier::sync(C::kWarpGroup, C::kQoBar);
-}
-
-// Row of a part's log2 sum in lse_part.
-template <class C>
-CUTE_DEVICE int64_t prefill_part_row(int slot, int cta, int head) {
-    return (int64_t(slot) * 2 + cta) * C::kHeads + head;
-}
-
-// Cluster of stream tile pos: last c with c * total < (pos + 1) * clusters.
-CUTE_DEVICE int prefill_cluster_of(int clusters, int total, int pos) {
-    return int((uint64_t(pos + 1) * clusters - 1) / uint64_t(total));
-}
-
-// The same over the main kernel's bounds: the last c with bound[c] <= pos.
+// Cluster of stream tile pos over the main kernel's bounds: the last c with
+// bound[c] <= pos.
 CUTE_DEVICE int prefill_cluster_of(const int* bound, int clusters, int pos) {
     int lo = 0, hi = clusters - 1;
     while (lo < hi) {
@@ -245,22 +214,6 @@ CUTE_DEVICE int prefill_cluster_of(const int* bound, int clusters, int pos) {
             hi = mid - 1;
     }
     return lo;
-}
-
-// Reads this lane's O columns [m * 128, +128), freeing them for the next PV.
-template <class C>
-CUTE_DEVICE void prefill_read_o_half(typename C::Smem& sm, uint32_t lane_base,
-                                     int t, int m, float (&o)[C::kOHalf]) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int c = 0; c < C::kOHalf; c += C::kTmemLd) {
-        tmem_ld_32dp32bNx<C::kTmemLd>(lane_base + C::kTmemO + m * C::kOHalf + c,
-                                      o + c);
-    }
-    cutlass::arch::fence_view_async_tmem_load();
-    tcgen05_before_thread_sync();
-    __syncwarp();
-    if (t % C::kWarp == 0)
-        cutlass::arch::ClusterBarrier::arrive(&sm.o_empty[m], 0, 1);
 }
 
 // N floats of v as bf16 to global memory, kStoreCols at a time.
@@ -289,7 +242,7 @@ CUTE_DEVICE void prefill_store_round(const PrefillMaps& maps,
         cutlass::arch::NamedBarrier::sync(C::kWarpGroup, C::kQoBar);
     }
     const uint32_t row =
-        prefill_swizzled_row<C>(sm.qo_stage[t / C::kHeads], t % C::kHeads);
+        pair_swizzled_row(sm.qo_stage[t / C::kHeads], t % C::kHeads);
     cute::for_each(cute::make_int_sequence<C::kChunksPerBox>{}, [&](auto q) {
         constexpr int Q = decltype(q)::value;
         sts_128b_xor<Q * C::kChunk>(
@@ -309,29 +262,6 @@ CUTE_DEVICE void prefill_store_round(const PrefillMaps& maps,
     }
 }
 
-// Reads half mh of this lane's O as scaled bf16 pairs and frees it.
-template <class C>
-CUTE_DEVICE void prefill_read_o_bf16(typename C::Smem& sm, uint32_t lane_base,
-                                     int t, int mh, float scale,
-                                     uint32_t (&w)[C::kOHalf / 2]) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int c = 0; c < C::kOHalf; c += C::kTmemLd) {
-        float o[C::kTmemLd];
-        tmem_ld_32dp32bNx_wait<C::kTmemLd>(
-            lane_base + C::kTmemO + mh * C::kOHalf + c, o);
-        CUTLASS_PRAGMA_UNROLL
-        for (int e = 0; e < C::kTmemLd / 2; ++e) {
-            const nv_bfloat162 b2 =
-                __floats2bfloat162_rn(o[2 * e] * scale, o[2 * e + 1] * scale);
-            w[c / 2 + e] = reinterpret_cast<const uint32_t&>(b2);
-        }
-    }
-    tcgen05_before_thread_sync();
-    __syncwarp();
-    if (t % C::kWarp == 0)
-        cutlass::arch::ClusterBarrier::arrive(&sm.o_empty[mh], 0, 1);
-}
-
 // bf16 output of an unsplit unit; `write` is false for a lone token's CTA 1.
 template <class C>
 CUTE_DEVICE void prefill_store_out_rows(const PrefillMaps& maps,
@@ -341,7 +271,7 @@ CUTE_DEVICE void prefill_store_out_rows(const PrefillMaps& maps,
     CUTLASS_PRAGMA_UNROLL
     for (int mh = 0; mh < 2; ++mh) {
         uint32_t w[C::kOHalf / 2];
-        prefill_read_o_bf16<C>(sm, lane_base, t, mh, scale, w);
+        pair_read_o_bf16<C>(sm, lane_base, t, mh, scale, w);
         if (write) {
             prefill_store_round<C>(maps, sm, token, t, 2 * mh, w);
             prefill_store_round<C>(maps, sm, token, t, 2 * mh + 1,
@@ -359,15 +289,6 @@ CUTE_DEVICE void prefill_for_parts(int clusters, const PrefillUnit& u,
     for (int c = first; c < clusters && bound[c] < end; ++c) {
         if (bound[c + 1] > bound[c]) f(c);
     }
-}
-
-// Box bx of the normalized partial O of slot and CTA cta.
-template <class C>
-CUTE_DEVICE const float* prefill_part_box(const PrefillParams& p, int slot,
-                                          int cta, int bx) {
-    return p.o_part +
-           (int64_t(slot * 2 + cta) * C::kPlanes + bx * C::kPartBoxPlanes) *
-               (C::kPlaneBytes / sizeof(float));
 }
 
 // O of a finished unit to bf16 (sink in the denominator). A split pair is
@@ -407,11 +328,11 @@ CUTE_DEVICE void prefill_store_o(const PrefillParams& p,
     const int others = n_parts - 1;
     if (u.split && first == cluster && t < C::kPartBoxes && !p.combine) {
         for (int k = 1; k <= others; ++k) {
-            prefetch_l2_bulk(prefill_part_box<C>(p, part_cluster(k), cta, t),
+            prefetch_l2_bulk(pair_part_box<C>(p, part_cluster(k), cta, t),
                              C::kPartBoxPlanes * C::kPlaneBytes);
         }
     }
-    prefill_qo_wait<C>(&sm.ml_full[b], (unit / 2) & 1, t);
+    pair_qo_wait<C>(&sm.ml_full[b], (unit / 2) & 1, t);
     const float2 own = sm.ml[b][t], other = sm.ml[b][t ^ C::kHeads];
     __syncwarp();
     if (t % C::kWarp == 0)
@@ -421,7 +342,7 @@ CUTE_DEVICE void prefill_store_o(const PrefillParams& p,
     if (!u.split) {
         const float scale =
             sum > 0.0f ? 1.0f / (sum + exp2f(sink_log2 - m)) : 0.0f;
-        prefill_qo_wait<C>(&sm.o_full, unit & 1, t);
+        pair_qo_wait<C>(&sm.o_full, unit & 1, t);
         tcgen05_after_thread_sync();
         prefill_store_out_rows<C>(maps, sm, u.g.a + cta, lane_base, t, scale,
                                   !lone);
@@ -433,20 +354,19 @@ CUTE_DEVICE void prefill_store_o(const PrefillParams& p,
         half * C::kHalfDims;
     const float own_scale = sum > 0.0f ? 1.0f / sum : 0.0f;
     const float own_lse = sum > 0.0f ? m + log2f(sum) : -CUDART_INF_F;
-    prefill_qo_wait<C>(&sm.o_full, unit & 1, t);
+    pair_qo_wait<C>(&sm.o_full, unit & 1, t);
     tcgen05_after_thread_sync();
     if (lone) {
         if (first != cluster) {
             float o[C::kOHalf];
-            prefill_read_o_half<C>(sm, lane_base, t, 0, o);
-            prefill_read_o_half<C>(sm, lane_base, t, 1, o);
+            pair_read_o_half<C>(sm, lane_base, t, 0, o);
+            pair_read_o_half<C>(sm, lane_base, t, 1, o);
             cutlass::arch::NamedBarrier::sync(C::kWarpGroup, C::kQoBar);
         }
         return;
     }
     const auto write_part = [&](int sid) {
-        if (half == 0)
-            p.lse_part[prefill_part_row<C>(sid, cta, head)] = own_lse;
+        if (half == 0) p.lse_part[pair_part_row<C>(sid, cta, head)] = own_lse;
         float* const dst =
             p.o_part +
             (int64_t(sid * 2 + cta) * C::kPlanes * C::kWarpGroup + t) *
@@ -454,7 +374,7 @@ CUTE_DEVICE void prefill_store_o(const PrefillParams& p,
         CUTLASS_PRAGMA_UNROLL
         for (int mh = 0; mh < 2; ++mh) {
             float o[C::kOHalf];
-            prefill_read_o_half<C>(sm, lane_base, t, mh, o);
+            pair_read_o_half<C>(sm, lane_base, t, mh, o);
             CUTLASS_PRAGMA_UNROLL
             for (int q = 0; q < C::kOHalf / C::kPlaneCols; ++q) {
                 const int pl = mh * C::kOHalf / C::kPlaneCols + q;
@@ -481,7 +401,7 @@ CUTE_DEVICE void prefill_store_o(const PrefillParams& p,
         write_part(sid);
         if (p.combine) {
             if (first == cluster && cta == 0 && t == 0)
-                p.jobs[cluster] = PrefillMergeJob{u.g.a, u.g.has_b, u.w0, u.wn};
+                p.jobs[cluster] = PairMergeJob{u.g.a, u.g.has_b, u.w0, u.wn};
             return;
         }
         int v = 0;
@@ -509,7 +429,7 @@ CUTE_DEVICE void prefill_store_o(const PrefillParams& p,
     const float lse0 =
         mode == 1
             ? own_lse
-            : __ldcg(p.lse_part + prefill_part_row<C>(merger_slot, cta, head));
+            : __ldcg(p.lse_part + pair_part_row<C>(merger_slot, cta, head));
     constexpr int kLseRegs = C::kLseRegs;
     float lse_r[kLseRegs];
     CUTLASS_PRAGMA_UNROLL
@@ -517,13 +437,13 @@ CUTE_DEVICE void prefill_store_o(const PrefillParams& p,
         lse_r[j] = j >= n_parts ? -CUDART_INF_F
                    : j == 0
                        ? lse0
-                       : __ldcg(p.lse_part + prefill_part_row<C>(
-                                                 part_cluster(j), cta, head));
+                       : __ldcg(p.lse_part +
+                                pair_part_row<C>(part_cluster(j), cta, head));
     }
     const auto lse_at = [&](int j) {
         if (j >= kLseRegs)
             return __ldcg(p.lse_part +
-                          prefill_part_row<C>(part_cluster(j), cta, head));
+                          pair_part_row<C>(part_cluster(j), cta, head));
         float v = 0.0f;
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < kLseRegs; ++k) {
@@ -611,7 +531,7 @@ CUTE_DEVICE void prefill_store_o(const PrefillParams& p,
                 cutlass::arch::ClusterTransactionBarrier::arrive_and_expect_tx(
                     &sm.merge_full[buf], C::kPartBoxPlanes * C::kPlaneBytes);
                 cute::SM90_BULK_COPY_G2S::copy(
-                    prefill_part_box<C>(p, part_cluster(k), cta, bx),
+                    pair_part_box<C>(p, part_cluster(k), cta, bx),
                     &sm.merge_full[buf], merge_buf(buf),
                     C::kPartBoxPlanes * C::kPlaneBytes);
             }
@@ -724,7 +644,7 @@ CUTE_DEVICE void prefill_qo_wg(const PrefillParams& p, const PrefillMaps& maps,
         }
         if constexpr (C::kQnr) prefill_qo_norm_rope<C>(p, sm, t, unit % 2, qv);
         if (unit > 0) {
-            prefill_qo_wait<C>(&sm.q_empty, (unit - 1) & 1, t);
+            pair_qo_wait<C>(&sm.q_empty, (unit - 1) & 1, t);
             tcgen05_after_thread_sync();
         }
         prefill_store_q<C>(sm, lane_base, t, qv);

@@ -22,7 +22,8 @@
 
 #include "common/sm100_arch.cuh"
 #include "kernel/mla/common/intrinsics.cuh"
-#include "kernel/mla/pair_mla_decode/smem.cuh"
+#include "kernel/mla/pair_mla/common/config.cuh"
+#include "kernel/mla/pair_mla/decode/smem.cuh"
 
 namespace halops {
 using namespace mla;
@@ -219,16 +220,6 @@ template <class C>
 CUTE_HOST_DEVICE constexpr int raw_pitch(int cta) {
     return cta == 0 ? C::kHalfDims : C::kRowBytes - C::kHalfDims;
 }
-
-template <int kCta, class C>
-struct DequantPlan {
-    static constexpr int kFp8Chunks =
-        (kCta == 0 ? C::kHalfDims : C::kNopeBytes1) / kChunk;
-    static constexpr int kFp8Loads = C::kTile * kFp8Chunks / kWarpGroup;
-    static constexpr int kRopeChunks =
-        kCta == 0 ? 0 : (C::kRowBytes - C::kNope) / kChunk;
-    static constexpr int kRopeLoads = C::kTile * kRopeChunks / kWarpGroup;
-};
 
 // Bit fields and widths of the PTX operands built by hca_ptx.cuh.
 struct HcaIsa {

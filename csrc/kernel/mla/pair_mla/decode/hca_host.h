@@ -19,22 +19,11 @@
 
 #include "common/sm100_arch.cuh"
 #include "kernel/gemm/gemm_utils.h"
-#include "kernel/mla/pair_mla_decode/config.cuh"
-#include "kernel/mla/pair_mla_decode/params.cuh"
+#include "kernel/mla/pair_mla/common/host.h"
+#include "kernel/mla/pair_mla/decode/config.cuh"
+#include "kernel/mla/pair_mla/decode/params.cuh"
 
 namespace halops::detail {
-
-template <class C>
-CUtensorMap make_map(const void* ptr, CUtensorMapDataType dtype,
-                     const torch::Tensor& pool, uint64_t cols, uint32_t box,
-                     CUtensorMapSwizzle swizzle) {
-    CUtensorMap map;
-    EncodeTmaDesc<2>(
-        &map, dtype, ptr,
-        {cols, uint64_t(pool.size(0) * (pool.stride(0) / C::kRowBytes))},
-        {C::kRowBytes}, {box, 1}, swizzle, "hca_decode_attention");
-    return map;
-}
 
 template <class C>
 void set_pool(HcaParams& p, HcaMaps& maps, int seg, const torch::Tensor& pool,
@@ -66,9 +55,10 @@ void set_pool(HcaParams& p, HcaMaps& maps, int seg, const torch::Tensor& pool,
     p.pool_tokens[seg] = pool.size(0) * pool.size(1);
     const uint8_t* base = pool.data_ptr<uint8_t>();
     for (int c = 0; c < 2; ++c) {
-        maps.raw[c][seg] = make_map<C>(
+        maps.raw[c][seg] = pair_make_pool_map<C>(
             base, CU_TENSOR_MAP_DATA_TYPE_UINT16, pool, C::kRowBytes / 2,
-            raw_pitch<C>(c) / 2, CU_TENSOR_MAP_SWIZZLE_NONE);
+            raw_pitch<C>(c) / 2, CU_TENSOR_MAP_SWIZZLE_NONE,
+            "hca_decode_attention");
     }
 }
 

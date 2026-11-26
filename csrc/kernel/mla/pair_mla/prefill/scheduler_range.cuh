@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "kernel/mla/pair_mla_prefill/scheduler.cuh"
+#include "kernel/mla/pair_mla/prefill/scheduler.cuh"
 
 namespace halops::mla {
 
@@ -37,7 +37,7 @@ CUTE_DEVICE void prefill_find_range(const PrefillParams& p,
     bool by_cost = !p.combine;
     int sum = 0, csum = 0;
     for (int q = first, j = 0; q < min(first + per, pairs); ++q, ++j) {
-        const PrefillPairLens l = prefill_load_lens<C>(p, q);
+        const PairLens l = prefill_load_lens<C>(p, q);
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < kKeep; ++k) {
             if (j == k)
@@ -176,7 +176,7 @@ CUTE_DEVICE void prefill_find_range(const PrefillParams& p,
         } else if (threadIdx.x < PrefillSchedTraits::kTableUnits &&
                    sm.start[0] + int(threadIdx.x) < pairs) {
             const int q = sm.start[0] + threadIdx.x;
-            const PrefillPairLens l = prefill_load_lens<C>(p, q);
+            const PairLens l = prefill_load_lens<C>(p, q);
             sm.unit_lens[threadIdx.x] =
                 make_int4(l.v[0][0], l.v[0][1], l.v[1][0], l.v[1][1]);
         }

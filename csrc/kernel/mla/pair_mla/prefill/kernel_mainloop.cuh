@@ -22,8 +22,10 @@
 #include <cute/arch/mma_sm100_desc.hpp>
 
 #include "kernel/mla/common/intrinsics.cuh"
-#include "kernel/mla/pair_mla_prefill/config.cuh"
-#include "kernel/mla/pair_mla_prefill/scheduler_range.cuh"
+#include "kernel/mla/pair_mla/common/pipeline.cuh"
+#include "kernel/mla/pair_mla/common/sw128.cuh"
+#include "kernel/mla/pair_mla/prefill/config.cuh"
+#include "kernel/mla/pair_mla/prefill/scheduler_range.cuh"
 
 namespace halops::mla {
 
@@ -52,33 +54,6 @@ CUTE_DEVICE uint64_t prefill_instr_desc() {
     return cute::UMMA::make_runtime_instr_desc<
         cutlass::bfloat16_t, cutlass::bfloat16_t, float, 2 * C::kHeads, N,
         cute::UMMA::Major::K, BMajor>();
-}
-
-// Row r and its swizzled 16-byte chunk c in a SW128 tile of 8-row atoms.
-template <class C>
-CUTE_DEVICE int prefill_row_offset(int r) {
-    return (r / C::kAtomRows) * C::kAtomBytes +
-           (r % C::kAtomRows) * C::kRowPitch;
-}
-template <class C>
-CUTE_DEVICE int prefill_sw128_offset(int r, int c) {
-    return prefill_row_offset<C>(r) + (c ^ (r % C::kAtomRows)) * C::kChunk;
-}
-
-// Eight fp8 e4m3 values times the e8 block scale, as bf16.
-template <class C>
-CUTE_DEVICE uint4 prefill_dequant8(uint32_t lo, uint32_t hi, uint8_t e8) {
-    const uint32_t raw[2] = {lo, hi};
-    const auto* f8 = reinterpret_cast<const __nv_fp8x2_e4m3*>(raw);
-    const nv_bfloat16 scale =
-        __ushort_as_bfloat16(uint16_t(e8) << C::kBf16Mant);
-    uint4 out;
-    auto* o = reinterpret_cast<nv_bfloat162*>(&out);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < C::kElemsPerChunk / 2; ++i) {
-        o[i] = fp8x2_to_bf16x2_with_scale(f8[i], scale);
-    }
-    return out;
 }
 
 // Index warp w resolves keys [32w, 32w + 32) of each tile and gathers their
@@ -168,7 +143,7 @@ CUTE_DEVICE void prefill_index_warp(const PrefillParams& p,
                     cute::SM90_TMA_LOAD_2D::copy(
                         &maps.bf16, &sm.raw_full[s], C::kBf16L2Hint,
                         sm.kv[s] + b * C::kBlockBytes +
-                            prefill_row_offset<C>(w * C::kWarp),
+                            pair_row_offset(w * C::kWarp),
                         cta * C::kHalfDims + b * C::kBlockDims,
                         r.bf + w * C::kWarp);
                 }
@@ -259,11 +234,11 @@ CUTE_DEVICE void prefill_rope_pair(uint32_t& w, float fr, float fi) {
     w = pack_bf16_rn(re, fma_rn_f32(xr, fi, mul_rn_f32(xi, fr)));
 }
 
-// Dequantizes each KV stage in place (PrefillDequantPlan); bf16-copy
+// Dequantizes each KV stage in place (PairDequantPlan); bf16-copy
 // tiles only pass the stage on.
 template <int kCta, class C>
 CUTE_DEVICE void prefill_dequant_wg(typename C::Smem& sm, int n, int t) {
-    using Plan = PrefillDequantPlan<C, kCta>;
+    using Plan = PairDequantPlan<kCta, C>;
     constexpr int kPitch = C::raw_pitch(kCta);
     for (int i = 0; i < n; ++i) {
         const int s = i % C::kKvStages, is = i % C::kIdxStages;
@@ -315,22 +290,22 @@ CUTE_DEVICE void prefill_dequant_wg(typename C::Smem& sm, int n, int t) {
             const int q0 = c % C::kFp8ChunksPerBlock * 2;
             uint8_t* const block =
                 stage + c / C::kFp8ChunksPerBlock * C::kBlockBytes;
-            const uint4 first = prefill_dequant8<C>(
-                odd ? raw[k].z : raw[k].x, odd ? raw[k].w : raw[k].y, e8[k]);
-            const uint4 second = prefill_dequant8<C>(
+            const uint4 first = pair_dequant8(odd ? raw[k].z : raw[k].x,
+                                              odd ? raw[k].w : raw[k].y, e8[k]);
+            const uint4 second = pair_dequant8(
                 odd ? raw[k].x : raw[k].z, odd ? raw[k].y : raw[k].w, e8[k]);
+            *reinterpret_cast<uint4*>(block +
+                                      pair_sw128_offset(row, q0 + odd)) = first;
             *reinterpret_cast<uint4*>(
-                block + prefill_sw128_offset<C>(row, q0 + odd)) = first;
-            *reinterpret_cast<uint4*>(
-                block + prefill_sw128_offset<C>(row, q0 + !odd)) = second;
+                block + pair_sw128_offset(row, q0 + !odd)) = second;
         }
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < Plan::kRopeLoads; ++k) {
             const int e = t + k * C::kWarpGroup;
             const int row = e / kRopeChunks, c = e % kRopeChunks;
-            *reinterpret_cast<uint4*>(
-                stage + (C::kLocalBlocks - 1) * C::kBlockBytes +
-                prefill_sw128_offset<C>(row, c)) = rope[k];
+            *reinterpret_cast<uint4*>(stage +
+                                      (C::kLocalBlocks - 1) * C::kBlockBytes +
+                                      pair_sw128_offset(row, c)) = rope[k];
         }
         cutlass::arch::fence_view_async_shared();
         __syncwarp();
@@ -420,19 +395,6 @@ CUTE_DEVICE void prefill_pv_warp(const PrefillParams& p, typename C::Smem& sm,
     }
 }
 
-// Softmax thread t owns TMEM lane t (head t % 64, dims half t / 64).
-template <class C>
-CUTE_DEVICE void prefill_pair_sync(int t) {
-    cutlass::arch::NamedBarrier::sync(2 * C::kWarp,
-                                      C::kPairBar + t / C::kWarp % 2);
-}
-
-// Waits for PV(j).
-template <class C>
-CUTE_DEVICE void prefill_wait_pv(typename C::Smem& sm, int j) {
-    cutlass::arch::ClusterBarrier::wait(&sm.pv_done[j % 2], (j / 2) & 1);
-}
-
 // Online softmax of tile i, adding the partner lane's partial S (exchanged
 // through bank-swizzled xchg rows). kQnr scales by the head's 1 / rms. O is
 // rescaled only after PV(i - 1), and P buffer i % 2 is reused after PV(i - 2).
@@ -477,7 +439,7 @@ CUTE_DEVICE void prefill_softmax_tile(const PrefillParams& p,
         cutlass::arch::ClusterBarrier::arrive(&sm.s_empty[sb], 0, 1);
         cutlass::arch::ClusterBarrier::arrive(&sm.idx_empty[is]);
     }
-    prefill_pair_sync<C>(t);
+    pair_lane_sync<C>(t);
     const float4* const got = reinterpret_cast<const float4*>(sm.xchg[t]);
     float2* const own2 = reinterpret_cast<float2*>(own);
     CUTLASS_PRAGMA_UNROLL
@@ -504,7 +466,7 @@ CUTE_DEVICE void prefill_softmax_tile(const PrefillParams& p,
     float local = mx[0];
     local *= scale_log2;
     sm.red[t] = local;
-    prefill_pair_sync<C>(t);
+    pair_lane_sync<C>(t);
     const float cur = fmaxf(local, sm.red[t ^ C::kHeads]);
     float factor = 1.0f;
     if (__any_sync(~0u, cur - m > C::kRescaleLog2)) {
@@ -526,7 +488,7 @@ CUTE_DEVICE void prefill_softmax_tile(const PrefillParams& p,
     }
     l = l * factor + (sum.x + sum.y);
     if (k > 0 && __any_sync(~0u, factor != 1.0f)) {
-        prefill_wait_pv<C>(sm, i - 1);
+        pair_wait_pv<C>(sm, i - 1);
         tcgen05_after_thread_sync();
         CUTLASS_PRAGMA_UNROLL
         for (int c0 = 0; c0 < C::kHalfDims; c0 += C::kTmemLd) {
@@ -538,12 +500,12 @@ CUTE_DEVICE void prefill_softmax_tile(const PrefillParams& p,
         }
         cutlass::arch::fence_view_async_tmem_store();
     }
-    if (i > 1 && !pv_ok) prefill_wait_pv<C>(sm, i - 2);
+    if (i > 1 && !pv_ok) pair_wait_pv<C>(sm, i - 2);
     CUTLASS_PRAGMA_UNROLL
     for (int q = 0; q < C::kHalf / C::kElemsPerChunk; ++q) {
         *reinterpret_cast<uint4*>(
-            sm.p[sb] + prefill_sw128_offset<C>(
-                           head, half * C::kHalf / C::kElemsPerChunk + q)) =
+            sm.p[sb] +
+            pair_sw128_offset(head, half * C::kHalf / C::kElemsPerChunk + q)) =
             reinterpret_cast<const uint4*>(pk)[q];
     }
     cutlass::arch::fence_view_async_shared();

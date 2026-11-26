@@ -20,7 +20,7 @@
 #include <cute/arch/tmem_allocator_sm100.hpp>
 
 #include "common/pdl.cuh"
-#include "kernel/mla/pair_mla_prefill/kernel_epilogue.cuh"
+#include "kernel/mla/pair_mla/prefill/kernel_epilogue.cuh"
 
 namespace halops::mla {
 
@@ -152,7 +152,7 @@ __global__ void prefill_pair_mla_combine_kernel(
     __shared__ float red[C::kCombSplit][C::kWarpGroup][C::kPlaneCols];
     __shared__ float redmd[C::kCombSplit][C::kWarpGroup][2];
     pdl_wait();
-    const PrefillMergeJob j = p.jobs[blockIdx.z];
+    const PairMergeJob j = p.jobs[blockIdx.z];
     const int cta = blockIdx.y;
     if (j.wn == 0 || (cta == 1 && !j.has_b)) return;
     const int pl = blockIdx.x;
@@ -161,8 +161,8 @@ __global__ void prefill_pair_mla_combine_kernel(
     const int head = tsi % C::kHeads, half = tsi / C::kHeads;
     const int total = *p.total_g;
     const int sched = *p.sched_g;
-    const int first = prefill_cluster_of(sched, total, j.w0);
-    const int last = prefill_cluster_of(sched, total, j.w0 + j.wn - 1);
+    const int first = pair_cluster_of(sched, total, j.w0);
+    const int last = pair_cluster_of(sched, total, j.w0 + j.wn - 1);
     const float sink_log2 =
         p.sink ? __ldg(p.sink + head) * CUDART_L2E_F : -CUDART_INF_F;
     const auto empty = [&](int c) {
@@ -175,7 +175,7 @@ __global__ void prefill_pair_mla_combine_kernel(
     for (int c = first + grp; c <= last; c += C::kCombSplit) {
         if (empty(c)) continue;
         const float lse =
-            __ldg(p.lse_part + prefill_part_row<C>(sid(c), cta, head));
+            __ldg(p.lse_part + pair_part_row<C>(sid(c), cta, head));
         if (!(lse > -CUDART_INF_F)) continue;
         const float nm = fmaxf(m, lse);
         const float sc = exp2f(m - nm), e = exp2f(lse - nm);
@@ -312,8 +312,8 @@ __global__ void __launch_bounds__(PrefillPredqTraits::kThreads)
         const uint8_t e8 =
             __ldg(base + (int64_t(1) << p.page_shift[0]) * C::kRowBytes +
                   row * C::kSfBytes + lane * C::kChunk / C::kBlockDims);
-        dst[2 * lane] = prefill_dequant8<C>(raw.x, raw.y, e8);
-        dst[2 * lane + 1] = prefill_dequant8<C>(raw.z, raw.w, e8);
+        dst[2 * lane] = pair_dequant8(raw.x, raw.y, e8);
+        dst[2 * lane + 1] = pair_dequant8(raw.z, raw.w, e8);
     } else {
         const uint4* const rope =
             reinterpret_cast<const uint4*>(src + C::kNope);

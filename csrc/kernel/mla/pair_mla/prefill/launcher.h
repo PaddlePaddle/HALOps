@@ -25,7 +25,8 @@
 
 #include "kernel/gemm/gemm_utils.h"
 #include "kernel/mla/common/host_utils.h"
-#include "kernel/mla/pair_mla_prefill/params.cuh"
+#include "kernel/mla/pair_mla/common/host.h"
+#include "kernel/mla/pair_mla/prefill/params.cuh"
 
 namespace halops::mla {
 
@@ -111,19 +112,6 @@ void prefill_check_kv_inputs(
     }
 }
 
-// A 2D TMA map over the KV pool rows (one row per token slot).
-template <class T>
-CUtensorMap prefill_make_map(const void* ptr, CUtensorMapDataType dtype,
-                             const torch::Tensor& pool, uint64_t cols,
-                             uint32_t box, CUtensorMapSwizzle swizzle) {
-    CUtensorMap map;
-    EncodeTmaDesc<2>(
-        &map, dtype, ptr,
-        {cols, uint64_t(pool.size(0) * (pool.stride(0) / T::kRowBytes))},
-        {T::kRowBytes}, {box, 1}, swizzle, "prefill_pair_mla");
-    return map;
-}
-
 // Segment seg's pool, lists and lengths, and the per-CTA raw row maps.
 template <class T>
 void prefill_set_pool(PrefillParams& p, PrefillMaps& maps, int seg,
@@ -139,9 +127,10 @@ void prefill_set_pool(PrefillParams& p, PrefillMaps& maps, int seg,
     p.pool_tokens[seg] = pool.size(0) * pool.size(1);
     const uint8_t* base = pool.data_ptr<uint8_t>();
     for (int c = 0; c < 2; ++c) {
-        maps.raw[c][seg] = prefill_make_map<T>(
+        maps.raw[c][seg] = pair_make_pool_map<T>(
             base, CU_TENSOR_MAP_DATA_TYPE_UINT16, pool, T::kRowBytes / 2,
-            T::raw_pitch(c) / 2, CU_TENSOR_MAP_SWIZZLE_NONE);
+            T::raw_pitch(c) / 2, CU_TENSOR_MAP_SWIZZLE_NONE,
+            "prefill_pair_mla");
     }
 }
 
@@ -153,7 +142,7 @@ struct PrefillWorkspace {
 };
 
 // The device's workspace, grown as needed; jobs holds
-// PrefillMergeJob[clusters].
+// PairMergeJob[clusters].
 template <class T>
 PrefillWorkspace& prefill_workspace(const torch::Tensor& q, int clusters,
                                     int64_t c128_rows, int64_t tokens) {

@@ -22,6 +22,7 @@
 #include <cute/arch/mma_sm100_umma.hpp>
 
 #include "kernel/mla/common/traits.cuh"
+#include "kernel/mla/pair_mla/common/config.cuh"
 
 namespace halops::mla {
 
@@ -38,7 +39,6 @@ struct PrefillPairTraits {
     static constexpr int kRowBytes = Dims::KvRowBytes;
     static constexpr int kSfBytes = KvCacheLayout::ScaleSlotBytes;
     static constexpr int kBlockDims = KvCacheLayout::NopeQuantBlock;
-    static constexpr int kBf16Mant = 7;
     static constexpr int kQRopeDims = kDim - kNope;
     static constexpr int kHalfDims = kDim / 2;
 
@@ -47,7 +47,6 @@ struct PrefillPairTraits {
     static constexpr int kLocalBlocks = kHalfDims / kBlockDims;
     static constexpr int kRowPitch = Sm100::Sw128Bytes;
     static constexpr int kAtomBytes = Sm100::Sw128AtomBytes;
-    static constexpr int kAtomRows = kAtomBytes / kRowPitch;
     static constexpr int kChunk = 16;
     static constexpr int kChunkMask = kChunk - 1;
     static constexpr int kElemsPerChunk = kChunk / sizeof(__nv_bfloat16);
@@ -245,17 +244,5 @@ using PrefillUmmaSs =
     cute::SM100_MMA_F16BF16_2x1SM_SS<cutlass::bfloat16_t, cutlass::bfloat16_t,
                                      float, 2 * C::kHeads, N,
                                      cute::UMMA::Major::K, BMajor>;
-
-// Dequantizes the KV stage of CTA kCta in place: all reads, a barrier, then
-// the writes. Only CTA 1 holds rope chunks.
-template <class C, int kCta>
-struct PrefillDequantPlan {
-    static constexpr int kFp8Chunks =
-        (kCta == 0 ? C::kHalfDims : C::kNopeBytes1) / C::kChunk;
-    static constexpr int kFp8Loads = C::kTile * kFp8Chunks / C::kWarpGroup;
-    static constexpr int kRopeChunks =
-        kCta == 0 ? 0 : (C::kRowBytes - C::kNope) / C::kChunk;
-    static constexpr int kRopeLoads = C::kTile * kRopeChunks / C::kWarpGroup;
-};
 
 }  // namespace halops::mla

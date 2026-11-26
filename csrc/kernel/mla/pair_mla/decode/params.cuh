@@ -20,6 +20,8 @@
 
 #include <cstdint>
 
+#include "kernel/mla/pair_mla/common/schedule.cuh"
+
 namespace halops::detail {
 
 // Host schedule defaults and the combine-kernel launch shape.  kNoCap marks
@@ -68,13 +70,6 @@ struct HcaMaps {
     CUtensorMap out;
 };
 
-// One split pair the separate combine kernel must finish: its first token,
-// whether it has a second, and the schedule-weight span used to recompute the
-// part clusters with cluster_of (identical to the main kernel's view).
-struct MergeJob {
-    int a, has_b, w0, wn;
-};
-
 struct HcaParams {
     const int* idx[2];
     const int* len[2];
@@ -99,7 +94,7 @@ struct HcaParams {
     int pipe;
     int combine;
     int fuse;
-    MergeJob* jobs;
+    PairMergeJob* jobs;
     int* total_g;
     int eff;
     int tpc;

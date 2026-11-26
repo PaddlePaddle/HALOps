@@ -20,10 +20,10 @@
 #include "common/pdl.cuh"
 #include "common/sm100_arch.cuh"
 #include "kernel/gemm/gemm_utils.h"
-#include "kernel/mla/pair_mla_decode/config.cuh"
-#include "kernel/mla/pair_mla_decode/hca_host.h"
-#include "kernel/mla/pair_mla_decode/kernel.cuh"
-#include "kernel/mla/pair_mla_decode/params.cuh"
+#include "kernel/mla/pair_mla/decode/config.cuh"
+#include "kernel/mla/pair_mla/decode/hca_host.h"
+#include "kernel/mla/pair_mla/decode/kernel.cuh"
+#include "kernel/mla/pair_mla/decode/params.cuh"
 
 namespace halops {
 
@@ -78,7 +78,7 @@ void launch_decode(HcaParams& p, const HcaMaps& maps, const torch::Tensor& q,
     p.o_part = ws.o_part.data_ptr<float>();
     p.lse_part = ws.lse_part.data_ptr<float>();
     p.counter = ws.counter.data_ptr<int>();
-    p.jobs = reinterpret_cast<MergeJob*>(ws.jobs.data_ptr<int>());
+    p.jobs = reinterpret_cast<PairMergeJob*>(ws.jobs.data_ptr<int>());
     p.total_g = ws.total_g.data_ptr<int>();
     p.eff_g = ws.eff_g.data_ptr<int>();
     const cudaStream_t stream = GetCurrentCUDAStream(q);
