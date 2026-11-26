@@ -13,22 +13,18 @@
 // limitations under the License.
 
 #include "common/cuda_utils.h"
-#include "kernel/mla/mega_mla/mla_attention_kernel.cuh"
+#include "kernel/mla/mega_mla/attention/kernel.cuh"
+#include "kernel/mla/mega_mla/attention/params.cuh"
 
 namespace halops {
 namespace mla {
 template <class KT>
 void launch_prequant_x(const MlaAttentionProblem<KT>& prob,
                        const ActAtoms<typename KT::GemmBase>& act_x);
-}  // namespace mla
 
-using namespace mla;
-
-namespace {
-
-using Problem = MlaAttentionProblem<TraitsN128>;
-
-void check_attention_inputs(const MlaAttentionArguments& args) {
+/// Checks the projection weights and their scale factors; returns hidden.
+int mla_attn_check_weights(const MlaAttentionArguments& args) {
+    using Problem = MlaAttentionProblem<TraitsN128>;
     const int hidden = check_attention_weights(
         args.wq_a_weight, args.wkv_weight, "mla_attention");
     TORCH_CHECK(Problem::w_rows(args.wq_b_weight) == ModelDims::QTotal &&
@@ -39,6 +35,12 @@ void check_attention_inputs(const MlaAttentionArguments& args) {
     check_sfatom_weight(args.wq_b_weight, args.wq_b_sf, "mla_attention");
     check_sfatom_weight(args.wkv_weight, args.wkv_sf, "mla_attention");
     check_rope_and_sink(args.freqs_real, args.attn_sink, "mla_attention");
+    return hidden;
+}
+
+/// Validates every MlaAttention input before dispatch.
+void mla_attn_check_inputs(const MlaAttentionArguments& args) {
+    const int hidden = mla_attn_check_weights(args);
     const int64_t num_tokens = args.q_or_x.size(0);
     TORCH_CHECK(num_tokens > 0 && args.q_or_x.scalar_type() == at::kBFloat16 &&
                     args.q_or_x.is_contiguous() &&
@@ -69,8 +71,9 @@ void check_attention_inputs(const MlaAttentionArguments& args) {
                 "mla_attention: c128_page_table needs c128_pool");
 }
 
+/// Builds the kernel parameters and launches the mega MLA attention kernel.
 template <class KT>
-void mla_attention_launch(const MlaAttentionArguments& args) {
+void mla_attn_launch(const MlaAttentionArguments& args) {
     const MlaAttentionProblem<KT> prob = MlaAttentionProblem<KT>::from(args);
     const int64_t bytes = prob.wsl.attention_end(prob.hidden);
     TORCH_CHECK(args.workspace.numel() >= bytes,
@@ -89,7 +92,9 @@ void mla_attention_launch(const MlaAttentionArguments& args) {
                {prob.grid_x, KT::NumThreads, sizeof(SharedMemoryPlan<KT>)}, mp,
                ep, sched);
 }
-}  // namespace
+}  // namespace mla
+
+using namespace mla;
 
 void MlaAttention(const torch::Tensor& q_or_x, const torch::Tensor& kv_cache,
                   int64_t page_size, const torch::Tensor& positions,
@@ -152,10 +157,10 @@ void MlaAttention(const torch::Tensor& q_or_x, const torch::Tensor& kv_cache,
         .draft_tokens = draft_tokens,
         .hidden_states = hidden_states,
         .reset_barriers = reset_barriers};
-    check_attention_inputs(args);
+    mla_attn_check_inputs(args);
     dispatch_tile_t(
         (int)args.q_or_x.size(0), !args.c128_attn_len.has_value(),
-        [&](auto trait) { mla_attention_launch<decltype(trait)>(args); });
+        [&](auto trait) { mla_attn_launch<decltype(trait)>(args); });
 }
 
 }  // namespace halops

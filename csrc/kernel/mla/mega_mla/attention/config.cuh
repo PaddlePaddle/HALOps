@@ -14,14 +14,35 @@
 
 #pragma once
 
-#include <cutlass/arch/reg_reconfig.h>
+#include <cuda_fp8.h>
 
 #include <cute/arch/tmem_allocator_sm100.hpp>
 
-#include "kernel/mla/mega_mla/mla_epilogue.cuh"
-#include "kernel/mla/mega_mla/mla_scheduler.cuh"
+#include "kernel/mla/mega_mla/mla_params.cuh"
 
 namespace halops::mla {
+/// Tuning and bit-layout constants of the mega MLA attention kernel.
+struct MlaAttnConfig {
+    static constexpr unsigned kFullMask = 0xffffffffu;
+    static constexpr int kXQuantBatch = 4;
+    static constexpr int kKvPerThread = 4;
+    static constexpr float kKvAmaxFloor = 1e-4f;
+    static constexpr int kF32MantBits = 23;
+    static constexpr int kF32ExpMask = 0xFF;
+    static constexpr int kF32MantMask = 0x7FFFFF;
+    static constexpr float kMinWeightSum = 1e-38f;
+    static constexpr int kF32PerVec4 = sizeof(float4) / sizeof(float);
+    static constexpr int kFp8x2PerWord =
+        sizeof(uint64_t) / sizeof(__nv_fp8x2_e4m3);
+    static constexpr int kRolledKvGateMinTile = 64;
+    static constexpr int kRescaleCols = 64;
+    static constexpr int kHalfKeys = AttnConfig::KvBlock / 2;
+    static constexpr int kUtccpBits = 256;
+    static constexpr int kTmemColBits = 32;
+    static constexpr int kSmemDescUnit = 16;
+    static constexpr int kRopeCopyBatch = 4;
+};
+
 template <class KT>
 struct SharedMemoryPlan {
     using Attn = typename KT::Attn;
@@ -51,7 +72,8 @@ struct SharedMemoryPlan {
                                 Dims::Heads * Dims::DimNope>
                 raw_nope[Attn::NumBufs];
 
-            float4 p_exchange_buf[2][KT::WarpSize * (Attn::KvBlock / 2) / 4];
+            float4 p_exchange_buf[2][KT::WarpSize * (Attn::KvBlock / 2) /
+                                     MlaAttnConfig::kF32PerVec4];
             cute::array_aligned<cutlass::bfloat16_t,
                                 cute::cosize_v<typename Attn::SmemLayoutS>>
                 s[Attn::NumBufs];
@@ -161,148 +183,4 @@ struct SharedMemoryPlan {
         cute::TMEM::Allocator1Sm().free(0, Attn::TmemCols::Total);
     }
 };
-
-template <class KT_, class MP, class EP, class Plan, class Bars, class Sched,
-          class PreludeRanges>
-struct KernelPipelines {
-    using KT = KT_;
-    static constexpr int TileT = KT::TileT;
-
-    const MP& params;
-    const EP& ep;
-    Plan& plan;
-    AttnRing& rs;
-    uint32_t& q_tma_phase;
-    uint32_t& q_utccp_phase;
-    int warp_idx;
-    int lane_idx;
-    int idx_in_warpgroup;
-    int warpgroup_idx;
-
-    int token_iters;
-    const Sched& sched;
-    PreludeRanges prelude;
-    Bars bars;
-};
-
-template <class KT, class Ctx>
-CUTE_DEVICE void run_role(const AttentionMainloop<KT>& main_loop,
-                          const AttentionEpilogue<KT>& epilogue_loop,
-                          const Ctx& ctx) {
-    using Roles = typename KT::Roles;
-    const int warp_idx = ctx.warp_idx;
-    if (Roles::is_mma(warp_idx)) {
-        cutlass::arch::warpgroup_reg_dealloc<Roles::RegsWg0>();
-        main_loop.role_mma(ctx);
-    } else if (Roles::is_tma1(warp_idx) || Roles::is_tma2(warp_idx)) {
-        cutlass::arch::warpgroup_reg_dealloc<Roles::RegsWg0>();
-        main_loop.role_tma12(ctx, warp_idx - Roles::Tma1Warp);
-    } else if (Roles::is_tma3(warp_idx)) {
-        cutlass::arch::warpgroup_reg_dealloc<Roles::RegsWg0>();
-        main_loop.role_tma3(ctx);
-    } else if (Roles::is_drain(warp_idx)) {
-        cutlass::arch::warpgroup_reg_alloc<Roles::RegsDrain>();
-        epilogue_loop.role_drain(ctx);
-    } else if (Roles::is_vec(warp_idx)) {
-        cutlass::arch::warpgroup_reg_dealloc<Roles::RegsVec>();
-        epilogue_loop.role_vec(ctx);
-    }
-}
-
-template <class KT, class MP, class EP, class SP>
-__global__ void __launch_bounds__(KT::NumThreads, 1, 1)
-    mla_attention_kernel(__grid_constant__ const MP mainloop_params,
-                         __grid_constant__ const EP epilogue_params,
-                         __grid_constant__ const SP scheduler_params) {
-    using Attn = typename KT::Attn;
-    using CfgQkv = typename KT::Qkv;
-    using CfgWqB = typename KT::WqB;
-    using CfgKvGate = typename KT::KvGate;
-
-    pdl_trigger();
-
-    const AttentionMainloop<KT> main_loop;
-    const AttentionEpilogue<KT> epilogue_loop;
-
-    extern __shared__ char smem_buf[];
-    SharedMemoryPlan<KT>& plan =
-        *reinterpret_cast<SharedMemoryPlan<KT>*>(smem_buf);
-
-    const int warp_idx = KT::warp_idx();
-    if (warp_idx == 0) {
-        if (cute::elect_one_sync()) {
-            mainloop_params.prefetch_descriptors();
-            plan.init_bars();
-        }
-        plan.acquire_tmem();
-    }
-    __syncthreads();
-
-    AttnRing rs;
-    uint32_t q_tma_phase = 0, q_utccp_phase = 0;
-
-    pdl_wait();
-
-    const auto scheduler = MlaScheduler<KT>::make(scheduler_params);
-
-    char* gemm_smem = plan.gemm_smem();
-    const GemmPipelineBars gemm_bars = plan.gemm_bars();
-
-    auto tmem_qkv = make_gemm_tmem_for<CfgQkv>(Attn::TmemCols::O);
-    auto tmem_wqb = make_gemm_tmem_for<CfgWqB>(Attn::TmemCols::O);
-    GemmResources<typename CfgQkv::Geom, decltype(tmem_qkv), CfgQkv> res_qkv{
-        .weight = mainloop_params.gemm_wq_a,
-        .act = mainloop_params.act_x,
-        .gemm_smem = gemm_smem,
-        .tmem = tmem_qkv,
-        .bars = gemm_bars};
-    GemmResources<typename CfgWqB::Geom, decltype(tmem_wqb)> res_wqb{
-        .weight = mainloop_params.gemm_wq_b,
-        .act = mainloop_params.act_qlora,
-        .gemm_smem = gemm_smem,
-        .tmem = tmem_wqb,
-        .bars = gemm_bars};
-    Bf16GemmResources<CfgKvGate, decltype(mainloop_params.tma_kv_gate_w),
-                      decltype(mainloop_params.tma_kv_gate_act)>
-        res_kv_gate{.tma_w = mainloop_params.tma_kv_gate_w,
-                    .tma_act = mainloop_params.tma_kv_gate_act,
-                    .gemm_smem = gemm_smem,
-                    .bars = gemm_bars,
-                    .tmem_base = Attn::TmemCols::O,
-                    .act_rows = mainloop_params.kv_gate_act_rows,
-                    .w_out = mainloop_params.shape_kv_gate.w_out,
-                    .k_dim = mainloop_params.shape_kv_gate.k_dim,
-                    .k_tiles = mainloop_params.shape_kv_gate.k_tiles,
-                    .ring = mainloop_params.kv_score_ring,
-                    .ring_rows = mainloop_params.kv_gate_ring_row};
-    auto ranges = make_mla_gemm_ranges<CfgQkv, CfgWqB>(
-        res_qkv, &mainloop_params.gemm_wkv, res_wqb, res_kv_gate,
-        mainloop_params.ws_qlora_part, mainloop_params.ws_kv_part,
-        mainloop_params.ws_flat_q_bf16);
-
-    const KernelBars<KT, MP> bars{mainloop_params};
-
-    using Ctx =
-        KernelPipelines<KT, MP, EP, SharedMemoryPlan<KT>, decltype(bars),
-                        decltype(scheduler), decltype(ranges)>;
-    const Ctx ctx{
-        .params = mainloop_params,
-        .ep = epilogue_params,
-        .plan = plan,
-        .rs = rs,
-        .q_tma_phase = q_tma_phase,
-        .q_utccp_phase = q_utccp_phase,
-        .warp_idx = warp_idx,
-        .lane_idx = (int)(threadIdx.x % KT::WarpSize),
-        .idx_in_warpgroup = (int)(threadIdx.x % KT::ThreadsPerWarpGroup),
-        .warpgroup_idx = (int)cutlass::canonical_warp_group_idx(),
-        .token_iters = scheduler.token_iters(),
-        .sched = scheduler,
-        .prelude = ranges,
-        .bars = bars};
-    run_role(main_loop, epilogue_loop, ctx);
-
-    if (warp_idx == 0) plan.release_tmem();
-    if (mainloop_params.reset_barriers) bars.reset_after_grid();
-}
 }  // namespace halops::mla

@@ -13,35 +13,13 @@
 // limitations under the License.
 
 #include "kernel/mla/mega_mla/mla_params.cuh"
+#include "kernel/mla/mega_mla/prequant_x/config.cuh"
+#include "kernel/mla/mega_mla/prequant_x/kernel.cuh"
 
 namespace halops::mla {
-namespace {
-
-constexpr int kPrequantThreads = 256;
-
-template <int TileTokens, class LayoutSF>
-__global__ void __launch_bounds__(kPrequantThreads)
-    mla_prequant_x_kernel(const __nv_bfloat16* __restrict__ x_input,
-                          int x_stride,
-                          cutlass::float_e4m3_t* __restrict__ ws_fp8,
-                          cutlass::float_ue8m0_t* __restrict__ ws_sf,
-                          LayoutSF layout_sf, int num_tokens, int hidden) {
-    pdl_trigger();
-    pdl_wait();
-    const int per_row = hidden / QuantX::PerThread;
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_tokens * per_row) return;
-    const int token = idx / per_row, chunk = idx - token * per_row;
-    __nv_bfloat16 vals[QuantX::PerThread];
-    *reinterpret_cast<uint4*>(vals) = __ldg(reinterpret_cast<const uint4*>(
-        x_input + (int64_t)token * x_stride + chunk * QuantX::PerThread));
-    quantize_group32_from_regs8<TileTokens>(
-        vals, ws_fp8, ws_sf, layout_sf, token, hidden,
-        chunk / QuantX::ThreadsPerGrp, KernelBase::lane_idx());
-}
-
+/// Rejects hidden rows the 16 B vector loads of the kernel cannot read.
 template <class KT>
-void check_prequant_x_inputs(const MlaAttentionProblem<KT>& prob) {
+void mla_prequant_x_check_inputs(const MlaAttentionProblem<KT>& prob) {
     constexpr int kVecBytes = sizeof(uint4);
     static_assert(QuantX::PerThread * sizeof(__nv_bfloat16) == kVecBytes,
                   "one 16 B load per thread");
@@ -52,18 +30,18 @@ void check_prequant_x_inputs(const MlaAttentionProblem<KT>& prob) {
                 "mla_prequant_x: needs T > 0, H a multiple of ", SfLayout::Gran,
                 " and 16 B aligned hidden rows");
 }
-}  // namespace
 
+/// Launches the x pre-quantisation kernel for one tile-size trait.
 template <class KT>
 void launch_prequant_x(const MlaAttentionProblem<KT>& prob,
                        const ActAtoms<typename KT::GemmBase>& act_x) {
-    check_prequant_x_inputs(prob);
+    mla_prequant_x_check_inputs(prob);
     auto layout = sf_layout(act_x);
     launch_pdl(
         mla_prequant_x_kernel<KT::TileT, decltype(layout)>,
         {cute::ceil_div(prob.num_tokens * (prob.hidden / QuantX::PerThread),
-                        kPrequantThreads),
-         kPrequantThreads},
+                        MlaPrequantXConfig::kThreads),
+         MlaPrequantXConfig::kThreads},
         reinterpret_cast<const __nv_bfloat16*>(prob.hidden_ptr),
         prob.hidden_row_stride, prob.ws_x_fp8, prob.ws_x_sf, layout,
         prob.num_tokens, prob.hidden);
