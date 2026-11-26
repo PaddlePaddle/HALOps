@@ -566,11 +566,14 @@ void gemm_impl_body(GemmParams& params, const int sm_count,
         scheduler_m, scheduler_n, params.num_experts, params.max_m_per_expert,
         params.masked_m, params.expert_ids);
 
-    int smem_size = KernelTraits::KSmemBytes;
-
     static_assert(sizeof(typename KernelTraits::SharedStorage) <=
                       cutlass::arch::sm100_smem_capacity_bytes,
                   "SMEM usage exceeded capacity");
+    static_assert(
+        KernelTraits::KSmemBytes <= cutlass::arch::sm100_smem_capacity_bytes,
+        "SMEM usage exceeded capacity");
+
+    int smem_size = cutlass::arch::sm100_smem_capacity_bytes;
 
     dim3 dimBlock(KernelTraits::KThreads);
     auto cluster_shape = ClusterShape_MNK{};

@@ -14,10 +14,14 @@
 
 #pragma once
 
+#include <cuda.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cutlass/float_subbyte.h>
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <type_traits>
 
 extern "C" int32_t aoti_torch_get_current_cuda_stream(int32_t device_index,
                                                       void** ret_stream);
@@ -89,6 +93,43 @@ inline int CurrentDeviceSmCount() {
     HALOPS_CUDA_CHECK(cudaDeviceGetAttribute(
         &sm_count, cudaDevAttrMultiProcessorCount, CurrentDevice()));
     return sm_count;
+}
+
+template <typename T>
+inline constexpr CUtensorMapDataType TmaDataType() {
+    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+    } else if constexpr (std::is_same_v<T, float>) {
+        return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
+    } else if constexpr (std::is_same_v<T, std::uint32_t>) {
+        return CU_TENSOR_MAP_DATA_TYPE_UINT32;
+    } else if constexpr (std::is_same_v<T, cutlass::float_e2m1_t>) {
+        return CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B;
+    } else {
+        static_assert(sizeof(T) == 1u, "unsupported TMA element type");
+        return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+    }
+}
+
+template <int Rank, typename T>
+inline CUtensorMap CreateTmaDesc(
+    const char* debug_name, const T* global_ptr,
+    const std::uint64_t (&shape)[Rank],
+    const std::uint64_t (&strides)[Rank - 1], const std::uint32_t (&box)[Rank],
+    bool use_swizzle = true,
+    CUtensorMapL2promotion promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_128B) {
+    static_assert(Rank >= 2 && Rank <= 5, "TMA supports rank 2..5 here");
+    static constexpr std::uint32_t kUnitStride[5] = {1u, 1u, 1u, 1u, 1u};
+    CUtensorMap desc{};
+    const CUresult res = cuTensorMapEncodeTiled(
+        &desc, TmaDataType<T>(), Rank,
+        const_cast<void*>(static_cast<const void*>(global_ptr)), shape, strides,
+        box, kUnitStride, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        use_swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE,
+        promotion, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(res == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for ",
+                debug_name, ": CUresult=", static_cast<int>(res));
+    return desc;
 }
 
 }  // namespace halops

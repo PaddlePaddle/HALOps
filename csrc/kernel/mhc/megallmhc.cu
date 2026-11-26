@@ -19,10 +19,9 @@
 #include <vector>
 
 #include "common/cuda_utils.h"
+#include "common/mx_quant.cuh"
 #include "common/pdl.cuh"
-#include "kernel/gemm/gemm_utils.h"
 #include "kernel/mhc/megallmhc.cuh"
-#include "kernel/moe/moe_tma.cuh"
 
 namespace halops {
 
@@ -47,14 +46,14 @@ void LaunchMegaLlMhc(const Params& p, float* part, bool has_shared,
     const uint64_t row = h * sizeof(__nv_bfloat16);
     const uint32_t cols = Traits::kCtaCols, rows = Traits::kMTile;
     TmaMaps maps;
-    maps.x = moe::CreateTmaDesc<2>("x", p.x, {h, t}, {row}, {cols, rows});
-    maps.shared = has_shared ? moe::CreateTmaDesc<2>("shared", p.shared, {h, t},
-                                                     {row}, {cols, rows})
+    maps.x = CreateTmaDesc<2>("x", p.x, {h, t}, {row}, {cols, rows});
+    maps.shared = has_shared ? CreateTmaDesc<2>("shared", p.shared, {h, t},
+                                                {row}, {cols, rows})
                              : maps.x;
-    maps.res = moe::CreateTmaDesc<3>("residual", p.residual, {h, hc, t},
-                                     {row, row * hc}, {cols, 1, rows});
-    maps.out = moe::CreateTmaDesc<3>("residual_out", p.residual_out, {h, hc, t},
-                                     {row, row * hc}, {cols, 1, rows});
+    maps.res = CreateTmaDesc<3>("residual", p.residual, {h, hc, t},
+                                {row, row * hc}, {cols, 1, rows});
+    maps.out = CreateTmaDesc<3>("residual_out", p.residual_out, {h, hc, t},
+                                {row, row * hc}, {cols, 1, rows});
 
     const int m_tiles = (p.num_tokens + Traits::kMTile - 1) / Traits::kMTile;
     const int tiles = static_cast<int>(std::min<int64_t>(token_tiles, m_tiles));
@@ -117,7 +116,8 @@ std::vector<torch::Tensor> MegaLlMhc(
     auto post_out = torch::empty({t, kHc}, opts.dtype(kF32));
     auto comb_out = torch::empty({t, kHc, kHc}, opts.dtype(kF32));
     auto q_out = torch::empty({t, kHidden}, opts.dtype(torch::kFloat8_e4m3fn));
-    const int64_t sf_rows = use_swizzle ? AlignSfM(static_cast<int>(t)) : t;
+    const int64_t sf_rows =
+        use_swizzle ? cute::round_up(t, int64_t{mxfp8::kAtomRows}) : t;
     auto sf_out =
         torch::empty({sf_rows, Traits::kSfCols}, opts.dtype(torch::kByte));
     std::vector<torch::Tensor> outs = {residual_out, layer_out, post_out,

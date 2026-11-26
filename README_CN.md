@@ -28,6 +28,7 @@ HALOps 面向 NVIDIA Blackwell（SM100）从零设计，基于 CUTLASS / CuTe �
 - **GQA Attention**：支持变长 prefill 与 paged-KV decode，覆盖 BF16 / FP8 KV cache、GQA 与投机解码等推理场景，结合 split-KV 并行、自适应规约与前后处理算子融合，在长上下文与小 batch decode 下充分释放 SM100 的算力与带宽。
 - **多精度 GEMM**：支持 FP8（MXFP8）与 FP4（NVFP4 / MXFP4）block-scaled GEMM，覆盖 dense、batched 与 MoE grouped 场景，结合超轻量开销的灵活 tile 配置与 pre-mapping tile 调度等策略，在 SM100 架构上在多数场景下取得了业界领先的性能。
 - **巨内核稀疏 MLA**：支持 HCA 与 SWA 的高性能巨内核（MegaKernel）稀疏 attention，消除 kernel 调度与中间结果的显存往返开销，并通过 tile 级流水编排掩盖计算与访存开销，进一步提升 GPU 算力利用率。
+- **低时延解码算子**：面向小并发、小计算规模的解码场景，提供低时延 GEMM、MegaLLMoE 巨内核与 One-Pass mHC 等算子，并配套相应量化算子。
 
 ## 性能
 以下数据均在 SM100 架构上测试：MXFP8 Dense GEMM 在部分场景下性能领先 DeepGEMM 与 FlashInfer；MegaMLA 在小并发场景下全面领先多流结合 PDL 的实现方式。
@@ -61,7 +62,7 @@ HALOps 面向 NVIDIA Blackwell（SM100）从零设计，基于 CUTLASS / CuTe �
 预编译包支持 Python 3.12 + CUDA 13.2，平台为 Linux x86_64 与 aarch64。安装 CUDA 13.2 版 PyTorch 后，可直接安装 [HALOps 预编译包](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/)：
 
 ```bash
-python -m pip install halops==0.1.0 -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
+python -m pip install halops==0.2.0 -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
 ```
 
 其他 Python 或 CUDA 版本请[从源码构建](#从源码构建)。
@@ -103,7 +104,6 @@ print(output.shape, output.dtype)
 
 - **全面的 GEMM 支持矩阵**：覆盖 W4A8、BF16 等类型的 GEMM，打造全量化类型的 GEMM 支持矩阵，满足不同推理性能与效果需求下的选择。
 - **更高性能的巨内核方案**：覆盖更多场景的通算融合，以及计算与访存 overlap 的优化方案。
-- **小计算规模下的高性能 kernel**：面向小数据规模的推理方案，为小并发下的极限推理速度提供 kernel 底座支撑。
 
 ## 如何贡献
 

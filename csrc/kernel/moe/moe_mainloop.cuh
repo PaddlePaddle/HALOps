@@ -219,7 +219,6 @@ struct CollectiveMainloopMoE {
              static_cast<std::uint64_t>(args.intermediate_size) * expert_width *
                  Traits::RoutedDownGemm::MmaCore::kElementABits) /
             8u;
-        // Latent, shared and tail weights also use L2 during this launch.
         const auto expert_cache_bytes = args.l2_cached_bytes / 2u;
         params.l2_expert_capacity =
             args.l2_cached_bytes > 0u && expert_weight_bytes > 0u

@@ -24,6 +24,7 @@
 #include <cute/tensor.hpp>
 
 #include "common/pdl.cuh"
+#include "common/ptx.cuh"
 
 namespace halops::mla {
 CUTE_DEVICE
@@ -70,6 +71,21 @@ void tma_gather4(const void* desc_ptr,
         : "memory");
 }
 
+// tma_gather4 with a shared::cluster destination and no cta_group.
+CUTE_DEVICE
+void tma_gather4_cluster(const void* desc_ptr, uint64_t* mbar_ptr,
+                         void* smem_ptr, int col_idx, int4 row_idxs,
+                         uint64_t cache_hint) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4.mbarrier:"
+        ":complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3, %4, %5, %6}], "
+        "[%7], %8;" ::"r"(cute::cast_smem_ptr_to_uint(smem_ptr)),
+        "l"(desc_ptr), "r"(col_idx), "r"(row_idxs.x), "r"(row_idxs.y),
+        "r"(row_idxs.z), "r"(row_idxs.w),
+        "r"(cute::cast_smem_ptr_to_uint(mbar_ptr)), "l"(cache_hint)
+        : "memory");
+}
+
 CUTE_DEVICE
 void tma_load_2d(const void* desc_ptr,
                  cutlass::arch::ClusterTransactionBarrier& mbar, void* smem_ptr,
@@ -83,6 +99,32 @@ void tma_load_2d(const void* desc_ptr,
         :
         : "r"(smem_addr), "l"(desc_ptr), "r"(mbar_addr), "r"(crd0), "r"(crd1),
           "l"(cache_hint)
+        : "memory");
+}
+
+// TMA tile loads without an L2 cache hint (cute::SM90_TMA_LOAD_2D/3D always
+// pass one).
+CUTE_DEVICE
+void tma_load_2d_no_hint(const void* desc_ptr, uint64_t* mbar_ptr,
+                         void* smem_ptr, int crd0, int crd1) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::"
+        "complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" ::"r"(
+            cute::cast_smem_ptr_to_uint(smem_ptr)),
+        "l"(desc_ptr), "r"(crd0), "r"(crd1),
+        "r"(cute::cast_smem_ptr_to_uint(mbar_ptr))
+        : "memory");
+}
+
+CUTE_DEVICE
+void tma_load_3d_no_hint(const void* desc_ptr, uint64_t* mbar_ptr,
+                         void* smem_ptr, int crd0, int crd1, int crd2) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::"
+        "complete_tx::bytes [%0], [%1, {%2, %3, %4}], [%5];" ::"r"(
+            cute::cast_smem_ptr_to_uint(smem_ptr)),
+        "l"(desc_ptr), "r"(crd0), "r"(crd1), "r"(crd2),
+        "r"(cute::cast_smem_ptr_to_uint(mbar_ptr))
         : "memory");
 }
 
@@ -118,6 +160,16 @@ int gmem_atom_add1_acq_rel(int* ptr) {
     asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;"
                  : "=r"(prev)
                  : "l"(ptr)
+                 : "memory");
+    return prev;
+}
+
+CUTE_DEVICE
+int gmem_atom_add_acq_rel(int* ptr, int v) {
+    int prev;
+    asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;"
+                 : "=r"(prev)
+                 : "l"(ptr), "r"(v)
                  : "memory");
     return prev;
 }
@@ -173,17 +225,6 @@ void mbar_arrive_cluster_relaxed(uint32_t bar_cluster) {
 }
 
 CUTE_DEVICE
-void mbar_wait_cluster(uint32_t bar, uint32_t phase) {
-    asm volatile(
-        "{\n.reg .pred p;\nWAIT_CL:\n"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], "
-        "%1;\n"
-        "@!p bra WAIT_CL;\n}\n" ::"r"(bar),
-        "r"(phase)
-        : "memory");
-}
-
-CUTE_DEVICE
 void bulk_copy_to_peer(uint32_t dst_cluster, uint32_t src, uint32_t bytes,
                        uint32_t bar_cluster) {
     asm volatile(
@@ -207,6 +248,42 @@ CUTE_DEVICE
 void smem_st_128b(uint32_t smem_addr, __int128_t const& data) {
     asm volatile("st.weak.shared::cta.b128 [%0], %1;\n" ::"r"(smem_addr),
                  "q"(data));
+}
+
+// 16-byte shared load / store at smem_addr ^ kXor (an address swizzle).
+template <uint32_t kXor>
+CUTE_DEVICE uint4 lds_128b_xor(uint32_t smem_addr) {
+    uint4 v;
+    asm volatile(
+        "{\n\t.reg .b32 a;\n\txor.b32 a, %4, %5;\n\t"
+        "ld.shared.v4.u32 {%0, %1, %2, %3}, [a];\n\t}"
+        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+        : "r"(smem_addr), "n"(kXor)
+        : "memory");
+    return v;
+}
+
+template <uint32_t kXor>
+CUTE_DEVICE void sts_128b_xor(uint32_t smem_addr, uint32_t a, uint32_t b,
+                              uint32_t c, uint32_t d) {
+    asm volatile(
+        "{\n\t.reg .b32 a;\n\txor.b32 a, %0, %1;\n\t"
+        "st.shared.v4.u32 [a], {%2, %3, %4, %5};\n\t}" ::"r"(smem_addr),
+        "n"(kXor), "r"(a), "r"(b), "r"(c), "r"(d)
+        : "memory");
+}
+
+// bar.red.or on named barrier kId (numbered as cutlass::arch::NamedBarrier),
+// result discarded.
+template <uint32_t kId, uint32_t kThreads>
+CUTE_DEVICE void named_bar_red_or(uint32_t pred) {
+    constexpr uint32_t kHwId =
+        kId + uint32_t(cutlass::arch::ReservedNamedBarriers::FirstUserBarrier);
+    asm volatile(
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %0, 0;\n\t"
+        "bar.red.or.pred p, %1, %2, p;\n\t}" ::"r"(pred),
+        "n"(kHwId), "n"(kThreads)
+        : "memory");
 }
 
 CUTE_DEVICE
@@ -237,6 +314,26 @@ float2 fma_rn_f32x2(const float2& lhs, const float2& rhs,
                    "l"(reinterpret_cast<uint64_t const&>(rhs)),
                    "l"(reinterpret_cast<uint64_t const&>(addend)));
     return result;
+}
+
+// Scalar .rn ops without .ftz, which __fmaf_rn and friends get under
+// --use_fast_math.
+CUTE_DEVICE float fma_rn_f32(float a, float b, float c) {
+    float d;
+    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(d) : "f"(a), "f"(b), "f"(c));
+    return d;
+}
+
+CUTE_DEVICE float mul_rn_f32(float a, float b) {
+    float d;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
+    return d;
+}
+
+CUTE_DEVICE float add_rn_f32(float a, float b) {
+    float d;
+    asm("add.rn.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
+    return d;
 }
 
 CUTE_DEVICE
@@ -296,6 +393,13 @@ CUTE_DEVICE void tmem_ld_32dp32bNx(uint32_t tmem_start, void* data_) {
     [&]<size_t... Is>(cute::index_sequence<Is...>) {
         TmemLoad32dp32b<kNumElements>::copy(tmem_start, data[Is]...);
     }(cute::make_index_sequence<kNumElements>{});
+}
+
+// tmem_ld_32dp32bNx, then wait for the load.
+template <int kNumElements>
+CUTE_DEVICE void tmem_ld_32dp32bNx_wait(uint32_t tmem_start, void* data) {
+    tmem_ld_32dp32bNx<kNumElements>(tmem_start, data);
+    cutlass::arch::fence_view_async_tmem_load();
 }
 
 template <int kNumElements>

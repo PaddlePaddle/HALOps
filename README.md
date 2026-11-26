@@ -28,6 +28,7 @@ HALOps is designed from the ground up for NVIDIA Blackwell (SM100). Built on CUT
 - **GQA attention**: variable-length prefill and paged-KV decode across BF16 / FP8 KV cache, GQA and speculative decoding; split-KV parallelism, adaptive reduction and fused pre/post-processing make full use of SM100 compute and bandwidth in long-context and small-batch decode.
 - **Multi-precision GEMM**: FP8 (MXFP8) and FP4 (NVFP4 / MXFP4) block-scaled GEMM for dense, batched and MoE grouped workloads; with ultra-lightweight flexible tile configurations and pre-mapped tile scheduling, it delivers industry-leading performance in most scenarios on SM100.
 - **MegaKernel sparse MLA**: high-performance MegaKernel sparse attention for HCA and SWA, removing kernel scheduling and intermediate memory round trips, with tile-level pipelining that hides compute and memory latency to push GPU utilization further.
+- **Low-latency decode operators**: for low-concurrency, small-workload decode, provides low-latency GEMM, the MegaLLMoE MegaKernel and One-Pass mHC, with supporting quantization operators.
 
 ## Performance
 All results are measured on SM100: MXFP8 dense GEMM outperforms DeepGEMM and FlashInfer in some cases, and MegaMLA consistently outperforms the multi-stream + PDL implementation at small concurrency.
@@ -61,7 +62,7 @@ See the [NVIDIA CUDA compatibility matrix](https://docs.nvidia.com/deploy/cuda-c
 Prebuilt wheels are available for Python 3.12 with CUDA 13.2 on Linux x86_64 and aarch64. With a CUDA 13.2 build of PyTorch installed, install the [prebuilt HALOps package](https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/) directly:
 
 ```bash
-python -m pip install halops==0.1.0 -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
+python -m pip install halops==0.2.0 -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
 ```
 
 For other Python or CUDA versions, [build from source](#build-from-source).
@@ -103,7 +104,6 @@ print(output.shape, output.dtype)
 
 - **Complete GEMM coverage**: add W4A8, BF16 and other GEMM types to build a full quantization-type support matrix, so users can pick the trade-off between inference speed and accuracy they need.
 - **Higher-performance MegaKernels**: cover more compute-communication fusion scenarios and further overlap compute with memory traffic.
-- **High-performance kernels for small workloads**: kernels tuned for small problem sizes that deliver the lowest latency at low concurrency.
 
 ## Contributing
 
